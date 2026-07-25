@@ -6,7 +6,7 @@
 //! 결정론: 최근접 면 동률은 낮은 face 인덱스 우선, 반복 상한 고정.
 
 use crate::gjk::SupportPoint;
-use crate::tolerance::{bary_denom_eps, characteristic_length, length_eps, length_sq_eps};
+use crate::tolerance::{area_eps, bary_denom_eps, characteristic_length, length_eps};
 use crate::{Pose, Shape};
 use maru_math::Vec3;
 
@@ -38,12 +38,13 @@ fn make_face(
     j: usize,
     k: usize,
     interior: Vec3,
-    eps_l2: f32,
+    eps_area: f32,
 ) -> Option<Face> {
     let (a, b, c) = (verts[i].w, verts[j].w, verts[k].w);
     let mut n = (b - a).cross(c - a);
-    if n.length_sq() < eps_l2 {
-        return None; // 퇴화 면 (L² 차원 — 절대 상수 금지)
+    // cross 길이 = 면적(L²) → L² 임계와 비교 (length_sq는 L⁴이라 차원 불일치)
+    if n.length() < eps_area {
+        return None; // 퇴화 면
     }
     let len = n.length();
     n = n * (1.0 / len);
@@ -67,13 +68,13 @@ fn make_face(
 pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> Penetration {
     let scale = characteristic_length(sa, sb);
     let eps_len = length_eps(scale);
-    let eps_l2 = length_sq_eps(scale);
+    let eps_area = area_eps(scale);
     let denom_eps = bary_denom_eps(scale);
     let mut verts: Vec<SupportPoint> = seed.to_vec();
     let interior = (verts[0].w + verts[1].w + verts[2].w + verts[3].w) * 0.25;
     let mut faces: Vec<Face> = Vec::with_capacity(32);
     for (i, j, k) in [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
-        if let Some(f) = make_face(&verts, i, j, k, interior, eps_l2) {
+        if let Some(f) = make_face(&verts, i, j, k, interior, eps_area) {
             faces.push(f);
         }
     }
@@ -131,7 +132,7 @@ pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose
             }
         }
         for &(a, b) in &horizon {
-            if let Some(nf) = make_face(&verts, a, b, wi, interior, eps_l2) {
+            if let Some(nf) = make_face(&verts, a, b, wi, interior, eps_area) {
                 faces.push(nf);
             }
         }

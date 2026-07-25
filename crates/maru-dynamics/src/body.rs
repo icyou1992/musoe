@@ -12,7 +12,11 @@ pub enum BodyType {
     Kinematic,
 }
 
+/// `#[non_exhaustive]`: **크레이트 밖에서 구조체 리터럴로 만들 수 없다**(리뷰 MAJOR).
+/// 생성자가 강제하는 불변식(유한 pose·양수 역질량·검증된 셰이프)을 우회하는 경로를
+/// 타입 수준에서 막는다. 읽기는 그대로 공개 필드로 한다(월드는 `&mut Body`를 밖에 주지 않는다).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Body {
     pub body_type: BodyType,
     pub pose: Pose,
@@ -39,6 +43,12 @@ impl Body {
             pose.pos.is_finite() && pose.rot.is_finite(),
             "pose must be finite"
         );
+        // **hull 재중심화**: 솔버는 pose.pos를 질량중심으로 가정한다(r = 접점 − pose.pos).
+        // 중심이 어긋난 hull은 평행축 항으로 대각 관성을 키워도 **관성곱(products of
+        // inertia)**이 빠져 2축 이상 어긋나면 축이 틀린 텐서가 된다(리뷰 MAJOR).
+        // 대각 텐서로 정확해지는 유일한 방법은 실제로 중심을 맞추는 것 — 점을 중심으로
+        // 옮기고 pose를 같은 양만큼 월드에서 밀어 **같은 물체**를 유지한다.
+        let (shape, pose) = recenter_hull(shape, pose);
         let (mass, inertia) = mass_properties(&shape, density);
         assert!(
             mass.is_finite()
@@ -124,6 +134,29 @@ impl Body {
     }
 }
 
+/// hull의 AABB 중심을 원점으로 옮기고, 같은 양을 월드 자세에 반영한다(물체는 불변).
+/// 결과: 질량중심이 pose.pos와 일치 → 평행축 항 0 → 관성곱 0 → 대각 텐서가 정확해진다.
+fn recenter_hull(shape: Shape, pose: Pose) -> (Shape, Pose) {
+    let Shape::Hull { points, radius } = shape else {
+        return (shape, pose);
+    };
+    let (mut min, mut max) = (points[0], points[0]);
+    for p in &points[1..] {
+        min = Vec3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z));
+        max = Vec3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z));
+    }
+    let c = (max + min) * 0.5;
+    if c == Vec3::ZERO {
+        return (Shape::Hull { points, radius }, pose);
+    }
+    let points = points.iter().map(|p| *p - c).collect();
+    let pose = Pose {
+        pos: pose.pos + pose.rot.rotate(c),
+        rot: pose.rot,
+    };
+    (Shape::Hull { points, radius }, pose)
+}
+
 /// (질량, 관성 대각). 캡슐은 원통+반구 근사 대신 v1은 동체 실린더 근사(문서화된 가정).
 fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
     match *shape {
@@ -157,9 +190,8 @@ fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
         }
         Shape::Hull { ref points, .. } => {
             // [가정] v1: AABB 근사 — hull 정밀 적분은 hull 빌더와 함께.
-            // **평행축 정리 필수**: 솔버는 pose.pos를 회전 중심으로 쓰므로(r = 접점 − pose.pos),
-            // 원점에서 벗어난 hull의 관성에 m·d²를 더하지 않으면 레버암 100m에 중심 박스의
-            // 작은 관성이 곱해져 비현실적 각가속도가 난다(리뷰 지적).
+            // 동적 바디는 `recenter_hull`을 이미 거쳐 d≈0이다(평행축 항은 방어적 잔존).
+            // d≠0 경로로 들어오면 관성곱이 빠진 근사임을 알고 쓴다.
             let mut min = points[0];
             let mut max = points[0];
             for p in &points[1..] {
@@ -208,14 +240,11 @@ mod tests {
         );
     }
 
-    /// 리뷰 회귀: 원점에서 벗어난 hull은 평행축 항(m·d²)이 관성에 들어가야 한다.
+    /// 리뷰 회귀: 중심이 2축 이상 어긋난 hull은 대각 텐서로 표현 불가 →
+    /// 생성 경계에서 재중심화해 pose.pos = 질량중심 계약을 참으로 만든다.
     #[test]
-    fn offset_hull_inertia_includes_parallel_axis() {
-        let far = 10.0f32;
-        let pts = vec![
-            Vec3::new(far - 0.5, -0.5, -0.5),
-            Vec3::new(far + 0.5, 0.5, 0.5),
-        ];
+    fn offset_hull_is_recentered_to_com() {
+        let pts = vec![Vec3::new(9.5, 19.5, 29.5), Vec3::new(10.5, 20.5, 30.5)];
         let b = Body::new_dynamic(
             Shape::Hull {
                 points: pts,
@@ -227,14 +256,27 @@ mod tests {
             },
             1.0,
         );
-        let m = 1.0f32; // 1×1×1
-        let i_center_y = m / 3.0 * (0.25 + 0.25);
-        let expect_y = i_center_y + m * far * far; // ≈100 지배
-        assert!(
-            (1.0 / b.inv_inertia_local.y - expect_y).abs() < 0.1 * expect_y,
-            "Iyy={} expect≈{expect_y}",
-            1.0 / b.inv_inertia_local.y
-        );
+        // 자세가 질량중심으로 이동했다 (같은 월드 위치의 같은 물체)
+        assert!((b.pose.pos - Vec3::new(10.0, 20.0, 30.0)).length() < 1e-3);
+        // 셰이프 점은 원점 중심
+        let Shape::Hull { ref points, .. } = b.shape else {
+            panic!()
+        };
+        let c = (points[0] + points[1]) * 0.5;
+        assert!(c.length() < 1e-4, "재중심화 실패 {c:?}");
+        // 관성은 1×1×1 중심 박스와 동일 — 평행축 항으로 부풀지 않는다
+        let expect = 1.0f32 / 6.0;
+        for v in [
+            b.inv_inertia_local.x,
+            b.inv_inertia_local.y,
+            b.inv_inertia_local.z,
+        ] {
+            assert!(
+                (1.0 / v - expect).abs() < 1e-3,
+                "I={} expect {expect}",
+                1.0 / v
+            );
+        }
     }
 
     #[test]

@@ -50,10 +50,14 @@ pub enum ApiError {
 }
 
 pub struct World {
-    pub params: WorldParams,
+    /// **비공개** — 무검증 대입을 막는다(리뷰 MAJOR). 읽기는 `params()`, 변경은 `set_params()`.
+    params: WorldParams,
     bodies: Vec<Body>,
     /// 슬롯 생존 여부. 죽은 슬롯은 재사용 대기(세대가 이미 증가한 상태).
     alive: Vec<bool>,
+    /// pending `AddBody`가 잡아둔 슬롯. `alive`도 `reserved`도 아닌 슬롯만 재사용한다.
+    /// 예약 슬롯은 쿼리에 보이지 않지만 세대는 이미 증가해 옛 핸들이 되살아나지 않는다.
+    reserved: Vec<bool>,
     generations: Vec<u32>,
     /// PCM 임펄스 캐시: canonical 페어 → (feature, 임펄스). 스텝 간 warm start (설계 §3).
     contact_cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
@@ -78,40 +82,46 @@ pub struct Diagnostics {
     pub max_penetration: f32,
 }
 
+/// 파라미터 불변식 — `new`와 `set_params`가 **같은** 검증을 쓴다.
+fn validate_params(params: &WorldParams) {
+    assert!(params.gravity.is_finite(), "gravity must be finite");
+    assert!(
+        (1..=64).contains(&params.substeps),
+        "substeps must be in 1..=64, got {}",
+        params.substeps
+    );
+    assert!(
+        params.speculative_margin.is_finite() && params.speculative_margin >= 0.0,
+        "speculative_margin must be finite and non-negative"
+    );
+    assert!(
+        params.solver.contact_hertz.is_finite() && params.solver.contact_hertz > 0.0,
+        "contact_hertz must be finite and positive"
+    );
+    assert!(
+        params.solver.contact_damping.is_finite() && params.solver.contact_damping >= 0.0,
+        "contact_damping must be finite and non-negative"
+    );
+    assert!(
+        params.solver.max_bias_speed.is_finite() && params.solver.max_bias_speed > 0.0,
+        "max_bias_speed must be finite and positive"
+    );
+    assert!(
+        params.sleep_linear_threshold >= 0.0 && params.sleep_angular_threshold >= 0.0,
+        "sleep thresholds must be non-negative"
+    );
+}
+
 impl World {
     /// 파라미터 불변식을 생성 경계에서 강제한다 (리뷰 MAJOR: 무검증 public 필드가
     /// dt/substeps·Softness 분모를 NaN/Inf로 만들 수 있었다).
     pub fn new(params: WorldParams) -> Self {
-        assert!(params.gravity.is_finite(), "gravity must be finite");
-        assert!(
-            (1..=64).contains(&params.substeps),
-            "substeps must be in 1..=64, got {}",
-            params.substeps
-        );
-        assert!(
-            params.speculative_margin.is_finite() && params.speculative_margin >= 0.0,
-            "speculative_margin must be finite and non-negative"
-        );
-        assert!(
-            params.solver.contact_hertz.is_finite() && params.solver.contact_hertz > 0.0,
-            "contact_hertz must be finite and positive"
-        );
-        assert!(
-            params.solver.contact_damping.is_finite() && params.solver.contact_damping >= 0.0,
-            "contact_damping must be finite and non-negative"
-        );
-        assert!(
-            params.solver.max_bias_speed.is_finite() && params.solver.max_bias_speed > 0.0,
-            "max_bias_speed must be finite and positive"
-        );
-        assert!(
-            params.sleep_linear_threshold >= 0.0 && params.sleep_angular_threshold >= 0.0,
-            "sleep thresholds must be non-negative"
-        );
+        validate_params(&params);
         Self {
             params,
             bodies: Vec::new(),
             alive: Vec::new(),
+            reserved: Vec::new(),
             generations: Vec::new(),
             contact_cache: HashMap::new(),
             sleep_timer: Vec::new(),
@@ -124,9 +134,60 @@ impl World {
         }
     }
 
+    #[inline]
+    pub fn params(&self) -> &WorldParams {
+        &self.params
+    }
+
+    /// 파라미터 교체 — 생성자와 **같은 불변식**을 통과해야 한다.
+    pub fn set_params(&mut self, params: WorldParams) {
+        validate_params(&params);
+        self.params = params;
+    }
+
+    /// 재사용 가능한 최소 인덱스 슬롯 (살아있지도 예약되지도 않은 것).
+    fn free_slot(&self) -> Option<usize> {
+        (0..self.bodies.len()).find(|&i| !self.alive[i] && !self.reserved[i])
+    }
+
+    fn push_slot(&mut self, body: Body, alive: bool, reserved: bool) -> u32 {
+        let index = self.bodies.len() as u32;
+        self.bodies.push(body);
+        self.alive.push(alive);
+        self.reserved.push(reserved);
+        self.generations.push(0);
+        self.sleep_timer.push(0.0);
+        self.asleep.push(false);
+        self.island.push(u32::MAX);
+        index
+    }
+
+    /// `AddBody`를 큐에 쌓고 **핸들을 즉시 반환**한다(리뷰 BLOCKER: 커맨드 경로에서
+    /// 새 바디를 가리킬 방법이 없었다). 슬롯을 예약하고 세대를 올려 ABA를 차단한다.
+    /// 반환된 핸들은 flush 이후에 유효해지며, 그 전에도 같은 배치의 후속 커맨드에 쓸 수 있다.
+    pub fn enqueue_add_body(&mut self, body: Body) -> BodyHandle {
+        let index = if let Some(index) = self.free_slot() {
+            self.reserved[index] = true;
+            // 슬롯 재사용 — 예약 시점에 세대를 올려 옛 핸들이 새 바디를 가리키지 못하게 한다
+            self.generations[index] = self.generations[index].wrapping_add(1);
+            self.sleep_timer[index] = 0.0;
+            self.asleep[index] = false;
+            self.island[index] = u32::MAX;
+            index as u32
+        } else {
+            self.push_slot(body.clone(), false, true)
+        };
+        let h = BodyHandle {
+            index,
+            generation: self.generations[index as usize],
+        };
+        self.commands.push(Command::AddBody(h, Box::new(body)));
+        h
+    }
+
     /// 바디 추가. 빈 슬롯이 있으면 **최소 인덱스**를 재사용한다(이력 무관 canonical 배치).
     pub fn add_body(&mut self, body: Body) -> BodyHandle {
-        if let Some(index) = (0..self.bodies.len()).find(|&i| !self.alive[i]) {
+        if let Some(index) = self.free_slot() {
             self.bodies[index] = body;
             self.alive[index] = true;
             self.sleep_timer[index] = 0.0;
@@ -137,16 +198,10 @@ impl World {
                 generation: self.generations[index],
             };
         }
-        let index = self.bodies.len() as u32;
-        self.bodies.push(body);
-        self.alive.push(true);
-        self.generations.push(0);
-        self.sleep_timer.push(0.0);
-        self.asleep.push(false);
-        self.island.push(u32::MAX);
+        let index = self.push_slot(body, true, false);
         BodyHandle {
             index,
-            generation: 0,
+            generation: self.generations[index as usize],
         }
     }
 
@@ -176,10 +231,10 @@ impl World {
             }
         }
         for j in &self.joints {
-            if j.body_a == i {
-                neighbors.push(j.body_b);
-            } else if j.body_b == i {
-                neighbors.push(j.body_a);
+            if j.ia() == i {
+                neighbors.push(j.ib());
+            } else if j.ib() == i {
+                neighbors.push(j.ia());
             }
         }
         neighbors.sort_unstable();
@@ -191,11 +246,12 @@ impl World {
         }
         // ② 구조 변경
         self.alive[i] = false;
+        self.reserved[i] = false;
         self.generations[i] = self.generations[i].wrapping_add(1);
         self.asleep[i] = false;
         self.island[i] = u32::MAX;
         // ③ 인접 정리
-        self.joints.retain(|j| j.body_a != i && j.body_b != i);
+        self.joints.retain(|j| j.ia() != i && j.ib() != i);
         let id = i as u32;
         self.contact_cache
             .retain(|(a, b), _| *a != id && (*b & !STATIC_BIT) != id);
@@ -313,29 +369,30 @@ impl World {
         let mut report = CommandReport::default();
         for cmd in cmds {
             let ok = match cmd {
-                Command::AddBody(b) => {
-                    self.add_body(*b);
-                    true
+                Command::AddBody(h, b) => {
+                    let i = h.index as usize;
+                    // 예약이 살아있고 세대가 맞을 때만 실현한다(스냅샷에서 온 바이트 방어)
+                    if i < self.bodies.len()
+                        && self.reserved[i]
+                        && self.generations[i] == h.generation
+                    {
+                        self.bodies[i] = *b;
+                        self.reserved[i] = false;
+                        self.alive[i] = true;
+                        self.sleep_timer[i] = 0.0;
+                        self.asleep[i] = false;
+                        self.island[i] = u32::MAX;
+                        true
+                    } else {
+                        false
+                    }
                 }
                 Command::RemoveBody(h) => self.remove_body(h).is_ok(),
                 Command::SetLinearVelocity(h, v) => self.set_linear_velocity(h, v).is_ok(),
                 Command::SetAngularVelocity(h, v) => self.set_angular_velocity(h, v).is_ok(),
                 Command::SetPose(h, p) => self.set_pose(h, p).is_ok(),
                 Command::SetMaterial(h, f, r) => self.set_material(h, f, r).is_ok(),
-                Command::AddJoint(j) => {
-                    let (a, b) = (j.body_a, j.body_b);
-                    if a < self.bodies.len()
-                        && b < self.bodies.len()
-                        && a != b
-                        && self.alive[a]
-                        && self.alive[b]
-                    {
-                        self.add_joint(*j);
-                        true
-                    } else {
-                        false
-                    }
-                }
+                Command::AddJoint(j) => self.try_add_joint(*j).is_ok(),
             };
             if ok {
                 report.applied += 1;
@@ -352,26 +409,40 @@ impl World {
         self.diag
     }
 
+    /// 잠들었는지. **stale 핸들은 false**(살아있지 않은 것은 잠든 것이 아니다).
+    /// raw 인덱스 접근은 재사용된 슬롯의 남의 상태를 읽으므로 쓰지 않는다(리뷰 MAJOR).
     pub fn is_asleep(&self, h: BodyHandle) -> bool {
-        self.asleep[h.index as usize]
+        self.resolve(h).map(|i| self.asleep[i]).unwrap_or(false)
     }
 
     /// 조인트 추가. 연결 바디를 깨운다 (edge 생성형 변이 — 설계 §4.6).
-    pub fn add_joint(&mut self, mut joint: Joint) -> usize {
-        assert!(
-            joint.body_a < self.bodies.len()
-                && joint.body_b < self.bodies.len()
-                && self.alive[joint.body_a]
-                && self.alive[joint.body_b]
-                && joint.body_a != joint.body_b,
-            "joint endpoints must be distinct live bodies"
-        );
-        self.wake(joint.body_a);
-        self.wake(joint.body_b);
+    pub fn add_joint(&mut self, joint: Joint) -> usize {
+        self.try_add_joint(joint)
+            .expect("joint endpoints must be distinct live bodies")
+    }
+
+    /// 조인트 추가 (오류 반환형). 엔드포인트는 **세대까지** 검증한다 — 인덱스만 보면
+    /// 제거·재사용된 슬롯의 새 바디에 붙는다(리뷰 BLOCKER: ABA).
+    pub fn try_add_joint(&mut self, mut joint: Joint) -> Result<usize, ApiError> {
+        let (a, b) = (self.resolve(joint.body_a)?, self.resolve(joint.body_b)?);
+        if a == b {
+            return Err(ApiError::InvalidValue);
+        }
+        if !joint.anchor_a.is_finite() || !joint.anchor_b.is_finite() {
+            return Err(ApiError::InvalidValue);
+        }
+        if let crate::joint::JointKind::Hinge { axis_a, axis_b } = joint.kind {
+            // normalize_or_zero가 0을 남기면 각 제약이 조용히 사라진다
+            if axis_a.length_sq() < 0.5 || axis_b.length_sq() < 0.5 {
+                return Err(ApiError::InvalidValue);
+            }
+        }
+        self.wake(a);
+        self.wake(b);
         joint.linear_impulse = Vec3::ZERO;
         joint.angular_impulse = [0.0, 0.0]; // 재사용 Joint 값의 잔여 임펄스 차단(리뷰 지적)
         self.joints.push(joint);
-        self.joints.len() - 1
+        Ok(self.joints.len() - 1)
     }
 
     /// 캐노니컬 상태 접근 (snapshot 모듈 전용).
@@ -381,6 +452,7 @@ impl World {
     ) -> (
         &Vec<Body>,
         &Vec<bool>,
+        &Vec<bool>,
         &Vec<u32>,
         &Vec<f32>,
         &Vec<bool>,
@@ -388,10 +460,12 @@ impl World {
         &Vec<Joint>,
         &HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
         &Vec<Command>,
+        CommandReport,
     ) {
         (
             &self.bodies,
             &self.alive,
+            &self.reserved,
             &self.generations,
             &self.sleep_timer,
             &self.asleep,
@@ -399,6 +473,7 @@ impl World {
             &self.joints,
             &self.contact_cache,
             &self.commands,
+            self.last_report,
         )
     }
 
@@ -407,6 +482,7 @@ impl World {
         &mut self,
         bodies: Vec<Body>,
         alive: Vec<bool>,
+        reserved: Vec<bool>,
         generations: Vec<u32>,
         sleep_timer: Vec<f32>,
         asleep: Vec<bool>,
@@ -414,8 +490,10 @@ impl World {
         joints: Vec<Joint>,
         cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
         commands: Vec<Command>,
+        last_report: CommandReport,
     ) {
         self.alive = alive;
+        self.reserved = reserved;
         self.generations = generations;
         self.bodies = bodies;
         self.sleep_timer = sleep_timer;
@@ -424,6 +502,7 @@ impl World {
         self.joints = joints;
         self.contact_cache = cache;
         self.commands = commands;
+        self.last_report = last_report;
     }
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
@@ -466,10 +545,12 @@ impl World {
             dt.is_finite(),
             "dt must be finite (NaN dt would poison all state)"
         );
-        if dt <= 0.0 || self.bodies.is_empty() {
+        if dt <= 0.0 {
             return;
         }
-        // 0) 커맨드 적용 (설계 §4 파이프라인 0단계 — 쓰기의 정본 경로)
+        // 0) 커맨드 적용 (설계 §4 파이프라인 0단계 — 쓰기의 정본 경로).
+        //    **빈 월드 판정보다 먼저** 해야 한다: 빈 월드에 AddBody만 큐잉하면 영원히
+        //    적용되지 않아 '다음 step에서 적용' 계약이 깨진다(리뷰 NOT_RESOLVED).
         if !self.commands.is_empty() {
             self.flush_commands();
         }
@@ -523,12 +604,39 @@ impl World {
             .iter()
             .filter(|j| !j.collide_connected)
             .map(|j| {
-                let (a, b) = (j.body_a as u32, j.body_b as u32);
+                let (a, b) = (j.ia() as u32, j.ib() as u32);
                 (a.min(b), a.max(b))
             })
             .collect();
 
         // 1.5) **wake 폐쇄를 제약 생성보다 먼저 끝낸다** (리뷰 MAJOR).
+        // 조인트 edge와 접촉 edge를 **번갈아 닫힐 때까지** 돌린다: 조인트로 깨어난 바디가
+        // 접촉 상대를 깨우고, 그 상대가 다시 조인트 상대를 깨우는 연쇄가 한 패스로는
+        // 닫히지 않는다. 조인트 wake를 접촉 제약 생성 뒤에 두면 그 프레임은 지지 없이
+        // 중력만 받는다(리뷰 MAJOR: 2.5단계 잔존).
+        let joint_pairs: Vec<(usize, usize)> =
+            self.joints.iter().map(|j| (j.ia(), j.ib())).collect();
+        // kinematic은 **항상 활성**이다 — 처방 속도로 움직이므로 잠든 상대를 깨워야 한다.
+        let is_active = |i: usize, this: &Self| match this.bodies[i].body_type {
+            BodyType::Kinematic => true,
+            BodyType::Dynamic => !this.asleep[i],
+            BodyType::Static => false,
+        };
+        for _ in 0..=joint_pairs.len() {
+            let mut changed = false;
+            for &(a, b) in &joint_pairs {
+                for (x, y) in [(a, b), (b, a)] {
+                    if is_active(x, self) && self.bodies[y].is_dynamic() && self.asleep[y] {
+                        self.wake(y);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
         // 단일 패스로 섞으면 pair 순서에 따라 이미 스킵된 하위 접촉이 이번 스텝에 제약을
         // 얻지 못한다: 잠든 스택 (1,ground)/(1,2)/(2,3)이 먼저 스킵된 뒤 (3,4)가 아일랜드를
         // 깨우면 그 프레임은 지지망 없이 중력만 적분된다.
@@ -627,20 +735,6 @@ impl World {
             }
         }
 
-        // 2.5) 조인트: 한쪽이 깨어있으면 상대도 wake (설계 §4.3 조인트 edge)
-        let joint_pairs: Vec<(usize, usize)> =
-            self.joints.iter().map(|j| (j.body_a, j.body_b)).collect();
-        for (a, b) in &joint_pairs {
-            let a_awake = self.bodies[*a].is_dynamic() && !self.asleep[*a];
-            let b_awake = self.bodies[*b].is_dynamic() && !self.asleep[*b];
-            if a_awake && self.bodies[*b].is_dynamic() && self.asleep[*b] {
-                self.wake(*b);
-            }
-            if b_awake && self.bodies[*a].is_dynamic() && self.asleep[*a] {
-                self.wake(*a);
-            }
-        }
-
         // 3) TGS-soft 서브스텝 루프
         let g = self.params.gravity;
         // 조인트는 접촉보다 강성 (Box2D v3: 2×contact hertz, ζ=2)
@@ -658,8 +752,14 @@ impl World {
             .iter()
             .enumerate()
             .filter(|(_, j)| {
-                let awake = |i: usize| self.bodies[i].is_dynamic() && !self.asleep[i];
-                awake(j.body_a) || awake(j.body_b)
+                // kinematic도 활성 — 구동 중인 kinematic에 매달린 조인트를 스킵하면
+                // 체인이 처방 운동을 따라가지 못한다(리뷰 MAJOR).
+                let awake = |i: usize| match self.bodies[i].body_type {
+                    BodyType::Kinematic => true,
+                    BodyType::Dynamic => !self.asleep[i],
+                    BodyType::Static => false,
+                };
+                awake(j.ia()) || awake(j.ib())
             })
             .map(|(i, _)| i)
             .collect();

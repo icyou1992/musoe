@@ -117,9 +117,11 @@ fn effective_mass(
 }
 
 /// 캐시된 접점 임펄스 (스텝 간 warm start — 설계 §3 PCM).
-/// warm start 매칭 시 위치 근접 허용치 (특성 길이 대비 비율).
+/// warm start 매칭 시 위치 근접 허용치 (**최소 특징 크기** 대비 비율).
 /// 접점이 이보다 멀리 "점프"하면 다른 접촉으로 보고 임펄스를 물려주지 않는다.
-const WARM_MATCH_REL: f32 = 0.05;
+/// 기준을 AABB 대각이 아니라 최소 두께로 잡는 이유는 `min_feature_size` 주석 참조 —
+/// 접점 매칭은 **접촉 국소** 판정이라 형상의 전체 크기가 아니라 얇은 쪽 두께가 척도다.
+const WARM_MATCH_REL: f32 = 0.25;
 
 #[derive(Clone, Copy, Default)]
 pub struct CachedImpulse {
@@ -143,7 +145,7 @@ pub fn prepare(
 ) -> ContactConstraint {
     // 위치 근접 허용치는 형상 크기에 비례해야 한다(절대 상수 금지 — 톨러런스 정책과 동일 원칙).
     let match_tol =
-        WARM_MATCH_REL * maru_collide::characteristic_length(&bodies[a].shape, &bodies[b].shape);
+        WARM_MATCH_REL * maru_collide::min_feature_size(&bodies[a].shape, &bodies[b].shape);
     let match_tol2 = match_tol * match_tol;
     let (ba, bb) = (&bodies[a], &bodies[b]);
     let n = m.normal;

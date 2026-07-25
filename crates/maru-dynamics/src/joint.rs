@@ -3,7 +3,7 @@
 //! 서브스텝마다 TGS 방식으로 현재 자세에서 위치 오차 C를 재계산하고 soft bias로 해석.
 //! [근거: Box2D v3가 조인트까지 soft-step 단일 솔버로 처리 — 01 §2 정정 반영]
 
-use crate::body::Body;
+use crate::body::{Body, BodyHandle};
 use crate::solver::Softness;
 use maru_math::{Mat3, Vec3};
 
@@ -15,10 +15,14 @@ pub enum JointKind {
     Hinge { axis_a: Vec3, axis_b: Vec3 },
 }
 
+/// **엔드포인트는 세대 보유 핸들**이다(리뷰 BLOCKER). raw 인덱스면 같은 배치 안에서
+/// 슬롯이 제거·재사용될 때 조인트가 엉뚱한 새 바디에 붙는 ABA가 성립한다.
+/// 핫패스는 `ia()`/`ib()`로 인덱스만 쓰되, 정본 상태·직렬화·검증은 핸들로 한다.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Joint {
-    pub body_a: usize,
-    pub body_b: usize,
+    pub body_a: BodyHandle,
+    pub body_b: BodyHandle,
     /// 질량중심 기준 로컬 앵커.
     pub anchor_a: Vec3,
     pub anchor_b: Vec3,
@@ -32,7 +36,17 @@ pub struct Joint {
 }
 
 impl Joint {
-    pub fn point(body_a: usize, body_b: usize, anchor_a: Vec3, anchor_b: Vec3) -> Self {
+    /// 슬롯 인덱스 (월드가 생존·세대를 이미 검증한 뒤의 핫패스 전용).
+    #[inline]
+    pub(crate) fn ia(&self) -> usize {
+        self.body_a.index as usize
+    }
+    #[inline]
+    pub(crate) fn ib(&self) -> usize {
+        self.body_b.index as usize
+    }
+
+    pub fn point(body_a: BodyHandle, body_b: BodyHandle, anchor_a: Vec3, anchor_b: Vec3) -> Self {
         Self {
             body_a,
             body_b,
@@ -46,8 +60,8 @@ impl Joint {
     }
 
     pub fn hinge(
-        body_a: usize,
-        body_b: usize,
+        body_a: BodyHandle,
+        body_b: BodyHandle,
         anchor_a: Vec3,
         anchor_b: Vec3,
         axis_a: Vec3,
@@ -80,18 +94,18 @@ fn apply_angular(body: &mut Body, imp: Vec3, inv_i: &Mat3) {
 
 /// warm start (서브스텝 시작마다 — 접촉과 동일 패턴).
 pub fn warm_start(bodies: &mut [Body], j: &Joint) {
-    let ia = bodies[j.body_a].inv_inertia_world();
-    let ib = bodies[j.body_b].inv_inertia_world();
-    let ra = bodies[j.body_a].pose.rot.rotate(j.anchor_a);
-    let rb = bodies[j.body_b].pose.rot.rotate(j.anchor_b);
-    apply(&mut bodies[j.body_a], j.linear_impulse, ra, &ia);
-    apply(&mut bodies[j.body_b], -j.linear_impulse, rb, &ib);
+    let ia = bodies[j.ia()].inv_inertia_world();
+    let ib = bodies[j.ib()].inv_inertia_world();
+    let ra = bodies[j.ia()].pose.rot.rotate(j.anchor_a);
+    let rb = bodies[j.ib()].pose.rot.rotate(j.anchor_b);
+    apply(&mut bodies[j.ia()], j.linear_impulse, ra, &ia);
+    apply(&mut bodies[j.ib()], -j.linear_impulse, rb, &ib);
     if let JointKind::Hinge { axis_a, .. } = &j.kind {
-        let wa = bodies[j.body_a].pose.rot.rotate(*axis_a);
+        let wa = bodies[j.ia()].pose.rot.rotate(*axis_a);
         let (u, v) = perp_basis(wa);
         let ang = u * j.angular_impulse[0] + v * j.angular_impulse[1];
-        apply_angular(&mut bodies[j.body_a], ang, &ia);
-        apply_angular(&mut bodies[j.body_b], -ang, &ib);
+        apply_angular(&mut bodies[j.ia()], ang, &ia);
+        apply_angular(&mut bodies[j.ib()], -ang, &ib);
     }
 }
 
@@ -106,11 +120,11 @@ fn perp_basis(a: Vec3) -> (Vec3, Vec3) {
 
 /// 서브스텝 해석. `soft`=bias 페이즈, None=relax.
 pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<&Softness>) {
-    let ia = bodies[j.body_a].inv_inertia_world();
-    let ib = bodies[j.body_b].inv_inertia_world();
-    let (inv_ma, inv_mb) = (bodies[j.body_a].inv_mass, bodies[j.body_b].inv_mass);
-    let ra = bodies[j.body_a].pose.rot.rotate(j.anchor_a);
-    let rb = bodies[j.body_b].pose.rot.rotate(j.anchor_b);
+    let ia = bodies[j.ia()].inv_inertia_world();
+    let ib = bodies[j.ib()].inv_inertia_world();
+    let (inv_ma, inv_mb) = (bodies[j.ia()].inv_mass, bodies[j.ib()].inv_mass);
+    let ra = bodies[j.ia()].pose.rot.rotate(j.anchor_a);
+    let rb = bodies[j.ib()].pose.rot.rotate(j.anchor_b);
 
     // --- 선형 3-DOF: K = (1/ma+1/mb)I + skew(ra)ᵀIa⁻¹skew(ra) + skew(rb)ᵀIb⁻¹skew(rb) ---
     let k = {
@@ -131,8 +145,8 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<&Softness>) {
         }
         m
     };
-    let c_pos = (bodies[j.body_a].pose.pos + ra) - (bodies[j.body_b].pose.pos + rb);
-    let cdot = bodies[j.body_a].velocity_at(ra) - bodies[j.body_b].velocity_at(rb);
+    let c_pos = (bodies[j.ia()].pose.pos + ra) - (bodies[j.ib()].pose.pos + rb);
+    let cdot = bodies[j.ia()].velocity_at(ra) - bodies[j.ib()].velocity_at(rb);
     let (bias, mass_scale, impulse_scale) = match soft {
         Some(sf) => (c_pos * sf.bias_rate, sf.mass_scale, sf.impulse_scale),
         None => (Vec3::ZERO, 1.0, 0.0),
@@ -140,15 +154,15 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<&Softness>) {
     let impulse =
         k.inverse().mul_vec(-(cdot + bias)) * mass_scale - j.linear_impulse * impulse_scale;
     j.linear_impulse += impulse;
-    apply(&mut bodies[j.body_a], impulse, ra, &ia);
-    apply(&mut bodies[j.body_b], -impulse, rb, &ib);
+    apply(&mut bodies[j.ia()], impulse, ra, &ia);
+    apply(&mut bodies[j.ib()], -impulse, rb, &ib);
 
     // --- hinge 각 2-DOF: 축 수직 성분 상대 각속도 = 0, 위치 bias = 축 어긋남 ---
     if let JointKind::Hinge { axis_a, axis_b } = j.kind {
-        let wa_axis = bodies[j.body_a].pose.rot.rotate(axis_a);
-        let wb_axis = bodies[j.body_b].pose.rot.rotate(axis_b);
+        let wa_axis = bodies[j.ia()].pose.rot.rotate(axis_a);
+        let wb_axis = bodies[j.ib()].pose.rot.rotate(axis_b);
         let (u, v) = perp_basis(wa_axis);
-        let wrel = bodies[j.body_a].angvel - bodies[j.body_b].angvel;
+        let wrel = bodies[j.ia()].angvel - bodies[j.ib()].angvel;
         // 축 오차. 부호는 임펄스 적용 규약(A += imp, B -= imp)과 맞아야 한다 —
         // wa×wb를 쓰면 20° 어긋난 축이 정렬되는 대신 반대축(-1)으로 넘어간다(실증).
         let err = wb_axis.cross(wa_axis);
@@ -167,8 +181,8 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<&Softness>) {
             let imp = -(cdot + bias) / k_ang * ms - j.angular_impulse[axis_i] * is_;
             j.angular_impulse[axis_i] += imp;
             let ang = dir * imp;
-            apply_angular(&mut bodies[j.body_a], ang, &ia);
-            apply_angular(&mut bodies[j.body_b], -ang, &ib);
+            apply_angular(&mut bodies[j.ia()], ang, &ia);
+            apply_angular(&mut bodies[j.ib()], -ang, &ib);
         }
     }
 }

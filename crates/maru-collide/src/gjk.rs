@@ -160,7 +160,8 @@ fn complete_on_boundary(
         _ => {
             let (a, b, c) = (simplex[0], simplex[1], simplex[2]);
             let n = (b.w - a.w).cross(c.w - a.w);
-            if n.length_sq() <= eps_l2 {
+            // cross 길이는 L²(면적) — L² 임계와 비교한다. length_sq()는 L⁴이라 차원이 안 맞는다.
+            if n.length() <= eps_l2 {
                 return separated_with_normal(simplex, Vec3::ZERO, fallback_normal);
             }
             let s1 = sup(n);
@@ -181,12 +182,16 @@ fn separated(simplex: &[SupportPoint], v: Vec3) -> GjkResult {
 }
 
 fn separated_with_normal(simplex: &[SupportPoint], v: Vec3, fallback: Vec3) -> GjkResult {
-    // witness 바리센트릭 분모는 길이의 4제곱 — 심플렉스 자체 스케일에서 유도한다.
-    let s2 = simplex
-        .iter()
-        .map(|p| p.w.length_sq())
-        .fold(0.0f32, f32::max);
-    let denom_eps = bary_denom_eps(s2.sqrt().max(1.0e-6));
+    // witness 바리센트릭 분모는 L⁴ — **심플렉스 에지 길이**에서 유도한다.
+    // max|w|(원점 기준 거리)를 쓰면 서로 멀리 떨어진 작은 물체에서 중심 거리가 임계를 부풀려
+    // 정상 삼각형 witness가 (0,0)으로 강등된다(리뷰 NOT_RESOLVED).
+    let mut max_edge = 0.0f32;
+    for i in 0..simplex.len() {
+        for j in (i + 1)..simplex.len() {
+            max_edge = max_edge.max((simplex[i].w - simplex[j].w).length());
+        }
+    }
+    let denom_eps = bary_denom_eps(max_edge);
     // 비유한 값 위생 (설계 §8): NaN/Inf는 호출자의 비교·분기를 조용히 통과시킨다.
     let v = if v.x.is_finite() && v.y.is_finite() && v.z.is_finite() {
         v

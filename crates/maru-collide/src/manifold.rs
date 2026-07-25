@@ -9,7 +9,7 @@
 
 use crate::epa::epa;
 use crate::gjk::{gjk, GjkResult};
-use crate::tolerance::{characteristic_length, length_sq_eps};
+use crate::tolerance::{area_eps, characteristic_length};
 use crate::{Pose, Shape};
 use maru_math::{Quat, Vec3};
 
@@ -82,8 +82,9 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
         },
     ) = (sa, sb)
     {
-        let eps_l2 = length_sq_eps(characteristic_length(sa, sb));
-        if let Some(m) = clip_box_box(eps_l2, *ha, *ra_box, pa, *hb, *rb_box, pb, normal, margin) {
+        let eps_area = area_eps(characteristic_length(sa, sb));
+        if let Some(m) = clip_box_box(eps_area, *ha, *ra_box, pa, *hb, *rb_box, pb, normal, margin)
+        {
             return Some(m);
         }
     }
@@ -176,7 +177,7 @@ fn best_face(rot: Quat, want: Vec3) -> (usize, f32) {
 /// box-box 면 클리핑. 법선이 면 지배적이 아니면 None(→ witness 폴백).
 #[allow(clippy::too_many_arguments)]
 fn clip_box_box(
-    eps_l2: f32,
+    eps_area: f32,
     ha: Vec3,
     ra: f32,
     pa: &Pose,
@@ -212,14 +213,15 @@ fn clip_box_box(
         .map(|v| ip.pos + ip.rot.rotate(*v))
         .collect();
     // radius가 half를 잠식해 평면 패치가 선/점으로 퇴화하면 클리핑 불가 → witness 폴백
+    // cross 길이 = 면적(L²) → L² 임계와 비교 (length_sq는 L⁴)
     if (rverts[1] - rverts[0])
         .cross(rverts[2] - rverts[1])
-        .length_sq()
-        <= eps_l2
+        .length()
+        <= eps_area
         || (iverts[1] - iverts[0])
             .cross(iverts[2] - iverts[1])
-            .length_sq()
-            <= eps_l2
+            .length()
+            <= eps_area
     {
         return None;
     }

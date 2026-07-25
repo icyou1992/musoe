@@ -16,7 +16,11 @@ use maru_math::Vec3;
 
 #[derive(Clone, Debug)]
 pub enum Command {
-    AddBody(Box<Body>),
+    /// **예약된 핸들**을 동반한다(리뷰 BLOCKER). `World::enqueue_add_body`가 슬롯을 즉시
+    /// 예약하고 핸들을 돌려주므로, 호스트는 바디가 실제로 생기기 전에도 그 핸들로
+    /// 후속 커맨드(조인트·속도)를 같은 배치에 쌓을 수 있고, 슬롯 재사용 ABA는
+    /// 예약 시점의 세대 증가로 차단된다.
+    AddBody(BodyHandle, Box<Body>),
     RemoveBody(BodyHandle),
     SetLinearVelocity(BodyHandle, Vec3),
     SetAngularVelocity(BodyHandle, Vec3),

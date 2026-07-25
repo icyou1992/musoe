@@ -31,17 +31,48 @@ pub fn characteristic_length(a: &Shape, b: &Shape) -> f32 {
     }
 }
 
+/// 페어의 **최소 특징 크기** — 두 셰이프 중 가장 얇은 방향의 두께(반두께/반지름).
+///
+/// `characteristic_length`(AABB 대각)는 등방 형상에서만 접촉 국소 스케일을 대변한다.
+/// 10×0.01×10 판처럼 종횡비가 큰 형상은 대각이 ~14라 그 5%가 0.7 m가 되고, 판 두께의
+/// 70배짜리 "근접" 허용치가 서로 다른 접촉을 같은 것으로 오인하게 한다(리뷰 MAJOR).
+/// 접점 매칭처럼 **접촉 국소** 판정에는 이 값을 쓴다.
+pub fn min_feature_size(a: &Shape, b: &Shape) -> f32 {
+    let thin = |s: &Shape| {
+        let bb = s.local_aabb();
+        let e = (bb.max - bb.min) * 0.5;
+        e.x.min(e.y).min(e.z)
+    };
+    let l = thin(a).min(thin(b));
+    if l.is_finite() && l > 0.0 {
+        l
+    } else {
+        1.0
+    }
+}
+
 /// 길이 차원 epsilon (L¹).
 #[inline]
 pub fn length_eps(scale: f32) -> f32 {
     (REL * scale).max(FLOOR)
 }
 
-/// 길이² 차원 (제곱 길이 비교·cross 길이²).
+/// 길이² 차원. **두 용도가 있으니 혼동 금지**:
+/// - 제곱 길이(`v.length_sq()`) 비교 — v가 L이면 L²
+/// - 면적(`cross(e1,e2).length()`) 비교 — 두 에지의 cross **길이**가 L²
+///
+/// `cross(...).length_sq()`는 **L⁴**이므로 이 값과 비교하면 안 된다(스케일 k배에서 좌변 k⁴,
+/// 임계 k² → 작은 스케일에서 정상 면을 퇴화로 오판. 리뷰 NOT_RESOLVED).
 #[inline]
 pub fn length_sq_eps(scale: f32) -> f32 {
     let e = length_eps(scale);
     (e * e).max(FLOOR)
+}
+
+/// 면적 차원 별칭 — `cross(e1,e2).length()`와 비교할 때 의도를 드러내기 위해.
+#[inline]
+pub fn area_eps(scale: f32) -> f32 {
+    length_sq_eps(scale)
 }
 
 /// 부피 차원 (L³) — 사면체 퇴화 판정.
@@ -62,6 +93,26 @@ pub fn bary_denom_eps(scale: f32) -> f32 {
 mod tests {
     use super::*;
     use maru_math::Vec3;
+
+    /// 차원 계약: 스케일 k배에서 각 epsilon은 해당 차수로 스케일해야 한다.
+    #[test]
+    fn eps_dimensions_are_consistent() {
+        let (s, k) = (1.0f32, 10.0f32);
+        let r_len = length_eps(s * k) / length_eps(s);
+        let r_area = area_eps(s * k) / area_eps(s);
+        let r_vol = volume_eps(s * k) / volume_eps(s);
+        let r_bary = bary_denom_eps(s * k) / bary_denom_eps(s);
+        assert!((r_len - k).abs() < 1e-3 * k, "L 차수 {r_len}");
+        assert!((r_area - k * k).abs() < 1e-3 * k * k, "L² 차수 {r_area}");
+        assert!(
+            (r_vol - k.powi(3)).abs() < 1e-3 * k.powi(3),
+            "L³ 차수 {r_vol}"
+        );
+        assert!(
+            (r_bary - k.powi(4)).abs() < 1e-2 * k.powi(4),
+            "L⁴ 차수 {r_bary}"
+        );
+    }
 
     #[test]
     fn eps_scales_with_dimension() {

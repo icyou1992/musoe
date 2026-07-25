@@ -20,5 +20,8 @@ pub use manifold::{contact, ContactPoint, FeatureId, Manifold, FEATURE_GENERIC};
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, STATIC_BIT};
 pub use shape::Shape;
-pub use tolerance::{bary_denom_eps, characteristic_length, length_eps, length_sq_eps, volume_eps};
+pub use tolerance::{
+    area_eps, bary_denom_eps, characteristic_length, length_eps, length_sq_eps, min_feature_size,
+    volume_eps,
+};
 pub use tree::Tree;

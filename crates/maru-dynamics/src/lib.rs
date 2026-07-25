@@ -272,8 +272,8 @@ mod tests {
             1.0,
         ));
         w.add_joint(Joint::point(
-            anchor.index as usize,
-            bob.index as usize,
+            anchor,
+            bob,
             Vec3::ZERO,
             Vec3::new(-1.0, 0.0, 0.0), // bob 로컬 (-1,0,0)이 앵커에 붙음
         ));
@@ -320,8 +320,8 @@ mod tests {
             1.0,
         ));
         w.add_joint(Joint::hinge(
-            anchor.index as usize,
-            b.index as usize,
+            anchor,
+            b,
             Vec3::ZERO,
             Vec3::ZERO,
             Vec3::new(1.0, 0.0, 0.0),
@@ -357,7 +357,7 @@ mod tests {
             Shape::Sphere { radius: 0.05 },
             pose(0.0, 0.1, 0.0),
         ));
-        let mut prev = anchor.index as usize;
+        let mut prev = anchor;
         let mut links = Vec::new();
         for i in 0..20 {
             let x = 0.4 + i as f32 * 0.8;
@@ -376,14 +376,14 @@ mod tests {
             };
             w.add_joint(Joint::hinge(
                 prev,
-                h.index as usize,
+                h,
                 ap,
                 Vec3::new(-0.4, 0.0, 0.0),
                 Vec3::new(0.0, 0.0, 1.0),
                 Vec3::new(0.0, 0.0, 1.0),
             ));
             links.push(h);
-            prev = h.index as usize;
+            prev = h;
         }
         for _ in 0..480 {
             w.step(DT);
@@ -424,7 +424,7 @@ mod tests {
             Shape::Sphere { radius: 0.05 },
             pose(0.0, 3.0, 0.0),
         ));
-        let mut prev = anchor.index as usize;
+        let mut prev = anchor;
         let mut links = Vec::new();
         for i in 0..20 {
             let x = 0.4 + i as f32 * 0.8;
@@ -443,14 +443,14 @@ mod tests {
             };
             w.add_joint(Joint::hinge(
                 prev,
-                h.index as usize,
+                h,
                 ap,
                 Vec3::new(-0.4, 0.0, 0.0),
                 Vec3::new(0.0, 0.0, 1.0),
                 Vec3::new(0.0, 0.0, 1.0),
             ));
             links.push(h);
-            prev = h.index as usize;
+            prev = h;
         }
         for _ in 0..720 {
             w.step(DT);
@@ -737,10 +737,12 @@ mod tests {
 
         // 1) 빈/짧은 입력
         assert_eq!(w.restore(&[]), Err(SnapshotError::Truncated));
-        assert_eq!(
+        // 잘린 입력: 바이트가 모자라 읽다 끊기거나(Truncated), 남은 바이트로는 담을 수 없는
+        // 개수를 만나 **읽기 전에** 거부된다(CountTooLarge). 둘 다 정상 방어다.
+        assert!(matches!(
             w.restore(&good[..good.len() / 2]),
-            Err(SnapshotError::Truncated)
-        );
+            Err(SnapshotError::Truncated) | Err(SnapshotError::CountTooLarge)
+        ));
         // 2) 매직 훼손
         let mut bad = good.clone();
         bad[0] ^= 0xFF;
@@ -759,8 +761,8 @@ mod tests {
         assert_eq!(w.restore(&bad), Err(SnapshotError::TrailingBytes));
         // 6) 비유한 값 주입 (바디 위치 필드)
         let mut bad = good.clone();
-        // magic(4)+version(4)+count(4) + alive(1)+generation(4)+body_type(1) = pos.x
-        let pos_off = 12 + 1 + 4 + 1;
+        // magic4+version4+count4 + alive1+reserved1+generation4+body_type1 = pos.x
+        let pos_off = 12 + 1 + 1 + 4 + 1;
         bad[pos_off..pos_off + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(matches!(
             w.restore(&bad),
@@ -811,5 +813,222 @@ mod tests {
                 .collect::<Vec<u32>>()
         };
         assert_eq!(run(), run());
+    }
+
+    // ─────────── 리뷰 rev_fd76395d 회귀 (BLOCKER 3 + MAJOR) ───────────
+
+    fn dyn_box(w: &mut World, x: f32, y: f32) -> BodyHandle {
+        w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(x, y, 0.0),
+            1.0,
+        ))
+    }
+
+    /// BLOCKER: 커맨드로 만든 바디를 가리킬 방법이 있어야 한다 —
+    /// `enqueue_add_body`가 **예약 핸들**을 즉시 돌려주고, 같은 배치의 조인트가 그것을 쓴다.
+    #[test]
+    fn enqueue_add_body_returns_handle_usable_in_same_batch() {
+        let mut w = World::new(WorldParams::default());
+        let anchor = w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 5.0, 0.0),
+        ));
+        let bob = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(1.5, 5.0, 0.0),
+            1.0,
+        ));
+        // 아직 flush 전 — 쿼리에는 보이지 않는다 (설계 §7)
+        assert!(!w.is_alive(bob), "pending 바디가 쿼리에 보임");
+        w.enqueue(Command::AddJoint(Box::new(Joint::point(
+            anchor,
+            bob,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-0.5, 0.0, 0.0),
+        ))));
+        for _ in 0..120 {
+            w.step(DT);
+        }
+        assert_eq!(w.last_command_report().rejected, 0, "배치가 거부됨");
+        assert!(w.is_alive(bob), "예약 핸들이 실현되지 않음");
+        // 조인트가 실제로 걸렸다면 앵커에서 1.5m 안쪽에 매달려 있다 (자유낙하면 훨씬 아래)
+        let p = w.body(bob).pose.pos;
+        assert!(
+            (p - Vec3::new(0.0, 5.0, 0.0)).length() < 2.0,
+            "조인트 미체결 — bob={p:?}"
+        );
+    }
+
+    /// MAJOR: 빈 월드에 AddBody만 큐잉하면 `bodies.is_empty()` 조기 반환에 막혀
+    /// 영원히 적용되지 않았다. 커맨드 플러시는 그 판정보다 **먼저**여야 한다.
+    #[test]
+    fn empty_world_applies_pending_add_body() {
+        let mut w = World::new(WorldParams::default());
+        let h = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(0.0, 10.0, 0.0),
+            1.0,
+        ));
+        w.step(DT);
+        assert!(w.is_alive(h), "빈 월드의 pending AddBody가 적용되지 않음");
+        assert_eq!(w.body_count(), 1);
+    }
+
+    /// BLOCKER(ABA): 슬롯이 제거·재사용되면 옛 핸들은 새 바디를 가리켜선 안 된다.
+    /// 조인트 엔드포인트가 raw 인덱스였을 때 성립하던 경로다.
+    #[test]
+    fn slot_reuse_kills_old_handle_and_joint_command() {
+        let mut w = World::new(WorldParams::default());
+        let old = dyn_box(&mut w, 0.0, 3.0);
+        let keep = dyn_box(&mut w, 5.0, 3.0);
+        w.remove_body(old).unwrap();
+        // 최소 인덱스 재사용 → 같은 슬롯, 다른 세대
+        let new = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(0.0, 3.0, 0.0),
+            1.0,
+        ));
+        assert_eq!(new.index, old.index, "슬롯 재사용 전제가 깨짐");
+        assert_ne!(new.generation, old.generation, "세대가 증가하지 않음");
+        // 옛 핸들로 만든 조인트는 flush에서 거부돼야 한다
+        w.enqueue(Command::AddJoint(Box::new(Joint::point(
+            old,
+            keep,
+            Vec3::ZERO,
+            Vec3::ZERO,
+        ))));
+        w.flush_commands();
+        assert_eq!(
+            w.last_command_report().rejected,
+            1,
+            "stale 핸들 조인트가 통과"
+        );
+        assert!(w.is_alive(new) && !w.is_alive(old));
+    }
+
+    /// MAJOR: `is_asleep`가 raw 인덱스를 읽으면 재사용된 슬롯의 **남의 상태**를 돌려준다.
+    #[test]
+    fn is_asleep_rejects_stale_handle() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let h = dyn_box(&mut w, 0.0, 0.5);
+        for _ in 0..400 {
+            w.step(DT);
+        }
+        assert!(w.is_asleep(h), "정착한 바디가 잠들지 않음");
+        w.remove_body(h).unwrap();
+        assert!(!w.is_asleep(h), "stale 핸들이 잠든 상태를 보고함");
+    }
+
+    /// BLOCKER(자원): 고정 상한 대신 **입력 길이**로 개수를 묶는다 — 12바이트 파일이
+    /// 400만 개를 주장해도 산술적으로 불가능하므로 읽기 전에 거부된다.
+    #[test]
+    fn snapshot_counts_bounded_by_input_length() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        dyn_box(&mut w, 0.0, 3.0);
+        w.step(DT);
+        let good = w.snapshot();
+        let before = w.state_hash();
+
+        // 헤더만 남기고 바디 100만 개를 주장 (고정 상한 1<<22 아래라 예전엔 통과했다)
+        let mut bad = good[..12].to_vec();
+        bad[8..12].copy_from_slice(&1_000_000u32.to_le_bytes());
+        assert_eq!(w.restore(&bad), Err(SnapshotError::CountTooLarge));
+
+        // 중첩 개수(hull 점)도 같은 규칙 — 총량 예산이 파일 크기에서 자동으로 나온다
+        let mut bad = good.clone();
+        bad[8..12].copy_from_slice(&(good.len() as u32).to_le_bytes());
+        assert!(matches!(
+            w.restore(&bad),
+            Err(SnapshotError::CountTooLarge) | Err(SnapshotError::Truncated)
+        ));
+        assert_eq!(w.state_hash(), before, "거부된 restore가 월드를 오염시킴");
+    }
+
+    /// BLOCKER(구조): 값이 유한·범위 안이어도 **타입과 질량의 관계**가 깨지면 거부한다.
+    /// dynamic의 타입 바이트를 static(0)으로 바꾸면 질량은 그대로라 불일치가 된다.
+    #[test]
+    fn snapshot_rejects_type_mass_mismatch() {
+        let mut w = World::new(WorldParams::default());
+        let g = ground(&mut w);
+        dyn_box(&mut w, 0.0, 3.0);
+        w.step(DT);
+        let good = w.snapshot();
+        let before = w.state_hash();
+
+        // 슬롯 레이아웃(Box 셰이프): alive1+reserved1+gen4 + 본문94 + sleep4+asleep1+island4 = 109
+        //   본문94 = type1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + Box17
+        const SLOT: usize = 109;
+        let type_off = 12 + SLOT + 1 + 1 + 4; // 헤더 + 슬롯0(ground) + alive/reserved/gen
+        assert_eq!(
+            good[type_off], 1,
+            "슬롯1이 dynamic이 아님 — 레이아웃 가정 붕괴"
+        );
+        let mut bad = good.clone();
+        bad[type_off] = 0; // Dynamic → Static (질량은 그대로 남는다)
+        assert_eq!(
+            w.restore(&bad),
+            Err(SnapshotError::InconsistentState),
+            "질량을 가진 static이 통과"
+        );
+        assert_eq!(w.state_hash(), before);
+        assert!(w.is_alive(g));
+    }
+
+    /// MAJOR: kinematic은 **항상 활성**이다 — 구동 중인 kinematic에 매달린 조인트를
+    /// 비활성으로 스킵하면 체인이 처방 운동을 따라가지 못한다.
+    #[test]
+    fn kinematic_drives_jointed_body() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..Default::default()
+        });
+        let k = w.add_body(Body::new_kinematic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 5.0, 0.0),
+        ));
+        let b = dyn_box(&mut w, 1.5, 5.0);
+        w.add_joint(Joint::point(
+            k,
+            b,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-0.5, 0.0, 0.0),
+        ));
+        w.set_linear_velocity(k, Vec3::new(2.0, 0.0, 0.0)).unwrap();
+        for _ in 0..120 {
+            w.step(DT);
+        }
+        let kx = w.body(k).pose.pos.x;
+        let bx = w.body(b).pose.pos.x;
+        assert!(kx > 3.0, "kinematic이 구동되지 않음 x={kx}");
+        assert!(
+            (bx - (kx + 1.5)).abs() < 0.5,
+            "조인트가 kinematic을 따라가지 못함 k={kx} b={bx}"
+        );
+    }
+
+    /// MAJOR: `World.params`는 비공개 — 교체도 생성자와 같은 검증을 거친다.
+    #[test]
+    #[should_panic(expected = "substeps must be in 1..=64")]
+    fn set_params_revalidates() {
+        let mut w = World::new(WorldParams::default());
+        w.set_params(WorldParams {
+            substeps: 0,
+            ..Default::default()
+        });
     }
 }
