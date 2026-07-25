@@ -169,7 +169,6 @@ fn best_face(rot: Quat, want: Vec3) -> (usize, f32) {
 
 /// box-box 면 클리핑. 법선이 면 지배적이 아니면 None(→ witness 폴백).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn clip_box_box(
     eps_l2: f32,
     ha: Vec3,
