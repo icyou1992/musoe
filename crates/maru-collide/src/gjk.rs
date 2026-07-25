@@ -86,8 +86,6 @@ pub fn gjk(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> GjkResult {
     let mut v = dir; // 현재 심플렉스에서 원점까지의 최근접 벡터(초기값은 임의 추정)
 
     for _ in 0..MAX_ITER {
-        // 깊이 0 접촉(v=0)에서 법선을 잃지 않도록 마지막 유효 탐색 방향을 승계한다
-        // (리뷰 BLOCKER: 동일 박스 정확 면접촉에서 첫 support가 w=0이면 +X 오답 법선).
         let previous_v = v;
         let w = support(sa, pa, sb, pb, -v);
         // 진전 없음 → 분리 확정. 첫 반복(빈 심플렉스)은 v가 추정일 뿐이라 판정하지 않는다.
@@ -177,13 +175,19 @@ fn separated(simplex: &[SupportPoint], v: Vec3) -> GjkResult {
 }
 
 fn separated_with_normal(simplex: &[SupportPoint], v: Vec3, fallback: Vec3) -> GjkResult {
+    // 비유한 값 위생 (설계 §8): NaN/Inf는 호출자의 비교·분기를 조용히 통과시킨다.
+    let v = if v.x.is_finite() && v.y.is_finite() && v.z.is_finite() {
+        v
+    } else {
+        Vec3::ZERO
+    };
     let (on_a, on_b) = witness(simplex, v);
     let distance = v.length();
     let normal = if distance > 0.0 {
         v * (1.0 / distance)
     } else {
         let l2 = fallback.length_sq();
-        if l2 > 0.0 {
+        if l2 > 0.0 && l2.is_finite() {
             fallback * (1.0 / l2.sqrt())
         } else {
             Vec3::new(1.0, 0.0, 0.0)
@@ -250,7 +254,11 @@ fn closest_and_reduce(simplex: &mut Vec<SupportPoint>) -> (Vec3, bool) {
                 simplex.swap_remove(0); // a만 지지
                 (a, false)
             } else {
-                let t = (-a).dot(ab) / ab.length_sq();
+                let ab2 = ab.length_sq();
+                if ab2 <= 0.0 {
+                    return (a, false); // 중복 support — a만 지지 (0/0 방지, 설계 §8)
+                }
+                let t = (-a).dot(ab) / ab2;
                 if t >= 1.0 {
                     simplex.swap_remove(1);
                     (b, false)
@@ -289,7 +297,8 @@ fn closest_triangle(simplex: &mut Vec<SupportPoint>) -> (Vec3, bool) {
     }
     let vc = d1 * d4 - d3 * d2;
     if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-        let t = d1 / (d1 - d3);
+        let den = d1 - d3;
+        let t = if den != 0.0 { d1 / den } else { 0.0 };
         simplex.clear();
         simplex.extend([pb, pa]);
         return (a + ab * t, false);
@@ -304,20 +313,30 @@ fn closest_triangle(simplex: &mut Vec<SupportPoint>) -> (Vec3, bool) {
     }
     let vb = d5 * d2 - d1 * d6;
     if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-        let t = d2 / (d2 - d6);
+        let den = d2 - d6;
+        let t = if den != 0.0 { d2 / den } else { 0.0 };
         simplex.clear();
         simplex.extend([pc, pa]);
         return (a + ac * t, false);
     }
     let va = d3 * d6 - d5 * d4;
     if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-        let t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        let den = (d4 - d3) + (d5 - d6);
+        let t = if den != 0.0 { (d4 - d3) / den } else { 0.0 };
         simplex.clear();
         simplex.extend([pc, pb]);
         return (b + (c - b) * t, false);
     }
-    // 면 내부
-    let denom = 1.0 / (va + vb + vc);
+    // 면 내부. 퇴화 삼각형(va+vb+vc==0)이면 최신 정점으로 강등 — 0으로 나누면 v가 NaN이 되고,
+    // NaN distance는 `sep > margin` 비교를 통과해 잘못된 폴백 법선으로 접촉을 만든다
+    // (피라미드 100단 붕괴 실사고: sep=-2.0, 법선 +x 역전).
+    let sum = va + vb + vc;
+    if sum == 0.0 {
+        simplex.clear();
+        simplex.push(pa);
+        return (a, false);
+    }
+    let denom = 1.0 / sum;
     let (v, w) = (vb * denom, vc * denom);
     (a + ab * v + ac * w, false)
 }

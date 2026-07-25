@@ -46,6 +46,10 @@ pub struct World {
     sleep_timer: Vec<f32>,
     asleep: Vec<bool>,
     joints: Vec<Joint>,
+    /// [진단] 직전 스텝의 warm-start 적중/전체 접점 수, 최대 침투(음의 separation).
+    pub warm_hits: usize,
+    pub warm_total: usize,
+    pub max_penetration: f32,
 }
 
 impl World {
@@ -58,6 +62,9 @@ impl World {
             sleep_timer: Vec::new(),
             asleep: Vec::new(),
             joints: Vec::new(),
+            warm_hits: 0,
+            warm_total: 0,
+            max_penetration: 0.0,
         }
     }
 
@@ -173,12 +180,12 @@ impl World {
         let n_sub = self.params.substeps.max(1);
         let h = dt / n_sub as f32;
         let inv_h = 1.0 / h;
-        let soft = Softness::new(
-            // contact hertz는 서브스텝 주파수의 1/4을 넘지 않게 (Box2D v3 관행)
-            self.params.solver.contact_hertz.min(0.25 * inv_h),
-            self.params.solver.contact_damping,
-            h,
-        );
+        // contact hertz는 서브스텝 주파수의 1/4을 넘지 않게 (Box2D v3 관행)
+        let hertz = self.params.solver.contact_hertz.min(0.25 * inv_h);
+        let soft = Softness::new(hertz, self.params.solver.contact_damping, h);
+        // 정적/키네마틱 상대 접촉은 2배 강성 (Box2D v3 staticSoftness) — 무한 질량 상대라
+        // 더 단단히 잡아도 안정하고, 지면 침하가 스택 전체 침하의 시작점이 된다.
+        let static_soft = Softness::new(2.0 * hertz, self.params.solver.contact_damping, h);
 
         // 1) 브로드페이즈 — canonical 페어 (트리 비의존 계약은 maru-collide가 보장)
         let mut dyn_items: Vec<(u32, Aabb)> = Vec::new();
@@ -199,6 +206,9 @@ impl World {
                 }
             }
         }
+        self.warm_hits = 0;
+        self.warm_total = 0;
+        self.max_penetration = 0.0;
         let bp = Broadphase::build(dyn_items, static_items);
         let pairs = bp.canonical_pairs();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
@@ -250,6 +260,49 @@ impl World {
                         self.wake(b_id);
                     }
                     let cached = self.contact_cache.get(&key).unwrap_or(&empty);
+                    for p in &m.points {
+                        self.warm_total += 1;
+                        if -p.separation > 1.0 && self.max_penetration <= 1.0 {
+                            let (qa, qb) = (self.bodies[a_id].pose.rot, self.bodies[b_id].pose.rot);
+                            let g = maru_collide::gjk(
+                                &self.bodies[a_id].shape,
+                                &self.bodies[a_id].pose,
+                                &self.bodies[b_id].shape,
+                                &self.bodies[b_id].pose,
+                            );
+                            eprintln!(
+                                "   GJK={}  shapes a={:?} b={:?}",
+                                match g {
+                                    maru_collide::GjkResult::Separated {
+                                        distance, normal, ..
+                                    } => format!("Sep d={distance:e} n={normal:?}"),
+                                    maru_collide::GjkResult::Intersecting(_) =>
+                                        "Intersecting".to_string(),
+                                },
+                                self.bodies[a_id].shape,
+                                self.bodies[b_id].shape
+                            );
+                            eprintln!(
+                                "DEEP pa=({:?},{},{},{},{}) pb=({:?},{},{},{},{}) n={:?} sep={}",
+                                self.bodies[a_id].pose.pos,
+                                qa.x,
+                                qa.y,
+                                qa.z,
+                                qa.w,
+                                self.bodies[b_id].pose.pos,
+                                qb.x,
+                                qb.y,
+                                qb.z,
+                                qb.w,
+                                m.normal,
+                                p.separation
+                            );
+                        }
+                        self.max_penetration = self.max_penetration.max(-p.separation);
+                        if cached.iter().any(|(f, _)| *f == p.feature) {
+                            self.warm_hits += 1;
+                        }
+                    }
                     constraints.push(solver::prepare(&self.bodies, a_id, b_id, &m, cached));
                     constraint_keys.push(key);
                 }
@@ -310,11 +363,16 @@ impl World {
                 joint::solve(&mut self.bodies, &mut joints[ji], Some(&joint_soft));
             }
             for c in constraints.iter_mut() {
+                let sf = if self.bodies[c.a].is_dynamic() && self.bodies[c.b].is_dynamic() {
+                    &soft
+                } else {
+                    &static_soft
+                };
                 solver::solve(
                     &mut self.bodies,
                     c,
                     inv_h,
-                    Some((&soft, self.params.solver.max_bias_speed)),
+                    Some((sf, self.params.solver.max_bias_speed)),
                 );
             }
             // 위치 적분 (dynamic + kinematic, sleeping 제외)
