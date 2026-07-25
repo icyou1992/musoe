@@ -49,14 +49,26 @@ impl Body {
                 && inertia.z > 0.0,
             "dynamic shape must have finite positive mass/inertia (mass={mass}, inertia={inertia:?})"
         );
+        // 역수까지 검사해야 한다: subnormal 질량은 양수·유한이지만 1/mass가 inf가 되고,
+        // 임펄스 적용의 0·inf가 다시 NaN을 만든다(리뷰 지적).
+        let inv_mass = 1.0 / mass;
+        let inv_inertia = Vec3::new(1.0 / inertia.x, 1.0 / inertia.y, 1.0 / inertia.z);
+        assert!(
+            inv_mass.is_finite()
+                && inv_mass > 0.0
+                && inv_inertia.x.is_finite()
+                && inv_inertia.y.is_finite()
+                && inv_inertia.z.is_finite(),
+            "mass/inertia too small: reciprocals must stay finite (mass={mass}, inertia={inertia:?})"
+        );
         Self {
             body_type: BodyType::Dynamic,
             pose,
             linvel: Vec3::ZERO,
             angvel: Vec3::ZERO,
             shape,
-            inv_mass: 1.0 / mass,
-            inv_inertia_local: Vec3::new(1.0 / inertia.x, 1.0 / inertia.y, 1.0 / inertia.z),
+            inv_mass,
+            inv_inertia_local: inv_inertia,
             friction: 0.6,
             restitution: 0.0,
         }
@@ -161,6 +173,20 @@ pub struct BodyHandle {
 mod tests {
     use super::*;
     use maru_math::Quat;
+
+    /// 리뷰 회귀: subnormal 질량은 검사를 통과하지만 역수가 inf → 0·inf = NaN
+    #[test]
+    #[should_panic(expected = "reciprocals must stay finite")]
+    fn tiny_density_rejected_at_construction() {
+        Body::new_dynamic(
+            Shape::Sphere { radius: 1.0 },
+            Pose {
+                pos: Vec3::ZERO,
+                rot: Quat::IDENTITY,
+            },
+            1.0e-40,
+        );
+    }
 
     #[test]
     fn box_inertia_analytic() {

@@ -497,13 +497,17 @@ impl World {
                 union(&mut parent, *a, *b);
             }
         }
-        // 아일랜드 대표를 다음 스텝의 wake 전파용으로 저장 (동적 바디만)
+        // 아일랜드 대표를 다음 스텝의 wake 전파용으로 저장.
+        // **잠든 바디는 직전 대표를 보존한다**: 잠든 쌍은 제약을 만들지 않으므로(위 level-trigger)
+        // 여기서 재계산하면 잠든 스택이 낱개 대표로 분해되고, 그 상태를 스냅샷하면 복원 후에도
+        // 분해된 채 남아 wake가 다시 한 홉만 전파된다(리뷰 BLOCKER). 잠든 동안 멤버십은
+        // 변할 수 없으므로(변하려면 깨어나야 한다) 보존이 곧 정답이다.
         for i in 0..n {
-            self.island[i] = if self.bodies[i].is_dynamic() {
-                find(&mut parent, i) as u32
-            } else {
-                u32::MAX
-            };
+            if !self.bodies[i].is_dynamic() {
+                self.island[i] = u32::MAX;
+            } else if !self.asleep[i] {
+                self.island[i] = find(&mut parent, i) as u32;
+            }
         }
         let lin2 = self.params.sleep_linear_threshold * self.params.sleep_linear_threshold;
         let ang2 = self.params.sleep_angular_threshold * self.params.sleep_angular_threshold;

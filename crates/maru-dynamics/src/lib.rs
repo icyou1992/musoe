@@ -204,6 +204,53 @@ mod tests {
         let _ = ball;
     }
 
+    /// 리뷰 BLOCKER 회귀: 접촉으로만 연결된 스택이 **완전히 잠든 뒤**에도 아일랜드가
+    /// 유지되어, 한 바디만 깨워도 전원이 함께 깨어나야 한다(설계 §4.6 island 단위 wake).
+    /// 스냅샷 왕복 후에도 같아야 한다(아일랜드가 캐노니컬 상태에 포함되므로).
+    #[test]
+    fn sleeping_stack_wakes_as_one_island() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let mut hs = Vec::new();
+        for i in 0..3 {
+            hs.push(w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.5, 0.5),
+                    radius: 0.0,
+                },
+                pose(0.0, 0.5 + i as f32, 0.0),
+                1.0,
+            )));
+        }
+        // 충분히 오래 재워 아일랜드가 잠든 상태로 여러 스텝 유지되게 한다
+        for _ in 0..300 {
+            w.step(DT);
+        }
+        assert!(hs.iter().all(|h| w.is_asleep(*h)), "스택이 잠들지 않음");
+
+        // 스냅샷 왕복 후에도 아일랜드가 보존되는지 함께 확인
+        let snap = w.snapshot();
+        let mut w2 = World::new(WorldParams::default());
+        ground(&mut w2);
+        for i in 0..3 {
+            w2.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.5, 0.5),
+                    radius: 0.0,
+                },
+                pose(0.0, 0.5 + i as f32, 0.0),
+                1.0,
+            ));
+        }
+        w2.restore(&snap);
+
+        // 맨 아래 바디만 건드린다 → 아일랜드 전원이 깨어나야 함
+        w2.body_mut(hs[0]).linvel = Vec3::new(0.1, 0.0, 0.0);
+        for (i, h) in hs.iter().enumerate() {
+            assert!(!w2.is_asleep(*h), "restore 후 box {i}가 깨어나지 않음");
+        }
+    }
+
     /// point 조인트: 흔들리는 진자 — 제약 오차(앵커 간 거리)가 계속 작아야 함
     #[test]
     fn point_joint_pendulum_holds() {
