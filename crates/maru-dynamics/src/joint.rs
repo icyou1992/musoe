@@ -5,7 +5,7 @@
 
 use crate::body::{Body, BodyHandle};
 use crate::solver::Softness;
-use maru_collide::{in_state_range, vec_in_range, vec_in_state_range};
+use maru_collide::{in_state_range, vec_anchor_in_range, vec_in_state_range};
 use maru_math::{Mat3, Vec3};
 
 #[derive(Clone, Debug)]
@@ -58,7 +58,9 @@ impl Joint {
     /// 비교는 **양성 조건**으로 쓴다: `!(x < 0.5)`는 NaN에서 참이 되어 통과시킨다.
     pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
         use crate::world::ApiError;
-        if !vec_in_range(self.anchor_a) || !vec_in_range(self.anchor_b) {
+        // 앵커는 **레버암**이다: `ω×r` 점 속도를 유계로 만들려면 셰이프 범위로 묶어야 한다
+        // (리뷰 BLOCKER: 앵커 1e6 × 각속도 100rad/s = 점 속도 1e8 m/s).
+        if !vec_anchor_in_range(self.anchor_a) || !vec_anchor_in_range(self.anchor_b) {
             return Err(ApiError::InvalidValue);
         }
         if !vec_in_state_range(self.linear_impulse)
@@ -189,8 +191,27 @@ fn perp_basis(a: Vec3) -> (Vec3, Vec3) {
     (u, a.cross(u))
 }
 
-/// 서브스텝 해석. `soft`=bias 페이즈, None=relax.
-pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<&Softness>) {
+/// 벡터 길이를 상한으로 자른다 (방향 보존).
+#[inline]
+fn clamp_len(v: Vec3, max: f32) -> Vec3 {
+    let l2 = v.length_sq();
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(l2 <= max * max) {
+        let l = v.length();
+        if l.is_finite() && l > 0.0 {
+            return v * (max / l);
+        }
+        return Vec3::ZERO;
+    }
+    v
+}
+
+/// 서브스텝 해석. `soft`=(bias 파라미터, 최대 bias 속도), None=relax.
+///
+/// **bias 속도를 클램프한다**(리뷰 BLOCKER): `c_pos × bias_rate`는 위치 오차가 크고 h가
+/// 작을 때 1e12까지 가고, 유효질량을 곱하면 파생 상태 상한을 넘긴다. 접촉이 이미
+/// `max_bias_speed`로 같은 방어를 하고 있었는데 조인트만 빠져 있었다.
+pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32)>) {
     let ia = bodies[j.ia()].inv_inertia_world();
     let ib = bodies[j.ib()].inv_inertia_world();
     let (inv_ma, inv_mb) = (bodies[j.ia()].inv_mass, bodies[j.ib()].inv_mass);
@@ -219,7 +240,11 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<&Softness>) {
     let c_pos = (bodies[j.ia()].pose.pos + ra) - (bodies[j.ib()].pose.pos + rb);
     let cdot = bodies[j.ia()].velocity_at(ra) - bodies[j.ib()].velocity_at(rb);
     let (bias, mass_scale, impulse_scale) = match soft {
-        Some(sf) => (c_pos * sf.bias_rate, sf.mass_scale, sf.impulse_scale),
+        Some((sf, max_bias)) => (
+            clamp_len(c_pos * sf.bias_rate, max_bias),
+            sf.mass_scale,
+            sf.impulse_scale,
+        ),
         None => (Vec3::ZERO, 1.0, 0.0),
     };
     let impulse =
@@ -246,7 +271,11 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<&Softness>) {
             // (ωa−ωb)를 −bias_rate·err 로 구동하면 두 축이 서로를 향해 회전한다.
             let c = dir.dot(err);
             let (bias, ms, is_) = match soft {
-                Some(sf) => (c * sf.bias_rate, sf.mass_scale, sf.impulse_scale),
+                Some((sf, max_bias)) => (
+                    (c * sf.bias_rate).clamp(-max_bias, max_bias),
+                    sf.mass_scale,
+                    sf.impulse_scale,
+                ),
                 None => (0.0, 1.0, 0.0),
             };
             let imp = -(cdot + bias) / k_ang * ms - j.angular_impulse[axis_i] * is_;

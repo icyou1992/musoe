@@ -131,7 +131,7 @@ fn check_params(p: &WorldParams) -> Result<(), ApiError> {
         && p.time_to_sleep >= 0.0
         && speed_in_range(p.max_linear_velocity)
         && p.max_linear_velocity > 0.0
-        && speed_in_range(p.max_angular_velocity)
+        && maru_collide::angular_in_range(p.max_angular_velocity)
         && p.max_angular_velocity > 0.0;
     if ok {
         Ok(())
@@ -370,7 +370,7 @@ impl World {
     }
 
     pub fn set_angular_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
-        if !maru_collide::vec_speed_in_range(v) {
+        if !maru_collide::vec_angular_in_range(v) {
             return Err(ApiError::InvalidValue);
         }
         let i = self.mutate(h)?;
@@ -451,8 +451,14 @@ impl World {
         };
         match cmd {
             Command::RemoveBody(h) => target(h),
-            Command::SetLinearVelocity(h, v) | Command::SetAngularVelocity(h, v) => {
+            Command::SetLinearVelocity(h, v) => {
                 if !maru_collide::vec_speed_in_range(*v) {
+                    return Err(ApiError::InvalidValue);
+                }
+                target(h)
+            }
+            Command::SetAngularVelocity(h, v) => {
+                if !maru_collide::vec_angular_in_range(*v) {
                     return Err(ApiError::InvalidValue);
                 }
                 target(h)
@@ -502,6 +508,7 @@ impl World {
                     if i < self.bodies.len()
                         && self.reserved[i]
                         && self.generations[i] == h.generation
+                        && b.validate().is_ok()
                     {
                         self.bodies[i] = *b;
                         self.reserved[i] = false;
@@ -729,6 +736,9 @@ impl World {
         self.contact_cache = cache;
         self.commands = commands;
         self.last_report = last_report;
+        // 진단은 캐노니컬 상태가 아니다 — 복원 후 **미래 동작에 영향을 주면 안 된다**
+        // (stale `state_saturations`가 다음 `try_step`을 StateOverflow로 만들던 경로).
+        self.diag = Diagnostics::default();
     }
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
@@ -803,6 +813,13 @@ impl World {
     }
 
     fn step_inner(&mut self, dt: f32) {
+        // 진단 초기화와 속도 클램프는 **무엇보다 먼저** 한다(리뷰 BLOCKER ×2):
+        // ① stale diagnostics가 남으면 restore 후 `try_step` 반환값이 달라져 L0가 깨진다
+        //    (빈 월드 조기 반환 경로 포함).
+        // ② 복원된 큰 속도가 브로드페이즈 sweep AABB를 부풀려 O(N²) 페어를 만든다 —
+        //    `try_step`이 오류를 돌려주기 전에 wasm OOM이 먼저 온다.
+        self.diag = Diagnostics::default();
+        self.clamp_velocities();
         // 0) 커맨드 적용 (설계 §4 파이프라인 0단계 — 쓰기의 정본 경로).
         //    **빈 월드 판정보다 먼저** 해야 한다: 빈 월드에 AddBody만 큐잉하면 영원히
         //    적용되지 않아 '다음 step에서 적용' 계약이 깨진다(리뷰 NOT_RESOLVED).
@@ -850,9 +867,6 @@ impl World {
                 }
             }
         }
-        self.diag = Diagnostics::default();
-        // 복원된 스냅샷의 큰 속도가 솔버 산술에 들어가기 전에 잡는다
-        self.clamp_velocities();
         let bp = Broadphase::build(dyn_items, static_items);
         let pairs = bp.canonical_pairs();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
@@ -1036,7 +1050,11 @@ impl World {
                 solver::warm_start(&mut self.bodies, c);
             }
             for &ji in &active_joints {
-                joint::solve(&mut self.bodies, &mut joints[ji], Some(&joint_soft));
+                joint::solve(
+                    &mut self.bodies,
+                    &mut joints[ji],
+                    Some((&joint_soft, self.params.solver.max_bias_speed)),
+                );
             }
             for c in constraints.iter_mut() {
                 let sf = if self.bodies[c.a].is_dynamic() && self.bodies[c.b].is_dynamic() {

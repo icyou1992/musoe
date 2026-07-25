@@ -360,9 +360,9 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
             // 질량을 **양쪽**으로 묶는다: 너무 작은 inv_mass(=거대 질량)는 조인트 솔버의
             // K⁻¹를 폭발시켜 중간 연산에서 Inf를 만든다(리뷰 BLOCKER 공격 시나리오).
             if !(maru_collide::inv_mass_in_range(inv_mass)
-                && maru_collide::inv_mass_in_range(inv_inertia_local.x)
-                && maru_collide::inv_mass_in_range(inv_inertia_local.y)
-                && maru_collide::inv_mass_in_range(inv_inertia_local.z))
+                && maru_collide::inv_inertia_in_range(inv_inertia_local.x)
+                && maru_collide::inv_inertia_in_range(inv_inertia_local.y)
+                && maru_collide::inv_inertia_in_range(inv_inertia_local.z))
             {
                 return Err(SnapshotError::InconsistentState);
             }
@@ -549,7 +549,10 @@ pub fn write_world(world: &World, w: &mut Writer) -> Result<(), SnapshotError> {
     if size > MAX_SNAPSHOT_BYTES {
         return Err(SnapshotError::CountTooLarge);
     }
-    w.0.reserve_exact(size);
+    // `reserve_exact`은 할당 실패를 abort/trap으로 표현한다 — 오류 ABI를 지키려면
+    // `try_reserve_exact`이어야 한다(리뷰 MAJOR).
+    w.0.try_reserve_exact(size)
+        .map_err(|_| SnapshotError::CountTooLarge)?;
     write_world_bytes(world, w);
     debug_assert_eq!(w.0.len(), size, "preflight 크기 계산이 writer와 어긋남");
     Ok(())
@@ -644,7 +647,9 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         reserved.push(r.u8()? != 0);
         generations.push(r.u32()?);
         bodies.push(read_body(&mut r)?);
-        let t = r.f32()?;
+        // sleep timer는 **파생 상태**다(dt 누적). time_to_sleep가 큰 월드에서 입력 상한을
+        // 넘길 수 있는데 writer는 그대로 쓰므로, 리더도 상태 정책으로 읽어야 대칭이 된다.
+        let t = r.state_f32()?;
         if t < 0.0 {
             return Err(SnapshotError::NonFinite);
         }
@@ -666,23 +671,44 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         let cmd = match r.u8()? {
             0 => {
                 let h = r.handle()?;
-                PendingCommand::Add(h, Box::new(read_body(&mut r)?))
+                let b = read_body(&mut r)?;
+                // 아직 월드에 들어가지 않은 바디 = 호스트 입력. `enqueue_add_body`와 같은
+                // 검증을 통과해야 한다(read_body는 파생 상태 범위를 쓴다).
+                if b.validate().is_err() {
+                    return Err(SnapshotError::InconsistentState);
+                }
+                PendingCommand::Add(h, Box::new(b))
             }
             1 => PendingCommand::Public(Command::RemoveBody(r.handle()?)),
+            // pending 페이로드는 **호스트 입력**이다 — 공개 `enqueue`와 **같은 정책**으로
+            // 읽어야 한다(리뷰 BLOCKER: state 범위로 읽으면 조작 스냅샷이 거대 속도 커맨드를
+            // 큐에 심고, flush 뒤 브로드페이즈 DoS로 이어진다).
             2 => {
                 let h = r.handle()?;
-                PendingCommand::Public(Command::SetLinearVelocity(h, r.state_vec3()?))
+                let v = r.state_vec3()?;
+                if !maru_collide::vec_speed_in_range(v) {
+                    return Err(SnapshotError::NonFinite);
+                }
+                PendingCommand::Public(Command::SetLinearVelocity(h, v))
             }
             3 => {
                 let h = r.handle()?;
-                PendingCommand::Public(Command::SetAngularVelocity(h, r.state_vec3()?))
+                let v = r.state_vec3()?;
+                if !maru_collide::vec_angular_in_range(v) {
+                    return Err(SnapshotError::NonFinite);
+                }
+                PendingCommand::Public(Command::SetAngularVelocity(h, v))
             }
             4 => {
                 let h = r.handle()?;
+                let pos = r.state_vec3()?;
+                if !maru_collide::vec_in_range(pos) {
+                    return Err(SnapshotError::NonFinite);
+                }
                 PendingCommand::Public(Command::SetPose(
                     h,
                     Pose {
-                        pos: r.state_vec3()?,
+                        pos,
                         rot: r.quat()?,
                     },
                 ))

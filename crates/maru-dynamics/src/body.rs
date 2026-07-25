@@ -2,7 +2,8 @@
 
 use crate::world::ApiError;
 use maru_collide::{
-    in_range, inv_mass_in_range, vec_extent_in_range, vec_in_range, vec_speed_in_range, Pose, Shape,
+    in_range, inv_inertia_in_range, inv_mass_in_range, vec_angular_in_range, vec_extent_in_range,
+    vec_in_range, vec_speed_in_range, Pose, Shape,
 };
 use maru_math::{Mat3, Vec3};
 
@@ -100,7 +101,7 @@ impl Body {
         if !vec_in_range(self.pose.pos) || self.pose.rot.try_normalize().is_none() {
             return Err(ApiError::InvalidValue);
         }
-        if !vec_speed_in_range(self.linvel) || !vec_speed_in_range(self.angvel) {
+        if !vec_speed_in_range(self.linvel) || !vec_angular_in_range(self.angvel) {
             return Err(ApiError::InvalidValue);
         }
         if !vec_extent_in_range(self.shape_origin_offset) {
@@ -118,9 +119,9 @@ impl Body {
                 // 질량·관성은 **양쪽**으로 묶는다: 너무 가벼우면 역수가 폭발하고,
                 // 너무 무거우면(1e9 kg 초과) 그 임펄스가 파생 상한을 위협한다.
                 if !(inv_mass_in_range(self.inv_mass)
-                    && inv_mass_in_range(inv_i.x)
-                    && inv_mass_in_range(inv_i.y)
-                    && inv_mass_in_range(inv_i.z))
+                    && inv_inertia_in_range(inv_i.x)
+                    && inv_inertia_in_range(inv_i.y)
+                    && inv_inertia_in_range(inv_i.z))
                 {
                     return Err(ApiError::InvalidValue);
                 }

@@ -5,7 +5,7 @@
 //! 침투 깊이가 얕게 유지되어 EPA 진입이 최소화된다. [근거: Jolt convex radius]
 //! Hull의 코어 포인트는 빌더가 이미 수축된 점을 준다는 계약(v1 — 문서화된 가정).
 
-use crate::limits::{extent_in_range, vec_extent_in_range, MAX_HULL_POINTS};
+use crate::limits::{extent_in_range, vec_extent_in_range, MAX_HULL_POINTS, MIN_SHAPE_EXTENT};
 use crate::Aabb;
 use maru_math::Vec3;
 
@@ -32,8 +32,10 @@ impl Shape {
         }
         match self {
             Shape::Sphere { radius } => {
-                if !extent_in_range(*radius) || *radius <= 0.0 {
-                    return Err("sphere radius must be finite and positive");
+                if !extent_in_range(*radius) || *radius < MIN_SHAPE_EXTENT {
+                    return Err(
+                        "sphere radius must be within [MIN_SHAPE_EXTENT, MAX_SHAPE_EXTENT]",
+                    );
                 }
             }
             Shape::Capsule { half_height, .. } => {
@@ -45,8 +47,14 @@ impl Shape {
                 }
             }
             Shape::Box { half, .. } => {
-                if !vec_extent_in_range(*half) || half.x <= 0.0 || half.y <= 0.0 || half.z <= 0.0 {
-                    return Err("box half extents must be finite and positive");
+                if !vec_extent_in_range(*half)
+                    || half.x < MIN_SHAPE_EXTENT
+                    || half.y < MIN_SHAPE_EXTENT
+                    || half.z < MIN_SHAPE_EXTENT
+                {
+                    return Err(
+                        "box half extents must be within [MIN_SHAPE_EXTENT, MAX_SHAPE_EXTENT]",
+                    );
                 }
                 if r > half.x.min(half.y).min(half.z) {
                     return Err("box convex radius must not exceed the smallest half extent");

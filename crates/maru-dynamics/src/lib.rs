@@ -1734,4 +1734,182 @@ mod tests {
         assert!(r.is_ok(), "상태 폐쇄에서 빠진 필드가 있다: {r:?}");
         assert_eq!(w.diagnostics().state_saturations, 0);
     }
+
+    // ─────────── 리뷰 rev_d76fd99f 회귀 ───────────
+
+    /// BLOCKER: 최악 임펄스 논증에서 빠졌던 **조인트 레버암 × 각속도**.
+    /// 앵커를 셰이프 범위로 묶어 `ω×r` 점 속도를 유계로 만든다.
+    #[test]
+    fn large_anchor_with_spinning_kinematic_stays_in_policy() {
+        // 앵커는 레버암이므로 셰이프 범위를 넘을 수 없다
+        assert!(Joint::try_point(
+            BodyHandle {
+                index: 0,
+                generation: 0
+            },
+            BodyHandle {
+                index: 1,
+                generation: 0
+            },
+            Vec3::new(maru_collide::MAX_ANCHOR * 2.0, 0.0, 0.0),
+            Vec3::ZERO,
+        )
+        .is_err());
+
+        // 허용 범위 안의 최대 조합: 큰 앵커 + 상한 각속도 + 무거운 바디
+        let mut w = World::new(WorldParams::default());
+        let k = w.add_body(Body::new_kinematic(
+            Shape::Box {
+                half: Vec3::new(1.0, 1.0, 1.0),
+                radius: 0.0,
+            },
+            pose(0.0, 0.0, 0.0),
+        ));
+        let heavy = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(2.0, 2.0, 2.0),
+                radius: 0.0,
+            },
+            pose(50.0, 0.0, 0.0),
+            1.0e4, // 부피 64m³ × 1e4 = 6.4e5 kg (질량 상한 1e6 안)
+        ));
+        w.set_angular_velocity(k, Vec3::new(0.0, 100.0, 0.0))
+            .unwrap();
+        w.add_joint(Joint::point(
+            k,
+            heavy,
+            Vec3::new(maru_collide::MAX_ANCHOR, 0.0, 0.0),
+            Vec3::ZERO,
+        ));
+        for _ in 0..30 {
+            // 지원 범위 안의 합법 월드는 StateOverflow를 내면 안 된다
+            assert_eq!(
+                w.try_step(DT),
+                Ok(()),
+                "합법 월드가 StateOverflow: sat={}",
+                w.diagnostics().state_saturations
+            );
+        }
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
+
+    /// BLOCKER: 복원된 큰 속도가 **브로드페이즈보다 먼저** 잡혀야 한다 —
+    /// sweep AABB가 부풀면 O(N²) 페어로 오류 반환 전에 메모리가 터진다.
+    #[test]
+    fn restored_huge_velocity_is_clamped_before_broadphase() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let hs: Vec<_> = (0..40)
+            .map(|i| dyn_box(&mut w, i as f32 * 2.0 - 40.0, 1.0))
+            .collect();
+        w.step(DT);
+        // 스냅샷 바이트를 직접 조작하는 대신, 리더가 허용하는 상태 범위 속도를
+        // 엔진 내부 경로로 만들어 같은 조건을 재현한다.
+        for h in &hs {
+            let _ = w.set_linear_velocity(*h, Vec3::new(9000.0, 0.0, 0.0));
+        }
+        let snap = w.snapshot();
+        assert!(w.restore(&snap).is_ok());
+        // 클램프가 브로드페이즈 앞이라면 페어 폭발 없이 정상 스텝이 끝난다
+        assert_eq!(w.try_step(DT), Ok(()));
+        for h in &hs {
+            let v = w.body(*h).linvel().length();
+            assert!(v <= 500.0 + 1e-3, "속도 상한 미적용: {v}");
+        }
+    }
+
+    /// BLOCKER: 진단은 캐노니컬 상태가 아니므로 **복원 후 미래 동작에 영향을 주면 안 된다**.
+    /// stale `state_saturations`가 다음 `try_step`을 StateOverflow로 만들던 경로.
+    #[test]
+    fn diagnostics_do_not_survive_restore() {
+        let mut a = World::new(WorldParams::default());
+        ground(&mut a);
+        dyn_box(&mut a, 0.0, 3.0);
+        a.step(DT);
+        let snap = a.snapshot();
+
+        // 진단이 오염된 인스턴스와 새 인스턴스가 같은 스냅샷에서 같게 동작해야 한다
+        let mut dirty = World::new(WorldParams::default());
+        ground(&mut dirty);
+        let h = dyn_box(&mut dirty, 0.0, 3.0);
+        let _ = dirty.set_linear_velocity(h, Vec3::new(9000.0, 0.0, 0.0));
+        dirty.step(DT);
+        dirty.restore(&snap).unwrap();
+
+        let mut fresh = World::new(WorldParams::default());
+        fresh.restore(&snap).unwrap();
+
+        assert_eq!(
+            dirty.try_step(DT),
+            fresh.try_step(DT),
+            "stale 진단이 반환값을 바꿈"
+        );
+        assert_eq!(dirty.state_hash(), fresh.state_hash(), "L0 재생 불일치");
+    }
+
+    /// BLOCKER: pending 커맨드 페이로드는 **호스트 입력**이므로 공개 enqueue와 같은 정책이다.
+    #[test]
+    fn pending_payload_uses_input_policy() {
+        let mut w = World::new(WorldParams::default());
+        let h = dyn_box(&mut w, 0.0, 3.0);
+        // 공개 경로가 거부하는 값은 스냅샷 왕복으로도 큐에 들어올 수 없다
+        assert!(w
+            .enqueue(Command::SetLinearVelocity(
+                h,
+                Vec3::new(maru_collide::MAX_SPEED * 2.0, 0.0, 0.0)
+            ))
+            .is_err());
+        assert!(w
+            .enqueue(Command::SetAngularVelocity(
+                h,
+                Vec3::new(maru_collide::MAX_ANGULAR * 2.0, 0.0, 0.0)
+            ))
+            .is_err());
+        // 정상 범위는 통과하고 왕복도 성립
+        w.enqueue(Command::SetLinearVelocity(h, Vec3::new(10.0, 0.0, 0.0)))
+            .unwrap();
+        w.enqueue(Command::SetAngularVelocity(h, Vec3::new(1.0, 0.0, 0.0)))
+            .unwrap();
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
+
+    /// BLOCKER: sleep timer는 파생 상태(dt 누적)라 writer/reader 정책이 같아야 한다.
+    #[test]
+    fn large_time_to_sleep_survives_roundtrip() {
+        let mut w = World::new(WorldParams {
+            time_to_sleep: maru_collide::MAX_INPUT * 0.999,
+            ..Default::default()
+        });
+        ground(&mut w);
+        dyn_box(&mut w, 0.0, 0.5);
+        for _ in 0..30 {
+            w.step(0.2);
+        }
+        assert!(w.restore(&w.snapshot()).is_ok(), "sleep timer 정책 비대칭");
+    }
+
+    /// MAJOR: 좌표 정밀도와 최소 특징 크기의 정합.
+    #[test]
+    fn world_extent_matches_float_precision() {
+        // 월드 경계에서의 f32 간격이 최소 특징 크기 이하여야 한다
+        let spacing = {
+            let x = maru_collide::MAX_INPUT;
+            let next = f32::from_bits(x.to_bits() + 1);
+            next - x
+        };
+        assert!(
+            spacing <= maru_collide::MIN_SHAPE_EXTENT,
+            "월드 경계 f32 간격 {spacing} > 최소 특징 크기 {}",
+            maru_collide::MIN_SHAPE_EXTENT
+        );
+        // 최소 크기 미만 셰이프는 거부된다
+        assert!(Body::try_new_dynamic(
+            Shape::Sphere {
+                radius: maru_collide::MIN_SHAPE_EXTENT * 0.5
+            },
+            pose(0.0, 0.0, 0.0),
+            1.0
+        )
+        .is_err());
+    }
 }

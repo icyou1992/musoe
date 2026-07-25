@@ -20,26 +20,47 @@
 
 use maru_math::Vec3;
 
-/// 셰이프 반크기·반지름·hull 정점 상한 (m).
-pub const MAX_SHAPE_EXTENT: f32 = 1.0e4;
-/// 위치·앵커·일반 파라미터 상한 (m). 월드 범위이기도 하다.
-pub const MAX_INPUT: f32 = 1.0e6;
-/// 선속도·각속도 상한 (m/s, rad/s).
+/// 셰이프 반크기·반지름·hull 정점 상한 (m). 레버암 r의 상한이기도 하다.
+pub const MAX_SHAPE_EXTENT: f32 = 1.0e3;
+/// 셰이프 **최소** 특징 크기 (m). 좌표 정밀도와 정합해야 한다 — 아래 MAX_INPUT 주석 참조.
+pub const MIN_SHAPE_EXTENT: f32 = 1.0e-3;
+/// 위치·파라미터 상한 (m) = **월드 범위**.
+///
+/// f32 정밀도와 최소 특징 크기의 정합이 이 값을 정한다(리뷰 MAJOR): 1e4 부근의 f32 간격은
+/// 약 9.8e-4 m로 `MIN_SHAPE_EXTENT`(1mm) 이하다. 1e6이면 간격이 0.0625 m가 되어 1cm 떨어진
+/// 두 자세가 같은 값으로 반올림되고 작은 AABB가 퇴화한다.
+/// 더 넓은 월드는 floating-origin(주기적 rebase)이 필요하며 v1의 계약이 아니다.
+pub const MAX_INPUT: f32 = 1.0e4;
+/// **조인트 앵커 상한** = 셰이프 범위. 앵커는 바디에 붙은 점이므로 셰이프를 벗어날 이유가
+/// 없고, 이것이 레버암 r을 묶어 `ω×r` 점 속도를 유계로 만든다(리뷰 BLOCKER: 앵커를
+/// MAX_INPUT까지 허용하면 각속도 100rad/s × 앵커 1e6 = 점 속도 1e8 m/s).
+pub const MAX_ANCHOR: f32 = MAX_SHAPE_EXTENT;
+/// 호스트가 넣는 선속도 상한 (m/s).
 pub const MAX_SPEED: f32 = 1.0e4;
-/// 역질량 상한 (1/kg) = 질량 하한 1e-9 kg. 역관성도 같은 상한을 쓴다.
-pub const MAX_INV_MASS: f32 = 1.0e9;
-/// 역질량 하한 (1/kg) = **질량 상한 1e9 kg**. 이보다 무거운 물체는 지원하지 않는다 —
-/// 그 임펄스가 파생 상한을 위협하고, 물리적으로도 static으로 모델링할 대상이다.
-pub const MIN_INV_MASS: f32 = 1.0e-9;
+/// 각속도 상한 (rad/s). `MAX_ANGULAR × MAX_SHAPE_EXTENT`가 점 속도 기여의 상한이다.
+pub const MAX_ANGULAR: f32 = 1.0e2;
+/// 역질량 범위 (1/kg) = **질량 1e-6 ~ 1e6 kg**. 유효질량 `1/k ≤ 1/MIN_INV_MASS`가
+/// 임펄스 상한의 첫 인수다.
+pub const MIN_INV_MASS: f32 = 1.0e-6;
+pub const MAX_INV_MASS: f32 = 1.0e6;
+/// 역관성 범위 (1/(kg·m²)). 관성은 차원이 달라 질량과 같은 상한을 쓸 수 없다
+/// (반지름 1cm 구의 역관성은 이미 1e9 수준). 임펄스 상한 논증에는 들어가지 않는다 —
+/// `k ≥ inv_mass`라 유효질량은 회전 항과 무관하게 묶인다.
+pub const MIN_INV_INERTIA: f32 = 1.0e-12;
+pub const MAX_INV_INERTIA: f32 = 1.0e12;
 /// hull 정점 수 상한. support가 O(n) 선형 스캔이라 성능 상한이자 직렬화 자원 상한이다.
 /// 더 복잡한 메시는 convex decomposition으로 나눈다(v1 계약).
 pub const MAX_HULL_POINTS: usize = 1024;
 
 /// 파생 상태 상한 (위치·속도·누적 임펄스·PCM).
 ///
-/// 지원 범위 안의 최악 임펄스 여유: `k ≥ inv_mass ≥ 1e-9` 이므로 유효질량 `1/k ≤ 1e9`,
-/// 상대속도 ≤ `2·MAX_SPEED = 2e4` → 임펄스 ≤ `2e13`. `MAX_STATE`는 그 **50배 위**다.
-/// 즉 정상 물리는 여기 닿지 않는다 — 닿으면 신호다.
+/// **최악 임펄스 논증** (리뷰 BLOCKER: 앵커·각속도를 빠뜨렸던 부분을 포함해 재계산):
+/// - 유효질량 `1/k ≤ 1/MIN_INV_MASS = 1e6` kg (k는 회전 항이 있어 항상 `≥ inv_mass`)
+/// - 접점/앵커 속도 `|v + ω×r| ≤ MAX_SPEED + MAX_ANGULAR·MAX_SHAPE_EXTENT = 1.1e5` m/s
+/// - 조인트·접촉 bias 속도는 `max_bias_speed ≤ MAX_SPEED = 1e4`로 클램프된다
+///   (bias를 안 묶으면 `c_pos × (1/h)`가 1e12까지 간다)
+///
+/// 따라서 임펄스 ≤ `1e6 × (2·1.1e5 + 1e4) ≈ 2.3e11`. `MAX_STATE`는 그 **4000배 위**다.
 pub const MAX_STATE: f32 = 1.0e15;
 
 /// 스텝 크기 범위. 하한이 필요한 이유: soft 계수의 `1/h`가 폭발해 조인트 bias가
@@ -74,10 +95,33 @@ pub fn speed_in_range(v: f32) -> bool {
 pub fn vec_speed_in_range(v: Vec3) -> bool {
     speed_in_range(v.x) && speed_in_range(v.y) && speed_in_range(v.z)
 }
-/// 동적 바디의 역질량·역관성 성분.
+/// 동적 바디의 역질량.
 #[inline]
 pub fn inv_mass_in_range(v: f32) -> bool {
     v.is_finite() && (MIN_INV_MASS..=MAX_INV_MASS).contains(&v)
+}
+/// 동적 바디의 역관성 성분 (차원이 달라 별도 범위).
+#[inline]
+pub fn inv_inertia_in_range(v: f32) -> bool {
+    v.is_finite() && (MIN_INV_INERTIA..=MAX_INV_INERTIA).contains(&v)
+}
+/// 각속도.
+#[inline]
+pub fn angular_in_range(v: f32) -> bool {
+    v.is_finite() && v.abs() <= MAX_ANGULAR
+}
+#[inline]
+pub fn vec_angular_in_range(v: Vec3) -> bool {
+    angular_in_range(v.x) && angular_in_range(v.y) && angular_in_range(v.z)
+}
+/// 조인트 앵커 (레버암).
+#[inline]
+pub fn anchor_in_range(v: f32) -> bool {
+    v.is_finite() && v.abs() <= MAX_ANCHOR
+}
+#[inline]
+pub fn vec_anchor_in_range(v: Vec3) -> bool {
+    anchor_in_range(v.x) && anchor_in_range(v.y) && anchor_in_range(v.z)
 }
 
 /// 파생 상태가 상한 안인가.

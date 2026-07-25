@@ -68,14 +68,24 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
 - **지원 범위는 차원별**이다(`maru-collide/limits.rs`). 스칼라 하나로 묶으면 동시에
   너무 넓고 너무 좁다 — 넓으면 큰 위치 × 작은 역질량이 조인트 솔버의 **중간 연산**에서
   먼저 Inf가 되고, 좁으면 정상 물리의 임펄스가 잘려 warm start가 조용히 부족해진다.
-  | 차원 | 상한 | 위반 시 |
+
+  | 차원 | 범위 | 위반 시 |
   |---|---|---|
-  | 셰이프 치수 | `MAX_SHAPE_EXTENT` 1e4 m | 거부 |
-  | 위치·앵커·파라미터 | `MAX_INPUT` 1e6 m | 거부 |
-  | 호스트가 넣는 속도 | `MAX_SPEED` 1e4 | 거부 |
-  | 질량 | 1e-9 ~ 1e9 kg | 거부 |
+  | 셰이프 치수 | `MIN_SHAPE_EXTENT` 1e-3 ~ `MAX_SHAPE_EXTENT` 1e3 m | 거부 |
+  | 위치·파라미터 (월드 범위) | `MAX_INPUT` 1e4 m | 거부 |
+  | 조인트 앵커 (레버암) | `MAX_ANCHOR` = 셰이프 범위 | 거부 |
+  | 선속도 | `MAX_SPEED` 1e4 m/s | 거부 |
+  | 각속도 | `MAX_ANGULAR` 1e2 rad/s | 거부 |
+  | 질량 | 1e-6 ~ 1e6 kg | 거부 |
+  | 역관성 | 1e-12 ~ 1e12 | 거부 |
   | dt | `MIN_DT` 1e-4 ~ `MAX_DT` 0.25 s | 거부 |
   | 파생 상태(위치·속도·임펄스·PCM) | `MAX_STATE` 1e15 | 포화 + `StateOverflow` |
+
+  **앵커가 셰이프 범위인 이유**: 앵커는 레버암이고 점 속도는 `v + ω×r`다. 앵커를 월드
+  범위까지 허용하면 각속도 100 rad/s × 앵커 1e4 m = 점 속도 1e6 m/s가 되어 임펄스 논증이
+  깨진다. **월드 범위가 1e4인 이유**: 1e4 부근의 f32 간격(≈9.8e-4 m)이
+  `MIN_SHAPE_EXTENT`(1mm) 이하여야 작은 물체가 좌표 반올림으로 퇴화하지 않는다.
+  더 넓은 월드는 floating-origin(주기적 rebase)이 필요하며 v1의 계약이 아니다.
 - **속도 상한은 물리 파라미터다** (`WorldParams::max_linear_velocity` 500 m/s,
   `max_angular_velocity` 100 rad/s — Jolt `mMaxLinearVelocity` 계열). 터널링·폭주를 막는
   정상 기능이며 도달은 오류가 아니라 `Diagnostics::velocity_clamped`로 집계된다.
@@ -88,6 +98,12 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
 - 공개 커맨드 스키마(`Command`)에 **바디 추가가 없다**. 슬롯 예약과 커맨드 등록이 한 원자
   연산이어야 하므로 정본 경로는 `enqueue_add_body`(예약 핸들을 즉시 반환)뿐이다.
 - hull은 정점 `MAX_HULL_POINTS`(1024)까지. 더 복잡한 메시는 convex decomposition으로 나눈다.
+
+- **CCD 없음 (v1).** 브로드페이즈는 `velocity × dt`로 sweep AABB를 확장하지만
+  내로우페이즈는 **현재 자세에서만** 판정한다. 500 m/s 물체는 60Hz에 8.3 m를 지나므로
+  얇은 벽을 한 프레임에 통과할 수 있다. 호스트가 `max_linear_velocity`를 낮추거나
+  `substeps`를 올려 `속도 × dt / substeps < 최소 두께`를 유지해야 한다.
+  swept 내로우페이즈는 설계 §4.5의 M4 과제다.
 
 ## 규율 (설계 문서에서 상속)
 
