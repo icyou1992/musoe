@@ -299,12 +299,27 @@ mod tests {
         assert!(vclose((a * b).rotate(v), a.rotate(b.rotate(v))));
     }
 
+    /// 리뷰 지적: 구 버전은 z축 회전인데 x·w만 검사해 **z 성분의 부호·크기가 틀려도 통과**했다.
+    /// 전 성분 + 오차 차수(dt를 반으로 줄이면 오차가 ~4배 준다 = 2차)까지 본다.
     #[test]
-    fn integrate_small_step_matches_axis_angle() {
+    fn integrate_matches_axis_angle_all_components() {
         let omega = Vec3::new(0.0, 0.0, 2.0);
-        let dt = 1.0e-3;
+        let err_at = |dt: f32| {
+            let q = Quat::IDENTITY.integrate(omega, dt);
+            let e = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 2.0 * dt);
+            // 전 성분 비교 (z가 핵심 — 회전축 성분)
+            ((q.x - e.x).abs() + (q.y - e.y).abs() + (q.z - e.z).abs() + (q.w - e.w).abs())
+                .max(1.0e-12)
+        };
+        let dt = 1.0e-2f32;
+        let e1 = err_at(dt);
+        let e2 = err_at(dt * 0.5);
+        assert!(e1 < 1.0e-4, "절대 오차 과다: {e1}");
+        // 2차 정확도면 비율 ≈ 4 (1차면 ≈ 2) — 부호 오류는 여기서 비율이 무너진다
+        let ratio = e1 / e2;
+        assert!(ratio > 2.5, "오차 차수 저하: e1={e1} e2={e2} ratio={ratio}");
+        // 부호: +z 각속도는 +z 성분을 만든다
         let q = Quat::IDENTITY.integrate(omega, dt);
-        let expect = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 2.0 * dt);
-        assert!(close(q.x, expect.x) && close(q.w, expect.w));
+        assert!(q.z > 0.0, "회전 부호 반전: {q:?}");
     }
 }

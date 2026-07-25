@@ -198,19 +198,38 @@ mod tests {
         assert_eq!(s.local_aabb().max, Vec3::new(0.5, 1.5, 0.5));
     }
 
+    /// 리뷰 지적: 구 버전은 **좌표가 같은 두 점**을 넣어 반환값만 비교했으므로 어느 쪽이
+    /// 선택됐는지 관측할 수 없었다(동률 규칙을 검증하지 못함). 좌표는 다르되 dot이 같은
+    /// 두 점을 써서 '낮은 인덱스가 이긴다'를 실제로 관측한다.
     #[test]
-    fn hull_support_deterministic_tie() {
-        // 동률 꼭짓점 2개 — 낮은 인덱스가 이겨야 함(결정론 계약)
+    fn hull_support_tie_prefers_lower_index() {
+        // d=(1,0,0)에 대해 dot이 모두 1.0인 서로 다른 점들
         let s = Shape::Hull {
             points: vec![
-                Vec3::new(1.0, 0.0, 0.0),
-                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.5, 0.0),  // idx 0 (선택되어야 함)
+                Vec3::new(1.0, -0.5, 0.0), // idx 1 동률
+                Vec3::new(1.0, 0.0, 0.7),  // idx 2 동률
                 Vec3::new(-1.0, 0.0, 0.0),
             ],
             radius: 0.0,
         };
-        let p = s.support_core(Vec3::new(1.0, 0.0, 0.0));
-        assert_eq!(p, Vec3::new(1.0, 0.0, 0.0));
+        let d = Vec3::new(1.0, 0.0, 0.0);
+        let p = s.support_core(d);
+        assert_eq!(
+            p,
+            Vec3::new(1.0, 0.5, 0.0),
+            "동률에서 낮은 인덱스가 이겨야 한다"
+        );
+        // 순서를 바꾸면 선택도 바뀌어야 관측이 유효함을 증명
+        let s2 = Shape::Hull {
+            points: vec![
+                Vec3::new(1.0, -0.5, 0.0),
+                Vec3::new(1.0, 0.5, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+            ],
+            radius: 0.0,
+        };
+        assert_eq!(s2.support_core(d), Vec3::new(1.0, -0.5, 0.0));
     }
 
     #[test]

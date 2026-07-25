@@ -15,13 +15,15 @@ const REL: f32 = 1.0e-6;
 /// f32 정규수 하한 근처의 절대 바닥 — 특성 길이가 0에 수렴해도 0으로 나누지 않게.
 const FLOOR: f32 = 1.0e-30;
 
-/// 형상 쌍의 특성 길이 L (로컬 AABB 대각 중 큰 쪽).
+/// 형상 쌍의 특성 길이 L = **작은 쪽** 로컬 AABB 대각.
+/// 접촉 feature의 크기는 작은 형상이 상한이다 — 거대한 지면(대각 243m)을 기준으로 잡으면
+/// 그 위 1m 박스의 임계가 240배 느슨해져 침하가 커진다(40단 수용 게이트에서 실측).
 pub fn characteristic_length(a: &Shape, b: &Shape) -> f32 {
     let ext = |s: &Shape| {
         let bb = s.local_aabb();
         (bb.max - bb.min).length()
     };
-    let l = ext(a).max(ext(b));
+    let l = ext(a).min(ext(b));
     if l.is_finite() && l > 0.0 {
         l
     } else {
@@ -72,14 +74,15 @@ mod tests {
         assert!(length_eps(0.0) > 0.0 && length_eps(0.0).is_finite());
     }
 
+    /// 접촉 임계는 **작은 형상**이 지배한다 (거대 지면이 임계를 느슨하게 만들면 안 됨).
     #[test]
-    fn characteristic_length_uses_larger_shape() {
+    fn characteristic_length_uses_smaller_shape() {
         let small = Shape::Sphere { radius: 0.01 };
         let large = Shape::Box {
-            half: Vec3::new(5.0, 5.0, 5.0),
+            half: Vec3::new(120.0, 1.0, 20.0),
             radius: 0.0,
         };
         let l = characteristic_length(&small, &large);
-        assert!(l > 10.0, "l={l}");
+        assert!(l < 0.1, "l={l} — 큰 형상이 임계를 지배하면 안 된다");
     }
 }

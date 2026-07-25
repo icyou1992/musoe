@@ -233,18 +233,34 @@ mod tests {
         assert!((p.normal.y - 1.0).abs() < 1e-3, "normal={:?}", p.normal); // A는 위 → +y로 탈출
     }
 
+    /// 리뷰 지적: 구 버전은 이름과 달리 **witness에 대해 아무것도 단정하지 않았다**.
+    /// witness는 두 표면 위의 대응점이어야 하며, 그 차이를 법선에 투영하면 침투 깊이가 나온다.
     #[test]
-    fn sphere_core_witness() {
-        // 구 코어=점이라 GJK 단계에서 미세거리로 나오는 경우가 있어 박스로 깊은 교차 검증
+    fn witness_points_satisfy_depth_relation() {
         let s = Shape::Box {
             half: Vec3::new(1.0, 1.0, 1.0),
             radius: 0.0,
         };
-        let p = run_epa(&s, &pose(0.2, 0.1, -0.15), &s, &pose(0.0, 0.0, 0.0));
-        // witness 점은 두 박스 표면 위 (해당 축 좌표가 half와 일치)
-        assert!(p.depth > 0.0);
-        let n = p.normal;
-        assert!((n.length() - 1.0).abs() < 1e-4);
+        let pa = pose(0.2, 0.1, -0.15);
+        let pb = pose(0.0, 0.0, 0.0);
+        let p = run_epa(&s, &pa, &s, &pb);
+        assert!(p.depth > 0.0, "깊이 {}", p.depth);
+        assert!((p.normal.length() - 1.0).abs() < 1e-4);
+        // 계약: (on_b − on_a)·n = depth  (A를 +n으로 depth만큼 밀면 표면이 만난다)
+        let proj = (p.on_b - p.on_a).dot(p.normal);
+        assert!(
+            (proj - p.depth).abs() < 1.0e-3,
+            "witness 관계 위반: (on_b−on_a)·n={proj} vs depth={}",
+            p.depth
+        );
+        // witness는 각 박스의 표면 위 (로컬 좌표 성분 하나가 half와 일치)
+        for (w, pose_) in [(p.on_a, pa), (p.on_b, pb)] {
+            let local = pose_.rot.conjugate().rotate(w - pose_.pos);
+            let on_surface = (local.x.abs() - 1.0).abs() < 1e-3
+                || (local.y.abs() - 1.0).abs() < 1e-3
+                || (local.z.abs() - 1.0).abs() < 1e-3;
+            assert!(on_surface, "witness가 표면 위가 아님: local={local:?}");
+        }
     }
 
     #[test]
