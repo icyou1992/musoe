@@ -127,6 +127,17 @@ impl Quat {
         v + t * self.w + u.cross(t)
     }
 
+    /// 켤레 = 단위 쿼터니언의 역회전. 월드→로컬 방향 변환에 사용.
+    #[inline]
+    pub fn conjugate(self) -> Self {
+        Self {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+            w: self.w,
+        }
+    }
+
     #[inline]
     pub fn normalize(self) -> Self {
         let l2 = self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w;

@@ -93,9 +93,9 @@ impl Tree {
         while let Some(n) = stack.pop() {
             let n = n as usize;
             let mask = self.bounds[n].overlaps_mask(qmin, qmax).to_array();
-            for lane in 0..4 {
-                if mask[lane] != 0.0 {
-                    match decode(self.children[n][lane]) {
+            for (hit, &child) in mask.iter().zip(&self.children[n]) {
+                if *hit != 0.0 {
+                    match decode(child) {
                         Child::Node(c) => stack.push(c),
                         Child::Leaf(id) => out.push(id),
                         Child::None => {}
