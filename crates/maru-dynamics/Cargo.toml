@@ -1,0 +1,10 @@
+[package]
+name = "maru-dynamics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Maru rigid body dynamics: TGS-soft solver, islands, sleeping, joints"
+
+[dependencies]
+maru-math = { path = "../maru-math" }
+maru-collide = { path = "../maru-collide" }

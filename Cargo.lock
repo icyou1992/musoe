@@ -25,6 +25,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "maru-dynamics"
+version = "0.1.0"
+dependencies = [
+ "maru-collide",
+ "maru-math",
+]
+
+[[package]]
 name = "maru-math"
 version = "0.1.0"
 dependencies = [

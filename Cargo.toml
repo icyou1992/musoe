@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/maru-math", "crates/maru-collide", "crates/maru-bench"]
+members = ["crates/maru-math", "crates/maru-collide", "crates/maru-dynamics", "crates/maru-bench"]
 
 [workspace.package]
 version = "0.1.0"

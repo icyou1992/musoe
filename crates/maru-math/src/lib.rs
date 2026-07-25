@@ -6,9 +6,11 @@
 //!   배치의 정본 레이아웃.
 //! - §8: 재결합 금지(기본 프로파일), denormal은 정의 지점 flush(`flush_tiny`).
 
+mod mat3;
 mod scalar;
 mod soa;
 
+pub use mat3::Mat3;
 pub use scalar::{Quat, Vec3};
 pub use soa::{Aabbx4, Vec3x4};
 
