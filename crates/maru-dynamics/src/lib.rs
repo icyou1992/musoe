@@ -12,7 +12,7 @@ pub use body::{Body, BodyHandle, BodyType};
 pub use joint::{Joint, JointKind};
 pub use snapshot::SnapshotError;
 pub use solver::SolverParams;
-pub use world::{World, WorldParams};
+pub use world::{ApiError, Diagnostics, World, WorldParams};
 
 #[cfg(test)]
 mod tests {
@@ -246,7 +246,8 @@ mod tests {
         w2.restore(&snap).expect("restore");
 
         // 맨 아래 바디만 건드린다 → 아일랜드 전원이 깨어나야 함
-        w2.body_mut(hs[0]).linvel = Vec3::new(0.1, 0.0, 0.0);
+        w2.set_linear_velocity(hs[0], Vec3::new(0.1, 0.0, 0.0))
+            .expect("set velocity");
         for (i, h) in hs.iter().enumerate() {
             assert!(!w2.is_asleep(*h), "restore 후 box {i}가 깨어나지 않음");
         }
@@ -542,6 +543,96 @@ mod tests {
         assert_pyramid_stable(&w, &hs, 40);
     }
 
+    /// 리뷰 MAJOR 회귀: generational arena가 실제로 동작하는가 —
+    /// 제거 시 이웃 wake, 핸들 무효화, 슬롯 재사용 시 세대 증가로 옛 핸들 거부.
+    #[test]
+    fn body_removal_wakes_neighbors_and_invalidates_handles() {
+        let mut w = World::new(WorldParams::default());
+        let g = ground(&mut w);
+        let base = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.5, 0.0),
+            1.0,
+        ));
+        let top = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 1.5, 0.0),
+            1.0,
+        ));
+        for _ in 0..300 {
+            w.step(DT);
+        }
+        assert!(w.is_asleep(top) && w.is_asleep(base), "스택이 잠들지 않음");
+
+        // 받침 제거 → 위 바디가 깨어나 낙하해야 한다 (설계 §4.6 pre-mutation wake)
+        w.remove_body(base).expect("remove");
+        assert!(!w.is_asleep(top), "받침 제거인데 위 바디가 잠든 채");
+        assert!(!w.is_alive(base), "제거된 핸들이 살아있다고 보고됨");
+        assert_eq!(w.try_body(base).err(), Some(ApiError::StaleHandle));
+        assert_eq!(w.body_count(), 2); // ground + top
+
+        let y0 = w.body(top).pose.pos.y;
+        for _ in 0..60 {
+            w.step(DT);
+        }
+        assert!(w.body(top).pose.pos.y < y0 - 0.3, "받침이 없는데 안 떨어짐");
+
+        // 슬롯 재사용: 같은 인덱스라도 세대가 달라 옛 핸들은 거부된다
+        let reused = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.2 },
+            pose(5.0, 5.0, 0.0),
+            1.0,
+        ));
+        assert_eq!(reused.index, base.index, "최소 인덱스 슬롯 재사용");
+        assert_ne!(reused.generation, base.generation, "세대가 증가해야 함");
+        assert_eq!(w.try_body(base).err(), Some(ApiError::StaleHandle));
+        assert!(w.try_body(reused).is_ok());
+        let _ = g;
+    }
+
+    /// 리뷰 MAJOR 회귀: 공개 변이는 불변식을 강제한다 (NaN·범위 밖·static 거부).
+    #[test]
+    fn mutation_api_enforces_invariants() {
+        let mut w = World::new(WorldParams::default());
+        let g = ground(&mut w);
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 2.0, 0.0),
+            1.0,
+        ));
+        assert_eq!(
+            w.set_linear_velocity(b, Vec3::new(f32::NAN, 0.0, 0.0))
+                .err(),
+            Some(ApiError::InvalidValue)
+        );
+        assert_eq!(
+            w.set_material(b, -1.0, 0.5).err(),
+            Some(ApiError::InvalidValue)
+        );
+        assert_eq!(
+            w.set_material(b, 0.5, 2.0).err(),
+            Some(ApiError::InvalidValue)
+        );
+        // static은 불변 (설계 §9)
+        assert_eq!(
+            w.set_linear_velocity(g, Vec3::ZERO).err(),
+            Some(ApiError::ImmutableStatic)
+        );
+        // 정상 값은 통과하고 상태가 유지된다
+        assert!(w.set_linear_velocity(b, Vec3::new(1.0, 0.0, 0.0)).is_ok());
+        assert_eq!(w.body(b).linvel.x, 1.0);
+        for _ in 0..30 {
+            w.step(DT);
+        }
+        assert!(w.body(b).pose.pos.is_finite());
+    }
+
     /// 리뷰 BLOCKER 회귀: 조작·손상된 스냅샷은 **패닉·OOM 없이 거부**되고 월드는 불변이어야 한다
     /// (M3에서 JS가 임의 바이트를 넘길 수 있다).
     #[test]
@@ -586,7 +677,8 @@ mod tests {
         assert_eq!(w.restore(&bad), Err(SnapshotError::TrailingBytes));
         // 6) 비유한 값 주입 (바디 위치 필드)
         let mut bad = good.clone();
-        let pos_off = 12 + 1; // magic+version+count, body_type 1바이트 뒤 = pos.x
+        // magic(4)+version(4)+count(4) + alive(1)+generation(4)+body_type(1) = pos.x
+        let pos_off = 12 + 1 + 4 + 1;
         bad[pos_off..pos_off + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(matches!(
             w.restore(&bad),

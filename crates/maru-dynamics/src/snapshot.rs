@@ -182,9 +182,12 @@ fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
 pub fn write_world(world: &World, w: &mut Writer) {
     w.u32(MAGIC);
     w.u32(VERSION);
-    let (bodies, sleep_timer, asleep, island, joints, cache) = world.canonical_parts();
+    let (bodies, alive, generations, sleep_timer, asleep, island, joints, cache) =
+        world.canonical_parts();
     w.u32(bodies.len() as u32);
     for (i, b) in bodies.iter().enumerate() {
+        w.u8(alive[i] as u8);
+        w.u32(generations[i]);
         w.u8(match b.body_type {
             BodyType::Static => 0,
             BodyType::Dynamic => 1,
@@ -256,7 +259,11 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     let mut sleep_timer = Vec::with_capacity(nb.min(4096));
     let mut asleep = Vec::with_capacity(nb.min(4096));
     let mut island = Vec::with_capacity(nb.min(4096));
+    let mut alive = Vec::with_capacity(nb.min(4096));
+    let mut generations = Vec::with_capacity(nb.min(4096));
     for _ in 0..nb {
+        alive.push(r.u8()? != 0);
+        generations.push(r.u32()?);
         let body_type = match r.u8()? {
             0 => BodyType::Static,
             1 => BodyType::Dynamic,
@@ -367,7 +374,16 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         return Err(SnapshotError::TrailingBytes);
     }
     // 여기까지 통과해야 월드를 교체한다 (원자적 복원)
-    world.restore_parts(bodies, sleep_timer, asleep, island, joints, cache);
+    world.restore_parts(
+        bodies,
+        alive,
+        generations,
+        sleep_timer,
+        asleep,
+        island,
+        joints,
+        cache,
+    );
     Ok(())
 }
 

@@ -37,9 +37,22 @@ impl Default for WorldParams {
     }
 }
 
+/// 공개 API 오류 (설계 §9·§8: 불변식은 경계에서 강제한다).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApiError {
+    /// 제거됐거나 세대가 다른 핸들.
+    StaleHandle,
+    /// 비유한 값 또는 범위를 벗어난 인자.
+    InvalidValue,
+    /// static 바디는 불변 (설계 §9 — 움직이려면 Kinematic).
+    ImmutableStatic,
+}
+
 pub struct World {
     pub params: WorldParams,
     bodies: Vec<Body>,
+    /// 슬롯 생존 여부. 죽은 슬롯은 재사용 대기(세대가 이미 증가한 상태).
+    alive: Vec<bool>,
     generations: Vec<u32>,
     /// PCM 임펄스 캐시: canonical 페어 → (feature, 임펄스). 스텝 간 warm start (설계 §3).
     contact_cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
@@ -50,32 +63,77 @@ pub struct World {
     /// 아직 잠든 바디 사이에 제약이 걸리며 속도만 펌핑되는 경로가 생긴다(리뷰 BLOCKER).
     island: Vec<u32>,
     joints: Vec<Joint>,
-    /// [진단] 직전 스텝의 warm-start 적중/전체 접점 수, 최대 침투(음의 separation).
+    diag: Diagnostics,
+}
+
+/// 읽기 전용 진단 (엔진 캐노니컬 상태가 아니다 — 스냅샷·해시에 포함되지 않는다).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Diagnostics {
     pub warm_hits: usize,
     pub warm_total: usize,
     pub max_penetration: f32,
 }
 
 impl World {
+    /// 파라미터 불변식을 생성 경계에서 강제한다 (리뷰 MAJOR: 무검증 public 필드가
+    /// dt/substeps·Softness 분모를 NaN/Inf로 만들 수 있었다).
     pub fn new(params: WorldParams) -> Self {
+        assert!(params.gravity.is_finite(), "gravity must be finite");
+        assert!(
+            (1..=64).contains(&params.substeps),
+            "substeps must be in 1..=64, got {}",
+            params.substeps
+        );
+        assert!(
+            params.speculative_margin.is_finite() && params.speculative_margin >= 0.0,
+            "speculative_margin must be finite and non-negative"
+        );
+        assert!(
+            params.solver.contact_hertz.is_finite() && params.solver.contact_hertz > 0.0,
+            "contact_hertz must be finite and positive"
+        );
+        assert!(
+            params.solver.contact_damping.is_finite() && params.solver.contact_damping >= 0.0,
+            "contact_damping must be finite and non-negative"
+        );
+        assert!(
+            params.solver.max_bias_speed.is_finite() && params.solver.max_bias_speed > 0.0,
+            "max_bias_speed must be finite and positive"
+        );
+        assert!(
+            params.sleep_linear_threshold >= 0.0 && params.sleep_angular_threshold >= 0.0,
+            "sleep thresholds must be non-negative"
+        );
         Self {
             params,
             bodies: Vec::new(),
+            alive: Vec::new(),
             generations: Vec::new(),
             contact_cache: HashMap::new(),
             sleep_timer: Vec::new(),
             asleep: Vec::new(),
             island: Vec::new(),
             joints: Vec::new(),
-            warm_hits: 0,
-            warm_total: 0,
-            max_penetration: 0.0,
+            diag: Diagnostics::default(),
         }
     }
 
+    /// 바디 추가. 빈 슬롯이 있으면 **최소 인덱스**를 재사용한다(이력 무관 canonical 배치).
     pub fn add_body(&mut self, body: Body) -> BodyHandle {
+        if let Some(index) = (0..self.bodies.len()).find(|&i| !self.alive[i]) {
+            self.bodies[index] = body;
+            self.alive[index] = true;
+            self.sleep_timer[index] = 0.0;
+            self.asleep[index] = false;
+            self.island[index] = u32::MAX;
+            return BodyHandle {
+                index: index as u32,
+                generation: self.generations[index],
+            };
+        }
         let index = self.bodies.len() as u32;
         self.bodies.push(body);
+        self.alive.push(true);
         self.generations.push(0);
         self.sleep_timer.push(0.0);
         self.asleep.push(false);
@@ -86,33 +144,150 @@ impl World {
         }
     }
 
-    pub fn body(&self, h: BodyHandle) -> &Body {
-        assert_eq!(
-            self.generations[h.index as usize], h.generation,
-            "stale handle"
-        );
-        &self.bodies[h.index as usize]
+    #[inline]
+    fn resolve(&self, h: BodyHandle) -> Result<usize, ApiError> {
+        let i = h.index as usize;
+        if i < self.bodies.len() && self.alive[i] && self.generations[i] == h.generation {
+            Ok(i)
+        } else {
+            Err(ApiError::StaleHandle)
+        }
     }
 
-    /// 가변 접근. **공개 변이는 edge/접촉 상태를 바꾸므로 반드시 깨우고 stale PCM을 버린다**
-    /// (리뷰 지적: 잠든 바디에 속도를 써도 계속 잠들어 적분이 생략됐다).
-    /// static은 설계 §9상 불변 — kinematic을 쓸 것.
-    pub fn body_mut(&mut self, h: BodyHandle) -> &mut Body {
-        let i = h.index as usize;
-        assert_eq!(self.generations[i], h.generation, "stale handle");
-        assert!(
-            self.bodies[i].body_type != BodyType::Static,
-            "static bodies are immutable (design §9) — use Kinematic"
-        );
+    /// 바디 제거. 설계 §4.6의 **변이 커맨드 3단 원자 절차**를 따른다:
+    /// ①변이 전 그래프에서 wake 대상 수집·적용 → ②구조 변경 → ③인접(조인트·PCM) 정리.
+    /// 받침을 지웠는데 위 바디가 공중에 잠든 채 남는 것을 막는다.
+    pub fn remove_body(&mut self, h: BodyHandle) -> Result<(), ApiError> {
+        let i = self.resolve(h)?;
+        // ① 변이 전: 이 바디를 참조하는 접촉/조인트로 도달하는 상대를 깨운다(아일랜드 단위)
+        let mut neighbors: Vec<usize> = Vec::new();
+        for (a, b) in self.contact_cache.keys() {
+            let (a, b) = (*a as usize, (*b & !STATIC_BIT) as usize);
+            if a == i {
+                neighbors.push(b);
+            } else if b == i {
+                neighbors.push(a);
+            }
+        }
+        for j in &self.joints {
+            if j.body_a == i {
+                neighbors.push(j.body_b);
+            } else if j.body_b == i {
+                neighbors.push(j.body_a);
+            }
+        }
+        neighbors.sort_unstable();
+        neighbors.dedup();
+        for n in neighbors {
+            if n < self.bodies.len() && self.alive[n] && self.bodies[n].is_dynamic() {
+                self.wake(n);
+            }
+        }
+        // ② 구조 변경
+        self.alive[i] = false;
+        self.generations[i] = self.generations[i].wrapping_add(1);
+        self.asleep[i] = false;
+        self.island[i] = u32::MAX;
+        // ③ 인접 정리
+        self.joints.retain(|j| j.body_a != i && j.body_b != i);
+        let id = i as u32;
+        self.contact_cache
+            .retain(|(a, b), _| *a != id && (*b & !STATIC_BIT) != id);
+        Ok(())
+    }
+
+    /// 읽기 접근 (stale 핸들이면 패닉 — 테스트·내부용).
+    pub fn body(&self, h: BodyHandle) -> &Body {
+        &self.bodies[self.resolve(h).expect("stale handle")]
+    }
+
+    /// 읽기 접근 (오류 반환형 — 바인딩용).
+    pub fn try_body(&self, h: BodyHandle) -> Result<&Body, ApiError> {
+        Ok(&self.bodies[self.resolve(h)?])
+    }
+
+    pub fn is_alive(&self, h: BodyHandle) -> bool {
+        self.resolve(h).is_ok()
+    }
+
+    /// 변이 진입점 — **불변식을 한 곳에서 강제한다**(리뷰 MAJOR: `body_mut`이 불변식 보유
+    /// 구조체를 통째로 공개해 friction=-1·inv_mass=∞·NaN pose가 들어갈 수 있었다).
+    /// 모든 변이는 유한성 검사 + wake + stale PCM 폐기를 거친다. static은 불변(설계 §9).
+    fn mutate(&mut self, h: BodyHandle) -> Result<usize, ApiError> {
+        let i = self.resolve(h)?;
+        if self.bodies[i].body_type == BodyType::Static {
+            return Err(ApiError::ImmutableStatic);
+        }
         self.wake(i);
         let id = i as u32;
         self.contact_cache
             .retain(|(a, b), _| *a != id && (*b & !STATIC_BIT) != id);
-        &mut self.bodies[i]
+        Ok(i)
     }
 
+    pub fn set_linear_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
+        if !v.is_finite() {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.mutate(h)?;
+        self.bodies[i].linvel = v;
+        Ok(())
+    }
+
+    pub fn set_angular_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
+        if !v.is_finite() {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.mutate(h)?;
+        self.bodies[i].angvel = v;
+        Ok(())
+    }
+
+    /// 텔레포트 (설계 §9: 속도를 만들지 않는다 — kinematic 구동은 별도 API).
+    pub fn set_pose(&mut self, h: BodyHandle, pose: maru_collide::Pose) -> Result<(), ApiError> {
+        if !pose.pos.is_finite() || pose.rot.try_normalize().is_none() {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.mutate(h)?;
+        self.bodies[i].pose = maru_collide::Pose {
+            pos: pose.pos,
+            rot: pose.rot.normalize(),
+        };
+        Ok(())
+    }
+
+    pub fn set_material(
+        &mut self,
+        h: BodyHandle,
+        friction: f32,
+        restitution: f32,
+    ) -> Result<(), ApiError> {
+        if !friction.is_finite()
+            || friction < 0.0
+            || !restitution.is_finite()
+            || !(0.0..=1.0).contains(&restitution)
+        {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.mutate(h)?;
+        self.bodies[i].friction = friction;
+        self.bodies[i].restitution = restitution;
+        Ok(())
+    }
+
+    /// 살아있는 바디 수 (제거된 슬롯 제외).
     pub fn body_count(&self) -> usize {
+        self.alive.iter().filter(|a| **a).count()
+    }
+
+    /// 슬롯 용량 (인덱스 상한 — 내부·스냅샷용).
+    pub fn slot_count(&self) -> usize {
         self.bodies.len()
+    }
+
+    /// 직전 스텝 진단 스냅샷.
+    pub fn diagnostics(&self) -> Diagnostics {
+        self.diag
     }
 
     pub fn is_asleep(&self, h: BodyHandle) -> bool {
@@ -121,7 +296,14 @@ impl World {
 
     /// 조인트 추가. 연결 바디를 깨운다 (edge 생성형 변이 — 설계 §4.6).
     pub fn add_joint(&mut self, mut joint: Joint) -> usize {
-        // 핸들 인덱스 검증은 v1 단순화: usize 인덱스 직접 사용 (BodyHandle API는 M3 바인딩에서)
+        assert!(
+            joint.body_a < self.bodies.len()
+                && joint.body_b < self.bodies.len()
+                && self.alive[joint.body_a]
+                && self.alive[joint.body_b]
+                && joint.body_a != joint.body_b,
+            "joint endpoints must be distinct live bodies"
+        );
         self.wake(joint.body_a);
         self.wake(joint.body_b);
         joint.linear_impulse = Vec3::ZERO;
@@ -136,6 +318,8 @@ impl World {
         &self,
     ) -> (
         &Vec<Body>,
+        &Vec<bool>,
+        &Vec<u32>,
         &Vec<f32>,
         &Vec<bool>,
         &Vec<u32>,
@@ -144,6 +328,8 @@ impl World {
     ) {
         (
             &self.bodies,
+            &self.alive,
+            &self.generations,
             &self.sleep_timer,
             &self.asleep,
             &self.island,
@@ -152,16 +338,20 @@ impl World {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore_parts(
         &mut self,
         bodies: Vec<Body>,
+        alive: Vec<bool>,
+        generations: Vec<u32>,
         sleep_timer: Vec<f32>,
         asleep: Vec<bool>,
         island: Vec<u32>,
         joints: Vec<Joint>,
         cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
     ) {
-        self.generations = vec![0; bodies.len()];
+        self.alive = alive;
+        self.generations = generations;
         self.bodies = bodies;
         self.sleep_timer = sleep_timer;
         self.asleep = asleep;
@@ -197,7 +387,7 @@ impl World {
             return;
         }
         for k in 0..self.bodies.len() {
-            if self.island[k] == island && self.bodies[k].is_dynamic() {
+            if self.alive[k] && self.island[k] == island && self.bodies[k].is_dynamic() {
                 self.asleep[k] = false;
                 self.sleep_timer[k] = 0.0;
             }
@@ -227,6 +417,9 @@ impl World {
         let mut dyn_items: Vec<(u32, Aabb)> = Vec::new();
         let mut static_items: Vec<(u32, Aabb)> = Vec::new();
         for (i, b) in self.bodies.iter().enumerate() {
+            if !self.alive[i] {
+                continue; // 제거된 슬롯
+            }
             let local = b.shape.local_aabb();
             // 회전 보수 AABB: pose 원점 중심이므로 반경은 **로컬 원점에서** 가장 먼 코너까지.
             // (max-min)/2로 잡으면 원점에서 벗어난 hull이 통째로 누락된다(리뷰 지적).
@@ -248,9 +441,7 @@ impl World {
                 }
             }
         }
-        self.warm_hits = 0;
-        self.warm_total = 0;
-        self.max_penetration = 0.0;
+        self.diag = Diagnostics::default();
         let bp = Broadphase::build(dyn_items, static_items);
         let pairs = bp.canonical_pairs();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
@@ -350,10 +541,10 @@ impl World {
                 if !m.points.is_empty() {
                     let cached = self.contact_cache.get(&key).unwrap_or(&empty);
                     for p in &m.points {
-                        self.warm_total += 1;
-                        self.max_penetration = self.max_penetration.max(-p.separation);
+                        self.diag.warm_total += 1;
+                        self.diag.max_penetration = self.diag.max_penetration.max(-p.separation);
                         if cached.iter().any(|(f, _)| *f == p.feature) {
-                            self.warm_hits += 1;
+                            self.diag.warm_hits += 1;
                         }
                     }
                     constraints.push(solver::prepare(&self.bodies, a_id, b_id, &m, cached));
@@ -402,7 +593,7 @@ impl World {
         for _ in 0..n_sub {
             // 속도 적분 (sleeping 제외)
             for (i, b) in self.bodies.iter_mut().enumerate() {
-                if b.is_dynamic() && !self.asleep[i] {
+                if self.alive[i] && b.is_dynamic() && !self.asleep[i] {
                     b.linvel += g * h;
                 }
             }
@@ -431,7 +622,7 @@ impl World {
             }
             // 위치 적분 (dynamic + kinematic, sleeping 제외)
             for (i, b) in self.bodies.iter_mut().enumerate() {
-                if b.body_type != BodyType::Static && !self.asleep[i] {
+                if self.alive[i] && b.body_type != BodyType::Static && !self.asleep[i] {
                     b.pose.pos += b.linvel * h;
                     b.pose.rot = b.pose.rot.integrate(b.angvel, h);
                 }
@@ -512,7 +703,7 @@ impl World {
         // 분해된 채 남아 wake가 다시 한 홉만 전파된다(리뷰 BLOCKER). 잠든 동안 멤버십은
         // 변할 수 없으므로(변하려면 깨어나야 한다) 보존이 곧 정답이다.
         for i in 0..n {
-            if !self.bodies[i].is_dynamic() {
+            if !self.alive[i] || !self.bodies[i].is_dynamic() {
                 self.island[i] = u32::MAX;
             } else if !self.asleep[i] {
                 self.island[i] = find(&mut parent, i) as u32;
@@ -521,7 +712,7 @@ impl World {
         let lin2 = self.params.sleep_linear_threshold * self.params.sleep_linear_threshold;
         let ang2 = self.params.sleep_angular_threshold * self.params.sleep_angular_threshold;
         for i in 0..n {
-            if self.bodies[i].is_dynamic() && !self.asleep[i] {
+            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] {
                 let low = self.bodies[i].linvel.length_sq() < lin2
                     && self.bodies[i].angvel.length_sq() < ang2;
                 self.sleep_timer[i] = if low { self.sleep_timer[i] + dt } else { 0.0 };
@@ -530,14 +721,14 @@ impl World {
         // island 전원이 임계 시간을 넘겨야 일괄 sleep (부분 sleep 금지)
         let mut island_min: HashMap<usize, f32> = HashMap::new();
         for i in 0..n {
-            if self.bodies[i].is_dynamic() && !self.asleep[i] {
+            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] {
                 let root = find(&mut parent, i);
                 let e = island_min.entry(root).or_insert(f32::INFINITY);
                 *e = e.min(self.sleep_timer[i]);
             }
         }
         for i in 0..n {
-            if self.bodies[i].is_dynamic() && !self.asleep[i] {
+            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] {
                 let root = find(&mut parent, i);
                 if island_min[&root] >= self.params.time_to_sleep {
                     self.asleep[i] = true;
@@ -550,8 +741,8 @@ impl World {
         self.joints = joints;
 
         // 7) denormal 위생 (설계 §8 flush 지점)
-        for b in self.bodies.iter_mut() {
-            if b.is_dynamic() {
+        for (i, b) in self.bodies.iter_mut().enumerate() {
+            if self.alive[i] && b.is_dynamic() {
                 b.linvel = Vec3::new(
                     maru_math::flush_tiny(b.linvel.x),
                     maru_math::flush_tiny(b.linvel.y),

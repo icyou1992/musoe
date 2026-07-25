@@ -66,11 +66,14 @@ fn main() {
                 "  step {}/{steps}  {:.1}s  warm-start {}/{} ({:.0}%)",
                 i + 1,
                 t.elapsed().as_secs_f64(),
-                w.warm_hits,
-                w.warm_total,
-                100.0 * w.warm_hits as f64 / w.warm_total.max(1) as f64
+                w.diagnostics().warm_hits,
+                w.diagnostics().warm_total,
+                100.0 * w.diagnostics().warm_hits as f64 / w.diagnostics().warm_total.max(1) as f64
             );
-            println!("      max_penetration={:.4} m", w.max_penetration);
+            println!(
+                "      max_penetration={:.4} m",
+                w.diagnostics().max_penetration
+            );
         }
     }
     let ms_per_step = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
