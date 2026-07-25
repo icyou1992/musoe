@@ -1,5 +1,6 @@
 //! 강체 — 타입 3종 시맨틱 (설계 §9).
 
+use crate::world::ApiError;
 use maru_collide::{in_range, vec_in_range, Pose, Shape};
 use maru_math::{Mat3, Vec3};
 
@@ -15,7 +16,7 @@ pub enum BodyType {
 /// 크레이트 밖에서는 필드 대입이 **컴파일되지 않는다** (인코딩된 회귀 테스트):
 ///
 /// ```compile_fail
-/// use maru_collide::{in_range, vec_in_range, Pose, Shape};
+/// use maru_collide::{Pose, Shape};
 /// use maru_dynamics::Body;
 /// use maru_math::{Quat, Vec3};
 /// let mut b = Body::new_dynamic(
@@ -92,7 +93,7 @@ impl Body {
     pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
         use crate::world::ApiError;
         self.shape.validate().map_err(|_| ApiError::InvalidValue)?;
-        // 크기 상한(MAX_MAGNITUDE)까지 여기서 강제한다 — 스냅샷 리더와 **같은 정책**이라야
+        // 크기 상한(MAX_INPUT)까지 여기서 강제한다 — 스냅샷 리더와 **같은 정책**이라야
         // `restore(snapshot())`가 항상 성립한다(리뷰 BLOCKER: 비대칭).
         if !vec_in_range(self.pose.pos) || self.pose.rot.try_normalize().is_none() {
             return Err(ApiError::InvalidValue);
@@ -142,6 +143,71 @@ impl Body {
 impl Body {
     /// 동적 바디 생성. 질량·관성이 유한 양수가 아니면 **생성 경계에서 거부**한다
     /// (설계 §8 위생: inv_mass=∞는 0·∞=NaN으로 속도를 오염시킨다 — 리뷰 지적).
+    /// 동적 바디 생성 (오류 반환형 — **M3 바인딩의 정본 경로**).
+    /// 생성자가 자기 삽입 정책을 위반하는 값을 만들 수 있었다(리뷰 NEW MAJOR):
+    /// 반지름 1m 구에 `density=1e-10`이면 질량·역수는 유한 양수라 통과하지만
+    /// `inv_mass ≈ 2.39e9`가 입력 상한을 넘어 뒤따르는 `add_body`가 패닉했다.
+    /// **최종 Body에 `validate()`를 걸어** 생성 경계에서 끝낸다.
+    pub fn try_new_dynamic(shape: Shape, pose: Pose, density: f32) -> Result<Self, ApiError> {
+        if !(in_range(density) && density > 0.0) {
+            return Err(ApiError::InvalidValue);
+        }
+        shape.validate().map_err(|_| ApiError::InvalidValue)?;
+        if !vec_in_range(pose.pos) || pose.rot.try_normalize().is_none() {
+            return Err(ApiError::InvalidValue);
+        }
+        let pose = Pose {
+            pos: pose.pos,
+            rot: pose.rot.normalize(),
+        };
+        let (shape, pose, shape_origin_offset) = recenter_hull(shape, pose);
+        let (mass, inertia) = mass_properties(&shape, density);
+        if !(mass.is_finite() && mass > 0.0) {
+            return Err(ApiError::InvalidValue);
+        }
+        let inv_mass = 1.0 / mass;
+        let inv_inertia = Vec3::new(1.0 / inertia.x, 1.0 / inertia.y, 1.0 / inertia.z);
+        let b = Self {
+            body_type: BodyType::Dynamic,
+            pose,
+            linvel: Vec3::ZERO,
+            angvel: Vec3::ZERO,
+            shape,
+            inv_mass,
+            inv_inertia_local: inv_inertia,
+            friction: 0.6,
+            restitution: 0.0,
+            shape_origin_offset,
+        };
+        b.validate()?;
+        Ok(b)
+    }
+
+    /// 정적 바디 생성 (오류 반환형).
+    pub fn try_new_static(shape: Shape, pose: Pose) -> Result<Self, ApiError> {
+        shape.validate().map_err(|_| ApiError::InvalidValue)?;
+        if !vec_in_range(pose.pos) || pose.rot.try_normalize().is_none() {
+            return Err(ApiError::InvalidValue);
+        }
+        let b = Self {
+            body_type: BodyType::Static,
+            pose: Pose {
+                pos: pose.pos,
+                rot: pose.rot.normalize(),
+            },
+            linvel: Vec3::ZERO,
+            angvel: Vec3::ZERO,
+            shape,
+            inv_mass: 0.0,
+            inv_inertia_local: Vec3::ZERO,
+            friction: 0.6,
+            restitution: 0.0,
+            shape_origin_offset: Vec3::ZERO,
+        };
+        b.validate()?;
+        Ok(b)
+    }
+
     pub fn new_dynamic(shape: Shape, pose: Pose, density: f32) -> Self {
         assert!(
             density.is_finite() && density > 0.0,
@@ -179,7 +245,7 @@ impl Body {
                 && inv_inertia.z.is_finite(),
             "mass/inertia too small: reciprocals must stay finite (mass={mass}, inertia={inertia:?})"
         );
-        Self {
+        let b = Self {
             body_type: BodyType::Dynamic,
             pose,
             linvel: Vec3::ZERO,
@@ -190,13 +256,19 @@ impl Body {
             friction: 0.6,
             restitution: 0.0,
             shape_origin_offset,
-        }
+        };
+        // **생성자는 자기 삽입 정책을 위반한 값을 내보내지 않는다**(리뷰 NEW MAJOR):
+        // density=1e-10인 반지름 1m 구는 위 검사를 다 통과하지만 inv_mass≈2.39e9로
+        // 입력 상한을 넘어, 패닉이 `add_body`까지 미뤄졌었다.
+        b.validate()
+            .expect("constructed body violates the size policy (density/shape out of range)");
+        b
     }
 
     pub fn new_static(shape: Shape, pose: Pose) -> Self {
         shape.validate().expect("invalid shape");
         let pose = normalized_pose(pose);
-        Self {
+        let b = Self {
             body_type: BodyType::Static,
             pose,
             linvel: Vec3::ZERO,
@@ -207,7 +279,10 @@ impl Body {
             friction: 0.6,
             restitution: 0.0,
             shape_origin_offset: Vec3::ZERO,
-        }
+        };
+        b.validate()
+            .expect("constructed body violates the size policy");
+        b
     }
 
     pub fn new_kinematic(shape: Shape, pose: Pose) -> Self {
@@ -245,7 +320,7 @@ impl Body {
 fn normalized_pose(pose: Pose) -> Pose {
     assert!(
         vec_in_range(pose.pos),
-        "pose.pos must be finite and within MAX_MAGNITUDE"
+        "pose.pos must be finite and within MAX_INPUT"
     );
     let rot = pose
         .rot

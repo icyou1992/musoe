@@ -14,19 +14,29 @@ use crate::joint::Joint;
 use maru_collide::Pose;
 use maru_math::Vec3;
 
+/// **공개 커맨드 스키마** — 호스트(JS)가 보낼 수 있는 것만 담는다.
+///
+/// 바디 추가가 여기 없는 것은 의도다(리뷰 MINOR): 바디 생성은 슬롯 예약과 커맨드 등록이
+/// **한 원자 연산**이어야 하고(예약 핸들을 즉시 돌려줘야 하므로), 예약 슬롯당 pending
+/// 추가는 정확히 하나여야 한다. 공개 열거형에 태그로 노출하면 호스트가 합법적인 명령으로
+/// 이해하고 보내지만 항상 거부되는 반쪽 variant가 된다. 정본 경로는 `World::enqueue_add_body`.
 #[derive(Clone, Debug)]
 pub enum Command {
-    /// **예약된 핸들**을 동반한다(리뷰 BLOCKER). `World::enqueue_add_body`가 슬롯을 즉시
-    /// 예약하고 핸들을 돌려주므로, 호스트는 바디가 실제로 생기기 전에도 그 핸들로
-    /// 후속 커맨드(조인트·속도)를 같은 배치에 쌓을 수 있고, 슬롯 재사용 ABA는
-    /// 예약 시점의 세대 증가로 차단된다.
-    AddBody(BodyHandle, Box<Body>),
     RemoveBody(BodyHandle),
     SetLinearVelocity(BodyHandle, Vec3),
     SetAngularVelocity(BodyHandle, Vec3),
     SetPose(BodyHandle, Pose),
     SetMaterial(BodyHandle, f32, f32),
     AddJoint(Box<Joint>),
+}
+
+/// **내부 pending 큐의 원소.** 공개 스키마에 없는 바디 추가를 포함한다 —
+/// 큐는 캐노니컬 상태라 직렬화 대상이므로 표현이 필요하지만, 호스트에게 열지는 않는다.
+#[derive(Clone, Debug)]
+pub enum PendingCommand {
+    /// 예약된 핸들 + 채울 바디. `enqueue_add_body`만 만든다.
+    Add(BodyHandle, Box<Body>),
+    Public(Command),
 }
 
 /// 커맨드 적용 결과 — 실패한 커맨드는 **드롭되고 카운트된다**(스텝을 중단시키지 않는다:

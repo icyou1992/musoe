@@ -6,7 +6,7 @@
 //! M2a 범위: 바디 제거·아일랜드·슬리핑·조인트는 후속 유닛. 커맨드 버퍼는 M2f와 함께.
 
 use crate::body::{Body, BodyHandle, BodyType};
-use crate::command::{Command, CommandReport};
+use crate::command::{Command, CommandReport, PendingCommand};
 use crate::joint::{self, Joint};
 use crate::solver::{self, CachedImpulse, ContactConstraint, Softness, SolverParams};
 use maru_collide::{contact, Aabb, Broadphase, FeatureId, STATIC_BIT};
@@ -69,7 +69,7 @@ pub struct World {
     island: Vec<u32>,
     joints: Vec<Joint>,
     /// pending 쓰기 커맨드 (설계 §7). **캐노니컬 상태** — 스냅샷에 포함된다.
-    commands: Vec<Command>,
+    commands: Vec<PendingCommand>,
     last_report: CommandReport,
     diag: Diagnostics,
 }
@@ -83,7 +83,7 @@ pub struct Diagnostics {
 }
 
 /// 스텝 크기 상한. 이보다 큰 dt는 speculative margin·CCD·soft 계수가 전부 의미를 잃고,
-/// 유한한 속도라도 위치 적분에서 크기 정책(MAX_MAGNITUDE)을 넘긴다.
+/// 유한한 속도라도 위치 적분에서 크기 정책(MAX_INPUT)을 넘긴다.
 pub const MAX_DT: f32 = 0.25;
 
 /// 파라미터 불변식 — `new`와 `set_params`가 **같은** 검증을 쓴다.
@@ -97,7 +97,7 @@ fn validate_params(params: &WorldParams) {
     let finite_gt0 = |v: f32| maru_collide::in_range(v) && v > 0.0;
     assert!(
         maru_collide::vec_in_range(params.gravity),
-        "gravity must be finite and within MAX_MAGNITUDE"
+        "gravity must be finite and within MAX_INPUT"
     );
     assert!(
         (1..=64).contains(&params.substeps),
@@ -204,7 +204,7 @@ impl World {
             index,
             generation: self.generations[index as usize],
         };
-        self.commands.push(Command::AddBody(h, Box::new(body)));
+        self.commands.push(PendingCommand::Add(h, Box::new(body)));
         h
     }
 
@@ -382,7 +382,7 @@ impl World {
     /// 리포트에 잡힌다(스텝을 중단시키지 않는다 — 설계 §3 스텝 원자성).
     pub fn enqueue(&mut self, cmd: Command) -> Result<(), ApiError> {
         self.validate_command(&cmd)?;
-        self.commands.push(cmd);
+        self.commands.push(PendingCommand::Public(cmd));
         Ok(())
     }
 
@@ -401,11 +401,6 @@ impl World {
             }
         };
         match cmd {
-            // **공개 경로로는 AddBody를 넣을 수 없다**(리뷰 BLOCKER). 예약 슬롯당 pending
-            // AddBody는 정확히 하나여야 하는데, 공개 enqueue를 열어두면 같은 예약 핸들에
-            // 두 번째 AddBody를 넣을 수 있고 그 상태는 restore가 거부해 왕복 계약이 깨진다.
-            // 유일한 정본 경로는 `enqueue_add_body`(예약과 커맨드를 한 번에 만든다)다.
-            Command::AddBody(..) => Err(ApiError::InvalidValue),
             Command::RemoveBody(h) => target(h),
             Command::SetLinearVelocity(h, v) | Command::SetAngularVelocity(h, v) => {
                 if !maru_collide::vec_in_range(*v) {
@@ -452,7 +447,7 @@ impl World {
         let mut report = CommandReport::default();
         for cmd in cmds {
             let ok = match cmd {
-                Command::AddBody(h, b) => {
+                PendingCommand::Add(h, b) => {
                     let i = h.index as usize;
                     // 예약이 살아있고 세대가 맞을 때만 실현한다(스냅샷에서 온 바이트 방어)
                     if i < self.bodies.len()
@@ -470,12 +465,14 @@ impl World {
                         false
                     }
                 }
-                Command::RemoveBody(h) => self.remove_body(h).is_ok(),
-                Command::SetLinearVelocity(h, v) => self.set_linear_velocity(h, v).is_ok(),
-                Command::SetAngularVelocity(h, v) => self.set_angular_velocity(h, v).is_ok(),
-                Command::SetPose(h, p) => self.set_pose(h, p).is_ok(),
-                Command::SetMaterial(h, f, r) => self.set_material(h, f, r).is_ok(),
-                Command::AddJoint(j) => self.try_add_joint(*j).is_ok(),
+                PendingCommand::Public(c) => match c {
+                    Command::RemoveBody(h) => self.remove_body(h).is_ok(),
+                    Command::SetLinearVelocity(h, v) => self.set_linear_velocity(h, v).is_ok(),
+                    Command::SetAngularVelocity(h, v) => self.set_angular_velocity(h, v).is_ok(),
+                    Command::SetPose(h, p) => self.set_pose(h, p).is_ok(),
+                    Command::SetMaterial(h, f, r) => self.set_material(h, f, r).is_ok(),
+                    Command::AddJoint(j) => self.try_add_joint(*j).is_ok(),
+                },
             };
             if ok {
                 report.applied += 1;
@@ -487,24 +484,41 @@ impl World {
         report
     }
 
-    /// 스텝 후 캐노니컬 상태가 정책 안인지 확인한다(리뷰 NEW BLOCKER 방어선).
-    /// 경계 검증이 완전하면 여기서 걸릴 것이 없어야 한다 — 걸린다면 **엔진 버그**이므로
-    /// 디버그 빌드에서 즉시 터뜨린다. 릴리스 핫패스에는 비용을 두지 않는다.
-    #[cfg(debug_assertions)]
-    fn assert_state_in_policy(&self) {
-        for (i, b) in self.bodies.iter().enumerate() {
+    /// **정책을 닫는 지점**(리뷰 BLOCKER). 입력 정책만으로는 `step`에 대해 닫히지 않는다:
+    /// 합법인 `pos=0.9e9`·`v=0.9e9`가 한 스텝 뒤 1.125e9가 되고, 솔버는 큰 질량과 큰
+    /// 접근 속도에서 입력 상한을 넘는 임펄스를 정당하게 만든다. 거부(패닉)는 릴리스에서
+    /// 답이 아니므로 **캐노니컬 상태 전체를 상태 정책 안으로 클램프**한다 — 바디의 자세·속도,
+    /// 조인트 누적 임펄스, PCM 캐시까지. 그 결과
+    /// "엔진이 만들 수 있는 상태 = 리더가 받는 상태"가 항상 성립한다.
+    ///
+    /// 비유한 값도 여기서 정리된다(NaN→0, ±Inf→±MAX_STATE). 경계 검증이 완전하면
+    /// 클램프가 실제로 값을 바꿀 일은 없다 — 디버그 빌드는 그것까지 확인한다.
+    fn close_state_policy(&mut self) {
+        use maru_collide::{clamp_state, clamp_state_vec};
+        for (i, b) in self.bodies.iter_mut().enumerate() {
             if !self.alive[i] {
                 continue;
             }
-            debug_assert!(
-                maru_collide::vec_in_range(b.pose.pos)
-                    && maru_collide::vec_in_range(b.linvel)
-                    && maru_collide::vec_in_range(b.angvel),
-                "body {i} left the size policy after step: pos={:?} v={:?} w={:?}",
-                b.pose.pos,
-                b.linvel,
-                b.angvel
-            );
+            b.pose.pos = clamp_state_vec(b.pose.pos);
+            b.linvel = clamp_state_vec(b.linvel);
+            b.angvel = clamp_state_vec(b.angvel);
+        }
+        for j in self.joints.iter_mut() {
+            j.linear_impulse = clamp_state_vec(j.linear_impulse);
+            j.angular_impulse[0] = clamp_state(j.angular_impulse[0]);
+            j.angular_impulse[1] = clamp_state(j.angular_impulse[1]);
+        }
+        for entry in self.contact_cache.values_mut() {
+            for (_, imp) in entry.iter_mut() {
+                imp.normal = clamp_state(imp.normal);
+                imp.tangent[0] = clamp_state(imp.tangent[0]);
+                imp.tangent[1] = clamp_state(imp.tangent[1]);
+                imp.tangent_world = clamp_state_vec(imp.tangent_world);
+                imp.position = clamp_state_vec(imp.position);
+            }
+        }
+        for t in self.sleep_timer.iter_mut() {
+            *t = clamp_state(*t).max(0.0);
         }
     }
 
@@ -558,7 +572,7 @@ impl World {
         &Vec<u32>,
         &Vec<Joint>,
         &HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
-        &Vec<Command>,
+        &Vec<PendingCommand>,
         CommandReport,
     ) {
         (
@@ -588,7 +602,7 @@ impl World {
         island: Vec<u32>,
         joints: Vec<Joint>,
         cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
-        commands: Vec<Command>,
+        commands: Vec<PendingCommand>,
         last_report: CommandReport,
     ) {
         self.alive = alive;
@@ -624,6 +638,11 @@ impl World {
     }
 
     /// L0 상태 해시 (리플레이 CI 비교).
+    /// 캐노니컬 상태 해시 (오류 반환형 — M3는 이 경로만 노출한다).
+    pub fn try_state_hash(&self) -> Result<u64, crate::snapshot::SnapshotError> {
+        Ok(crate::snapshot::state_hash(&self.try_snapshot()?))
+    }
+
     pub fn state_hash(&self) -> u64 {
         crate::snapshot::state_hash(&self.snapshot())
     }
@@ -646,13 +665,25 @@ impl World {
 
     /// 고정 틱 스텝. 호스트 프레임과 무결합 (설계 §4).
     pub fn step(&mut self, dt: f32) {
-        // dt에도 상한이 필요하다(리뷰 NEW BLOCKER): `step(8.0)`은 유한하지만 첫 위치
-        // 적분에서 거대 속도와 곱해져 Inf를 만든다. 상한은 speculative margin·CCD가
-        // 의미를 갖는 범위 — 0.25s(4fps)를 넘는 스텝은 물리적으로 이미 무의미하다.
-        assert!(
-            dt.is_finite() && dt <= MAX_DT,
-            "dt must be finite and <= {MAX_DT} (got {dt})"
-        );
+        self.try_step(dt).expect("invalid dt");
+    }
+
+    /// 스텝 (오류 반환형 — **M3 바인딩의 정본 경로**).
+    ///
+    /// dt 계약: `0 < dt <= MAX_DT`. 이보다 큰 dt는 speculative margin·CCD·soft 계수가
+    /// 전부 의미를 잃는다. **호스트가 accumulator로 나눠 넣을 책임**이다(고정틱 엔진) —
+    /// 탭 복귀처럼 큰 dt가 들어오면 여러 스텝으로 쪼개거나 프레임을 버려야 한다.
+    /// 엔진이 조용히 클램프하면 시뮬레이션이 실시간과 어긋난 채 진행돼 더 나쁘다.
+    /// 위반은 wasm trap이 아니라 `ApiError::InvalidValue`로 표현된다.
+    pub fn try_step(&mut self, dt: f32) -> Result<(), ApiError> {
+        if !(dt.is_finite() && dt <= MAX_DT) {
+            return Err(ApiError::InvalidValue);
+        }
+        self.step_inner(dt);
+        Ok(())
+    }
+
+    fn step_inner(&mut self, dt: f32) {
         if dt <= 0.0 {
             return;
         }
@@ -1039,7 +1070,6 @@ impl World {
                 );
             }
         }
-        #[cfg(debug_assertions)]
-        self.assert_state_in_policy();
+        self.close_state_policy();
     }
 }

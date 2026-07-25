@@ -17,7 +17,10 @@ mod tree;
 pub use aabb::Aabb;
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
-pub use limits::{in_range, vec_in_range, MAX_HULL_POINTS, MAX_MAGNITUDE};
+pub use limits::{
+    clamp_state, clamp_state_vec, in_range, in_state_range, vec_in_range, vec_in_state_range,
+    MAX_HULL_POINTS, MAX_INPUT, MAX_STATE,
+};
 pub use manifold::{contact, ContactPoint, FeatureId, Manifold, FEATURE_GENERIC};
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, STATIC_BIT};

@@ -28,7 +28,7 @@ impl Shape {
         // 크기 상한까지 여기서 강제한다 — 라이브 생성과 역직렬화가 같은 정책을 쓴다.
         let r = self.radius();
         if !in_range(r) || r < 0.0 {
-            return Err("shape radius must be finite, non-negative and within MAX_MAGNITUDE");
+            return Err("shape radius must be finite, non-negative and within MAX_INPUT");
         }
         match self {
             Shape::Sphere { radius } => {
@@ -60,7 +60,7 @@ impl Shape {
                     return Err("hull point count exceeds MAX_HULL_POINTS");
                 }
                 if !points.iter().all(|p| vec_in_range(*p)) {
-                    return Err("hull points must be finite and within MAX_MAGNITUDE");
+                    return Err("hull points must be finite and within MAX_INPUT");
                 }
             }
         }

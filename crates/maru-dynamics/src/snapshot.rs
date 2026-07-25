@@ -25,7 +25,7 @@
 //! 검증이 끝나기 전에는 월드를 건드리지 않는다(원자적 복원).
 
 use crate::body::{Body, BodyHandle, BodyType};
-use crate::command::{Command, CommandReport};
+use crate::command::{Command, CommandReport, PendingCommand};
 use crate::joint::{Joint, JointKind};
 use crate::world::World;
 use maru_collide::{Pose, Shape};
@@ -42,11 +42,8 @@ const MAX_SNAPSHOT_BYTES: usize = 64 << 20;
 /// **디코딩 후** 힙 예산. count × 원소 크기를 누적 과금한다.
 const MAX_DECODED_BYTES: usize = 192 << 20;
 
-/// 물리량 크기 상한. 모든 |값| ≤ 1e9이면 솔버의 곱(임펄스×역질량, r×임펄스, k 계산)이
-/// 1e27 수준에 머물러 f32 범위(3.4e38) 안에 남고, 유한 개수의 합도 오버플로하지 않는다.
-/// `f32::MAX`처럼 **유한하지만 거대한** 값은 유한성 검사를 통과한 뒤 첫 warm start 곱에서
-/// Inf가 되어 상태를 즉시 오염시킨다(리뷰 PARTIAL BLOCKER: 음수 법선만 막아선 안 닫힌다).
-const MAX_MAGNITUDE: f32 = 1.0e9;
+// 크기 상한은 `maru_collide::limits`가 정본이다. `f32::MAX`처럼 **유한하지만 거대한** 값은
+// 유한성 검사를 통과한 뒤 첫 곱에서 Inf가 되므로 `is_finite()`만으로는 방어가 되지 않는다.
 
 /// 레코드 **최소** 직렬화 크기 — count 검증의 근거. 실제 레코드는 이보다 크거나 같다.
 mod min_bytes {
@@ -159,14 +156,27 @@ impl Reader<'_> {
     fn remaining(&self) -> usize {
         self.b.len() - self.at
     }
-    /// 물리량 f32 — 유한성뿐 아니라 **크기 상한**까지 요구한다(MAX_MAGNITUDE 주석 참조).
+    /// 호스트 입력에서 온 물리량 (셰이프 치수·질량·마찰·앵커) — **입력 정책**.
     fn f32(&mut self) -> Result<f32, SnapshotError> {
-        let v = f32::from_le_bytes(self.take(4)?.try_into().unwrap());
-        if v.is_finite() && v.abs() <= MAX_MAGNITUDE {
+        let v = self.raw_f32()?;
+        if maru_collide::in_range(v) {
             Ok(v)
         } else {
             Err(SnapshotError::NonFinite)
         }
+    }
+    /// 엔진이 진화시키는 물리량 (위치·속도·누적 임펄스·PCM 캐시) — **상태 정책**.
+    /// 솔버는 큰 질량과 큰 접근 속도의 조합에서 입력 상한을 넘는 임펄스를 정당하게 만든다.
+    fn state_f32(&mut self) -> Result<f32, SnapshotError> {
+        let v = self.raw_f32()?;
+        if maru_collide::in_state_range(v) {
+            Ok(v)
+        } else {
+            Err(SnapshotError::NonFinite)
+        }
+    }
+    fn raw_f32(&mut self) -> Result<f32, SnapshotError> {
+        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
     fn u32(&mut self) -> Result<u32, SnapshotError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -177,13 +187,23 @@ impl Reader<'_> {
     fn vec3(&mut self) -> Result<Vec3, SnapshotError> {
         Ok(Vec3::new(self.f32()?, self.f32()?, self.f32()?))
     }
+    fn state_vec3(&mut self) -> Result<Vec3, SnapshotError> {
+        Ok(Vec3::new(
+            self.state_f32()?,
+            self.state_f32()?,
+            self.state_f32()?,
+        ))
+    }
     fn quat(&mut self) -> Result<Quat, SnapshotError> {
         let q = Quat {
-            x: self.f32()?,
-            y: self.f32()?,
-            z: self.f32()?,
-            w: self.f32()?,
+            x: self.raw_f32()?,
+            y: self.raw_f32()?,
+            z: self.raw_f32()?,
+            w: self.raw_f32()?,
         };
+        if !(q.x.is_finite() && q.y.is_finite() && q.z.is_finite() && q.w.is_finite()) {
+            return Err(SnapshotError::NonFinite);
+        }
         // 단위 쿼터니언이 아니면 자세가 조용히 붕괴한다
         let l2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
         if !(0.9..=1.1).contains(&l2) {
@@ -308,11 +328,11 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
         _ => return Err(SnapshotError::BadShape),
     };
     let pose = Pose {
-        pos: r.vec3()?,
+        pos: r.state_vec3()?, // 위치는 적분으로 진화한다 → 상태 정책
         rot: r.quat()?,
     };
-    let linvel = r.vec3()?;
-    let angvel = r.vec3()?;
+    let linvel = r.state_vec3()?;
+    let angvel = r.state_vec3()?;
     let inv_mass = r.f32()?;
     let inv_inertia_local = r.vec3()?;
     let friction = r.f32()?;
@@ -401,8 +421,8 @@ fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
         _ => return Err(SnapshotError::BadShape),
     };
     let collide_connected = r.u8()? != 0;
-    let linear_impulse = r.vec3()?;
-    let angular_impulse = [r.f32()?, r.f32()?];
+    let linear_impulse = r.state_vec3()?;
+    let angular_impulse = [r.state_f32()?, r.state_f32()?];
     Ok(Joint {
         body_a,
         body_b,
@@ -415,13 +435,17 @@ fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
     })
 }
 
-fn write_command(w: &mut Writer, c: &Command) {
-    match c {
-        Command::AddBody(h, b) => {
+fn write_command(w: &mut Writer, c: &PendingCommand) {
+    let c = match c {
+        PendingCommand::Add(h, b) => {
             w.u8(0);
             w.handle(*h);
             write_body(w, b);
+            return;
         }
+        PendingCommand::Public(c) => c,
+    };
+    match c {
         Command::RemoveBody(h) => {
             w.u8(1);
             w.handle(*h);
@@ -455,14 +479,74 @@ fn write_command(w: &mut Writer, c: &Command) {
     }
 }
 
-/// **writer도 총량 정책을 강제한다**(리뷰 BLOCKER: 리더만 막으면 비대칭). 정상 API로
-/// 만들 수 있는 월드라도 슬롯 수가 많으면 바이트가 상한을 넘을 수 있으므로, 그 실패는
-/// 조용한 것이 아니라 **명시적**이어야 한다.
+/// 직렬화 크기를 **쓰기 전에** 계산한다(리뷰 BLOCKER: 다 만든 뒤 길이를 재면 wasm에서
+/// 통제된 오류보다 메모리 고갈이 먼저 온다). 아래 `write_*`와 **같은 레이아웃**을 세므로
+/// 한쪽을 고치면 다른 쪽도 고쳐야 한다 — 그 일치는 `snapshot_size_preflight_is_exact`가 잠근다.
+fn shape_size(s: &Shape) -> usize {
+    1 + match s {
+        Shape::Sphere { .. } => 4,
+        Shape::Capsule { .. } => 8,
+        Shape::Box { .. } => 16,
+        Shape::Hull { points, .. } => 4 + points.len() * 12 + 4,
+    }
+}
+
+fn body_size(b: &Body) -> usize {
+    1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + shape_size(&b.shape)
+}
+
+fn joint_size(j: &Joint) -> usize {
+    8 + 8
+        + 24
+        + match j.kind {
+            JointKind::Point => 1,
+            JointKind::Hinge { .. } => 1 + 24,
+        }
+        + 1
+        + 12
+        + 8
+}
+
+fn command_size(c: &PendingCommand) -> usize {
+    1 + match c {
+        PendingCommand::Add(_, b) => 8 + body_size(b),
+        PendingCommand::Public(Command::RemoveBody(_)) => 8,
+        PendingCommand::Public(Command::SetLinearVelocity(..))
+        | PendingCommand::Public(Command::SetAngularVelocity(..)) => 8 + 12,
+        PendingCommand::Public(Command::SetPose(..)) => 8 + 12 + 16,
+        PendingCommand::Public(Command::SetMaterial(..)) => 8 + 8,
+        PendingCommand::Public(Command::AddJoint(j)) => joint_size(j),
+    }
+}
+
+/// 스냅샷 바이트 수 (할당 전 preflight).
+pub fn serialized_size(world: &World) -> usize {
+    let (bodies, _, _, _, _, _, _, joints, cache, commands, _) = world.canonical_parts();
+    let mut n = 4 + 4 + 4; // magic + version + slot count
+    for (i, b) in bodies.iter().enumerate() {
+        let _ = i;
+        n += 1 + 1 + 4 + body_size(b) + 4 + 1 + 4;
+    }
+    n += 4 + joints.iter().map(joint_size).sum::<usize>();
+    n += 4 + commands.iter().map(command_size).sum::<usize>();
+    n += 4 + 4; // last_report
+    n += 4;
+    for entry in cache.values() {
+        n += 4 + 4 + 4 + entry.len() * (4 + 4 + 8 + 12 + 12 + 12);
+    }
+    n
+}
+
+/// **writer도 총량 정책을 강제한다**(리뷰 BLOCKER: 리더만 막으면 비대칭).
+/// 크기는 **할당 전에** 판정하고, 통과하면 정확한 용량으로 한 번에 잡는다.
 pub fn write_world(world: &World, w: &mut Writer) -> Result<(), SnapshotError> {
-    write_world_bytes(world, w);
-    if w.0.len() > MAX_SNAPSHOT_BYTES {
+    let size = serialized_size(world);
+    if size > MAX_SNAPSHOT_BYTES {
         return Err(SnapshotError::CountTooLarge);
     }
+    w.0.reserve_exact(size);
+    write_world_bytes(world, w);
+    debug_assert_eq!(w.0.len(), size, "preflight 크기 계산이 writer와 어긋남");
     Ok(())
 }
 
@@ -577,26 +661,26 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         let cmd = match r.u8()? {
             0 => {
                 let h = r.handle()?;
-                Command::AddBody(h, Box::new(read_body(&mut r)?))
+                PendingCommand::Add(h, Box::new(read_body(&mut r)?))
             }
-            1 => Command::RemoveBody(r.handle()?),
+            1 => PendingCommand::Public(Command::RemoveBody(r.handle()?)),
             2 => {
                 let h = r.handle()?;
-                Command::SetLinearVelocity(h, r.vec3()?)
+                PendingCommand::Public(Command::SetLinearVelocity(h, r.state_vec3()?))
             }
             3 => {
                 let h = r.handle()?;
-                Command::SetAngularVelocity(h, r.vec3()?)
+                PendingCommand::Public(Command::SetAngularVelocity(h, r.state_vec3()?))
             }
             4 => {
                 let h = r.handle()?;
-                Command::SetPose(
+                PendingCommand::Public(Command::SetPose(
                     h,
                     Pose {
-                        pos: r.vec3()?,
+                        pos: r.state_vec3()?,
                         rot: r.quat()?,
                     },
-                )
+                ))
             }
             5 => {
                 let h = r.handle()?;
@@ -604,9 +688,9 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
                 if f < 0.0 || !(0.0..=1.0).contains(&rest) {
                     return Err(SnapshotError::InconsistentState);
                 }
-                Command::SetMaterial(h, f, rest)
+                PendingCommand::Public(Command::SetMaterial(h, f, rest))
             }
-            6 => Command::AddJoint(Box::new(read_joint(&mut r)?)),
+            6 => PendingCommand::Public(Command::AddJoint(Box::new(read_joint(&mut r)?))),
             _ => return Err(SnapshotError::BadShape),
         };
         commands.push(cmd);
@@ -625,11 +709,11 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         for _ in 0..ne {
             let fid = maru_collide::FeatureId(r.u32()?);
             let imp = crate::solver::CachedImpulse {
-                normal: r.f32()?,
-                tangent: [r.f32()?, r.f32()?],
-                tangent_world: r.vec3()?,
-                position: r.vec3()?,
-                contact_normal: r.vec3()?,
+                normal: r.state_f32()?,
+                tangent: [r.state_f32()?, r.state_f32()?],
+                tangent_world: r.state_vec3()?,
+                position: r.state_vec3()?,
+                contact_normal: r.vec3()?, // 단위 벡터 — 입력 정책으로 충분
             };
             // 캐시된 법선은 단위 벡터이거나(정상) 0(초기값)이어야 한다 — 임의 벡터는
             // 매칭 게이트를 무력화한다
@@ -691,7 +775,7 @@ fn validate_structure(
     asleep: &[bool],
     island: &[u32],
     joints: &[Joint],
-    commands: &[Command],
+    commands: &[PendingCommand],
     cache: &std::collections::HashMap<
         (u32, u32),
         Vec<(maru_collide::FeatureId, crate::solver::CachedImpulse)>,
@@ -749,16 +833,19 @@ fn validate_structure(
     };
     let mut add_targets: Vec<u32> = Vec::new();
     for c in commands {
-        let h = match c {
-            Command::AddBody(h, _) => {
+        let c = match c {
+            PendingCommand::Add(h, _) => {
                 let i = h.index as usize;
                 // AddBody는 **예약된** 슬롯만 채울 수 있다
                 if i >= nb || !reserved[i] {
                     return Err(SnapshotError::InconsistentState);
                 }
                 add_targets.push(h.index);
-                h
+                continue;
             }
+            PendingCommand::Public(c) => c,
+        };
+        let h = match c {
             Command::RemoveBody(h)
             | Command::SetLinearVelocity(h, _)
             | Command::SetAngularVelocity(h, _)

@@ -51,6 +51,20 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
 - `enqueue_add_body`는 슬롯을 예약하고 **핸들을 즉시 반환**한다. 예약 슬롯은 쿼리에
   보이지 않지만(아직 alive 아님) 같은 배치의 후속 커맨드에 쓸 수 있다.
 - 불변식 보유 필드는 전부 비공개다. 읽기는 게터, 쓰기는 검증하는 API로만.
+- **`dt` 계약: `0 < dt <= MAX_DT`(0.25s).** 고정틱 엔진이므로 큰 dt를 쪼개는 것은
+  **호스트(accumulator) 책임**이다 — 탭 복귀처럼 큰 dt가 오면 여러 스텝으로 나누거나
+  프레임을 버린다. 엔진이 조용히 클램프하면 시뮬레이션이 실시간과 어긋난 채 진행돼 더 나쁘다.
+  위반은 trap이 아니라 `try_step`의 `ApiError`로 표현된다.
+- **실패는 오류로, trap으로가 아니다.** M3 바인딩이 쓰는 정본 경로는 전부 fallible이다:
+  `try_step` · `try_snapshot` · `try_state_hash` · `Body::try_new_dynamic`/`try_new_static` ·
+  `try_add_joint` · `enqueue`. 같은 이름의 비-try 함수는 패닉하는 편의 래퍼(테스트·진단용).
+- **크기 정책은 두 층**이다. 호스트가 넣는 값은 `MAX_INPUT`(1e9)을 넘으면 **거부**되고,
+  엔진이 진화시키는 값(위치·속도·누적 임펄스·PCM 캐시)은 `MAX_STATE`(1e18)로 **스텝 말에
+  클램프**된다. 입력 상한만 두면 정책이 step에 대해 닫히지 않는다 — 합법인 경계값 한 쌍이
+  한 스텝 뒤 상한을 넘어, 그 상태가 자기 스냅샷을 복원하지 못하게 된다.
+- 공개 커맨드 스키마(`Command`)에 **바디 추가가 없다**. 슬롯 예약과 커맨드 등록이 한 원자
+  연산이어야 하므로 정본 경로는 `enqueue_add_body`(예약 핸들을 즉시 반환)뿐이다.
+- hull은 정점 `MAX_HULL_POINTS`(1024)까지. 더 복잡한 메시는 convex decomposition으로 나눈다.
 
 ## 규율 (설계 문서에서 상속)
 

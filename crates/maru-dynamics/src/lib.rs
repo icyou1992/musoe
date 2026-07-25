@@ -1265,17 +1265,75 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "MAX_MAGNITUDE")]
+    #[should_panic(expected = "MAX_INPUT")]
     fn huge_pose_rejected_at_construction() {
         Body::new_dynamic(Shape::Sphere { radius: 1.0 }, pose(1.0e20, 0.0, 0.0), 1.0);
     }
 
+    /// NEW MAJOR: dt 위반은 **wasm trap이 아니라 오류**로 표현돼야 한다.
+    /// 고정틱 엔진이므로 큰 dt를 쪼개는 것은 호스트(accumulator) 책임이다.
     #[test]
-    #[should_panic(expected = "dt must be finite")]
-    fn huge_dt_rejected() {
+    fn huge_dt_returns_error_not_trap() {
         let mut w = World::new(WorldParams::default());
         ground(&mut w);
-        w.step(8.0);
+        assert_eq!(w.try_step(8.0), Err(ApiError::InvalidValue));
+        assert_eq!(w.try_step(f32::NAN), Err(ApiError::InvalidValue));
+        assert_eq!(w.try_step(crate::world::MAX_DT), Ok(()), "상한 자체는 합법");
+        assert_eq!(w.try_step(0.0), Ok(()), "0은 무연산");
+    }
+
+    /// BLOCKER: 입력 정책만으로는 step에 대해 닫히지 않는다 — 합법 경계값이 한 스텝 뒤
+    /// 정책을 벗어나면 그 상태는 자기 스냅샷을 복원하지 못한다.
+    /// 스텝 말 클램프로 "엔진이 만들 수 있는 상태 = 리더가 받는 상태"를 성립시킨다.
+    #[test]
+    fn legal_boundary_state_survives_step_and_roundtrip() {
+        let big = maru_collide::MAX_INPUT * 0.9;
+        let mut w = World::new(WorldParams::default());
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(big, 0.0, 0.0),
+            1.0,
+        ));
+        w.set_linear_velocity(h, Vec3::new(big, 0.0, 0.0)).unwrap();
+        // 한 스텝이면 위치가 입력 상한을 넘는다 (0.9e9 + 0.9e9*0.25 = 1.125e9)
+        w.try_step(crate::world::MAX_DT).unwrap();
+        let p = w.body(h).pose().pos.x;
+        assert!(
+            p > maru_collide::MAX_INPUT,
+            "경계 시나리오가 성립하지 않음: {p}"
+        );
+        assert!(
+            maru_collide::in_state_range(p),
+            "상태가 상태 정책을 벗어남: {p}"
+        );
+        let snap = w.snapshot();
+        assert!(
+            w.restore(&snap).is_ok(),
+            "step 뒤 상태가 자기 스냅샷을 복원하지 못함 (정책이 step에 대해 닫히지 않음)"
+        );
+    }
+
+    /// NEW MAJOR: 생성자가 자기 삽입 정책을 위반하는 Body를 반환하면 안 된다
+    /// (density=1e-10 → inv_mass≈2.39e9 > 입력 상한).
+    #[test]
+    #[should_panic(expected = "size policy")]
+    fn constructor_rejects_body_violating_insertion_policy() {
+        Body::new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 0.0, 0.0), 1.0e-10);
+    }
+
+    #[test]
+    fn fallible_constructor_returns_error() {
+        assert!(
+            Body::try_new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 0.0, 0.0), 1.0e-10)
+                .is_err()
+        );
+        assert!(
+            Body::try_new_dynamic(Shape::Sphere { radius: 1.0 }, pose(1.0e20, 0.0, 0.0), 1.0)
+                .is_err()
+        );
+        assert!(
+            Body::try_new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 0.0, 0.0), 1.0).is_ok()
+        );
     }
 
     #[test]
@@ -1294,37 +1352,103 @@ mod tests {
         );
     }
 
-    /// BLOCKER: 공개 경로로 같은 예약 핸들에 AddBody를 두 번 넣으면 restore가 거부하는
-    /// pending 상태가 만들어진다 → 공개 AddBody 자체를 막고 `enqueue_add_body`만 정본으로.
+    /// BLOCKER: 예약 핸들당 pending 추가는 정확히 하나여야 한다.
+    /// **타입 수준으로** 보장한다 — 공개 `Command`에 바디 추가 variant가 없으므로
+    /// 두 번째 추가를 표현할 방법 자체가 없다(정본 경로 = `enqueue_add_body`).
     #[test]
-    fn public_add_body_command_is_rejected() {
+    fn reserved_slot_has_exactly_one_pending_add() {
         let mut w = World::new(WorldParams::default());
         let h = w.enqueue_add_body(Body::new_dynamic(
             Shape::Sphere { radius: 0.3 },
             pose(0.0, 3.0, 0.0),
             1.0,
         ));
-        assert_eq!(
-            w.enqueue(Command::AddBody(
-                h,
-                Box::new(Body::new_dynamic(
-                    Shape::Sphere { radius: 0.9 },
-                    pose(5.0, 3.0, 0.0),
-                    1.0,
-                ))
-            )),
-            Err(ApiError::InvalidValue),
-            "예약 핸들에 두 번째 AddBody가 큐에 들어감"
-        );
-        assert_eq!(w.pending_commands(), 1, "예약당 AddBody는 정확히 하나");
+        assert_eq!(w.pending_commands(), 1);
+        // 같은 바디를 또 추가하면 **다른 슬롯**이 예약된다 (핸들이 다르다)
+        let h2 = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(1.0, 3.0, 0.0),
+            1.0,
+        ));
+        assert_ne!(h.index, h2.index, "같은 슬롯이 두 번 예약됨");
+        assert_eq!(w.pending_commands(), 2);
         assert!(w.restore(&w.snapshot()).is_ok());
+        w.step(DT);
+        assert!(w.is_alive(h) && w.is_alive(h2));
+        assert_eq!(w.last_command_report().rejected, 0);
+    }
+
+    /// BLOCKER: writer가 다 만든 뒤 길이를 재면 wasm에서 통제된 오류보다 메모리 고갈이
+    /// 먼저 온다 → 할당 **전에** 크기를 계산한다. 그 계산은 writer와 정확히 일치해야 한다.
+    #[test]
+    fn snapshot_size_preflight_is_exact() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let a = dyn_box(&mut w, 0.0, 3.0);
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Hull {
+                points: vec![
+                    Vec3::new(-0.4, -0.4, -0.4),
+                    Vec3::new(0.4, 0.4, 0.4),
+                    Vec3::new(0.4, -0.4, 0.2),
+                ],
+                radius: 0.0,
+            },
+            pose(2.0, 3.0, 0.0),
+            1.0,
+        ));
+        let c = w.add_body(Body::new_kinematic(
+            Shape::Capsule {
+                half_height: 0.5,
+                radius: 0.2,
+            },
+            pose(4.0, 3.0, 0.0),
+        ));
+        w.add_joint(Joint::hinge(
+            a,
+            b,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ));
+        w.add_joint(Joint::point(b, c, Vec3::ZERO, Vec3::ZERO));
+        for _ in 0..20 {
+            w.step(DT);
+        }
+        // pending 커맨드 전 종류를 큐에 남긴다
+        w.enqueue(Command::SetLinearVelocity(a, Vec3::new(1.0, 0.0, 0.0)))
+            .unwrap();
+        w.enqueue(Command::SetAngularVelocity(a, Vec3::new(0.0, 1.0, 0.0)))
+            .unwrap();
+        w.enqueue(Command::SetPose(a, pose(0.0, 4.0, 0.0))).unwrap();
+        w.enqueue(Command::SetMaterial(a, 0.3, 0.1)).unwrap();
+        w.enqueue(Command::RemoveBody(c)).unwrap();
+        w.enqueue(Command::AddJoint(Box::new(Joint::point(
+            a,
+            b,
+            Vec3::ZERO,
+            Vec3::ZERO,
+        ))))
+        .unwrap();
+        w.enqueue_add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(8.0, 3.0, 0.0),
+            1.0,
+        ));
+        let bytes = w.snapshot();
+        assert_eq!(
+            crate::snapshot::serialized_size(&w),
+            bytes.len(),
+            "preflight 크기가 writer와 어긋남 — 한쪽만 고친 것이다"
+        );
     }
 
     /// 정책 **경계**의 대칭: 라이브 API가 받아들이는 최대치는 스냅샷 리더도 받아야 한다.
     /// (리뷰가 지적한 비대칭의 정확한 형태 — 리더만 1e9로 막고 있었다.)
     #[test]
     fn boundary_legal_values_round_trip() {
-        let big = maru_collide::MAX_MAGNITUDE * 0.9;
+        let big = maru_collide::MAX_INPUT * 0.9;
         let mut w = World::new(WorldParams::default());
         let h = w.add_body(Body::new_dynamic(
             Shape::Sphere { radius: 0.5 },
@@ -1354,8 +1478,10 @@ mod tests {
             *rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (*rng >> 16) as usize
         };
-        for step_i in 0..200 {
-            match next(&mut rng) % 7 {
+        let big = maru_collide::MAX_INPUT * 0.9;
+        for step_i in 0..400 {
+            let f = (step_i % 5) as f32;
+            match next(&mut rng) % 13 {
                 0 => live.push(dyn_box(&mut w, (step_i % 9) as f32 - 4.0, 3.0)),
                 1 => {
                     if let Some(h) = live.pop() {
@@ -1364,10 +1490,7 @@ mod tests {
                 }
                 2 => {
                     if let Some(h) = live.first() {
-                        let _ = w.enqueue(Command::SetLinearVelocity(
-                            *h,
-                            Vec3::new((step_i % 5) as f32, 0.0, 0.0),
-                        ));
+                        let _ = w.enqueue(Command::SetLinearVelocity(*h, Vec3::new(f, 0.0, 0.0)));
                     }
                 }
                 3 => live.push(w.enqueue_add_body(Body::new_dynamic(
@@ -1386,8 +1509,58 @@ mod tests {
                     }
                 }
                 5 => w.step(DT),
-                _ => {
+                6 => {
                     w.flush_commands();
+                }
+                // ── 리뷰 MINOR: 빠져 있던 연산들 ──
+                7 => {
+                    if let Some(h) = live.first() {
+                        let _ = w.enqueue(Command::SetAngularVelocity(*h, Vec3::new(0.0, f, 0.0)));
+                    }
+                }
+                8 => {
+                    if let Some(h) = live.first() {
+                        let _ = w.enqueue(Command::SetPose(*h, pose(f, 4.0, 0.0)));
+                        let _ = w.enqueue(Command::SetMaterial(*h, 0.2 * f, 0.1 * f));
+                    }
+                }
+                9 => {
+                    // pending RemoveBody + pending AddJoint (같은 배치 안 상호작용)
+                    if live.len() >= 3 {
+                        let doomed = live.remove(live.len() - 1);
+                        let _ = w.enqueue(Command::RemoveBody(doomed));
+                        let _ = w.enqueue(Command::AddJoint(Box::new(Joint::point(
+                            live[0],
+                            live[1],
+                            Vec3::ZERO,
+                            Vec3::ZERO,
+                        ))));
+                    }
+                }
+                10 => live.push(w.add_body(Body::new_kinematic(
+                    Shape::Capsule {
+                        half_height: 0.3,
+                        radius: 0.2,
+                    },
+                    pose((step_i % 6) as f32, 2.0, 1.0),
+                ))),
+                11 => {
+                    // 파라미터 변경 + MAX_DT 경계 스텝
+                    w.set_params(WorldParams {
+                        substeps: 1 + (step_i % 4) as u32,
+                        ..Default::default()
+                    });
+                    w.try_step(crate::world::MAX_DT).unwrap();
+                }
+                _ => {
+                    // 경계 크기 바디 — step 뒤 상태 정책 폐쇄가 걸리는 지점
+                    let h = w.add_body(Body::new_dynamic(
+                        Shape::Sphere { radius: 0.5 },
+                        pose(big, 0.0, 0.0),
+                        1.0,
+                    ));
+                    let _ = w.set_linear_velocity(h, Vec3::new(big, 0.0, 0.0));
+                    live.push(h);
                 }
             }
             let snap = w.snapshot();
