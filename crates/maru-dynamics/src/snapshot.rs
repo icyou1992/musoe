@@ -455,7 +455,18 @@ fn write_command(w: &mut Writer, c: &Command) {
     }
 }
 
-pub fn write_world(world: &World, w: &mut Writer) {
+/// **writer도 총량 정책을 강제한다**(리뷰 BLOCKER: 리더만 막으면 비대칭). 정상 API로
+/// 만들 수 있는 월드라도 슬롯 수가 많으면 바이트가 상한을 넘을 수 있으므로, 그 실패는
+/// 조용한 것이 아니라 **명시적**이어야 한다.
+pub fn write_world(world: &World, w: &mut Writer) -> Result<(), SnapshotError> {
+    write_world_bytes(world, w);
+    if w.0.len() > MAX_SNAPSHOT_BYTES {
+        return Err(SnapshotError::CountTooLarge);
+    }
+    Ok(())
+}
+
+fn write_world_bytes(world: &World, w: &mut Writer) {
     w.u32(MAGIC);
     w.u32(VERSION);
     let (
@@ -727,8 +738,15 @@ fn validate_structure(
         }
     }
 
-    // 커맨드 대상: 인덱스·세대가 맞아야 한다. 대상이 아직 alive가 아닐 수는 있다 —
-    // 같은 배치의 앞선 AddBody가 만들 예정인 예약 슬롯이 그렇다(세대는 예약 시점에 확정).
+    // 커맨드 대상 검증은 **공개 `enqueue`와 동일한 술어**를 쓴다(리뷰 PARTIAL MAJOR).
+    // 세대만 보면, 공개 API로는 만들 수 없는 pending 상태(죽은 비예약 슬롯을 겨냥한
+    // SetVelocity·AddJoint)를 조작 스냅샷이 주입할 수 있다 — 정본이 아닌 상태를
+    // 정본 큐에 들이는 셈이다.
+    // enqueue와 같은 술어: 대상은 살아있거나 예약된 슬롯이고 세대가 일치해야 한다.
+    let enqueueable = |h: &BodyHandle| -> bool {
+        let i = h.index as usize;
+        i < nb && (alive[i] || reserved[i]) && generations[i] == h.generation
+    };
     let mut add_targets: Vec<u32> = Vec::new();
     for c in commands {
         let h = match c {
@@ -748,8 +766,7 @@ fn validate_structure(
             | Command::SetMaterial(h, _, _) => h,
             Command::AddJoint(j) => {
                 for h in [&j.body_a, &j.body_b] {
-                    let i = h.index as usize;
-                    if i >= nb || generations[i] != h.generation {
+                    if !enqueueable(h) {
                         return Err(SnapshotError::BadIndex);
                     }
                 }
@@ -759,8 +776,7 @@ fn validate_structure(
                 continue;
             }
         };
-        let i = h.index as usize;
-        if i >= nb || generations[i] != h.generation {
+        if !enqueueable(h) {
             return Err(SnapshotError::BadIndex);
         }
     }

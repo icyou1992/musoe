@@ -5,6 +5,7 @@
 //! 침투 깊이가 얕게 유지되어 EPA 진입이 최소화된다. [근거: Jolt convex radius]
 //! Hull의 코어 포인트는 빌더가 이미 수축된 점을 준다는 계약(v1 — 문서화된 가정).
 
+use crate::limits::{in_range, vec_in_range, MAX_HULL_POINTS};
 use crate::Aabb;
 use maru_math::Vec3;
 
@@ -24,18 +25,19 @@ impl Shape {
     /// 형상 불변식 검증. **모든 바디 타입의 생성 경계에서 호출된다** — static/kinematic도
     /// 빈 hull이면 support/local_aabb가 `points[0]`에서 패닉한다(리뷰 지적).
     pub fn validate(&self) -> Result<(), &'static str> {
+        // 크기 상한까지 여기서 강제한다 — 라이브 생성과 역직렬화가 같은 정책을 쓴다.
         let r = self.radius();
-        if !r.is_finite() || r < 0.0 {
-            return Err("shape radius must be finite and non-negative");
+        if !in_range(r) || r < 0.0 {
+            return Err("shape radius must be finite, non-negative and within MAX_MAGNITUDE");
         }
         match self {
             Shape::Sphere { radius } => {
-                if !radius.is_finite() || *radius <= 0.0 {
+                if !in_range(*radius) || *radius <= 0.0 {
                     return Err("sphere radius must be finite and positive");
                 }
             }
             Shape::Capsule { half_height, .. } => {
-                if !half_height.is_finite() || *half_height < 0.0 {
+                if !in_range(*half_height) || *half_height < 0.0 {
                     return Err("capsule half_height must be finite and non-negative");
                 }
                 if r <= 0.0 {
@@ -43,7 +45,7 @@ impl Shape {
                 }
             }
             Shape::Box { half, .. } => {
-                if !half.is_finite() || half.x <= 0.0 || half.y <= 0.0 || half.z <= 0.0 {
+                if !vec_in_range(*half) || half.x <= 0.0 || half.y <= 0.0 || half.z <= 0.0 {
                     return Err("box half extents must be finite and positive");
                 }
                 if r > half.x.min(half.y).min(half.z) {
@@ -54,8 +56,11 @@ impl Shape {
                 if points.is_empty() {
                     return Err("hull must contain at least one point");
                 }
-                if !points.iter().all(|p| p.is_finite()) {
-                    return Err("hull points must be finite");
+                if points.len() > MAX_HULL_POINTS {
+                    return Err("hull point count exceeds MAX_HULL_POINTS");
+                }
+                if !points.iter().all(|p| vec_in_range(*p)) {
+                    return Err("hull points must be finite and within MAX_MAGNITUDE");
                 }
             }
         }

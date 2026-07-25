@@ -1,6 +1,6 @@
 //! 강체 — 타입 3종 시맨틱 (설계 §9).
 
-use maru_collide::{Pose, Shape};
+use maru_collide::{in_range, vec_in_range, Pose, Shape};
 use maru_math::{Mat3, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,7 +15,7 @@ pub enum BodyType {
 /// 크레이트 밖에서는 필드 대입이 **컴파일되지 않는다** (인코딩된 회귀 테스트):
 ///
 /// ```compile_fail
-/// use maru_collide::{Pose, Shape};
+/// use maru_collide::{in_range, vec_in_range, Pose, Shape};
 /// use maru_dynamics::Body;
 /// use maru_math::{Quat, Vec3};
 /// let mut b = Body::new_dynamic(
@@ -92,17 +92,19 @@ impl Body {
     pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
         use crate::world::ApiError;
         self.shape.validate().map_err(|_| ApiError::InvalidValue)?;
-        if !self.pose.pos.is_finite() || self.pose.rot.try_normalize().is_none() {
+        // 크기 상한(MAX_MAGNITUDE)까지 여기서 강제한다 — 스냅샷 리더와 **같은 정책**이라야
+        // `restore(snapshot())`가 항상 성립한다(리뷰 BLOCKER: 비대칭).
+        if !vec_in_range(self.pose.pos) || self.pose.rot.try_normalize().is_none() {
             return Err(ApiError::InvalidValue);
         }
-        if !self.linvel.is_finite() || !self.angvel.is_finite() {
+        if !vec_in_range(self.linvel) || !vec_in_range(self.angvel) {
             return Err(ApiError::InvalidValue);
         }
-        if !self.shape_origin_offset.is_finite() {
+        if !vec_in_range(self.shape_origin_offset) {
             return Err(ApiError::InvalidValue);
         }
         // 비교는 양성 조건으로 — `!(x < 0.0)`은 NaN에서 참이라 통과시킨다
-        if !(self.friction >= 0.0 && self.friction.is_finite())
+        if !(self.friction >= 0.0 && in_range(self.friction))
             || !(0.0..=1.0).contains(&self.restitution)
         {
             return Err(ApiError::InvalidValue);
@@ -111,11 +113,11 @@ impl Body {
         match self.body_type {
             BodyType::Dynamic => {
                 if !(self.inv_mass > 0.0
-                    && self.inv_mass.is_finite()
+                    && in_range(self.inv_mass)
                     && inv_i.x > 0.0
                     && inv_i.y > 0.0
                     && inv_i.z > 0.0
-                    && inv_i.is_finite())
+                    && vec_in_range(inv_i))
                 {
                     return Err(ApiError::InvalidValue);
                 }
@@ -241,7 +243,10 @@ impl Body {
 /// `is_finite`만 보면 `Quat{0,0,0,0}`이 통과해 support 방향·관성 회전이 무효화되고
 /// dynamic은 첫 적분에서 갑자기 identity로 튄다(리뷰 NEW MAJOR).
 fn normalized_pose(pose: Pose) -> Pose {
-    assert!(pose.pos.is_finite(), "pose.pos must be finite");
+    assert!(
+        vec_in_range(pose.pos),
+        "pose.pos must be finite and within MAX_MAGNITUDE"
+    );
     let rot = pose
         .rot
         .try_normalize()

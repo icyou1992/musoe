@@ -82,15 +82,23 @@ pub struct Diagnostics {
     pub max_penetration: f32,
 }
 
+/// 스텝 크기 상한. 이보다 큰 dt는 speculative margin·CCD·soft 계수가 전부 의미를 잃고,
+/// 유한한 속도라도 위치 적분에서 크기 정책(MAX_MAGNITUDE)을 넘긴다.
+pub const MAX_DT: f32 = 0.25;
+
 /// 파라미터 불변식 — `new`와 `set_params`가 **같은** 검증을 쓴다.
 fn validate_params(params: &WorldParams) {
     // **모든 스칼라**가 유한하고 범위 안이어야 한다(리뷰 PARTIAL MAJOR: time_to_sleep와
     // restitution_threshold는 아예 검사하지 않았고 sleep 임계의 +Inf도 통과했다).
     // NaN 임계는 조용히 게이트를 무력화한다 — NaN 비교는 항상 false라
     // restitution_threshold=NaN이면 임계 이하 접촉에도 반발 패스가 돈다.
-    let finite_ge0 = |v: f32| v.is_finite() && v >= 0.0;
-    let finite_gt0 = |v: f32| v.is_finite() && v > 0.0;
-    assert!(params.gravity.is_finite(), "gravity must be finite");
+    // 크기 상한까지 요구한다 — 유한하지만 거대한 값은 몇 서브스텝 만에 Inf를 만든다.
+    let finite_ge0 = |v: f32| maru_collide::in_range(v) && v >= 0.0;
+    let finite_gt0 = |v: f32| maru_collide::in_range(v) && v > 0.0;
+    assert!(
+        maru_collide::vec_in_range(params.gravity),
+        "gravity must be finite and within MAX_MAGNITUDE"
+    );
     assert!(
         (1..=64).contains(&params.substeps),
         "substeps must be in 1..=64, got {}",
@@ -304,7 +312,7 @@ impl World {
     }
 
     pub fn set_linear_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
-        if !v.is_finite() {
+        if !maru_collide::vec_in_range(v) {
             return Err(ApiError::InvalidValue);
         }
         let i = self.mutate(h)?;
@@ -313,7 +321,7 @@ impl World {
     }
 
     pub fn set_angular_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
-        if !v.is_finite() {
+        if !maru_collide::vec_in_range(v) {
             return Err(ApiError::InvalidValue);
         }
         let i = self.mutate(h)?;
@@ -323,7 +331,7 @@ impl World {
 
     /// 텔레포트 (설계 §9: 속도를 만들지 않는다 — kinematic 구동은 별도 API).
     pub fn set_pose(&mut self, h: BodyHandle, pose: maru_collide::Pose) -> Result<(), ApiError> {
-        if !pose.pos.is_finite() || pose.rot.try_normalize().is_none() {
+        if !maru_collide::vec_in_range(pose.pos) || pose.rot.try_normalize().is_none() {
             return Err(ApiError::InvalidValue);
         }
         let i = self.mutate(h)?;
@@ -340,9 +348,8 @@ impl World {
         friction: f32,
         restitution: f32,
     ) -> Result<(), ApiError> {
-        if !friction.is_finite()
+        if !maru_collide::in_range(friction)
             || friction < 0.0
-            || !restitution.is_finite()
             || !(0.0..=1.0).contains(&restitution)
         {
             return Err(ApiError::InvalidValue);
@@ -394,31 +401,26 @@ impl World {
             }
         };
         match cmd {
-            Command::AddBody(h, b) => {
-                let i = h.index as usize;
-                if i >= self.bodies.len()
-                    || !self.reserved[i]
-                    || self.generations[i] != h.generation
-                {
-                    return Err(ApiError::StaleHandle);
-                }
-                b.validate()
-            }
+            // **공개 경로로는 AddBody를 넣을 수 없다**(리뷰 BLOCKER). 예약 슬롯당 pending
+            // AddBody는 정확히 하나여야 하는데, 공개 enqueue를 열어두면 같은 예약 핸들에
+            // 두 번째 AddBody를 넣을 수 있고 그 상태는 restore가 거부해 왕복 계약이 깨진다.
+            // 유일한 정본 경로는 `enqueue_add_body`(예약과 커맨드를 한 번에 만든다)다.
+            Command::AddBody(..) => Err(ApiError::InvalidValue),
             Command::RemoveBody(h) => target(h),
             Command::SetLinearVelocity(h, v) | Command::SetAngularVelocity(h, v) => {
-                if !v.is_finite() {
+                if !maru_collide::vec_in_range(*v) {
                     return Err(ApiError::InvalidValue);
                 }
                 target(h)
             }
             Command::SetPose(h, p) => {
-                if !p.pos.is_finite() || p.rot.try_normalize().is_none() {
+                if !maru_collide::vec_in_range(p.pos) || p.rot.try_normalize().is_none() {
                     return Err(ApiError::InvalidValue);
                 }
                 target(h)
             }
             Command::SetMaterial(h, f, rest) => {
-                if !f.is_finite() || *f < 0.0 || !(0.0..=1.0).contains(rest) {
+                if !maru_collide::in_range(*f) || *f < 0.0 || !(0.0..=1.0).contains(rest) {
                     return Err(ApiError::InvalidValue);
                 }
                 target(h)
@@ -483,6 +485,27 @@ impl World {
         }
         self.last_report = report;
         report
+    }
+
+    /// 스텝 후 캐노니컬 상태가 정책 안인지 확인한다(리뷰 NEW BLOCKER 방어선).
+    /// 경계 검증이 완전하면 여기서 걸릴 것이 없어야 한다 — 걸린다면 **엔진 버그**이므로
+    /// 디버그 빌드에서 즉시 터뜨린다. 릴리스 핫패스에는 비용을 두지 않는다.
+    #[cfg(debug_assertions)]
+    fn assert_state_in_policy(&self) {
+        for (i, b) in self.bodies.iter().enumerate() {
+            if !self.alive[i] {
+                continue;
+            }
+            debug_assert!(
+                maru_collide::vec_in_range(b.pose.pos)
+                    && maru_collide::vec_in_range(b.linvel)
+                    && maru_collide::vec_in_range(b.angvel),
+                "body {i} left the size policy after step: pos={:?} v={:?} w={:?}",
+                b.pose.pos,
+                b.linvel,
+                b.angvel
+            );
+        }
     }
 
     /// 직전 스텝 진단 스냅샷.
@@ -582,10 +605,16 @@ impl World {
     }
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
-    pub fn snapshot(&self) -> Vec<u8> {
+    /// 캐노니컬 스냅샷 — **총량 정책 초과 시 명시적으로 실패한다**. M3 바인딩은 이 경로를 쓴다.
+    pub fn try_snapshot(&self) -> Result<Vec<u8>, crate::snapshot::SnapshotError> {
         let mut w = crate::snapshot::Writer(Vec::new());
-        crate::snapshot::write_world(self, &mut w);
-        w.0
+        crate::snapshot::write_world(self, &mut w)?;
+        Ok(w.0)
+    }
+
+    /// 편의 래퍼 (테스트·진단용). 정책 초과는 패닉 — 실패를 다루려면 `try_snapshot`.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.try_snapshot().expect("snapshot exceeds size policy")
     }
 
     /// 스냅샷 복원. 재생은 원 실행과 같은 타깃에서 L0 비트 동일.
@@ -617,9 +646,12 @@ impl World {
 
     /// 고정 틱 스텝. 호스트 프레임과 무결합 (설계 §4).
     pub fn step(&mut self, dt: f32) {
+        // dt에도 상한이 필요하다(리뷰 NEW BLOCKER): `step(8.0)`은 유한하지만 첫 위치
+        // 적분에서 거대 속도와 곱해져 Inf를 만든다. 상한은 speculative margin·CCD가
+        // 의미를 갖는 범위 — 0.25s(4fps)를 넘는 스텝은 물리적으로 이미 무의미하다.
         assert!(
-            dt.is_finite(),
-            "dt must be finite (NaN dt would poison all state)"
+            dt.is_finite() && dt <= MAX_DT,
+            "dt must be finite and <= {MAX_DT} (got {dt})"
         );
         if dt <= 0.0 {
             return;
@@ -1007,5 +1039,7 @@ impl World {
                 );
             }
         }
+        #[cfg(debug_assertions)]
+        self.assert_state_in_policy();
     }
 }

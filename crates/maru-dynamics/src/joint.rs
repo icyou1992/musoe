@@ -5,6 +5,7 @@
 
 use crate::body::{Body, BodyHandle};
 use crate::solver::Softness;
+use maru_collide::{in_range, vec_in_range};
 use maru_math::{Mat3, Vec3};
 
 #[derive(Clone, Debug)]
@@ -57,12 +58,12 @@ impl Joint {
     /// 비교는 **양성 조건**으로 쓴다: `!(x < 0.5)`는 NaN에서 참이 되어 통과시킨다.
     pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
         use crate::world::ApiError;
-        if !self.anchor_a.is_finite() || !self.anchor_b.is_finite() {
+        if !vec_in_range(self.anchor_a) || !vec_in_range(self.anchor_b) {
             return Err(ApiError::InvalidValue);
         }
-        if !self.linear_impulse.is_finite()
-            || !self.angular_impulse[0].is_finite()
-            || !self.angular_impulse[1].is_finite()
+        if !vec_in_range(self.linear_impulse)
+            || !in_range(self.angular_impulse[0])
+            || !in_range(self.angular_impulse[1])
         {
             return Err(ApiError::InvalidValue);
         }

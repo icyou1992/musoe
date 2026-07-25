@@ -1234,4 +1234,167 @@ mod tests {
             "슬라이딩 중 warm start 계승률 {ratio:.2} — 매 프레임 끊기고 있다"
         );
     }
+
+    // ─────────── 리뷰 rev_9a7af148 회귀 ───────────
+
+    /// NEW BLOCKER: 유한하지만 과대한 값은 몇 서브스텝 만에 Inf가 된다 —
+    /// `is_finite()`만으로는 방어가 아니다. 라이브 API도 스냅샷과 **같은 정책**을 쓴다.
+    #[test]
+    fn live_api_rejects_huge_finite_values() {
+        let mut w = World::new(WorldParams::default());
+        let b = dyn_box(&mut w, 0.0, 3.0);
+        assert_eq!(
+            w.set_linear_velocity(b, Vec3::new(f32::MAX, 0.0, 0.0)),
+            Err(ApiError::InvalidValue),
+            "f32::MAX 속도가 통과"
+        );
+        assert_eq!(
+            w.enqueue(Command::SetLinearVelocity(b, Vec3::new(f32::MAX, 0.0, 0.0))),
+            Err(ApiError::InvalidValue)
+        );
+        assert_eq!(
+            w.set_pose(
+                b,
+                Pose {
+                    pos: Vec3::new(1.0e20, 0.0, 0.0),
+                    rot: Quat::IDENTITY
+                }
+            ),
+            Err(ApiError::InvalidValue)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "MAX_MAGNITUDE")]
+    fn huge_pose_rejected_at_construction() {
+        Body::new_dynamic(Shape::Sphere { radius: 1.0 }, pose(1.0e20, 0.0, 0.0), 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "dt must be finite")]
+    fn huge_dt_rejected() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        w.step(8.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid shape")]
+    fn oversized_hull_rejected() {
+        let points: Vec<Vec3> = (0..(maru_collide::MAX_HULL_POINTS + 1))
+            .map(|i| Vec3::new(i as f32 * 1e-3, 0.0, 0.0))
+            .collect();
+        Body::new_dynamic(
+            Shape::Hull {
+                points,
+                radius: 0.0,
+            },
+            pose(0.0, 0.0, 0.0),
+            1.0,
+        );
+    }
+
+    /// BLOCKER: 공개 경로로 같은 예약 핸들에 AddBody를 두 번 넣으면 restore가 거부하는
+    /// pending 상태가 만들어진다 → 공개 AddBody 자체를 막고 `enqueue_add_body`만 정본으로.
+    #[test]
+    fn public_add_body_command_is_rejected() {
+        let mut w = World::new(WorldParams::default());
+        let h = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 3.0, 0.0),
+            1.0,
+        ));
+        assert_eq!(
+            w.enqueue(Command::AddBody(
+                h,
+                Box::new(Body::new_dynamic(
+                    Shape::Sphere { radius: 0.9 },
+                    pose(5.0, 3.0, 0.0),
+                    1.0,
+                ))
+            )),
+            Err(ApiError::InvalidValue),
+            "예약 핸들에 두 번째 AddBody가 큐에 들어감"
+        );
+        assert_eq!(w.pending_commands(), 1, "예약당 AddBody는 정확히 하나");
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
+
+    /// 정책 **경계**의 대칭: 라이브 API가 받아들이는 최대치는 스냅샷 리더도 받아야 한다.
+    /// (리뷰가 지적한 비대칭의 정확한 형태 — 리더만 1e9로 막고 있었다.)
+    #[test]
+    fn boundary_legal_values_round_trip() {
+        let big = maru_collide::MAX_MAGNITUDE * 0.9;
+        let mut w = World::new(WorldParams::default());
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(big, 0.0, 0.0),
+            1.0,
+        ));
+        w.set_linear_velocity(h, Vec3::new(big, 0.0, 0.0)).unwrap();
+        let snap = w.snapshot();
+        assert!(
+            w.restore(&snap).is_ok(),
+            "라이브 API가 허용한 최대치를 리더가 거부 — 정책 비대칭"
+        );
+        assert!((w.body(h).pose().pos.x - big).abs() < big * 1e-6);
+    }
+
+    /// **정책 대칭 속성**: 공개 API로 도달할 수 있는 어떤 상태든 자기 스냅샷을 복원할 수
+    /// 있어야 한다. 리뷰가 두 라운드 연속으로 이 계약의 구멍을 찾았으므로, 개별 사례가
+    /// 아니라 **연산 시퀀스 전체**를 훑어 계약을 성질로 검증한다.
+    #[test]
+    fn every_reachable_state_restores_its_own_snapshot() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let mut live: Vec<BodyHandle> = Vec::new();
+        // 결정적 LCG — 무작위성 없이 시퀀스를 흔든다
+        let mut rng: u32 = 0x2545_f491;
+        let next = |rng: &mut u32| {
+            *rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (*rng >> 16) as usize
+        };
+        for step_i in 0..200 {
+            match next(&mut rng) % 7 {
+                0 => live.push(dyn_box(&mut w, (step_i % 9) as f32 - 4.0, 3.0)),
+                1 => {
+                    if let Some(h) = live.pop() {
+                        let _ = w.remove_body(h);
+                    }
+                }
+                2 => {
+                    if let Some(h) = live.first() {
+                        let _ = w.enqueue(Command::SetLinearVelocity(
+                            *h,
+                            Vec3::new((step_i % 5) as f32, 0.0, 0.0),
+                        ));
+                    }
+                }
+                3 => live.push(w.enqueue_add_body(Body::new_dynamic(
+                    Shape::Sphere { radius: 0.3 },
+                    pose((step_i % 7) as f32 - 3.0, 5.0, 0.0),
+                    1.0,
+                ))),
+                4 => {
+                    if live.len() >= 2 {
+                        let _ = w.try_add_joint(Joint::point(
+                            live[0],
+                            live[1],
+                            Vec3::ZERO,
+                            Vec3::new(0.0, 1.0, 0.0),
+                        ));
+                    }
+                }
+                5 => w.step(DT),
+                _ => {
+                    w.flush_commands();
+                }
+            }
+            let snap = w.snapshot();
+            assert!(
+                w.restore(&snap).is_ok(),
+                "연산 {step_i} 이후 자기 스냅샷이 복원되지 않음 (정책 비대칭)"
+            );
+        }
+    }
 }

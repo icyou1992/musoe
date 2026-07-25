@@ -7,6 +7,7 @@
 mod aabb;
 mod epa;
 mod gjk;
+mod limits;
 mod manifold;
 mod pairs;
 mod shape;
@@ -16,6 +17,7 @@ mod tree;
 pub use aabb::Aabb;
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
+pub use limits::{in_range, vec_in_range, MAX_HULL_POINTS, MAX_MAGNITUDE};
 pub use manifold::{contact, ContactPoint, FeatureId, Manifold, FEATURE_GENERIC};
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, STATIC_BIT};
