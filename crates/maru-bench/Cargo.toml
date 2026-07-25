@@ -7,4 +7,6 @@ description = "Maru bench harness (M0: SIMD math microbenches, native + wasm)"
 
 [dependencies]
 maru-math = { path = "../maru-math" }
+maru-collide = { path = "../maru-collide" }
+maru-dynamics = { path = "../maru-dynamics" }
 wide = { workspace = true }

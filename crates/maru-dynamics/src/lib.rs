@@ -4,6 +4,7 @@
 
 mod body;
 mod joint;
+mod snapshot;
 mod solver;
 mod world;
 
@@ -242,15 +243,16 @@ mod tests {
     }
 
     /// M2 수용 기준: hinge 체인 20링크 + 접촉 혼합 수렴 (설계 §11 M2).
-    /// 앵커를 바닥 바로 위(y=0.6)에 둬 전 링크가 즉시 바닥과 접촉 — 채찍 혼돈 없이
-    /// 접촉+조인트 혼합 수렴 자체를 판정한다 (혼돈 안무는 판정 대상 아님).
+    /// 체인을 **바닥에 눕힌 상태**로 검증한다 — 전 링크가 동시에 접촉 제약과 조인트 제약을
+    /// 받는 결정적 시나리오. (공중에서 떨어뜨리면 혼돈계라 더미 형태가 플랫폼마다 달라
+    /// 판정 기준으로 쓸 수 없다 — 낙하 케이스는 아래 무발산 테스트가 담당.)
     #[test]
-    fn hinge_chain_20_links_with_ground_contact() {
+    fn hinge_chain_20_links_on_ground() {
         let mut w = World::new(WorldParams::default());
         ground(&mut w);
         let anchor = w.add_body(Body::new_static(
             Shape::Sphere { radius: 0.05 },
-            pose(0.0, 0.6, 0.0),
+            pose(0.0, 0.1, 0.0),
         ));
         let mut prev = anchor.index as usize;
         let mut links = Vec::new();
@@ -261,7 +263,7 @@ mod tests {
                     half: Vec3::new(0.4, 0.1, 0.1),
                     radius: 0.0,
                 },
-                pose(x, 0.6, 0.0),
+                pose(x, 0.1, 0.0), // 바닥 위에 정확히 누움
                 1.0,
             ));
             let ap = if i == 0 {
@@ -280,36 +282,139 @@ mod tests {
             links.push(h);
             prev = h.index as usize;
         }
-        // 낙하 → 전 링크 접촉 + 조인트 동시 해석 → 정착 → 슬립
-        for _ in 0..720 {
+        for _ in 0..480 {
             w.step(DT);
         }
-        let mut grounded = 0;
         for (i, h) in links.iter().enumerate() {
             let b = w.body(*h);
             assert!(b.pose.pos.y.is_finite(), "link {i} 발산");
-            assert!(b.linvel.length() < 0.5, "link {i} 미정착: {:?}", b.linvel);
-            // 접힌 체인은 3~4층으로 쌓일 수 있음(y≈0.7±) — 진짜 공중 잔류만 금지.
-            // wasm/native는 혼돈계 더미 형태가 다름(L0는 플랫폼별 계약 — 설계 §8)
-            assert!(b.pose.pos.y < 1.2, "link {i} 공중 잔류: {:?}", b.pose.pos);
-            if b.pose.pos.y < 0.3 {
-                grounded += 1;
-            }
+            assert!(b.linvel.length() < 0.05, "link {i} 미정착: {:?}", b.linvel);
+            // 접촉이 실제로 유지되는가 (가라앉지도, 튀어오르지도 않음)
+            assert!(
+                (b.pose.pos.y - 0.1).abs() < 0.02,
+                "link {i} 높이 이탈: {:?}",
+                b.pose.pos
+            );
         }
-        assert!(
-            grounded >= 10,
-            "바닥 정착 링크 {grounded}개 — 혼합 수렴 미발생"
-        );
-        // 조인트 오차: 인접 링크 앵커 간 거리 (혼합 상태에서도 조인트가 유지되는가)
+        // 조인트가 접촉과 동시에 유지되는가 (혼합 수렴의 핵심 판정)
         for i in 1..20 {
             let a = w.body(links[i - 1]);
             let b = w.body(links[i]);
             let pa = a.pose.pos + a.pose.rot.rotate(Vec3::new(0.4, 0.0, 0.0));
             let pb = b.pose.pos + b.pose.rot.rotate(Vec3::new(-0.4, 0.0, 0.0));
-            let err = (pa - pb).length();
-            assert!(err < 0.05, "joint {i} 벌어짐 {err}");
+            assert!(
+                (pa - pb).length() < 0.02,
+                "joint {i} 벌어짐 {}",
+                (pa - pb).length()
+            );
         }
     }
+
+    /// 낙하 체인(혼돈계): 형태는 판정하지 않고 무발산·정착·조인트 유지만 본다.
+    #[test]
+    fn hinge_chain_dropped_does_not_diverge() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.05 },
+            pose(0.0, 3.0, 0.0),
+        ));
+        let mut prev = anchor.index as usize;
+        let mut links = Vec::new();
+        for i in 0..20 {
+            let x = 0.4 + i as f32 * 0.8;
+            let h = w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.4, 0.1, 0.1),
+                    radius: 0.0,
+                },
+                pose(x, 3.0, 0.0),
+                1.0,
+            ));
+            let ap = if i == 0 {
+                Vec3::ZERO
+            } else {
+                Vec3::new(0.4, 0.0, 0.0)
+            };
+            w.add_joint(Joint::hinge(
+                prev,
+                h.index as usize,
+                ap,
+                Vec3::new(-0.4, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ));
+            links.push(h);
+            prev = h.index as usize;
+        }
+        for _ in 0..720 {
+            w.step(DT);
+        }
+        for (i, h) in links.iter().enumerate() {
+            let b = w.body(*h);
+            assert!(b.pose.pos.y.is_finite(), "link {i} 발산");
+            assert!(b.linvel.length() < 0.5, "link {i} 미정착: {:?}", b.linvel);
+        }
+        for i in 1..20 {
+            let a = w.body(links[i - 1]);
+            let b = w.body(links[i]);
+            let pa = a.pose.pos + a.pose.rot.rotate(Vec3::new(0.4, 0.0, 0.0));
+            let pb = b.pose.pos + b.pose.rot.rotate(Vec3::new(-0.4, 0.0, 0.0));
+            assert!((pa - pb).length() < 0.05, "joint {i} 벌어짐");
+        }
+    }
+
+    fn pyramid(w: &mut World, tiers: usize) -> Vec<BodyHandle> {
+        let mut hs = Vec::new();
+        let half = 0.5f32;
+        for tier in 0..tiers {
+            let count = tiers - tier;
+            let y = half + tier as f32 * 2.0 * half;
+            let x0 = -(count as f32 - 1.0) * half;
+            for i in 0..count {
+                hs.push(w.add_body(Body::new_dynamic(
+                    Shape::Box {
+                        half: Vec3::new(half, half, half),
+                        radius: 0.0,
+                    },
+                    pose(x0 + i as f32 * 2.0 * half, y, 0.0),
+                    1.0,
+                )));
+            }
+        }
+        hs
+    }
+
+    fn assert_pyramid_stable(w: &World, hs: &[BodyHandle], tiers: usize) {
+        for (idx, h) in hs.iter().enumerate() {
+            let b = w.body(*h);
+            assert!(b.pose.pos.y.is_finite(), "box {idx} 발산");
+            assert!(b.linvel.length() < 0.2, "box {idx} 미정착: {:?}", b.linvel);
+        }
+        // 꼭대기 박스가 제 높이를 유지 (붕괴 판정)
+        let top = w.body(*hs.last().unwrap());
+        let expect_y = 0.5 + (tiers - 1) as f32;
+        assert!(
+            (top.pose.pos.y - expect_y).abs() < 0.15,
+            "정상 y={} expect {expect_y} — 붕괴",
+            top.pose.pos.y
+        );
+    }
+
+    /// 피라미드 10단 (55박스) — CI 상시 게이트 (100단의 축소판)
+    #[test]
+    fn pyramid_10_tiers_stable() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let hs = pyramid(&mut w, 10);
+        for _ in 0..600 {
+            w.step(DT);
+        }
+        assert_pyramid_stable(&w, &hs, 10);
+    }
+
+    // 피라미드 100단(5050박스) 수용 벤치는 `maru-bench --bin pyramid100`이 정본
+    // (release 전용, 수십 초 소요 — CI는 위 10단 게이트가 담당).
 
     /// 결정론 L0 스모크: 같은 씬 2회 실행 → 비트 동일
     #[test]

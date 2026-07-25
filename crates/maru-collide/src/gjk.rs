@@ -46,6 +46,26 @@ pub enum GjkResult {
 const MAX_ITER: usize = 64;
 const REL_EPS: f32 = 1.0e-6;
 
+/// 사면체가 EPA 시드로 쓸 수 있는 부피를 갖는가.
+/// **상대 임계**: 절대 임계는 스케일에 취약하다 — 1m 박스 쌍의 vol=5e-10 시드가 절대 1e-10을
+/// 통과해 EPA 폴리토프를 폭주시킨 실사고(피라미드 100단, 인접 박스 면접촉)로 도입.
+#[inline]
+fn tetra_has_volume(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> bool {
+    let vol = (b - a).cross(c - a).dot(d - a);
+    let max_e2 = [
+        (b - a).length_sq(),
+        (c - a).length_sq(),
+        (d - a).length_sq(),
+        (c - b).length_sq(),
+        (d - b).length_sq(),
+        (d - c).length_sq(),
+    ]
+    .iter()
+    .fold(0.0f32, |m, v| m.max(*v));
+    let scale_cubed = max_e2 * max_e2.sqrt(); // L³
+    vol.abs() > 1.0e-6 * scale_cubed.max(1.0e-20)
+}
+
 #[inline]
 fn support(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, d: Vec3) -> SupportPoint {
     let on_a = pa.support_core(sa, d);
@@ -81,7 +101,7 @@ pub fn gjk(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> GjkResult {
             debug_assert_eq!(simplex.len(), 4);
             // 퇴화(평면) 사면체는 EPA 시드가 될 수 없음 → 접촉(깊이≈0)으로 강등
             let (a, b, c, d) = (simplex[0].w, simplex[1].w, simplex[2].w, simplex[3].w);
-            if (b - a).cross(c - a).dot(d - a).abs() < 1.0e-10 {
+            if !tetra_has_volume(a, b, c, d) {
                 return separated_with_normal(&simplex[..3], Vec3::ZERO, previous_v);
             }
             return GjkResult::Intersecting([simplex[0], simplex[1], simplex[2], simplex[3]]);
@@ -126,8 +146,7 @@ fn complete_on_boundary(
             for i in 0..cands.len() {
                 for s2 in cands.iter().skip(i + 1) {
                     let s1 = cands[i];
-                    let vol = ab.cross(s1.w - a.w).dot(s2.w - a.w);
-                    if vol.abs() > 1.0e-10 {
+                    if tetra_has_volume(a.w, b.w, s1.w, s2.w) {
                         return GjkResult::Intersecting([a, b, s1, *s2]);
                     }
                 }
@@ -141,11 +160,11 @@ fn complete_on_boundary(
                 return separated_with_normal(simplex, Vec3::ZERO, fallback_normal);
             }
             let s1 = sup(n);
-            if (s1.w - a.w).dot(n).abs() > 1.0e-8 {
+            if tetra_has_volume(a.w, b.w, c.w, s1.w) {
                 return GjkResult::Intersecting([a, b, c, s1]);
             }
             let s2 = sup(-n);
-            if (s2.w - a.w).dot(n).abs() > 1.0e-8 {
+            if tetra_has_volume(a.w, b.w, c.w, s2.w) {
                 return GjkResult::Intersecting([a, b, c, s2]);
             }
             separated_with_normal(simplex, Vec3::ZERO, fallback_normal)
@@ -393,6 +412,50 @@ mod tests {
                 assert!((normal.y - 1.0).abs() < 1.0e-6, "normal={normal:?}");
             }
             r => panic!("expected touching separation: {r:?}"),
+        }
+    }
+
+    /// 회귀(피라미드 100단 실사고): 인접 박스가 거의 정확히 면접촉하면 GJK가 부피 5e-10짜리
+    /// 사면체를 EPA 시드로 넘겨 폴리토프가 폭주했다(스텝 16에서 무한 확장). 상대 퇴화 판정으로
+    /// 깊이 0 접촉으로 강등되어야 한다.
+    #[test]
+    fn near_flat_intersection_degrades_to_zero_depth_contact() {
+        let s = Shape::Box {
+            half: Vec3::new(0.5, 0.5, 0.5),
+            radius: 0.0,
+        };
+        let pa = Pose {
+            pos: Vec3::new(-19.046108, 55.40236, 0.0023186088),
+            rot: Quat {
+                x: 0.00012426352,
+                y: -0.0014365312,
+                z: -0.001989146,
+                w: 0.99999696,
+            },
+        };
+        let pb = Pose {
+            pos: Vec3::new(-18.045982, 55.3985, 0.0027412514),
+            rot: Quat {
+                x: 0.0006017331,
+                y: -0.0013692725,
+                z: -0.001860802,
+                w: 0.9999972,
+            },
+        };
+        match gjk(&s, &pa, &s, &pb) {
+            GjkResult::Separated {
+                distance, normal, ..
+            } => {
+                assert!(distance < 1.0e-4, "distance={distance}");
+                // A는 B의 왼쪽 → −x로 밀어야 분리
+                assert!(normal.x < -0.99, "normal={normal:?}");
+            }
+            GjkResult::Intersecting(seed) => {
+                // 시드를 넘긴다면 EPA가 쓸 수 있는 부피여야 한다
+                let v: Vec<Vec3> = seed.iter().map(|p| p.w).collect();
+                let vol = (v[1] - v[0]).cross(v[2] - v[0]).dot(v[3] - v[0]).abs();
+                assert!(vol > 1.0e-7, "퇴화 시드가 EPA로 새어나감 vol={vol:e}");
+            }
         }
     }
 

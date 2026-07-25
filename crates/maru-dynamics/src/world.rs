@@ -107,6 +107,59 @@ impl World {
         self.joints.len() - 1
     }
 
+    /// 캐노니컬 상태 접근 (snapshot 모듈 전용).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn canonical_parts(
+        &self,
+    ) -> (
+        &Vec<Body>,
+        &Vec<f32>,
+        &Vec<bool>,
+        &Vec<Joint>,
+        &HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+    ) {
+        (
+            &self.bodies,
+            &self.sleep_timer,
+            &self.asleep,
+            &self.joints,
+            &self.contact_cache,
+        )
+    }
+
+    pub(crate) fn restore_parts(
+        &mut self,
+        bodies: Vec<Body>,
+        sleep_timer: Vec<f32>,
+        asleep: Vec<bool>,
+        joints: Vec<Joint>,
+        cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+    ) {
+        self.generations = vec![0; bodies.len()];
+        self.bodies = bodies;
+        self.sleep_timer = sleep_timer;
+        self.asleep = asleep;
+        self.joints = joints;
+        self.contact_cache = cache;
+    }
+
+    /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut w = crate::snapshot::Writer(Vec::new());
+        crate::snapshot::write_world(self, &mut w);
+        w.0
+    }
+
+    /// 스냅샷 복원. 재생은 원 실행과 같은 타깃에서 L0 비트 동일.
+    pub fn restore(&mut self, bytes: &[u8]) {
+        crate::snapshot::read_world(self, bytes);
+    }
+
+    /// L0 상태 해시 (리플레이 CI 비교).
+    pub fn state_hash(&self) -> u64 {
+        crate::snapshot::state_hash(&self.snapshot())
+    }
+
     fn wake(&mut self, i: usize) {
         self.asleep[i] = false;
         self.sleep_timer[i] = 0.0;

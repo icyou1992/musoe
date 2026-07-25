@@ -20,6 +20,9 @@ pub struct Penetration {
 
 const MAX_ITER: usize = 64;
 const EPS: f32 = 1.0e-5;
+/// 폴리토프 크기 하드 상한 — 퇴화 시드가 들어와도 **절대 무한 확장하지 않는다**(설계 §6
+/// "유한 자원" 규율). 초과 시 현재 최근접 면으로 결정적 마감.
+const MAX_FACES: usize = 512;
 
 #[derive(Clone, Copy)]
 struct Face {
@@ -91,6 +94,9 @@ pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose
         // 확장량이 없으면 수렴
         if w.w.dot(f.n) - f.d < EPS {
             return finish(&verts, f);
+        }
+        if faces.len() > MAX_FACES {
+            break; // 상한 도달 → 아래 alive 최근접 면으로 마감
         }
         // 새 정점에서 보이는 면 제거, horizon 에지 수집
         let wi = verts.len();
