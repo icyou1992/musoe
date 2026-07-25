@@ -9,6 +9,7 @@
 
 use crate::epa::epa;
 use crate::gjk::{gjk, GjkResult};
+use crate::tolerance::{characteristic_length, length_sq_eps};
 use crate::{Pose, Shape};
 use maru_math::{Quat, Vec3};
 
@@ -77,7 +78,8 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
         },
     ) = (sa, sb)
     {
-        if let Some(m) = clip_box_box(*ha, *ra_box, pa, *hb, *rb_box, pb, normal, margin) {
+        let eps_l2 = length_sq_eps(characteristic_length(sa, sb));
+        if let Some(m) = clip_box_box(eps_l2, *ha, *ra_box, pa, *hb, *rb_box, pb, normal, margin) {
             return Some(m);
         }
     }
@@ -167,7 +169,9 @@ fn best_face(rot: Quat, want: Vec3) -> (usize, f32) {
 
 /// box-box 면 클리핑. 법선이 면 지배적이 아니면 None(→ witness 폴백).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn clip_box_box(
+    eps_l2: f32,
     ha: Vec3,
     ra: f32,
     pa: &Pose,
@@ -206,11 +210,11 @@ fn clip_box_box(
     if (rverts[1] - rverts[0])
         .cross(rverts[2] - rverts[1])
         .length_sq()
-        <= 1.0e-12
+        <= eps_l2
         || (iverts[1] - iverts[0])
             .cross(iverts[2] - iverts[1])
             .length_sq()
-            <= 1.0e-12
+            <= eps_l2
     {
         return None;
     }
@@ -514,6 +518,50 @@ mod tests {
             for q in m.points.iter().skip(i + 1) {
                 let d = (p.position - q.position).length_sq();
                 assert!(d > 1.0e-8, "중복 접점: {p:?} vs {q:?}");
+            }
+        }
+    }
+
+    /// 리뷰 요구: **metamorphic 스케일 테스트**. 같은 씬을 1e-3~1e2배로 변환해도
+    /// 접촉 판정·법선·상대 침투가 유지되어야 한다(절대 임계가 남아 있으면 여기서 깨진다).
+    #[test]
+    fn contact_is_scale_invariant() {
+        for &k in &[1.0e-3f32, 1.0e-1, 1.0, 1.0e1, 1.0e2] {
+            let top = Shape::Box {
+                half: Vec3::new(k, k, k),
+                radius: 0.0,
+            };
+            let ground = Shape::Box {
+                half: Vec3::new(4.0 * k, k, 4.0 * k),
+                radius: 0.0,
+            };
+            // 상대 침투 1% 로 동일하게 구성
+            let m = contact(
+                &top,
+                &pose(0.0, 1.99 * k, 0.0),
+                &ground,
+                &pose(0.0, 0.0, 0.0),
+                0.05 * k,
+            )
+            .unwrap_or_else(|| panic!("scale {k}: 접촉 소실"));
+            assert_eq!(
+                m.points.len(),
+                4,
+                "scale {k}: 매니폴드 점수 {}",
+                m.points.len()
+            );
+            assert!(
+                (m.normal.y - 1.0).abs() < 1.0e-3,
+                "scale {k}: 법선 {:?}",
+                m.normal
+            );
+            for p in &m.points {
+                let rel = p.separation / k;
+                assert!(
+                    (rel + 0.01).abs() < 0.05,
+                    "scale {k}: 상대 침투 {rel} (절대 {})",
+                    p.separation
+                );
             }
         }
     }

@@ -10,6 +10,7 @@ mod gjk;
 mod manifold;
 mod pairs;
 mod shape;
+mod tolerance;
 mod tree;
 
 pub use aabb::Aabb;
@@ -19,4 +20,5 @@ pub use manifold::{contact, ContactPoint, FeatureId, Manifold};
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, STATIC_BIT};
 pub use shape::Shape;
+pub use tolerance::{bary_denom_eps, characteristic_length, length_eps, length_sq_eps, volume_eps};
 pub use tree::Tree;

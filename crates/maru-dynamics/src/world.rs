@@ -263,90 +263,93 @@ impl World {
             })
             .collect();
 
+        // 1.5) **wake 폐쇄를 제약 생성보다 먼저 끝낸다** (리뷰 MAJOR).
+        // 단일 패스로 섞으면 pair 순서에 따라 이미 스킵된 하위 접촉이 이번 스텝에 제약을
+        // 얻지 못한다: 잠든 스택 (1,ground)/(1,2)/(2,3)이 먼저 스킵된 뒤 (3,4)가 아일랜드를
+        // 깨우면 그 프레임은 지지망 없이 중력만 적분된다.
+        // 아일랜드 단위 wake이므로 한 바퀴로 폐쇄된다(전파는 wake() 내부에서 완결).
+        for &(a_id, b_raw) in &pairs {
+            let is_static_pair = b_raw & STATIC_BIT != 0;
+            let b_plain = b_raw & !STATIC_BIT;
+            if excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
+                continue;
+            }
+            let (a, b) = (a_id as usize, b_plain as usize);
+            let active = |i: usize, this: &Self| match this.bodies[i].body_type {
+                BodyType::Kinematic => true,
+                BodyType::Dynamic => !this.asleep[i],
+                BodyType::Static => false,
+            };
+            let sleeping_dyn =
+                |i: usize, this: &Self| this.bodies[i].is_dynamic() && this.asleep[i];
+            let a_sleep = sleeping_dyn(a, self);
+            let b_sleep = !is_static_pair && sleeping_dyn(b, self);
+            // static은 **비활성** anchor다(설계 §4.6). 정적 상대를 활성으로 치면 바닥에 얹힌
+            // 스택이 매 스텝 깨어나 영영 잠들지 못한다.
+            let b_active = !is_static_pair && active(b, self);
+            let wake_a = a_sleep && b_active;
+            let wake_b = b_sleep && active(a, self);
+            if !wake_a && !wake_b {
+                continue;
+            }
+            // 실제 접촉이 있을 때만 깨운다 (AABB 근접만으로 깨우면 스택이 영영 못 잔다)
+            if contact(
+                &self.bodies[a].shape,
+                &self.bodies[a].pose,
+                &self.bodies[b].shape,
+                &self.bodies[b].pose,
+                self.params.speculative_margin,
+            )
+            .is_some()
+            {
+                if wake_a {
+                    self.wake(a);
+                }
+                if wake_b {
+                    self.wake(b);
+                }
+            }
+        }
+
         // 2) 내로우페이즈 → 제약 준비 (A=첫 인덱스, B=둘째 — canonical 순서가 곧 해석 순서)
         //    PCM 캐시에서 feature 일치 접점의 임펄스를 warm load (설계 §3)
         let mut constraints: Vec<ContactConstraint> = Vec::new();
         let mut constraint_keys: Vec<(u32, u32)> = Vec::new();
         let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
-        for (a_id, b_raw) in pairs {
+        let mut live_keys: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        for &(a_id, b_raw) in &pairs {
             let key = (a_id, b_raw);
             let is_static_pair = b_raw & STATIC_BIT != 0;
-            // 조인트 연결 쌍 충돌 제외 — 정적 상대 포함 (앵커 바디와의 접촉이 조인트와 맞서며
-            // 영구 에너지 주입 → link0 발산 실증). 비교는 STATIC_BIT를 벗긴 실제 인덱스로.
             let b_plain = b_raw & !STATIC_BIT;
             if excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
                 continue;
             }
-            let b_id = (b_raw & !STATIC_BIT) as usize;
-            let a_id = a_id as usize;
-            // level-trigger(설계 §4.6): 양쪽 모두 비활성(sleeping/static)이면 스킵.
-            // 한쪽이 깨어있는 동적이면 잠든 상대를 깨워 정상 해석.
-            let a_asleep = self.asleep[a_id];
-            let b_asleep = if is_static_pair {
-                true
-            } else {
-                self.asleep[b_id]
+            let (a_id, b_id) = (a_id as usize, b_plain as usize);
+            // 양쪽 모두 비활성이면 제약 없음. wake는 위 1.5에서 이미 끝났다.
+            let a_asleep = !self.bodies[a_id].is_dynamic() || self.asleep[a_id];
+            let b_asleep = is_static_pair || !self.bodies[b_id].is_dynamic() || self.asleep[b_id];
+            let a_inactive = match self.bodies[a_id].body_type {
+                BodyType::Kinematic => false,
+                BodyType::Dynamic => self.asleep[a_id],
+                BodyType::Static => true,
             };
-            if a_asleep && b_asleep {
+            let b_inactive = match self.bodies[b_id].body_type {
+                BodyType::Kinematic => false,
+                BodyType::Dynamic => is_static_pair || self.asleep[b_id],
+                BodyType::Static => true,
+            };
+            if a_inactive && b_inactive {
+                live_keys.insert(key); // 잠든 페어의 PCM은 보존한다(아래 5))
                 continue;
             }
+            let _ = (a_asleep, b_asleep);
             let (sa, pa) = (&self.bodies[a_id].shape, &self.bodies[a_id].pose);
             let (sb, pb) = (&self.bodies[b_id].shape, &self.bodies[b_id].pose);
             if let Some(m) = contact(sa, pa, sb, pb, self.params.speculative_margin) {
                 if !m.points.is_empty() {
-                    if a_asleep {
-                        self.wake(a_id);
-                    }
-                    if !is_static_pair && self.asleep[b_id] {
-                        self.wake(b_id);
-                    }
-                    // 방어선: wake 후에도 잠든 동적 바디가 남아 있으면 제약을 만들지 않는다
-                    // (위치 적분 없이 속도만 펌핑되는 경로 차단 — 리뷰 BLOCKER)
-                    let a_still_asleep = self.bodies[a_id].is_dynamic() && self.asleep[a_id];
-                    let b_still_asleep =
-                        !is_static_pair && self.bodies[b_id].is_dynamic() && self.asleep[b_id];
-                    if a_still_asleep || b_still_asleep {
-                        continue;
-                    }
                     let cached = self.contact_cache.get(&key).unwrap_or(&empty);
                     for p in &m.points {
                         self.warm_total += 1;
-                        if -p.separation > 1.0 && self.max_penetration <= 1.0 {
-                            let (qa, qb) = (self.bodies[a_id].pose.rot, self.bodies[b_id].pose.rot);
-                            let g = maru_collide::gjk(
-                                &self.bodies[a_id].shape,
-                                &self.bodies[a_id].pose,
-                                &self.bodies[b_id].shape,
-                                &self.bodies[b_id].pose,
-                            );
-                            eprintln!(
-                                "   GJK={}  shapes a={:?} b={:?}",
-                                match g {
-                                    maru_collide::GjkResult::Separated {
-                                        distance, normal, ..
-                                    } => format!("Sep d={distance:e} n={normal:?}"),
-                                    maru_collide::GjkResult::Intersecting(_) =>
-                                        "Intersecting".to_string(),
-                                },
-                                self.bodies[a_id].shape,
-                                self.bodies[b_id].shape
-                            );
-                            eprintln!(
-                                "DEEP pa=({:?},{},{},{},{}) pb=({:?},{},{},{},{}) n={:?} sep={}",
-                                self.bodies[a_id].pose.pos,
-                                qa.x,
-                                qa.y,
-                                qa.z,
-                                qa.w,
-                                self.bodies[b_id].pose.pos,
-                                qb.x,
-                                qb.y,
-                                qb.z,
-                                qb.w,
-                                m.normal,
-                                p.separation
-                            );
-                        }
                         self.max_penetration = self.max_penetration.max(-p.separation);
                         if cached.iter().any(|(f, _)| *f == p.feature) {
                             self.warm_hits += 1;
@@ -354,6 +357,7 @@ impl World {
                     }
                     constraints.push(solver::prepare(&self.bodies, a_id, b_id, &m, cached));
                     constraint_keys.push(key);
+                    live_keys.insert(key);
                 }
             }
         }
@@ -449,8 +453,10 @@ impl World {
             );
         }
 
-        // 5) PCM 캐시 갱신 — 이번 스텝의 최종 임펄스를 feature 키로 저장 (사라진 페어는 폐기)
-        self.contact_cache.clear();
+        // 5) PCM 캐시 갱신. **잠든 페어의 엔트리는 보존**한다 — 전체 clear는 첫 수면 스텝에
+        //    지속 매니폴드를 날려, 나중에 깨어날 때 warm start 없이 거칠게 재정착한다(리뷰 지적).
+        //    이번 스텝에 살아있지 않은(페어 소멸) 키만 폐기.
+        self.contact_cache.retain(|k, _| live_keys.contains(k));
         for (c, key) in constraints.iter().zip(&constraint_keys) {
             let entry: Vec<(FeatureId, CachedImpulse)> = c
                 .points
@@ -461,6 +467,8 @@ impl World {
                         CachedImpulse {
                             normal: p.normal_impulse,
                             tangent: p.tangent_impulse,
+                            tangent_world: c.tangents[0] * p.tangent_impulse[0]
+                                + c.tangents[1] * p.tangent_impulse[1],
                         },
                     )
                 })

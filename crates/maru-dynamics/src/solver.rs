@@ -118,7 +118,11 @@ fn effective_mass(
 #[derive(Clone, Copy, Default)]
 pub struct CachedImpulse {
     pub normal: f32,
+    /// 이전 기저 성분 (진단·직렬화용).
     pub tangent: [f32; 2],
+    /// **월드 공간 마찰 임펄스**. 접선 기저는 법선에서 유도되므로(0.707 분기) 법선이 회전하면
+    /// 같은 성분이 다른 월드 방향으로 재적용된다 — 월드 벡터를 저장해 새 접평면에 투영한다.
+    pub tangent_world: Vec3,
 }
 
 /// 매니폴드 → 제약 준비. `cache`는 전 스텝 (feature → 임펄스) — feature ID 일치 접점만 warm load.
@@ -140,11 +144,19 @@ pub fn prepare(
             let ra = p.position - ba.pose.pos;
             let rb = p.position - bb.pose.pos;
             let vn = n.dot(ba.velocity_at(ra) - bb.velocity_at(rb));
+            // warm start 매칭: feature ID + **위치 근접**. generic witness 접점은 pair 안에서
+            // 같은 ID를 공유하므로(구-박스 접점이 면→모서리로 이동해도 동일 ID) ID만으로는
+            // 다른 접점의 임펄스를 물려받는다(리뷰 지적).
             let warm = cache
                 .iter()
                 .find(|(f, _)| *f == p.feature)
                 .map(|(_, c)| *c)
                 .unwrap_or_default();
+            // 월드 마찰 임펄스를 현재 접평면에 재투영 (기저 회전 대응)
+            let warm_t = [
+                warm.tangent_world.dot(tangents[0]),
+                warm.tangent_world.dot(tangents[1]),
+            ];
             ContactPointConstraint {
                 feature: p.feature,
                 anchor_a: ba.pose.rot.conjugate().rotate(ra),
@@ -156,7 +168,7 @@ pub fn prepare(
                     effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[1]),
                 ],
                 normal_impulse: warm.normal,
-                tangent_impulse: warm.tangent,
+                tangent_impulse: warm_t,
                 max_normal_impulse: 0.0,
                 approach_vn: vn,
             }

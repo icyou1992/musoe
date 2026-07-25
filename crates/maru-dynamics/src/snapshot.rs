@@ -179,6 +179,7 @@ pub fn write_world(world: &World, w: &mut Writer) {
             w.f32(imp.normal);
             w.f32(imp.tangent[0]);
             w.f32(imp.tangent[1]);
+            w.vec3(imp.tangent_world);
         }
     }
 }
@@ -261,6 +262,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) {
                 let imp = crate::solver::CachedImpulse {
                     normal: r.f32(),
                     tangent: [r.f32(), r.f32()],
+                    tangent_world: r.vec3(),
                 };
                 (fid, imp)
             })

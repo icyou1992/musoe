@@ -5,6 +5,7 @@
 //! Intersecting이면 원점을 감싸는 사면체 심플렉스를 반환(EPA 시드).
 //! 결정론: 반복 상한 고정, 탐색 방향·리덕션이 입력만의 함수.
 
+use crate::tolerance::{bary_denom_eps, characteristic_length, length_sq_eps, volume_eps};
 use crate::Shape;
 use maru_math::{Quat, Vec3};
 
@@ -63,7 +64,7 @@ fn tetra_has_volume(a: Vec3, b: Vec3, c: Vec3, d: Vec3) -> bool {
     .iter()
     .fold(0.0f32, |m, v| m.max(*v));
     let scale_cubed = max_e2 * max_e2.sqrt(); // L³
-    vol.abs() > 1.0e-6 * scale_cubed.max(1.0e-20)
+    vol.abs() > 1.0e-6 * scale_cubed.max(1.0e-30)
 }
 
 #[inline]
@@ -78,8 +79,11 @@ fn support(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, d: Vec3) -> SupportPoin
 }
 
 pub fn gjk(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> GjkResult {
+    // 차원별 톨러런스 (설계 §8·리뷰 MAJOR): 절대 상수는 씬 스케일에서 깨진다.
+    let scale = characteristic_length(sa, sb);
+    let eps_l2 = length_sq_eps(scale);
     let mut dir = pa.pos - pb.pos;
-    if dir.length_sq() < 1.0e-12 {
+    if dir.length_sq() < eps_l2 {
         dir = Vec3::new(1.0, 0.0, 0.0);
     }
     let mut simplex: Vec<SupportPoint> = Vec::with_capacity(4);
@@ -99,15 +103,16 @@ pub fn gjk(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> GjkResult {
             debug_assert_eq!(simplex.len(), 4);
             // 퇴화(평면) 사면체는 EPA 시드가 될 수 없음 → 접촉(깊이≈0)으로 강등
             let (a, b, c, d) = (simplex[0].w, simplex[1].w, simplex[2].w, simplex[3].w);
+            let _ = volume_eps(scale); // 부피 판정은 tetra_has_volume이 상대 기준으로 수행
             if !tetra_has_volume(a, b, c, d) {
                 return separated_with_normal(&simplex[..3], Vec3::ZERO, previous_v);
             }
             return GjkResult::Intersecting([simplex[0], simplex[1], simplex[2], simplex[3]]);
         }
-        if new_v.length_sq() <= 1.0e-12 {
+        if new_v.length_sq() <= eps_l2 {
             // 원점이 심플렉스 위. 리덕션 루프를 계속 돌면 수직 확장이 매번 같은 심플렉스로
             // 되돌아와 순환한다(축 정렬 깊은 교차에서 실증) — 리덕션 없이 즉시 사면체를 완성.
-            return complete_on_boundary(&simplex, sa, pa, sb, pb, previous_v);
+            return complete_on_boundary(&simplex, sa, pa, sb, pb, previous_v, eps_l2);
         }
         v = new_v;
     }
@@ -123,6 +128,7 @@ fn complete_on_boundary(
     sb: &Shape,
     pb: &Pose,
     fallback_normal: Vec3,
+    eps_l2: f32,
 ) -> GjkResult {
     let sup = |d: Vec3| support(sa, pa, sb, pb, d);
     match simplex.len() {
@@ -132,7 +138,7 @@ fn complete_on_boundary(
             let (a, b) = (simplex[0], simplex[1]);
             let ab = b.w - a.w;
             let p0 = ab.cross(Vec3::new(1.0, 0.0, 0.0));
-            let p = if p0.length_sq() > 1.0e-12 {
+            let p = if p0.length_sq() > eps_l2 {
                 p0
             } else {
                 ab.cross(Vec3::new(0.0, 1.0, 0.0))
@@ -154,7 +160,7 @@ fn complete_on_boundary(
         _ => {
             let (a, b, c) = (simplex[0], simplex[1], simplex[2]);
             let n = (b.w - a.w).cross(c.w - a.w);
-            if n.length_sq() <= 1.0e-12 {
+            if n.length_sq() <= eps_l2 {
                 return separated_with_normal(simplex, Vec3::ZERO, fallback_normal);
             }
             let s1 = sup(n);
@@ -175,13 +181,19 @@ fn separated(simplex: &[SupportPoint], v: Vec3) -> GjkResult {
 }
 
 fn separated_with_normal(simplex: &[SupportPoint], v: Vec3, fallback: Vec3) -> GjkResult {
+    // witness 바리센트릭 분모는 길이의 4제곱 — 심플렉스 자체 스케일에서 유도한다.
+    let s2 = simplex
+        .iter()
+        .map(|p| p.w.length_sq())
+        .fold(0.0f32, f32::max);
+    let denom_eps = bary_denom_eps(s2.sqrt().max(1.0e-6));
     // 비유한 값 위생 (설계 §8): NaN/Inf는 호출자의 비교·분기를 조용히 통과시킨다.
     let v = if v.x.is_finite() && v.y.is_finite() && v.z.is_finite() {
         v
     } else {
         Vec3::ZERO
     };
-    let (on_a, on_b) = witness(simplex, v);
+    let (on_a, on_b) = witness(simplex, v, denom_eps);
     let distance = v.length();
     let normal = if distance > 0.0 {
         v * (1.0 / distance)
@@ -202,7 +214,7 @@ fn separated_with_normal(simplex: &[SupportPoint], v: Vec3, fallback: Vec3) -> G
 }
 
 /// 현재 심플렉스(리덕션 후)에서 v = Σλw 를 만족하는 λ로 witness 복원.
-fn witness(simplex: &[SupportPoint], v: Vec3) -> (Vec3, Vec3) {
+fn witness(simplex: &[SupportPoint], v: Vec3, denom_eps: f32) -> (Vec3, Vec3) {
     match simplex.len() {
         0 => (Vec3::ZERO, Vec3::ZERO),
         1 => (simplex[0].on_a, simplex[0].on_b),
@@ -226,7 +238,7 @@ fn witness(simplex: &[SupportPoint], v: Vec3) -> (Vec3, Vec3) {
             let (d00, d01, d11) = (v0.dot(v0), v0.dot(v1), v1.dot(v1));
             let (d20, d21) = (v2.dot(v0), v2.dot(v1));
             let denom = d00 * d11 - d01 * d01;
-            let (bv, cv) = if denom.abs() > 1.0e-12 {
+            let (bv, cv) = if denom.abs() > denom_eps {
                 (
                     ((d11 * d20 - d01 * d21) / denom),
                     ((d00 * d21 - d01 * d20) / denom),

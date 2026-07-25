@@ -34,9 +34,11 @@ impl Body {
             density.is_finite() && density > 0.0,
             "density must be finite and positive, got {density}"
         );
-        if let Shape::Hull { points, .. } = &shape {
-            assert!(!points.is_empty(), "dynamic hull must contain points");
-        }
+        shape.validate().expect("invalid shape");
+        assert!(
+            pose.pos.is_finite() && pose.rot.is_finite(),
+            "pose must be finite"
+        );
         let (mass, inertia) = mass_properties(&shape, density);
         assert!(
             mass.is_finite()
@@ -75,6 +77,11 @@ impl Body {
     }
 
     pub fn new_static(shape: Shape, pose: Pose) -> Self {
+        shape.validate().expect("invalid shape");
+        assert!(
+            pose.pos.is_finite() && pose.rot.is_finite(),
+            "pose must be finite"
+        );
         Self {
             body_type: BodyType::Static,
             pose,
@@ -149,7 +156,10 @@ fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
             (m, Vec3::new(ixz, iy, ixz))
         }
         Shape::Hull { ref points, .. } => {
-            // [가정] v1: AABB 근사 — hull 정밀 질량은 hull 빌더와 함께
+            // [가정] v1: AABB 근사 — hull 정밀 적분은 hull 빌더와 함께.
+            // **평행축 정리 필수**: 솔버는 pose.pos를 회전 중심으로 쓰므로(r = 접점 − pose.pos),
+            // 원점에서 벗어난 hull의 관성에 m·d²를 더하지 않으면 레버암 100m에 중심 박스의
+            // 작은 관성이 곱해져 비현실적 각가속도가 난다(리뷰 지적).
             let mut min = points[0];
             let mut max = points[0];
             for p in &points[1..] {
@@ -157,7 +167,17 @@ fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
                 max = Vec3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z));
             }
             let half = (max - min) * 0.5;
-            mass_properties(&Shape::Box { half, radius: 0.0 }, density)
+            let center = (max + min) * 0.5;
+            let (m, i_center) = mass_properties(&Shape::Box { half, radius: 0.0 }, density);
+            let d = center;
+            (
+                m,
+                Vec3::new(
+                    i_center.x + m * (d.y * d.y + d.z * d.z),
+                    i_center.y + m * (d.x * d.x + d.z * d.z),
+                    i_center.z + m * (d.x * d.x + d.y * d.y),
+                ),
+            )
         }
     }
 }
@@ -185,6 +205,35 @@ mod tests {
                 rot: Quat::IDENTITY,
             },
             1.0e-40,
+        );
+    }
+
+    /// 리뷰 회귀: 원점에서 벗어난 hull은 평행축 항(m·d²)이 관성에 들어가야 한다.
+    #[test]
+    fn offset_hull_inertia_includes_parallel_axis() {
+        let far = 10.0f32;
+        let pts = vec![
+            Vec3::new(far - 0.5, -0.5, -0.5),
+            Vec3::new(far + 0.5, 0.5, 0.5),
+        ];
+        let b = Body::new_dynamic(
+            Shape::Hull {
+                points: pts,
+                radius: 0.0,
+            },
+            Pose {
+                pos: Vec3::ZERO,
+                rot: Quat::IDENTITY,
+            },
+            1.0,
+        );
+        let m = 1.0f32; // 1×1×1
+        let i_center_y = m / 3.0 * (0.25 + 0.25);
+        let expect_y = i_center_y + m * far * far; // ≈100 지배
+        assert!(
+            (1.0 / b.inv_inertia_local.y - expect_y).abs() < 0.1 * expect_y,
+            "Iyy={} expect≈{expect_y}",
+            1.0 / b.inv_inertia_local.y
         );
     }
 

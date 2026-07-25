@@ -21,6 +21,47 @@ pub enum Shape {
 }
 
 impl Shape {
+    /// 형상 불변식 검증. **모든 바디 타입의 생성 경계에서 호출된다** — static/kinematic도
+    /// 빈 hull이면 support/local_aabb가 `points[0]`에서 패닉한다(리뷰 지적).
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let r = self.radius();
+        if !r.is_finite() || r < 0.0 {
+            return Err("shape radius must be finite and non-negative");
+        }
+        match self {
+            Shape::Sphere { radius } => {
+                if !radius.is_finite() || *radius <= 0.0 {
+                    return Err("sphere radius must be finite and positive");
+                }
+            }
+            Shape::Capsule { half_height, .. } => {
+                if !half_height.is_finite() || *half_height < 0.0 {
+                    return Err("capsule half_height must be finite and non-negative");
+                }
+                if r <= 0.0 {
+                    return Err("capsule radius must be positive");
+                }
+            }
+            Shape::Box { half, .. } => {
+                if !half.is_finite() || half.x <= 0.0 || half.y <= 0.0 || half.z <= 0.0 {
+                    return Err("box half extents must be finite and positive");
+                }
+                if r > half.x.min(half.y).min(half.z) {
+                    return Err("box convex radius must not exceed the smallest half extent");
+                }
+            }
+            Shape::Hull { points, .. } => {
+                if points.is_empty() {
+                    return Err("hull must contain at least one point");
+                }
+                if !points.iter().all(|p| p.is_finite()) {
+                    return Err("hull points must be finite");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 겉면과 코어를 가르는 convex radius.
     #[inline]
     pub fn radius(&self) -> f32 {
@@ -99,6 +140,38 @@ impl Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 리뷰 회귀: 잘못된 형상은 생성 경계에서 거부되어야 한다(빈 hull은 첫 step에서 패닉했다).
+    #[test]
+    fn invalid_shapes_are_rejected() {
+        assert!(Shape::Hull {
+            points: vec![],
+            radius: 0.0
+        }
+        .validate()
+        .is_err());
+        assert!(Shape::Sphere { radius: 0.0 }.validate().is_err());
+        assert!(Shape::Sphere { radius: f32::NAN }.validate().is_err());
+        assert!(Shape::Box {
+            half: Vec3::new(1.0, -1.0, 1.0),
+            radius: 0.0
+        }
+        .validate()
+        .is_err());
+        // radius가 half를 잠식하면 평면 패치가 사라진다
+        assert!(Shape::Box {
+            half: Vec3::new(0.1, 1.0, 1.0),
+            radius: 0.5
+        }
+        .validate()
+        .is_err());
+        assert!(Shape::Box {
+            half: Vec3::new(1.0, 1.0, 1.0),
+            radius: 0.1
+        }
+        .validate()
+        .is_ok());
+    }
 
     #[test]
     fn box_core_shrinks_by_radius() {

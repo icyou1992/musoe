@@ -6,6 +6,7 @@
 //! 결정론: 최근접 면 동률은 낮은 face 인덱스 우선, 반복 상한 고정.
 
 use crate::gjk::SupportPoint;
+use crate::tolerance::{bary_denom_eps, characteristic_length, length_eps, length_sq_eps};
 use crate::{Pose, Shape};
 use maru_math::Vec3;
 
@@ -19,7 +20,6 @@ pub struct Penetration {
 }
 
 const MAX_ITER: usize = 64;
-const EPS: f32 = 1.0e-5;
 /// 폴리토프 크기 하드 상한 — 퇴화 시드가 들어와도 **절대 무한 확장하지 않는다**(설계 §6
 /// "유한 자원" 규율). 초과 시 현재 최근접 면으로 결정적 마감.
 const MAX_FACES: usize = 512;
@@ -32,13 +32,20 @@ struct Face {
     alive: bool,
 }
 
-fn make_face(verts: &[SupportPoint], i: usize, j: usize, k: usize, interior: Vec3) -> Option<Face> {
+fn make_face(
+    verts: &[SupportPoint],
+    i: usize,
+    j: usize,
+    k: usize,
+    interior: Vec3,
+    eps_l2: f32,
+) -> Option<Face> {
     let (a, b, c) = (verts[i].w, verts[j].w, verts[k].w);
     let mut n = (b - a).cross(c - a);
-    let len = n.length();
-    if len < 1.0e-10 {
-        return None; // 퇴화 면
+    if n.length_sq() < eps_l2 {
+        return None; // 퇴화 면 (L² 차원 — 절대 상수 금지)
     }
+    let len = n.length();
     n = n * (1.0 / len);
     // 바깥 법선 + **CCW 와인딩 일관성 강제**: horizon 에지 상쇄는 인접 면이 공유 에지를
     // 서로 반대 방향으로 갖는다는 가정에 선다 — 와인딩이 뒤집힌 면이 섞이면 상쇄가 실패해
@@ -58,11 +65,15 @@ fn make_face(verts: &[SupportPoint], i: usize, j: usize, k: usize, interior: Vec
 }
 
 pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> Penetration {
+    let scale = characteristic_length(sa, sb);
+    let eps_len = length_eps(scale);
+    let eps_l2 = length_sq_eps(scale);
+    let denom_eps = bary_denom_eps(scale);
     let mut verts: Vec<SupportPoint> = seed.to_vec();
     let interior = (verts[0].w + verts[1].w + verts[2].w + verts[3].w) * 0.25;
     let mut faces: Vec<Face> = Vec::with_capacity(32);
     for (i, j, k) in [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)] {
-        if let Some(f) = make_face(&verts, i, j, k, interior) {
+        if let Some(f) = make_face(&verts, i, j, k, interior, eps_l2) {
             faces.push(f);
         }
     }
@@ -92,8 +103,8 @@ pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose
             on_b,
         };
         // 확장량이 없으면 수렴
-        if w.w.dot(f.n) - f.d < EPS {
-            return finish(&verts, f);
+        if w.w.dot(f.n) - f.d < eps_len {
+            return finish(&verts, f, denom_eps);
         }
         if faces.len() > MAX_FACES {
             break; // 상한 도달 → 아래 alive 최근접 면으로 마감
@@ -120,7 +131,7 @@ pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose
             }
         }
         for &(a, b) in &horizon {
-            if let Some(nf) = make_face(&verts, a, b, wi, interior) {
+            if let Some(nf) = make_face(&verts, a, b, wi, interior, eps_l2) {
                 faces.push(nf);
             }
         }
@@ -138,13 +149,13 @@ pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose
         }
     }
     if best != usize::MAX {
-        finish(&verts, faces[best])
+        finish(&verts, faces[best], denom_eps)
     } else {
-        finish(&verts, last_best)
+        finish(&verts, last_best, denom_eps)
     }
 }
 
-fn finish(verts: &[SupportPoint], f: Face) -> Penetration {
+fn finish(verts: &[SupportPoint], f: Face, denom_eps: f32) -> Penetration {
     // 원점을 면 평면에 투영한 점 p = n·d 의 바리센트릭으로 witness 복원
     let (pa, pb, pc) = (verts[f.v[0]], verts[f.v[1]], verts[f.v[2]]);
     let p = f.n * f.d;
@@ -152,7 +163,7 @@ fn finish(verts: &[SupportPoint], f: Face) -> Penetration {
     let (d00, d01, d11) = (v0.dot(v0), v0.dot(v1), v1.dot(v1));
     let (d20, d21) = (v2.dot(v0), v2.dot(v1));
     let denom = d00 * d11 - d01 * d01;
-    let (bv, cv) = if denom.abs() > 1.0e-12 {
+    let (bv, cv) = if denom.abs() > denom_eps {
         (
             (d11 * d20 - d01 * d21) / denom,
             (d00 * d21 - d01 * d20) / denom,
