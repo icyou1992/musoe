@@ -421,8 +421,26 @@ mod tests {
         assert_pyramid_stable(&w, &hs, 10);
     }
 
-    // 피라미드 100단(5050박스) 수용 벤치는 `maru-bench --bin pyramid100`이 정본
-    // (release 전용, 수십 초 소요 — CI는 위 10단 게이트가 담당).
+    /// M2 수용 기준(2026-07-25 실측 재보정): 피라미드 40단(820박스) 안정.
+    /// release 전용 — debug는 수 분 걸린다. `cargo test --release -- --ignored`
+    /// 봉투 전체(20~100단 침하·ms/step)는 `maru-bench --bin pyramid100` + README 표.
+    #[test]
+    #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
+    fn pyramid_40_tiers_stable_acceptance() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(60.0, 1.0, 20.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        ));
+        let hs = pyramid(&mut w, 40);
+        for _ in 0..600 {
+            w.step(DT);
+        }
+        assert_pyramid_stable(&w, &hs, 40);
+    }
 
     /// 결정론 L0 스모크: 같은 씬 2회 실행 → 비트 동일
     #[test]

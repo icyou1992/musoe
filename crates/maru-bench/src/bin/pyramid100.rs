@@ -1,5 +1,6 @@
-//! M2 수용 벤치: 피라미드 100단(5050 박스) 안정성 — release 전용.
-//! 실행: cargo run --release -p maru-bench --bin pyramid100
+//! 스택 안정 봉투 벤치 — release 전용.
+//! 실행: cargo run --release -p maru-bench --bin pyramid100 -- [substeps] [steps] [tiers]
+//! M2 수용 기준은 40단(실측 재보정, README 표 참조). 100단은 현 솔버 범위 밖.
 
 use maru_collide::{Pose, Shape};
 use maru_dynamics::{Body, BodyHandle, World, WorldParams};
