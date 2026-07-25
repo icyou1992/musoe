@@ -5,7 +5,7 @@
 
 use crate::body::{Body, BodyHandle};
 use crate::solver::Softness;
-use maru_collide::{in_range, vec_in_range};
+use maru_collide::{in_state_range, vec_in_range, vec_in_state_range};
 use maru_math::{Mat3, Vec3};
 
 #[derive(Clone, Debug)]
@@ -61,9 +61,9 @@ impl Joint {
         if !vec_in_range(self.anchor_a) || !vec_in_range(self.anchor_b) {
             return Err(ApiError::InvalidValue);
         }
-        if !vec_in_range(self.linear_impulse)
-            || !in_range(self.angular_impulse[0])
-            || !in_range(self.angular_impulse[1])
+        if !vec_in_state_range(self.linear_impulse)
+            || !in_state_range(self.angular_impulse[0])
+            || !in_state_range(self.angular_impulse[1])
         {
             return Err(ApiError::InvalidValue);
         }
@@ -89,7 +89,17 @@ impl Joint {
     }
 
     pub fn point(body_a: BodyHandle, body_b: BodyHandle, anchor_a: Vec3, anchor_b: Vec3) -> Self {
-        Self {
+        Self::try_point(body_a, body_b, anchor_a, anchor_b).expect("invalid point joint")
+    }
+
+    /// 볼조인트 생성 (오류 반환형).
+    pub fn try_point(
+        body_a: BodyHandle,
+        body_b: BodyHandle,
+        anchor_a: Vec3,
+        anchor_b: Vec3,
+    ) -> Result<Self, crate::world::ApiError> {
+        let j = Self {
             body_a,
             body_b,
             anchor_a,
@@ -98,7 +108,9 @@ impl Joint {
             collide_connected: false,
             linear_impulse: Vec3::ZERO,
             angular_impulse: [0.0, 0.0],
-        }
+        };
+        j.validate()?;
+        Ok(j)
     }
 
     pub fn hinge(
@@ -109,18 +121,30 @@ impl Joint {
         axis_a: Vec3,
         axis_b: Vec3,
     ) -> Self {
-        Self {
-            kind: JointKind::Hinge {
-                // 0/NaN 축을 조용히 0으로 남기면 각 제약이 사라진다 — 생성 경계에서 거부
-                axis_a: axis_a
-                    .try_normalize()
-                    .expect("hinge axis_a must be normalizable"),
-                axis_b: axis_b
-                    .try_normalize()
-                    .expect("hinge axis_b must be normalizable"),
-            },
-            ..Self::point(body_a, body_b, anchor_a, anchor_b)
-        }
+        Self::try_hinge(body_a, body_b, anchor_a, anchor_b, axis_a, axis_b)
+            .expect("invalid hinge joint")
+    }
+
+    /// 힌지 생성 (오류 반환형 — **M3 바인딩의 정본 경로**). 0/NaN 축은 여기서 거부된다.
+    /// `try_add_joint`는 Joint가 만들어진 **뒤에** 불리므로 생성 단계의 trap을 잡지 못한다.
+    pub fn try_hinge(
+        body_a: BodyHandle,
+        body_b: BodyHandle,
+        anchor_a: Vec3,
+        anchor_b: Vec3,
+        axis_a: Vec3,
+        axis_b: Vec3,
+    ) -> Result<Self, crate::world::ApiError> {
+        use crate::world::ApiError;
+        // 0/NaN 축을 조용히 0으로 남기면 각 제약이 사라진다 — 생성 경계에서 거부
+        let axis_a = axis_a.try_normalize().ok_or(ApiError::InvalidValue)?;
+        let axis_b = axis_b.try_normalize().ok_or(ApiError::InvalidValue)?;
+        let j = Self {
+            kind: JointKind::Hinge { axis_a, axis_b },
+            ..Self::try_point(body_a, body_b, anchor_a, anchor_b)?
+        };
+        j.validate()?;
+        Ok(j)
     }
 }
 

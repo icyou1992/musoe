@@ -156,7 +156,7 @@ impl Reader<'_> {
     fn remaining(&self) -> usize {
         self.b.len() - self.at
     }
-    /// 호스트 입력에서 온 물리량 (셰이프 치수·질량·마찰·앵커) — **입력 정책**.
+    /// 호스트 입력에서 온 물리량 (앵커·마찰 등) — **입력 정책**.
     fn f32(&mut self) -> Result<f32, SnapshotError> {
         let v = self.raw_f32()?;
         if maru_collide::in_range(v) {
@@ -328,9 +328,12 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
         _ => return Err(SnapshotError::BadShape),
     };
     let pose = Pose {
-        pos: r.state_vec3()?, // 위치는 적분으로 진화한다 → 상태 정책
+        pos: r.state_vec3()?, // 위치는 적분으로 진화한다 → 상태 정책(월드 밖 이탈 허용)
         rot: r.quat()?,
     };
+    // 속도는 **파생 상태**다: 겹침 해소·충격은 정상 물리로도 입력 상한을 넘긴다.
+    // 그래서 리더는 상태 정책으로 받고, 스텝 시작의 속도 상한(물리 파라미터)이
+    // 솔버 산술에 들어가기 전에 잡는다.
     let linvel = r.state_vec3()?;
     let angvel = r.state_vec3()?;
     let inv_mass = r.f32()?;
@@ -354,10 +357,12 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
     let zero_mass = inv_mass == 0.0 && inv_inertia_local == Vec3::ZERO;
     match body_type {
         BodyType::Dynamic => {
-            if !(inv_mass > 0.0
-                && inv_inertia_local.x > 0.0
-                && inv_inertia_local.y > 0.0
-                && inv_inertia_local.z > 0.0)
+            // 질량을 **양쪽**으로 묶는다: 너무 작은 inv_mass(=거대 질량)는 조인트 솔버의
+            // K⁻¹를 폭발시켜 중간 연산에서 Inf를 만든다(리뷰 BLOCKER 공격 시나리오).
+            if !(maru_collide::inv_mass_in_range(inv_mass)
+                && maru_collide::inv_mass_in_range(inv_inertia_local.x)
+                && maru_collide::inv_mass_in_range(inv_inertia_local.y)
+                && maru_collide::inv_mass_in_range(inv_inertia_local.z))
             {
                 return Err(SnapshotError::InconsistentState);
             }

@@ -1279,7 +1279,16 @@ mod tests {
         assert_eq!(w.try_step(8.0), Err(ApiError::InvalidValue));
         assert_eq!(w.try_step(f32::NAN), Err(ApiError::InvalidValue));
         assert_eq!(w.try_step(crate::world::MAX_DT), Ok(()), "상한 자체는 합법");
-        assert_eq!(w.try_step(0.0), Ok(()), "0은 무연산");
+        // 문서와 구현 통일(리뷰 MAJOR): 0과 음수는 **합법이 아니다**.
+        // 일시정지는 step을 부르지 않는 것으로 표현한다 — "성공했는데 아무 일도 없음"이
+        // 오류와 구분되지 않으면 호스트가 정지 원인을 진단할 수 없다.
+        assert_eq!(w.try_step(0.0), Err(ApiError::InvalidValue));
+        assert_eq!(w.try_step(-DT), Err(ApiError::InvalidValue));
+        assert_eq!(
+            w.try_step(crate::world::MIN_DT * 0.5),
+            Err(ApiError::InvalidValue),
+            "너무 작은 dt는 1/h를 폭발시킨다"
+        );
     }
 
     /// BLOCKER: 입력 정책만으로는 step에 대해 닫히지 않는다 — 합법 경계값이 한 스텝 뒤
@@ -1287,15 +1296,19 @@ mod tests {
     /// 스텝 말 클램프로 "엔진이 만들 수 있는 상태 = 리더가 받는 상태"를 성립시킨다.
     #[test]
     fn legal_boundary_state_survives_step_and_roundtrip() {
-        let big = maru_collide::MAX_INPUT * 0.9;
-        let mut w = World::new(WorldParams::default());
+        // 월드 경계 바로 안쪽에서 상한 속도로 나간다 — 한 스텝이면 월드를 벗어난다.
+        let params = WorldParams::default();
+        let big = maru_collide::MAX_INPUT - 10.0;
+        let fast = params.max_linear_velocity;
+        let mut w = World::new(params);
         let h = w.add_body(Body::new_dynamic(
             Shape::Sphere { radius: 0.5 },
             pose(big, 0.0, 0.0),
             1.0,
         ));
-        w.set_linear_velocity(h, Vec3::new(big, 0.0, 0.0)).unwrap();
-        // 한 스텝이면 위치가 입력 상한을 넘는다 (0.9e9 + 0.9e9*0.25 = 1.125e9)
+        w.set_linear_velocity(h, Vec3::new(fast, 0.0, 0.0)).unwrap();
+        // 위치가 **월드 범위**를 넘는다 (물체가 월드를 벗어났다).
+        // 상태 정책 안이라 시뮬레이션은 계속되고 스냅샷도 왕복한다.
         w.try_step(crate::world::MAX_DT).unwrap();
         let p = w.body(h).pose().pos.x;
         assert!(
@@ -1307,9 +1320,10 @@ mod tests {
             "상태가 상태 정책을 벗어남: {p}"
         );
         let snap = w.snapshot();
+        let r = w.restore(&snap);
         assert!(
-            w.restore(&snap).is_ok(),
-            "step 뒤 상태가 자기 스냅샷을 복원하지 못함 (정책이 step에 대해 닫히지 않음)"
+            r.is_ok(),
+            "step 뒤 상태가 자기 스냅샷을 복원하지 못함 (정책이 step에 대해 닫히지 않음): {r:?}"
         );
     }
 
@@ -1449,13 +1463,14 @@ mod tests {
     #[test]
     fn boundary_legal_values_round_trip() {
         let big = maru_collide::MAX_INPUT * 0.9;
+        let fast = maru_collide::MAX_SPEED * 0.9;
         let mut w = World::new(WorldParams::default());
         let h = w.add_body(Body::new_dynamic(
             Shape::Sphere { radius: 0.5 },
             pose(big, 0.0, 0.0),
             1.0,
         ));
-        w.set_linear_velocity(h, Vec3::new(big, 0.0, 0.0)).unwrap();
+        w.set_linear_velocity(h, Vec3::new(fast, 0.0, 0.0)).unwrap();
         let snap = w.snapshot();
         assert!(
             w.restore(&snap).is_ok(),
@@ -1479,6 +1494,7 @@ mod tests {
             (*rng >> 16) as usize
         };
         let big = maru_collide::MAX_INPUT * 0.9;
+        let fast = maru_collide::MAX_SPEED * 0.9;
         for step_i in 0..400 {
             let f = (step_i % 5) as f32;
             match next(&mut rng) % 13 {
@@ -1550,7 +1566,9 @@ mod tests {
                         substeps: 1 + (step_i % 4) as u32,
                         ..Default::default()
                     });
-                    w.try_step(crate::world::MAX_DT).unwrap();
+                    // 월드를 벗어난 바디가 있으면 StateOverflow가 날 수 있다 — 상태는
+                    // 여전히 유효하므로 왕복 계약은 그대로 요구한다.
+                    let _ = w.try_step(crate::world::MAX_DT);
                 }
                 _ => {
                     // 경계 크기 바디 — step 뒤 상태 정책 폐쇄가 걸리는 지점
@@ -1559,15 +1577,161 @@ mod tests {
                         pose(big, 0.0, 0.0),
                         1.0,
                     ));
-                    let _ = w.set_linear_velocity(h, Vec3::new(big, 0.0, 0.0));
+                    let _ = w.set_linear_velocity(h, Vec3::new(fast, 0.0, 0.0));
                     live.push(h);
                 }
             }
             let snap = w.snapshot();
+            let r = w.restore(&snap);
             assert!(
-                w.restore(&snap).is_ok(),
-                "연산 {step_i} 이후 자기 스냅샷이 복원되지 않음 (정책 비대칭)"
+                r.is_ok(),
+                "연산 {step_i} 이후 자기 스냅샷이 복원되지 않음 (정책 비대칭): {r:?}"
             );
         }
+    }
+
+    // ─────────── 리뷰 rev_0dde9f23 회귀 ───────────
+
+    /// BLOCKER: 큰 위치 × 작은 역질량 조합은 조인트 솔버의 **중간 연산**에서 먼저 Inf가 된다.
+    /// 지원 범위를 차원별로 좁혀 그 조합 자체를 만들 수 없게 한다.
+    #[test]
+    fn snapshot_rejects_unsupported_mass_range() {
+        // 질량 1e9 kg 초과 = inv_mass < 1e-9 → 지원 범위 밖
+        assert!(!maru_collide::inv_mass_in_range(1.0e-30));
+        assert!(!maru_collide::inv_mass_in_range(1.0e12));
+        assert!(maru_collide::inv_mass_in_range(1.0));
+        // 생성 경계에서도 같은 정책 — half=1000m·density=1e9는 질량 8e18kg
+        assert!(Body::try_new_dynamic(
+            Shape::Box {
+                half: Vec3::new(1000.0, 1000.0, 1000.0),
+                radius: 0.0
+            },
+            pose(0.0, 0.0, 0.0),
+            1.0e9
+        )
+        .is_err());
+    }
+
+    /// BLOCKER: 속도 상한은 **문서화된 물리 파라미터**(Jolt mMaxLinearVelocity 계열)다.
+    /// 이것이 파생 상태를 유계로 만들어 정책이 step에 대해 닫힌다.
+    #[test]
+    fn velocity_limit_bounds_derived_state() {
+        let params = WorldParams {
+            max_linear_velocity: 50.0,
+            ..Default::default()
+        };
+        let mut w = World::new(params);
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(0.0, 0.0, 0.0),
+            1.0,
+        ));
+        w.set_linear_velocity(h, Vec3::new(1000.0, 0.0, 0.0))
+            .unwrap();
+        w.step(DT);
+        let v = w.body(h).linvel().length();
+        assert!(v <= 50.0 + 1e-3, "속도 상한이 적용되지 않음: {v}");
+        assert!(
+            w.diagnostics().velocity_clamped > 0,
+            "클램프가 집계되지 않음"
+        );
+    }
+
+    /// MAJOR: 포화는 **관측 가능**해야 한다. 서로 다른 초과 상태가 같은 값으로 합쳐지므로
+    /// 상태 해시만으로는 물리 오류가 숨는다.
+    #[test]
+    fn state_saturation_is_observable_and_reported() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let h = dyn_box(&mut w, 0.0, 3.0);
+        w.step(DT);
+        assert_eq!(
+            w.diagnostics().state_saturations,
+            0,
+            "정상 장면에서 포화 발생"
+        );
+        // 지원 범위 안에서는 StateOverflow가 나지 않는다
+        assert_eq!(w.try_step(DT), Ok(()));
+        assert!(w.body(h).pose().pos.y.is_finite());
+    }
+
+    /// PARTIAL BLOCKER: 호스트 입력 경로는 **전부** fallible이어야 한다 — wasm trap 금지.
+    #[test]
+    fn all_host_input_paths_are_fallible() {
+        // 월드 파라미터
+        assert!(World::try_new(WorldParams {
+            substeps: 0,
+            ..Default::default()
+        })
+        .is_err());
+        let mut w = World::try_new(WorldParams::default()).unwrap();
+        assert!(w
+            .try_set_params(WorldParams {
+                time_to_sleep: -1.0,
+                ..Default::default()
+            })
+            .is_err());
+        // 바디 (dynamic / static / kinematic)
+        let bad = Shape::Hull {
+            points: vec![],
+            radius: 0.0,
+        };
+        assert!(Body::try_new_dynamic(bad.clone(), pose(0.0, 0.0, 0.0), 1.0).is_err());
+        assert!(Body::try_new_static(bad.clone(), pose(0.0, 0.0, 0.0)).is_err());
+        assert!(Body::try_new_kinematic(bad, pose(0.0, 0.0, 0.0)).is_err());
+        // 조인트 — hinge 축은 Joint 생성 시점에 걸리므로 try_add_joint로는 못 잡는다
+        let a = dyn_box(&mut w, 0.0, 3.0);
+        let b = dyn_box(&mut w, 2.0, 3.0);
+        assert!(Joint::try_hinge(
+            a,
+            b,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(0.0, 1.0, 0.0)
+        )
+        .is_err());
+        assert!(Joint::try_hinge(
+            a,
+            b,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(f32::NAN, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0)
+        )
+        .is_err());
+        assert!(Joint::try_point(a, b, Vec3::new(f32::INFINITY, 0.0, 0.0), Vec3::ZERO).is_err());
+        assert!(Joint::try_hinge(
+            a,
+            b,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0)
+        )
+        .is_ok());
+        // 스텝·스냅샷·해시
+        assert!(w.try_step(0.0).is_err());
+        assert!(w.try_snapshot().is_ok());
+        assert!(w.try_state_hash().is_ok());
+    }
+
+    /// MAJOR: 직렬화되는 필드는 하나도 빠짐없이 상태 폐쇄에 들어가야 한다
+    /// (contact_normal이 빠져 NaN이 스텝 뒤에도 남던 경로).
+    #[test]
+    fn state_closure_covers_every_serialized_field() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        for i in 0..6 {
+            dyn_box(&mut w, i as f32 * 0.9 - 2.0, 0.6 + i as f32 * 1.1);
+        }
+        for _ in 0..90 {
+            w.step(DT);
+        }
+        // 접촉 캐시·조인트·슬립 타이머가 모두 채워진 상태에서 왕복이 성립해야 한다
+        let snap = w.snapshot();
+        let r = w.restore(&snap);
+        assert!(r.is_ok(), "상태 폐쇄에서 빠진 필드가 있다: {r:?}");
+        assert_eq!(w.diagnostics().state_saturations, 0);
     }
 }

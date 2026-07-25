@@ -22,6 +22,12 @@ pub struct WorldParams {
     pub sleep_linear_threshold: f32,
     pub sleep_angular_threshold: f32,
     pub time_to_sleep: f32,
+    /// **속도 상한 (물리 파라미터)** — Jolt `mMaxLinearVelocity`·Box2D `b2_maxTranslation`과
+    /// 같은 역할이다. 터널링과 폭주를 막는 정상 기능이며, 도달은 오류가 아니다.
+    /// 이것이 있어야 파생 상태(속도·임펄스)가 유계가 되어 정책이 step에 대해 닫힌다 —
+    /// 겹친 바디를 밀어내는 정상 물리도 이 상한을 향해 가속하기 때문이다.
+    pub max_linear_velocity: f32,
+    pub max_angular_velocity: f32,
 }
 
 impl Default for WorldParams {
@@ -34,6 +40,8 @@ impl Default for WorldParams {
             sleep_linear_threshold: 0.03,
             sleep_angular_threshold: 0.05,
             time_to_sleep: 0.5,
+            max_linear_velocity: 500.0,
+            max_angular_velocity: 100.0,
         }
     }
 }
@@ -47,6 +55,10 @@ pub enum ApiError {
     InvalidValue,
     /// static 바디는 불변 (설계 §9 — 움직이려면 Kinematic).
     ImmutableStatic,
+    /// 파생 상태가 상한을 넘어 포화됐다. **그 스텝의 물리는 신뢰할 수 없다**(리뷰 BLOCKER:
+    /// 포화를 정상 처리로 삼키면 안 된다). 상태 자체는 안전하고 복원 가능하게 유지되므로
+    /// 호스트는 계속 돌릴 수도, 되감을 수도 있다. 지원 범위 밖 입력의 신호다.
+    StateOverflow,
 }
 
 pub struct World {
@@ -80,21 +92,56 @@ pub struct Diagnostics {
     pub warm_hits: usize,
     pub warm_total: usize,
     pub max_penetration: f32,
+    /// 속도 상한에 걸린 바디 수. **정상 기능**이므로 오류가 아니지만, 지속적으로 크면
+    /// 장면 구성이나 파라미터를 의심할 신호다.
+    pub velocity_clamped: usize,
+    /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
+    /// 0이 아니면 지원 범위 밖 입력이거나 엔진 버그이며, 그 스텝의 물리는 신뢰할 수 없다.
+    /// 서로 다른 초과 상태가 같은 포화값으로 합쳐지므로 상태 해시만으로는 구분되지 않는다.
+    pub state_saturations: usize,
 }
 
-/// 스텝 크기 상한. 이보다 큰 dt는 speculative margin·CCD·soft 계수가 전부 의미를 잃고,
-/// 유한한 속도라도 위치 적분에서 크기 정책(MAX_INPUT)을 넘긴다.
-pub const MAX_DT: f32 = 0.25;
+pub use maru_collide::{MAX_DT, MIN_DT};
 
-/// 파라미터 불변식 — `new`와 `set_params`가 **같은** 검증을 쓴다.
+/// 파라미터 불변식 — **오류 반환형이 정본**이다(리뷰 PARTIAL BLOCKER: 호스트가 넘긴
+/// 파라미터로 wasm 모듈을 trap시키면 안 된다). 패닉 버전은 이것을 감싼 편의 함수다.
+///
+/// 각 스칼라를 **차원에 맞는 범위**로 검사한다: 속도 임계는 `MAX_SPEED`, 길이·일반
+/// 파라미터는 `MAX_INPUT`. NaN 임계는 비교가 항상 false라 게이트를 조용히 무력화하므로
+/// 유한성부터 요구한다.
+fn check_params(p: &WorldParams) -> Result<(), ApiError> {
+    use maru_collide::{in_range, speed_in_range, vec_in_range};
+    let ok = vec_in_range(p.gravity)
+        && (1..=64).contains(&p.substeps)
+        && in_range(p.speculative_margin)
+        && p.speculative_margin >= 0.0
+        && in_range(p.solver.contact_hertz)
+        && p.solver.contact_hertz > 0.0
+        && in_range(p.solver.contact_damping)
+        && p.solver.contact_damping >= 0.0
+        && speed_in_range(p.solver.max_bias_speed)
+        && p.solver.max_bias_speed > 0.0
+        && speed_in_range(p.solver.restitution_threshold)
+        && p.solver.restitution_threshold >= 0.0
+        && speed_in_range(p.sleep_linear_threshold)
+        && p.sleep_linear_threshold >= 0.0
+        && speed_in_range(p.sleep_angular_threshold)
+        && p.sleep_angular_threshold >= 0.0
+        && in_range(p.time_to_sleep)
+        && p.time_to_sleep >= 0.0
+        && speed_in_range(p.max_linear_velocity)
+        && p.max_linear_velocity > 0.0
+        && speed_in_range(p.max_angular_velocity)
+        && p.max_angular_velocity > 0.0;
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidValue)
+    }
+}
+
 fn validate_params(params: &WorldParams) {
-    // **모든 스칼라**가 유한하고 범위 안이어야 한다(리뷰 PARTIAL MAJOR: time_to_sleep와
-    // restitution_threshold는 아예 검사하지 않았고 sleep 임계의 +Inf도 통과했다).
-    // NaN 임계는 조용히 게이트를 무력화한다 — NaN 비교는 항상 false라
-    // restitution_threshold=NaN이면 임계 이하 접촉에도 반발 패스가 돈다.
-    // 크기 상한까지 요구한다 — 유한하지만 거대한 값은 몇 서브스텝 만에 Inf를 만든다.
-    let finite_ge0 = |v: f32| maru_collide::in_range(v) && v >= 0.0;
-    let finite_gt0 = |v: f32| maru_collide::in_range(v) && v > 0.0;
+    // 메시지는 진단용 — 어떤 필드가 걸렸는지 좁혀준다.
     assert!(
         maru_collide::vec_in_range(params.gravity),
         "gravity must be finite and within MAX_INPUT"
@@ -105,40 +152,33 @@ fn validate_params(params: &WorldParams) {
         params.substeps
     );
     assert!(
-        finite_ge0(params.speculative_margin),
-        "speculative_margin must be finite and non-negative"
+        maru_collide::speed_in_range(params.solver.restitution_threshold)
+            && params.solver.restitution_threshold >= 0.0,
+        "restitution_threshold must be finite, non-negative and within MAX_SPEED"
     );
     assert!(
-        finite_gt0(params.solver.contact_hertz),
-        "contact_hertz must be finite and positive"
-    );
-    assert!(
-        finite_ge0(params.solver.contact_damping),
-        "contact_damping must be finite and non-negative"
-    );
-    assert!(
-        finite_gt0(params.solver.max_bias_speed),
-        "max_bias_speed must be finite and positive"
-    );
-    assert!(
-        finite_ge0(params.solver.restitution_threshold),
-        "restitution_threshold must be finite and non-negative"
-    );
-    assert!(
-        finite_ge0(params.sleep_linear_threshold) && finite_ge0(params.sleep_angular_threshold),
-        "sleep thresholds must be finite and non-negative"
-    );
-    assert!(
-        finite_ge0(params.time_to_sleep),
+        maru_collide::in_range(params.time_to_sleep) && params.time_to_sleep >= 0.0,
         "time_to_sleep must be finite and non-negative"
     );
+    check_params(params).expect("invalid world params");
 }
 
 impl World {
     /// 파라미터 불변식을 생성 경계에서 강제한다 (리뷰 MAJOR: 무검증 public 필드가
     /// dt/substeps·Softness 분모를 NaN/Inf로 만들 수 있었다).
     pub fn new(params: WorldParams) -> Self {
-        validate_params(&params);
+        validate_params(&params); // 상세 메시지 유지 (진단용)
+        Self::new_unchecked(params)
+    }
+
+    /// 월드 생성 (오류 반환형 — **M3 바인딩의 정본 경로**). 호스트가 넘긴 파라미터로
+    /// wasm 모듈을 trap시키지 않는다.
+    pub fn try_new(params: WorldParams) -> Result<Self, ApiError> {
+        check_params(&params)?;
+        Ok(Self::new_unchecked(params))
+    }
+
+    fn new_unchecked(params: WorldParams) -> Self {
         Self {
             params,
             bodies: Vec::new(),
@@ -165,6 +205,13 @@ impl World {
     pub fn set_params(&mut self, params: WorldParams) {
         validate_params(&params);
         self.params = params;
+    }
+
+    /// 파라미터 교체 (오류 반환형).
+    pub fn try_set_params(&mut self, params: WorldParams) -> Result<(), ApiError> {
+        check_params(&params)?;
+        self.params = params;
+        Ok(())
     }
 
     /// 재사용 가능한 최소 인덱스 슬롯 (살아있지도 예약되지도 않은 것).
@@ -312,7 +359,9 @@ impl World {
     }
 
     pub fn set_linear_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
-        if !maru_collide::vec_in_range(v) {
+        // 속도는 **속도 차원 범위**다(MAX_SPEED). 일반 입력 범위를 쓰면 리더가 거부하는
+        // 값을 setter가 받아들여 같은 비대칭이 되살아난다.
+        if !maru_collide::vec_speed_in_range(v) {
             return Err(ApiError::InvalidValue);
         }
         let i = self.mutate(h)?;
@@ -321,7 +370,7 @@ impl World {
     }
 
     pub fn set_angular_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
-        if !maru_collide::vec_in_range(v) {
+        if !maru_collide::vec_speed_in_range(v) {
             return Err(ApiError::InvalidValue);
         }
         let i = self.mutate(h)?;
@@ -403,7 +452,7 @@ impl World {
         match cmd {
             Command::RemoveBody(h) => target(h),
             Command::SetLinearVelocity(h, v) | Command::SetAngularVelocity(h, v) => {
-                if !maru_collide::vec_in_range(*v) {
+                if !maru_collide::vec_speed_in_range(*v) {
                     return Err(ApiError::InvalidValue);
                 }
                 target(h)
@@ -493,33 +542,97 @@ impl World {
     ///
     /// 비유한 값도 여기서 정리된다(NaN→0, ±Inf→±MAX_STATE). 경계 검증이 완전하면
     /// 클램프가 실제로 값을 바꿀 일은 없다 — 디버그 빌드는 그것까지 확인한다.
-    fn close_state_policy(&mut self) {
-        use maru_collide::{clamp_state, clamp_state_vec};
+    /// 속도 상한 적용 (물리 파라미터). **스텝 시작과 매 서브스텝 속도 적분 뒤**에 건다:
+    /// 시작에 거는 이유는 복원된 스냅샷의 큰 속도가 솔버 산술에 들어가기 전에 잡히도록
+    /// 하기 위함이고, 서브스텝마다 거는 이유는 겹침 해소가 스텝 안에서 가속하기 때문이다.
+    fn clamp_velocities(&mut self) {
+        let (lin, ang) = (
+            self.params.max_linear_velocity,
+            self.params.max_angular_velocity,
+        );
+        for (i, b) in self.bodies.iter_mut().enumerate() {
+            if !self.alive[i] || b.body_type == BodyType::Static {
+                continue;
+            }
+            let l2 = b.linvel.length_sq();
+            // 부정 비교는 **의도**다: NaN은 어떤 비교에도 false이므로 `l2 > lin*lin`으로
+            // 쓰면 NaN 속도가 클램프를 그냥 통과한다. `!(l2 <= ...)`라야 NaN이 잡힌다.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
+            if !(l2 <= lin * lin) {
+                let n = b.linvel.length();
+                b.linvel = if n.is_finite() && n > 0.0 {
+                    b.linvel * (lin / n)
+                } else {
+                    Vec3::ZERO
+                };
+                self.diag.velocity_clamped += 1;
+            }
+            let a2 = b.angvel.length_sq();
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
+            if !(a2 <= ang * ang) {
+                let n = b.angvel.length();
+                b.angvel = if n.is_finite() && n > 0.0 {
+                    b.angvel * (ang / n)
+                } else {
+                    Vec3::ZERO
+                };
+                self.diag.velocity_clamped += 1;
+            }
+        }
+    }
+
+    fn close_state_policy(&mut self) -> usize {
+        use maru_collide::{saturate_state, saturate_state_vec};
+        let mut hits = 0usize;
+        macro_rules! sat {
+            ($slot:expr) => {{
+                let (v, changed) = saturate_state($slot);
+                $slot = v;
+                hits += changed as usize;
+            }};
+        }
+        macro_rules! sat_vec {
+            ($slot:expr) => {{
+                let (v, changed) = saturate_state_vec($slot);
+                $slot = v;
+                hits += changed as usize;
+            }};
+        }
         for (i, b) in self.bodies.iter_mut().enumerate() {
             if !self.alive[i] {
                 continue;
             }
-            b.pose.pos = clamp_state_vec(b.pose.pos);
-            b.linvel = clamp_state_vec(b.linvel);
-            b.angvel = clamp_state_vec(b.angvel);
+            sat_vec!(b.pose.pos);
+            sat_vec!(b.linvel);
+            sat_vec!(b.angvel);
         }
         for j in self.joints.iter_mut() {
-            j.linear_impulse = clamp_state_vec(j.linear_impulse);
-            j.angular_impulse[0] = clamp_state(j.angular_impulse[0]);
-            j.angular_impulse[1] = clamp_state(j.angular_impulse[1]);
+            sat_vec!(j.linear_impulse);
+            sat!(j.angular_impulse[0]);
+            sat!(j.angular_impulse[1]);
         }
         for entry in self.contact_cache.values_mut() {
             for (_, imp) in entry.iter_mut() {
-                imp.normal = clamp_state(imp.normal);
-                imp.tangent[0] = clamp_state(imp.tangent[0]);
-                imp.tangent[1] = clamp_state(imp.tangent[1]);
-                imp.tangent_world = clamp_state_vec(imp.tangent_world);
-                imp.position = clamp_state_vec(imp.position);
+                sat!(imp.normal);
+                sat!(imp.tangent[0]);
+                sat!(imp.tangent[1]);
+                sat_vec!(imp.tangent_world);
+                sat_vec!(imp.position);
+                // **직렬화되는 필드는 하나도 빠뜨리지 않는다**(리뷰 MAJOR): contact_normal이
+                // NaN이 되면 스텝 뒤에도 남아 restore가 실패한다. 단위 벡터라 포화가 아니라
+                // 정규화 실패 시 0으로 되돌린다(매칭 게이트가 자연히 끊긴다).
+                if imp.contact_normal.try_normalize().is_none() {
+                    imp.contact_normal = Vec3::ZERO;
+                    hits += 1;
+                }
             }
         }
         for t in self.sleep_timer.iter_mut() {
-            *t = clamp_state(*t).max(0.0);
+            let (v, changed) = saturate_state(*t);
+            *t = v.max(0.0);
+            hits += changed as usize;
         }
+        hits
     }
 
     /// 직전 스텝 진단 스냅샷.
@@ -676,17 +789,20 @@ impl World {
     /// 엔진이 조용히 클램프하면 시뮬레이션이 실시간과 어긋난 채 진행돼 더 나쁘다.
     /// 위반은 wasm trap이 아니라 `ApiError::InvalidValue`로 표현된다.
     pub fn try_step(&mut self, dt: f32) -> Result<(), ApiError> {
-        if !(dt.is_finite() && dt <= MAX_DT) {
+        // 문서와 구현을 하나로(리뷰 MAJOR): 0과 음수는 **합법이 아니다**. 일시정지는
+        // 호스트가 step을 부르지 않는 것으로 표현한다 — 0을 무연산으로 받아주면
+        // "성공했는데 아무 일도 없음"이 오류와 구분되지 않는다.
+        if !(dt.is_finite() && (MIN_DT..=MAX_DT).contains(&dt)) {
             return Err(ApiError::InvalidValue);
         }
         self.step_inner(dt);
+        if self.diag.state_saturations > 0 {
+            return Err(ApiError::StateOverflow);
+        }
         Ok(())
     }
 
     fn step_inner(&mut self, dt: f32) {
-        if dt <= 0.0 {
-            return;
-        }
         // 0) 커맨드 적용 (설계 §4 파이프라인 0단계 — 쓰기의 정본 경로).
         //    **빈 월드 판정보다 먼저** 해야 한다: 빈 월드에 AddBody만 큐잉하면 영원히
         //    적용되지 않아 '다음 step에서 적용' 계약이 깨진다(리뷰 NOT_RESOLVED).
@@ -735,6 +851,8 @@ impl World {
             }
         }
         self.diag = Diagnostics::default();
+        // 복원된 스냅샷의 큰 속도가 솔버 산술에 들어가기 전에 잡는다
+        self.clamp_velocities();
         let bp = Broadphase::build(dyn_items, static_items);
         let pairs = bp.canonical_pairs();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
@@ -933,6 +1051,8 @@ impl World {
                     Some((sf, self.params.solver.max_bias_speed)),
                 );
             }
+            // 속도 상한 — 위치 적분 **전에** 걸어야 변위도 유계가 된다
+            self.clamp_velocities();
             // 위치 적분 (dynamic + kinematic, sleeping 제외)
             for (i, b) in self.bodies.iter_mut().enumerate() {
                 if self.alive[i] && b.body_type != BodyType::Static && !self.asleep[i] {
@@ -1070,6 +1190,6 @@ impl World {
                 );
             }
         }
-        self.close_state_policy();
+        self.diag.state_saturations = self.close_state_policy();
     }
 }

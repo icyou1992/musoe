@@ -51,17 +51,40 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
 - `enqueue_add_body`는 슬롯을 예약하고 **핸들을 즉시 반환**한다. 예약 슬롯은 쿼리에
   보이지 않지만(아직 alive 아님) 같은 배치의 후속 커맨드에 쓸 수 있다.
 - 불변식 보유 필드는 전부 비공개다. 읽기는 게터, 쓰기는 검증하는 API로만.
-- **`dt` 계약: `0 < dt <= MAX_DT`(0.25s).** 고정틱 엔진이므로 큰 dt를 쪼개는 것은
+- **`dt` 계약: `MIN_DT(1e-4) <= dt <= MAX_DT(0.25)`.** 0과 음수는 합법이 아니다 —
+  일시정지는 step을 부르지 않는 것으로 표현한다("성공했는데 아무 일도 없음"이 오류와
+  구분되지 않으면 호스트가 정지 원인을 진단할 수 없다). 하한이 있는 이유는 soft 계수의
+  `1/h`가 폭발해 조인트 bias가 중간 연산에서 f32를 위협하기 때문이다. 고정틱 엔진이므로 큰 dt를 쪼개는 것은
   **호스트(accumulator) 책임**이다 — 탭 복귀처럼 큰 dt가 오면 여러 스텝으로 나누거나
   프레임을 버린다. 엔진이 조용히 클램프하면 시뮬레이션이 실시간과 어긋난 채 진행돼 더 나쁘다.
   위반은 trap이 아니라 `try_step`의 `ApiError`로 표현된다.
 - **실패는 오류로, trap으로가 아니다.** M3 바인딩이 쓰는 정본 경로는 전부 fallible이다:
-  `try_step` · `try_snapshot` · `try_state_hash` · `Body::try_new_dynamic`/`try_new_static` ·
-  `try_add_joint` · `enqueue`. 같은 이름의 비-try 함수는 패닉하는 편의 래퍼(테스트·진단용).
-- **크기 정책은 두 층**이다. 호스트가 넣는 값은 `MAX_INPUT`(1e9)을 넘으면 **거부**되고,
-  엔진이 진화시키는 값(위치·속도·누적 임펄스·PCM 캐시)은 `MAX_STATE`(1e18)로 **스텝 말에
-  클램프**된다. 입력 상한만 두면 정책이 step에 대해 닫히지 않는다 — 합법인 경계값 한 쌍이
-  한 스텝 뒤 상한을 넘어, 그 상태가 자기 스냅샷을 복원하지 못하게 된다.
+  `World::try_new` · `try_set_params` · `try_step` · `try_snapshot` · `try_state_hash` ·
+  `Body::try_new_dynamic`/`try_new_static`/`try_new_kinematic` ·
+  `Joint::try_point`/`try_hinge` · `World::try_add_joint` · `enqueue`.
+  같은 이름의 비-try 함수는 패닉하는 편의 래퍼(테스트·진단용).
+  `Joint::try_hinge`가 따로 필요한 이유: 0/NaN 축은 **Joint 생성 시점**에 걸리므로
+  `try_add_joint`(이미 만들어진 Joint를 받는다)로는 잡을 수 없다.
+- **지원 범위는 차원별**이다(`maru-collide/limits.rs`). 스칼라 하나로 묶으면 동시에
+  너무 넓고 너무 좁다 — 넓으면 큰 위치 × 작은 역질량이 조인트 솔버의 **중간 연산**에서
+  먼저 Inf가 되고, 좁으면 정상 물리의 임펄스가 잘려 warm start가 조용히 부족해진다.
+  | 차원 | 상한 | 위반 시 |
+  |---|---|---|
+  | 셰이프 치수 | `MAX_SHAPE_EXTENT` 1e4 m | 거부 |
+  | 위치·앵커·파라미터 | `MAX_INPUT` 1e6 m | 거부 |
+  | 호스트가 넣는 속도 | `MAX_SPEED` 1e4 | 거부 |
+  | 질량 | 1e-9 ~ 1e9 kg | 거부 |
+  | dt | `MIN_DT` 1e-4 ~ `MAX_DT` 0.25 s | 거부 |
+  | 파생 상태(위치·속도·임펄스·PCM) | `MAX_STATE` 1e15 | 포화 + `StateOverflow` |
+- **속도 상한은 물리 파라미터다** (`WorldParams::max_linear_velocity` 500 m/s,
+  `max_angular_velocity` 100 rad/s — Jolt `mMaxLinearVelocity` 계열). 터널링·폭주를 막는
+  정상 기능이며 도달은 오류가 아니라 `Diagnostics::velocity_clamped`로 집계된다.
+  **이것이 파생 상태를 유계로 만들어 정책이 step에 대해 닫힌다** — 겹친 바디를 밀어내는
+  정상 물리도 상한을 향해 가속하므로, 속도가 유계라야 임펄스와 변위가 유계가 된다.
+- `MAX_STATE` 도달은 **정상 물리에서 일어나지 않는다**(지원 범위 안 최악 임펄스 ≈ 2e13,
+  상한은 그 50배 위). 도달하면 지원 범위 밖 입력이거나 엔진 버그이므로 상태를 안전하게
+  포화시키되 `try_step`이 `StateOverflow`를 반환하고 `Diagnostics::state_saturations`에
+  집계한다 — 조용히 삼키지 않는다.
 - 공개 커맨드 스키마(`Command`)에 **바디 추가가 없다**. 슬롯 예약과 커맨드 등록이 한 원자
   연산이어야 하므로 정본 경로는 `enqueue_add_body`(예약 핸들을 즉시 반환)뿐이다.
 - hull은 정점 `MAX_HULL_POINTS`(1024)까지. 더 복잡한 메시는 convex decomposition으로 나눈다.

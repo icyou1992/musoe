@@ -1,7 +1,9 @@
 //! 강체 — 타입 3종 시맨틱 (설계 §9).
 
 use crate::world::ApiError;
-use maru_collide::{in_range, vec_in_range, Pose, Shape};
+use maru_collide::{
+    in_range, inv_mass_in_range, vec_extent_in_range, vec_in_range, vec_speed_in_range, Pose, Shape,
+};
 use maru_math::{Mat3, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,10 +100,10 @@ impl Body {
         if !vec_in_range(self.pose.pos) || self.pose.rot.try_normalize().is_none() {
             return Err(ApiError::InvalidValue);
         }
-        if !vec_in_range(self.linvel) || !vec_in_range(self.angvel) {
+        if !vec_speed_in_range(self.linvel) || !vec_speed_in_range(self.angvel) {
             return Err(ApiError::InvalidValue);
         }
-        if !vec_in_range(self.shape_origin_offset) {
+        if !vec_extent_in_range(self.shape_origin_offset) {
             return Err(ApiError::InvalidValue);
         }
         // 비교는 양성 조건으로 — `!(x < 0.0)`은 NaN에서 참이라 통과시킨다
@@ -113,12 +115,12 @@ impl Body {
         let inv_i = self.inv_inertia_local;
         match self.body_type {
             BodyType::Dynamic => {
-                if !(self.inv_mass > 0.0
-                    && in_range(self.inv_mass)
-                    && inv_i.x > 0.0
-                    && inv_i.y > 0.0
-                    && inv_i.z > 0.0
-                    && vec_in_range(inv_i))
+                // 질량·관성은 **양쪽**으로 묶는다: 너무 가벼우면 역수가 폭발하고,
+                // 너무 무거우면(1e9 kg 초과) 그 임펄스가 파생 상한을 위협한다.
+                if !(inv_mass_in_range(self.inv_mass)
+                    && inv_mass_in_range(inv_i.x)
+                    && inv_mass_in_range(inv_i.y)
+                    && inv_mass_in_range(inv_i.z))
                 {
                     return Err(ApiError::InvalidValue);
                 }
@@ -286,10 +288,15 @@ impl Body {
     }
 
     pub fn new_kinematic(shape: Shape, pose: Pose) -> Self {
-        Self {
+        Self::try_new_kinematic(shape, pose).expect("invalid kinematic body")
+    }
+
+    /// 기구학 바디 생성 (오류 반환형).
+    pub fn try_new_kinematic(shape: Shape, pose: Pose) -> Result<Self, ApiError> {
+        Ok(Self {
             body_type: BodyType::Kinematic,
-            ..Self::new_static(shape, pose)
-        }
+            ..Self::try_new_static(shape, pose)?
+        })
     }
 
     #[inline]

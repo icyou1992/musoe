@@ -18,8 +18,10 @@ pub use aabb::Aabb;
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
 pub use limits::{
-    clamp_state, clamp_state_vec, in_range, in_state_range, vec_in_range, vec_in_state_range,
-    MAX_HULL_POINTS, MAX_INPUT, MAX_STATE,
+    extent_in_range, in_range, in_state_range, inv_mass_in_range, saturate_state,
+    saturate_state_vec, speed_in_range, vec_extent_in_range, vec_in_range, vec_in_state_range,
+    vec_speed_in_range, MAX_DT, MAX_HULL_POINTS, MAX_INPUT, MAX_SHAPE_EXTENT, MAX_SPEED, MAX_STATE,
+    MIN_DT, MIN_INV_MASS,
 };
 pub use manifold::{contact, ContactPoint, FeatureId, Manifold, FEATURE_GENERIC};
 pub use maru_math::Aabbx4;
