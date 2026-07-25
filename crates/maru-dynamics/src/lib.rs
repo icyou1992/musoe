@@ -3,10 +3,12 @@
 //! 설계 계약(02-architecture.md): §4.4 TGS-soft, §4.6 슬리핑, §8 결정론·denormal 위생, §9 바디 3종.
 
 mod body;
+mod joint;
 mod solver;
 mod world;
 
 pub use body::{Body, BodyHandle, BodyType};
+pub use joint::{Joint, JointKind};
 pub use solver::SolverParams;
 pub use world::{World, WorldParams};
 
@@ -199,6 +201,114 @@ mod tests {
         }
         assert!(woke, "충격에도 깨어나지 않음");
         let _ = ball;
+    }
+
+    /// point 조인트: 흔들리는 진자 — 제약 오차(앵커 간 거리)가 계속 작아야 함
+    #[test]
+    fn point_joint_pendulum_holds() {
+        let mut w = World::new(WorldParams::default());
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.1 },
+            pose(0.0, 5.0, 0.0),
+        ));
+        let bob = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.2, 0.2, 0.2),
+                radius: 0.0,
+            },
+            pose(1.0, 5.0, 0.0), // 수평에서 놓아 흔들림 시작
+            1.0,
+        ));
+        w.add_joint(Joint::point(
+            anchor.index as usize,
+            bob.index as usize,
+            Vec3::ZERO,
+            Vec3::new(-1.0, 0.0, 0.0), // bob 로컬 (-1,0,0)이 앵커에 붙음
+        ));
+        let mut max_err: f32 = 0.0;
+        for _ in 0..300 {
+            w.step(DT);
+            let b = w.body(bob);
+            let attach = b.pose.pos + b.pose.rot.rotate(Vec3::new(-1.0, 0.0, 0.0));
+            max_err = max_err.max((attach - Vec3::new(0.0, 5.0, 0.0)).length());
+        }
+        let b = w.body(bob);
+        assert!(max_err < 0.03, "제약 오차 {max_err}");
+        assert!(
+            b.pose.pos.y < 5.0,
+            "진자가 흔들려 내려와야 함: {:?}",
+            b.pose.pos
+        );
+    }
+
+    /// M2 수용 기준: hinge 체인 20링크 + 접촉 혼합 수렴 (설계 §11 M2).
+    /// 앵커를 바닥 바로 위(y=0.6)에 둬 전 링크가 즉시 바닥과 접촉 — 채찍 혼돈 없이
+    /// 접촉+조인트 혼합 수렴 자체를 판정한다 (혼돈 안무는 판정 대상 아님).
+    #[test]
+    fn hinge_chain_20_links_with_ground_contact() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.05 },
+            pose(0.0, 0.6, 0.0),
+        ));
+        let mut prev = anchor.index as usize;
+        let mut links = Vec::new();
+        for i in 0..20 {
+            let x = 0.4 + i as f32 * 0.8;
+            let h = w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.4, 0.1, 0.1),
+                    radius: 0.0,
+                },
+                pose(x, 0.6, 0.0),
+                1.0,
+            ));
+            let ap = if i == 0 {
+                Vec3::ZERO
+            } else {
+                Vec3::new(0.4, 0.0, 0.0)
+            };
+            w.add_joint(Joint::hinge(
+                prev,
+                h.index as usize,
+                ap,
+                Vec3::new(-0.4, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ));
+            links.push(h);
+            prev = h.index as usize;
+        }
+        // 낙하 → 전 링크 접촉 + 조인트 동시 해석 → 정착 → 슬립
+        for _ in 0..720 {
+            w.step(DT);
+        }
+        let mut grounded = 0;
+        for (i, h) in links.iter().enumerate() {
+            let b = w.body(*h);
+            assert!(b.pose.pos.y.is_finite(), "link {i} 발산");
+            assert!(b.linvel.length() < 0.5, "link {i} 미정착: {:?}", b.linvel);
+            // 접힌 체인은 3~4층으로 쌓일 수 있음(y≈0.7±) — 진짜 공중 잔류만 금지.
+            // wasm/native는 혼돈계 더미 형태가 다름(L0는 플랫폼별 계약 — 설계 §8)
+            assert!(b.pose.pos.y < 1.2, "link {i} 공중 잔류: {:?}", b.pose.pos);
+            if b.pose.pos.y < 0.3 {
+                grounded += 1;
+            }
+        }
+        assert!(
+            grounded >= 10,
+            "바닥 정착 링크 {grounded}개 — 혼합 수렴 미발생"
+        );
+        // 조인트 오차: 인접 링크 앵커 간 거리 (혼합 상태에서도 조인트가 유지되는가)
+        for i in 1..20 {
+            let a = w.body(links[i - 1]);
+            let b = w.body(links[i]);
+            let pa = a.pose.pos + a.pose.rot.rotate(Vec3::new(0.4, 0.0, 0.0));
+            let pb = b.pose.pos + b.pose.rot.rotate(Vec3::new(-0.4, 0.0, 0.0));
+            let err = (pa - pb).length();
+            assert!(err < 0.05, "joint {i} 벌어짐 {err}");
+        }
     }
 
     /// 결정론 L0 스모크: 같은 씬 2회 실행 → 비트 동일

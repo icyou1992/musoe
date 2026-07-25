@@ -66,6 +66,29 @@ impl Mat3 {
         }
     }
 
+    /// 3×3 역행렬 (특이면 0 행렬 — NaN 생산 금지, 설계 §8).
+    pub fn inverse(&self) -> Mat3 {
+        let a = self.c[0];
+        let b = self.c[1];
+        let c = self.c[2];
+        let r0 = b.cross(c);
+        let r1 = c.cross(a);
+        let r2 = a.cross(b);
+        let det = a.dot(r0);
+        if det.abs() < 1.0e-12 {
+            return Mat3::from_diagonal(Vec3::ZERO);
+        }
+        let inv = 1.0 / det;
+        // 역행렬 = adj/det, adj 행 = cofactor → 열로 전치
+        Mat3 {
+            c: [
+                Vec3::new(r0.x, r1.x, r2.x) * inv,
+                Vec3::new(r0.y, r1.y, r2.y) * inv,
+                Vec3::new(r0.z, r1.z, r2.z) * inv,
+            ],
+        }
+    }
+
     /// 월드 역관성 = R · I⁻¹_local(대각) · Rᵀ
     #[inline]
     pub fn rotate_inertia(inv_inertia_diag: Vec3, q: Quat) -> Mat3 {
@@ -92,6 +115,25 @@ mod tests {
         assert!((m.c[0].x - 1.0).abs() < 1e-6);
         assert!((m.c[1].y - 2.0).abs() < 1e-6);
         assert!((m.c[2].z - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn inverse_roundtrip() {
+        let q = Quat::from_axis_angle(Vec3::new(1.0, 0.2, -0.4), 0.7);
+        let m = Mat3::rotate_inertia(Vec3::new(0.5, 2.0, 1.3), q);
+        let mi = m.inverse();
+        let id = m.mul_mat(&mi);
+        for i in 0..3 {
+            for (j, want) in [(0, i == 0), (1, i == 1), (2, i == 2)] {
+                let v = match j {
+                    0 => id.c[i].x,
+                    1 => id.c[i].y,
+                    _ => id.c[i].z,
+                };
+                let expect = if want { 1.0 } else { 0.0 };
+                assert!((v - expect).abs() < 1e-4, "[{i}][{j}]={v}");
+            }
+        }
     }
 
     #[test]

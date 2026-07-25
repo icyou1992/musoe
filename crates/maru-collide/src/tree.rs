@@ -158,9 +158,9 @@ fn split2(items: &[(u32, Aabb)], idx: &mut [usize]) -> usize {
         }
     };
     idx.sort_by(|&a, &b| {
+        // total_cmp: NaN에도 전순서 유지 (설계 §8 — 비교/분기에 NaN 유입 차단, 패닉 금지)
         key(a)
-            .partial_cmp(&key(b))
-            .unwrap()
+            .total_cmp(&key(b))
             .then_with(|| items[a].0.cmp(&items[b].0))
     });
     idx.len() / 2

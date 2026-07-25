@@ -6,6 +6,7 @@
 //! M2a 범위: 바디 제거·아일랜드·슬리핑·조인트는 후속 유닛. 커맨드 버퍼는 M2f와 함께.
 
 use crate::body::{Body, BodyHandle, BodyType};
+use crate::joint::{self, Joint};
 use crate::solver::{self, CachedImpulse, ContactConstraint, Softness, SolverParams};
 use maru_collide::{contact, Aabb, Broadphase, FeatureId, STATIC_BIT};
 use maru_math::Vec3;
@@ -44,6 +45,7 @@ pub struct World {
     contact_cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
     sleep_timer: Vec<f32>,
     asleep: Vec<bool>,
+    joints: Vec<Joint>,
 }
 
 impl World {
@@ -55,6 +57,7 @@ impl World {
             contact_cache: HashMap::new(),
             sleep_timer: Vec::new(),
             asleep: Vec::new(),
+            joints: Vec::new(),
         }
     }
 
@@ -92,6 +95,16 @@ impl World {
 
     pub fn is_asleep(&self, h: BodyHandle) -> bool {
         self.asleep[h.index as usize]
+    }
+
+    /// 조인트 추가. 연결 바디를 깨운다 (edge 생성형 변이 — 설계 §4.6).
+    pub fn add_joint(&mut self, mut joint: Joint) -> usize {
+        // 핸들 인덱스 검증은 v1 단순화: usize 인덱스 직접 사용 (BodyHandle API는 M3 바인딩에서)
+        self.wake(joint.body_a);
+        self.wake(joint.body_b);
+        joint.linear_impulse = Vec3::ZERO;
+        self.joints.push(joint);
+        self.joints.len() - 1
     }
 
     fn wake(&mut self, i: usize) {
@@ -135,6 +148,16 @@ impl World {
         }
         let bp = Broadphase::build(dyn_items, static_items);
         let pairs = bp.canonical_pairs();
+        // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
+        let excluded: std::collections::HashSet<(u32, u32)> = self
+            .joints
+            .iter()
+            .filter(|j| !j.collide_connected)
+            .map(|j| {
+                let (a, b) = (j.body_a as u32, j.body_b as u32);
+                (a.min(b), a.max(b))
+            })
+            .collect();
 
         // 2) 내로우페이즈 → 제약 준비 (A=첫 인덱스, B=둘째 — canonical 순서가 곧 해석 순서)
         //    PCM 캐시에서 feature 일치 접점의 임펄스를 warm load (설계 §3)
@@ -144,6 +167,12 @@ impl World {
         for (a_id, b_raw) in pairs {
             let key = (a_id, b_raw);
             let is_static_pair = b_raw & STATIC_BIT != 0;
+            // 조인트 연결 쌍 충돌 제외 — 정적 상대 포함 (앵커 바디와의 접촉이 조인트와 맞서며
+            // 영구 에너지 주입 → link0 발산 실증). 비교는 STATIC_BIT를 벗긴 실제 인덱스로.
+            let b_plain = b_raw & !STATIC_BIT;
+            if excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
+                continue;
+            }
             let b_id = (b_raw & !STATIC_BIT) as usize;
             let a_id = a_id as usize;
             // level-trigger(설계 §4.6): 양쪽 모두 비활성(sleeping/static)이면 스킵.
@@ -174,8 +203,42 @@ impl World {
             }
         }
 
+        // 2.5) 조인트: 한쪽이 깨어있으면 상대도 wake (설계 §4.3 조인트 edge)
+        let joint_pairs: Vec<(usize, usize)> =
+            self.joints.iter().map(|j| (j.body_a, j.body_b)).collect();
+        for (a, b) in &joint_pairs {
+            let a_awake = self.bodies[*a].is_dynamic() && !self.asleep[*a];
+            let b_awake = self.bodies[*b].is_dynamic() && !self.asleep[*b];
+            if a_awake && self.bodies[*b].is_dynamic() && self.asleep[*b] {
+                self.wake(*b);
+            }
+            if b_awake && self.bodies[*a].is_dynamic() && self.asleep[*a] {
+                self.wake(*a);
+            }
+        }
+
         // 3) TGS-soft 서브스텝 루프
         let g = self.params.gravity;
+        // 조인트는 접촉보다 강성 (Box2D v3: 2×contact hertz, ζ=2)
+        let joint_soft = Softness::new(
+            (2.0 * self.params.solver.contact_hertz).min(0.25 * inv_h),
+            2.0,
+            h,
+        );
+        let mut joints = std::mem::take(&mut self.joints);
+        // 조인트도 접촉과 같은 비활성 게이트 (설계 §4.6 level-trigger): 양쪽 모두
+        // 비활성(sleeping/static/kinematic)이면 스킵 — 잠든 바디에 warm-start 임펄스를
+        // 주입하면 위치 적분이 없는 채 속도만 펌핑돼 정착한 체인이 되살아난다(실증:
+        // t=6s vmax 0.006 정착 → 슬립 → t=8s 4.5 폭주).
+        let active_joints: Vec<usize> = joints
+            .iter()
+            .enumerate()
+            .filter(|(_, j)| {
+                let awake = |i: usize| self.bodies[i].is_dynamic() && !self.asleep[i];
+                awake(j.body_a) || awake(j.body_b)
+            })
+            .map(|(i, _)| i)
+            .collect();
         for _ in 0..n_sub {
             // 속도 적분 (sleeping 제외)
             for (i, b) in self.bodies.iter_mut().enumerate() {
@@ -183,9 +246,15 @@ impl World {
                     b.linvel += g * h;
                 }
             }
-            // warm start + bias 솔브
+            // warm start + bias 솔브 (조인트 먼저 — Box2D 순서)
+            for &ji in &active_joints {
+                joint::warm_start(&mut self.bodies, &joints[ji]);
+            }
             for c in constraints.iter_mut() {
                 solver::warm_start(&mut self.bodies, c);
+            }
+            for &ji in &active_joints {
+                joint::solve(&mut self.bodies, &mut joints[ji], Some(&joint_soft));
             }
             for c in constraints.iter_mut() {
                 solver::solve(
@@ -203,6 +272,9 @@ impl World {
                 }
             }
             // relax — bias 에너지 제거
+            for &ji in &active_joints {
+                joint::solve(&mut self.bodies, &mut joints[ji], None);
+            }
             for c in constraints.iter_mut() {
                 solver::solve(&mut self.bodies, c, inv_h, None);
             }
@@ -247,14 +319,22 @@ impl World {
             }
             x
         }
+        let union = |parent: &mut Vec<usize>, x: usize, y: usize| {
+            let (rx, ry) = (find(parent, x), find(parent, y));
+            if rx != ry {
+                let (lo, hi) = (rx.min(ry), rx.max(ry));
+                parent[hi] = lo; // canonical: 낮은 인덱스가 대표 (설계 §4.3)
+            }
+        };
         for c in &constraints {
             if self.bodies[c.a].is_dynamic() && self.bodies[c.b].is_dynamic() {
-                let (ra, rb) = (find(&mut parent, c.a), find(&mut parent, c.b));
-                // canonical: 낮은 인덱스가 대표 (설계 §4.3 결정론)
-                if ra != rb {
-                    let (lo, hi) = (ra.min(rb), ra.max(rb));
-                    parent[hi] = lo;
-                }
+                union(&mut parent, c.a, c.b);
+            }
+        }
+        // 조인트 edge (설계 §4.3 — hinge 체인이 바디별 아일랜드로 갈라지면 안 됨)
+        for (a, b) in &joint_pairs {
+            if self.bodies[*a].is_dynamic() && self.bodies[*b].is_dynamic() {
+                union(&mut parent, *a, *b);
             }
         }
         let lin2 = self.params.sleep_linear_threshold * self.params.sleep_linear_threshold;
@@ -285,6 +365,8 @@ impl World {
                 }
             }
         }
+
+        self.joints = joints;
 
         // 7) denormal 위생 (설계 §8 flush 지점)
         for b in self.bodies.iter_mut() {
