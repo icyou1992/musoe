@@ -84,6 +84,12 @@ pub struct Diagnostics {
 
 /// 파라미터 불변식 — `new`와 `set_params`가 **같은** 검증을 쓴다.
 fn validate_params(params: &WorldParams) {
+    // **모든 스칼라**가 유한하고 범위 안이어야 한다(리뷰 PARTIAL MAJOR: time_to_sleep와
+    // restitution_threshold는 아예 검사하지 않았고 sleep 임계의 +Inf도 통과했다).
+    // NaN 임계는 조용히 게이트를 무력화한다 — NaN 비교는 항상 false라
+    // restitution_threshold=NaN이면 임계 이하 접촉에도 반발 패스가 돈다.
+    let finite_ge0 = |v: f32| v.is_finite() && v >= 0.0;
+    let finite_gt0 = |v: f32| v.is_finite() && v > 0.0;
     assert!(params.gravity.is_finite(), "gravity must be finite");
     assert!(
         (1..=64).contains(&params.substeps),
@@ -91,24 +97,32 @@ fn validate_params(params: &WorldParams) {
         params.substeps
     );
     assert!(
-        params.speculative_margin.is_finite() && params.speculative_margin >= 0.0,
+        finite_ge0(params.speculative_margin),
         "speculative_margin must be finite and non-negative"
     );
     assert!(
-        params.solver.contact_hertz.is_finite() && params.solver.contact_hertz > 0.0,
+        finite_gt0(params.solver.contact_hertz),
         "contact_hertz must be finite and positive"
     );
     assert!(
-        params.solver.contact_damping.is_finite() && params.solver.contact_damping >= 0.0,
+        finite_ge0(params.solver.contact_damping),
         "contact_damping must be finite and non-negative"
     );
     assert!(
-        params.solver.max_bias_speed.is_finite() && params.solver.max_bias_speed > 0.0,
+        finite_gt0(params.solver.max_bias_speed),
         "max_bias_speed must be finite and positive"
     );
     assert!(
-        params.sleep_linear_threshold >= 0.0 && params.sleep_angular_threshold >= 0.0,
-        "sleep thresholds must be non-negative"
+        finite_ge0(params.solver.restitution_threshold),
+        "restitution_threshold must be finite and non-negative"
+    );
+    assert!(
+        finite_ge0(params.sleep_linear_threshold) && finite_ge0(params.sleep_angular_threshold),
+        "sleep thresholds must be finite and non-negative"
+    );
+    assert!(
+        finite_ge0(params.time_to_sleep),
+        "time_to_sleep must be finite and non-negative"
     );
 }
 
@@ -166,6 +180,7 @@ impl World {
     /// 새 바디를 가리킬 방법이 없었다). 슬롯을 예약하고 세대를 올려 ABA를 차단한다.
     /// 반환된 핸들은 flush 이후에 유효해지며, 그 전에도 같은 배치의 후속 커맨드에 쓸 수 있다.
     pub fn enqueue_add_body(&mut self, body: Body) -> BodyHandle {
+        body.validate().expect("invalid body");
         let index = if let Some(index) = self.free_slot() {
             self.reserved[index] = true;
             // 슬롯 재사용 — 예약 시점에 세대를 올려 옛 핸들이 새 바디를 가리키지 못하게 한다
@@ -187,6 +202,7 @@ impl World {
 
     /// 바디 추가. 빈 슬롯이 있으면 **최소 인덱스**를 재사용한다(이력 무관 canonical 배치).
     pub fn add_body(&mut self, body: Body) -> BodyHandle {
+        body.validate().expect("invalid body");
         if let Some(index) = self.free_slot() {
             self.bodies[index] = body;
             self.alive[index] = true;
@@ -349,8 +365,73 @@ impl World {
 
     /// 커맨드 큐에 쌓는다 (설계 §7 정본 쓰기 경로). 적용은 다음 step 0단계 또는 flush_commands().
     /// **쿼리는 pending을 보지 않는다** — 즉시 반영이 필요하면 flush_commands()를 호출한다.
-    pub fn enqueue(&mut self, cmd: Command) {
+    ///
+    /// **enqueue 시점에 검증한다**(리뷰 PARTIAL MAJOR). 예전에는 아무 커맨드나 받아들이면서
+    /// `restore`의 구조 검증은 그런 pending을 거부해, **자기 월드가 만든 스냅샷이 자기에게
+    /// 복원되지 않는** 모순이 있었다(제거된 바디의 옛 핸들로 SetVelocity를 enqueue → snapshot →
+    /// restore 실패). 이제 큐에 들어간 커맨드는 항상 구조적으로 유효하고, 두 계약이 일치한다.
+    ///
+    /// 유효성은 **enqueue 시점** 기준이다: 앞선 커맨드가 대상을 지우면 flush에서 거부되어
+    /// 리포트에 잡힌다(스텝을 중단시키지 않는다 — 설계 §3 스텝 원자성).
+    pub fn enqueue(&mut self, cmd: Command) -> Result<(), ApiError> {
+        self.validate_command(&cmd)?;
         self.commands.push(cmd);
+        Ok(())
+    }
+
+    /// 커맨드 대상이 지금 큐에 넣기에 유효한가. 대상은 살아있거나(일반 커맨드)
+    /// 예약된 슬롯(같은 배치의 AddBody가 채울 예정)이면 된다 — 세대는 어느 쪽이든 맞아야 한다.
+    fn validate_command(&self, cmd: &Command) -> Result<(), ApiError> {
+        let target = |h: &BodyHandle| -> Result<(), ApiError> {
+            let i = h.index as usize;
+            if i < self.bodies.len()
+                && (self.alive[i] || self.reserved[i])
+                && self.generations[i] == h.generation
+            {
+                Ok(())
+            } else {
+                Err(ApiError::StaleHandle)
+            }
+        };
+        match cmd {
+            Command::AddBody(h, b) => {
+                let i = h.index as usize;
+                if i >= self.bodies.len()
+                    || !self.reserved[i]
+                    || self.generations[i] != h.generation
+                {
+                    return Err(ApiError::StaleHandle);
+                }
+                b.validate()
+            }
+            Command::RemoveBody(h) => target(h),
+            Command::SetLinearVelocity(h, v) | Command::SetAngularVelocity(h, v) => {
+                if !v.is_finite() {
+                    return Err(ApiError::InvalidValue);
+                }
+                target(h)
+            }
+            Command::SetPose(h, p) => {
+                if !p.pos.is_finite() || p.rot.try_normalize().is_none() {
+                    return Err(ApiError::InvalidValue);
+                }
+                target(h)
+            }
+            Command::SetMaterial(h, f, rest) => {
+                if !f.is_finite() || *f < 0.0 || !(0.0..=1.0).contains(rest) {
+                    return Err(ApiError::InvalidValue);
+                }
+                target(h)
+            }
+            Command::AddJoint(j) => {
+                j.validate()?;
+                if j.body_a.index == j.body_b.index {
+                    return Err(ApiError::InvalidValue);
+                }
+                target(&j.body_a)?;
+                target(&j.body_b)
+            }
+        }
     }
 
     pub fn pending_commands(&self) -> usize {
@@ -424,18 +505,13 @@ impl World {
     /// 조인트 추가 (오류 반환형). 엔드포인트는 **세대까지** 검증한다 — 인덱스만 보면
     /// 제거·재사용된 슬롯의 새 바디에 붙는다(리뷰 BLOCKER: ABA).
     pub fn try_add_joint(&mut self, mut joint: Joint) -> Result<usize, ApiError> {
+        // 생성자를 통과했더라도 **삽입 경계에서 다시** 검증한다(리뷰 BLOCKER: 공개 필드
+        // 대입으로 생성 후 축을 NaN으로 바꿀 수 있었고, `length_sq() < 0.5` 비교는
+        // NaN에서 false라 그대로 통과했다).
+        joint.validate()?;
         let (a, b) = (self.resolve(joint.body_a)?, self.resolve(joint.body_b)?);
         if a == b {
             return Err(ApiError::InvalidValue);
-        }
-        if !joint.anchor_a.is_finite() || !joint.anchor_b.is_finite() {
-            return Err(ApiError::InvalidValue);
-        }
-        if let crate::joint::JointKind::Hinge { axis_a, axis_b } = joint.kind {
-            // normalize_or_zero가 0을 남기면 각 제약이 조용히 사라진다
-            if axis_a.length_sq() < 0.5 || axis_b.length_sq() < 0.5 {
-                return Err(ApiError::InvalidValue);
-            }
         }
         self.wake(a);
         self.wake(b);
@@ -722,13 +798,14 @@ impl World {
                 if !m.points.is_empty() {
                     let cached = self.contact_cache.get(&key).unwrap_or(&empty);
                     for p in &m.points {
-                        self.diag.warm_total += 1;
                         self.diag.max_penetration = self.diag.max_penetration.max(-p.separation);
-                        if cached.iter().any(|(f, _)| *f == p.feature) {
-                            self.diag.warm_hits += 1;
-                        }
                     }
-                    constraints.push(solver::prepare(&self.bodies, a_id, b_id, &m, cached));
+                    let c = solver::prepare(&self.bodies, a_id, b_id, &m, cached, dt);
+                    // 진단은 **실제 warm load**를 센다(feature ID 일치만 세면 generic 접점의
+                    // 위치·법선 게이트가 매칭을 끊어도 100%로 보인다 — 거짓 지표).
+                    self.diag.warm_total += c.points.len();
+                    self.diag.warm_hits += c.warm_matched as usize;
+                    constraints.push(c);
                     constraint_keys.push(key);
                     live_keys.insert(key);
                 }
@@ -835,6 +912,7 @@ impl World {
                             tangent_world: c.tangents[0] * p.tangent_impulse[0]
                                 + c.tangents[1] * p.tangent_impulse[1],
                             position: p.position,
+                            contact_normal: c.normal,
                         },
                     )
                 })

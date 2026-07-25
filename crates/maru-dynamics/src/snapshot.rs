@@ -10,6 +10,10 @@
 //!
 //! M3에서 JS가 넘기는 바이트는 짧거나 조작될 수 있다. 두 층으로 방어한다:
 //!
+//! 0. **입력 총 바이트와 디코딩 후 힙에 각각 상한을 둔다.** 길이 유도 상한만으로는
+//!    부족하다 — `RemoveBody` 최소 레코드는 9바이트인데 `Command` 원소는 그보다 수배 크므로,
+//!    수십 MB짜리 **유효한** 커맨드 스트림이 wasm 선형 메모리에서 수백 MB를 요구할 수 있다
+//!    (리뷰 PARTIAL BLOCKER). count는 남은 바이트뿐 아니라 **누적 디코딩 예산**에도 과금된다.
 //! 1. **자원 예산은 입력 길이에서 유도한다.** 고정 상한(`1<<22` 등)은 12바이트짜리 파일이
 //!    400만 개를 주장하고 수 GB를 할당하게 둔다. 모든 count는 "남은 바이트 ÷ 레코드
 //!    최소 크기"를 넘을 수 없다 — 산술적으로 불가능한 개수는 읽기 전에 거부된다.
@@ -29,15 +33,27 @@ use maru_math::{Quat, Vec3};
 
 /// 포맷 매직·버전 — 다른 빌드/포맷의 바이트를 조용히 먹지 않기 위해.
 const MAGIC: u32 = 0x4d41_5255; // "MARU"
-/// v2: 슬롯 예약 플래그 · AddBody 핸들 · last_report 편입.
-const VERSION: u32 = 2;
+/// v3: 슬롯 예약 플래그 · AddBody 핸들 · last_report · 셰이프 원점 오프셋.
+const VERSION: u32 = 3;
+
+/// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
+/// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
+const MAX_SNAPSHOT_BYTES: usize = 64 << 20;
+/// **디코딩 후** 힙 예산. count × 원소 크기를 누적 과금한다.
+const MAX_DECODED_BYTES: usize = 192 << 20;
+
+/// 물리량 크기 상한. 모든 |값| ≤ 1e9이면 솔버의 곱(임펄스×역질량, r×임펄스, k 계산)이
+/// 1e27 수준에 머물러 f32 범위(3.4e38) 안에 남고, 유한 개수의 합도 오버플로하지 않는다.
+/// `f32::MAX`처럼 **유한하지만 거대한** 값은 유한성 검사를 통과한 뒤 첫 warm start 곱에서
+/// Inf가 되어 상태를 즉시 오염시킨다(리뷰 PARTIAL BLOCKER: 음수 법선만 막아선 안 닫힌다).
+const MAX_MAGNITUDE: f32 = 1.0e9;
 
 /// 레코드 **최소** 직렬화 크기 — count 검증의 근거. 실제 레코드는 이보다 크거나 같다.
 mod min_bytes {
     /// 셰이프 최소: 태그(1) + Sphere 반지름(4)
     const SHAPE: usize = 5;
-    /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + inv_mass4 + inv_I12 + fric4 + rest4
-    const BODY_CORE: usize = 1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + SHAPE;
+    /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + offset12
+    const BODY_CORE: usize = 1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + SHAPE;
     /// 슬롯 레코드: alive1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
     pub const SLOT: usize = 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
     /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang8
@@ -46,10 +62,35 @@ mod min_bytes {
     pub const COMMAND: usize = 1 + 8;
     /// 캐시 페어: 키8 + 엔트리 수4
     pub const CACHE_PAIR: usize = 8 + 4;
-    /// 캐시 엔트리: fid4 + normal4 + tangent8 + tangent_world12 + position12
-    pub const CACHE_ENTRY: usize = 4 + 4 + 8 + 12 + 12;
+    /// 캐시 엔트리: fid4 + normal4 + tangent8 + tangent_world12 + position12 + 법선12
+    pub const CACHE_ENTRY: usize = 4 + 4 + 8 + 12 + 12 + 12;
     /// hull 점 12 + (뒤따르는 반지름 4는 개수와 무관하므로 제외)
     pub const HULL_POINT: usize = 12;
+}
+
+/// 디코딩 후 원소가 힙에서 차지하는 크기 — count 과금용.
+mod decoded_size {
+    use super::*;
+    pub fn slot() -> usize {
+        // Body + 슬롯 병렬 배열(alive/reserved/gen/sleep/asleep/island)
+        core::mem::size_of::<Body>() + 16
+    }
+    pub fn joint() -> usize {
+        core::mem::size_of::<Joint>()
+    }
+    pub fn command() -> usize {
+        core::mem::size_of::<Command>()
+    }
+    pub fn cache_pair() -> usize {
+        // HashMap 엔트리 + Vec 헤더
+        64
+    }
+    pub fn cache_entry() -> usize {
+        core::mem::size_of::<(maru_collide::FeatureId, crate::solver::CachedImpulse)>()
+    }
+    pub fn hull_point() -> usize {
+        core::mem::size_of::<Vec3>()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,7 +99,7 @@ pub enum SnapshotError {
     BadVersion(u32),
     Truncated,
     TrailingBytes,
-    /// 남은 바이트로는 담을 수 없는 개수 — 산술적 불가 (자원 고갈 방어).
+    /// 남은 바이트로는 담을 수 없는 개수, 또는 총 바이트·디코딩 예산 초과.
     CountTooLarge,
     NonFinite,
     BadIndex,
@@ -99,6 +140,8 @@ impl Writer {
 pub struct Reader<'a> {
     b: &'a [u8],
     at: usize,
+    /// 지금까지 과금된 디코딩 후 힙 바이트.
+    decoded: usize,
 }
 
 impl Reader<'_> {
@@ -116,9 +159,10 @@ impl Reader<'_> {
     fn remaining(&self) -> usize {
         self.b.len() - self.at
     }
+    /// 물리량 f32 — 유한성뿐 아니라 **크기 상한**까지 요구한다(MAX_MAGNITUDE 주석 참조).
     fn f32(&mut self) -> Result<f32, SnapshotError> {
         let v = f32::from_le_bytes(self.take(4)?.try_into().unwrap());
-        if v.is_finite() {
+        if v.is_finite() && v.abs() <= MAX_MAGNITUDE {
             Ok(v)
         } else {
             Err(SnapshotError::NonFinite)
@@ -155,12 +199,23 @@ impl Reader<'_> {
     }
     /// **입력 길이에서 유도한 상한**으로 개수를 검증한다(고정 상수 금지 — 리뷰 BLOCKER).
     /// n개를 담으려면 최소 `n * min_each` 바이트가 남아 있어야 한다.
-    fn count(&mut self, min_each: usize) -> Result<usize, SnapshotError> {
+    fn count(&mut self, min_each: usize, decoded_each: usize) -> Result<usize, SnapshotError> {
         let n = self.u32()? as usize;
         let need = n
             .checked_mul(min_each)
             .ok_or(SnapshotError::CountTooLarge)?;
         if need > self.remaining() {
+            return Err(SnapshotError::CountTooLarge);
+        }
+        // 디코딩 후 힙에도 과금한다 — 입력 길이만으로는 증폭을 못 막는다
+        let heap = n
+            .checked_mul(decoded_each)
+            .ok_or(SnapshotError::CountTooLarge)?;
+        self.decoded = self
+            .decoded
+            .checked_add(heap)
+            .ok_or(SnapshotError::CountTooLarge)?;
+        if self.decoded > MAX_DECODED_BYTES {
             return Err(SnapshotError::CountTooLarge);
         }
         Ok(n)
@@ -210,7 +265,7 @@ fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
         },
         3 => {
             // 점 개수도 남은 바이트로 묶인다 → 전체 파일 크기가 곧 총 점 예산이다
-            let n = r.count(min_bytes::HULL_POINT)?;
+            let n = r.count(min_bytes::HULL_POINT, decoded_size::hull_point())?;
             let mut points = Vec::with_capacity(n);
             for _ in 0..n {
                 points.push(r.vec3()?);
@@ -241,6 +296,7 @@ fn write_body(w: &mut Writer, b: &Body) {
     w.vec3(b.inv_inertia_local);
     w.f32(b.friction);
     w.f32(b.restitution);
+    w.vec3(b.shape_origin_offset);
     write_shape(w, &b.shape);
 }
 
@@ -261,6 +317,7 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
     let inv_inertia_local = r.vec3()?;
     let friction = r.f32()?;
     let restitution = r.f32()?;
+    let shape_origin_offset = r.vec3()?;
     let shape = read_shape(r)?;
     if inv_mass < 0.0
         || friction < 0.0
@@ -301,6 +358,7 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
         inv_inertia_local,
         friction,
         restitution,
+        shape_origin_offset,
     })
 }
 
@@ -451,13 +509,21 @@ pub fn write_world(world: &World, w: &mut Writer) {
             w.f32(imp.tangent[1]);
             w.vec3(imp.tangent_world);
             w.vec3(imp.position);
+            w.vec3(imp.contact_normal);
         }
     }
 }
 
 /// 신뢰하지 않는 바이트에서 월드 복원. **검증이 끝나기 전에는 월드를 건드리지 않는다.**
 pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> {
-    let mut r = Reader { b: bytes, at: 0 };
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(SnapshotError::CountTooLarge);
+    }
+    let mut r = Reader {
+        b: bytes,
+        at: 0,
+        decoded: 0,
+    };
     if r.u32()? != MAGIC {
         return Err(SnapshotError::BadMagic);
     }
@@ -465,7 +531,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     if v != VERSION {
         return Err(SnapshotError::BadVersion(v));
     }
-    let nb = r.count(min_bytes::SLOT)?;
+    let nb = r.count(min_bytes::SLOT, decoded_size::slot())?;
     let mut bodies = Vec::with_capacity(nb);
     let mut sleep_timer = Vec::with_capacity(nb);
     let mut asleep = Vec::with_capacity(nb);
@@ -487,14 +553,14 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         island.push(r.u32()?);
     }
 
-    let nj = r.count(min_bytes::JOINT)?;
+    let nj = r.count(min_bytes::JOINT, decoded_size::joint())?;
     let mut joints = Vec::with_capacity(nj);
     for _ in 0..nj {
         joints.push(read_joint(&mut r)?);
     }
 
     // pending 커맨드 (enqueue 순서 보존 — 설계 §7)
-    let ncmd = r.count(min_bytes::COMMAND)?;
+    let ncmd = r.count(min_bytes::COMMAND, decoded_size::command())?;
     let mut commands = Vec::with_capacity(ncmd);
     for _ in 0..ncmd {
         let cmd = match r.u8()? {
@@ -539,11 +605,11 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         rejected: r.u32()? as usize,
     };
 
-    let np = r.count(min_bytes::CACHE_PAIR)?;
+    let np = r.count(min_bytes::CACHE_PAIR, decoded_size::cache_pair())?;
     let mut cache = std::collections::HashMap::with_capacity(np);
     for _ in 0..np {
         let key = (r.u32()?, r.u32()?);
-        let ne = r.count(min_bytes::CACHE_ENTRY)?;
+        let ne = r.count(min_bytes::CACHE_ENTRY, decoded_size::cache_entry())?;
         let mut entry = Vec::with_capacity(ne);
         for _ in 0..ne {
             let fid = maru_collide::FeatureId(r.u32()?);
@@ -552,7 +618,14 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
                 tangent: [r.f32()?, r.f32()?],
                 tangent_world: r.vec3()?,
                 position: r.vec3()?,
+                contact_normal: r.vec3()?,
             };
+            // 캐시된 법선은 단위 벡터이거나(정상) 0(초기값)이어야 한다 — 임의 벡터는
+            // 매칭 게이트를 무력화한다
+            let nl2 = imp.contact_normal.length_sq();
+            if !(nl2 == 0.0 || (0.9..=1.1).contains(&nl2)) {
+                return Err(SnapshotError::InconsistentState);
+            }
             // 법선 임펄스는 **비음수**가 계약이다(단방향 접촉). 음수는 warm start가
             // 바디를 서로 끌어당기게 만든다.
             if imp.normal < 0.0 {

@@ -563,7 +563,8 @@ mod tests {
         ));
 
         // ① 큐에 쌓아도 쿼리는 이전 상태를 본다
-        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(3.0, 0.0, 0.0)));
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(3.0, 0.0, 0.0)))
+            .unwrap();
         assert_eq!(w.pending_commands(), 1);
         assert_eq!(w.body(b).linvel.x, 0.0, "pending이 쿼리에 보이면 안 된다");
 
@@ -574,21 +575,42 @@ mod tests {
         assert_eq!(w.pending_commands(), 0);
 
         // ③ 순서대로 적용된다 (마지막 값이 남는다)
-        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(1.0, 0.0, 0.0)));
-        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(2.0, 0.0, 0.0)));
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(1.0, 0.0, 0.0)))
+            .unwrap();
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(2.0, 0.0, 0.0)))
+            .unwrap();
         w.flush_commands();
         assert_eq!(w.body(b).linvel.x, 2.0, "enqueue 순서가 지켜지지 않음");
 
-        // ④ 잘못된 커맨드는 스텝을 중단시키지 않고 카운트된다
-        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(f32::NAN, 0.0, 0.0)));
-        w.enqueue(Command::SetMaterial(b, 0.5, 0.5));
+        // ④ 잘못된 값은 **enqueue에서** 거부된다 — 큐에 들어간 커맨드는 항상 구조적으로
+        //    유효하므로 스냅샷 왕복이 자기 자신에게 복원된다(enqueue/restore 계약 일치).
+        assert_eq!(
+            w.enqueue(Command::SetLinearVelocity(b, Vec3::new(f32::NAN, 0.0, 0.0))),
+            Err(ApiError::InvalidValue)
+        );
+        assert_eq!(w.pending_commands(), 0, "무효 커맨드가 큐에 남음");
+        w.enqueue(Command::SetMaterial(b, 0.5, 0.5)).unwrap();
         let rep = w.flush_commands();
         assert_eq!(rep.applied, 1);
-        assert_eq!(rep.rejected, 1);
+        assert_eq!(rep.rejected, 0);
         assert!(w.body(b).linvel.is_finite());
 
+        // ④' enqueue 시점엔 유효했지만 **앞선 커맨드가 대상을 지우면** flush에서 거부된다
+        //     (스텝을 중단시키지 않고 카운트만 — 설계 §3 스텝 원자성)
+        let doomed = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(9.0, 5.0, 0.0),
+            1.0,
+        ));
+        w.enqueue(Command::RemoveBody(doomed)).unwrap();
+        w.enqueue(Command::SetLinearVelocity(doomed, Vec3::new(1.0, 0.0, 0.0)))
+            .unwrap();
+        let rep = w.flush_commands();
+        assert_eq!((rep.applied, rep.rejected), (1, 1));
+
         // ⑤ step 0단계가 pending을 자동 적용한다
-        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(0.0, 0.0, 5.0)));
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(0.0, 0.0, 5.0)))
+            .unwrap();
         w.step(DT);
         assert_eq!(w.pending_commands(), 0);
         assert!(w.body(b).pose.pos.z > 0.0, "step이 커맨드를 적용하지 않음");
@@ -602,8 +624,10 @@ mod tests {
             1.0,
         ));
         w2.restore(&w.snapshot()).expect("restore");
-        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(-2.0, 0.0, 0.0)));
-        w2.enqueue(Command::SetLinearVelocity(b, Vec3::new(-2.0, 0.0, 0.0)));
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(-2.0, 0.0, 0.0)))
+            .unwrap();
+        w2.enqueue(Command::SetLinearVelocity(b, Vec3::new(-2.0, 0.0, 0.0)))
+            .unwrap();
         let snap_with_pending = w.snapshot();
         let mut w3 = World::new(WorldParams::default());
         ground(&mut w3);
@@ -855,7 +879,8 @@ mod tests {
             bob,
             Vec3::new(1.0, 0.0, 0.0),
             Vec3::new(-0.5, 0.0, 0.0),
-        ))));
+        ))))
+        .unwrap();
         for _ in 0..120 {
             w.step(DT);
         }
@@ -900,19 +925,20 @@ mod tests {
         ));
         assert_eq!(new.index, old.index, "슬롯 재사용 전제가 깨짐");
         assert_ne!(new.generation, old.generation, "세대가 증가하지 않음");
-        // 옛 핸들로 만든 조인트는 flush에서 거부돼야 한다
-        w.enqueue(Command::AddJoint(Box::new(Joint::point(
-            old,
-            keep,
-            Vec3::ZERO,
-            Vec3::ZERO,
-        ))));
-        w.flush_commands();
+        // 옛 핸들로 만든 조인트는 **enqueue에서** 거부된다 (계약 통일: 큐에 들어간 커맨드는
+        // 항상 유효 → 자기 스냅샷이 자기에게 복원된다)
         assert_eq!(
-            w.last_command_report().rejected,
-            1,
-            "stale 핸들 조인트가 통과"
+            w.enqueue(Command::AddJoint(Box::new(Joint::point(
+                old,
+                keep,
+                Vec3::ZERO,
+                Vec3::ZERO,
+            )))),
+            Err(ApiError::StaleHandle),
+            "stale 핸들 조인트가 큐에 들어감"
         );
+        assert_eq!(w.pending_commands(), 1, "예약 AddBody만 남아야 한다");
+        w.flush_commands();
         assert!(w.is_alive(new) && !w.is_alive(old));
     }
 
@@ -967,9 +993,10 @@ mod tests {
         let good = w.snapshot();
         let before = w.state_hash();
 
-        // 슬롯 레이아웃(Box 셰이프): alive1+reserved1+gen4 + 본문94 + sleep4+asleep1+island4 = 109
-        //   본문94 = type1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + Box17
-        const SLOT: usize = 109;
+        // 슬롯 레이아웃(Box 셰이프): alive1+reserved1+gen4 + 본문106 + sleep4+asleep1+island4 = 121
+        //   본문106 = type1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4
+        //            + shape_origin_offset12 + Box17
+        const SLOT: usize = 121;
         let type_off = 12 + SLOT + 1 + 1 + 4; // 헤더 + 슬롯0(ground) + alive/reserved/gen
         assert_eq!(
             good[type_off], 1,
@@ -1030,5 +1057,181 @@ mod tests {
             substeps: 0,
             ..Default::default()
         });
+    }
+
+    // ─────────── 리뷰 rev_1517fd7a 회귀 ───────────
+
+    /// BLOCKER: `#[non_exhaustive]`만으로는 필드 변조를 못 막는다 → 필드 비공개화 +
+    /// **삽입 경계 재검증**. (컴파일 차단 자체는 body.rs의 compile_fail 독테스트가 증명한다.)
+    #[test]
+    #[should_panic(expected = "invalid body")]
+    fn add_body_revalidates_mutated_body() {
+        let mut w = World::new(WorldParams::default());
+        let mut b = Body::new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 1.0, 0.0), 1.0);
+        // 크레이트 안에서만 가능한 변조를 흉내 — 밖에서는 컴파일되지 않는다
+        b.shape = Shape::Hull {
+            points: vec![],
+            radius: 0.0,
+        };
+        w.add_body(b);
+    }
+
+    /// NEW MAJOR: 생성자가 `is_finite`만 봐서 0 쿼터니언이 통과했다.
+    #[test]
+    #[should_panic(expected = "normalizable")]
+    fn zero_quaternion_rejected_at_construction() {
+        Body::new_dynamic(
+            Shape::Sphere { radius: 1.0 },
+            Pose {
+                pos: Vec3::ZERO,
+                rot: Quat {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                    w: 0.0,
+                },
+            },
+            1.0,
+        );
+    }
+
+    /// PARTIAL MAJOR: 검사하지 않던 파라미터들. NaN 임계는 비교가 항상 false라
+    /// 게이트를 조용히 무력화한다.
+    #[test]
+    #[should_panic(expected = "restitution_threshold")]
+    fn nan_restitution_threshold_rejected() {
+        World::new(WorldParams {
+            solver: crate::solver::SolverParams {
+                restitution_threshold: f32::NAN,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "time_to_sleep")]
+    fn negative_time_to_sleep_rejected() {
+        World::new(WorldParams {
+            time_to_sleep: -1.0,
+            ..Default::default()
+        });
+    }
+
+    /// PARTIAL BLOCKER: 유한하지만 거대한 값은 첫 곱에서 Inf가 된다 — 크기 상한이 필요하다.
+    #[test]
+    fn snapshot_rejects_huge_finite_values() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        dyn_box(&mut w, 0.0, 3.0);
+        w.step(DT);
+        let good = w.snapshot();
+        let before = w.state_hash();
+        // 슬롯1의 inv_mass 자리 (SLOT 121 · alive1+reserved1+gen4 + type1+pos12+rot16+lin12+ang12)
+        let off = 12 + 121 + 1 + 1 + 4 + 1 + 12 + 16 + 12 + 12;
+        let mut bad = good.clone();
+        bad[off..off + 4].copy_from_slice(&f32::MAX.to_le_bytes());
+        assert_eq!(
+            w.restore(&bad),
+            Err(SnapshotError::NonFinite),
+            "f32::MAX 역질량이 통과 — 첫 warm start 곱에서 Inf가 된다"
+        );
+        assert_eq!(w.state_hash(), before);
+    }
+
+    /// PARTIAL MAJOR: enqueue와 restore의 계약이 어긋나면 **자기 월드가 만든 스냅샷이
+    /// 자기에게 복원되지 않는다**. 큐에 무엇을 넣어도 왕복이 성립해야 한다.
+    #[test]
+    fn any_enqueued_state_survives_snapshot_roundtrip() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let a = dyn_box(&mut w, 0.0, 3.0);
+        let doomed = dyn_box(&mut w, 3.0, 3.0);
+        w.step(DT);
+        // 제거된 바디의 옛 핸들은 애초에 큐에 들어가지 못한다
+        w.remove_body(doomed).unwrap();
+        assert_eq!(
+            w.enqueue(Command::SetLinearVelocity(doomed, Vec3::ZERO)),
+            Err(ApiError::StaleHandle)
+        );
+        // 유효한 것만 쌓고 왕복
+        w.enqueue(Command::SetLinearVelocity(a, Vec3::new(1.0, 0.0, 0.0)))
+            .unwrap();
+        let fresh = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(6.0, 3.0, 0.0),
+            1.0,
+        ));
+        w.enqueue(Command::SetMaterial(fresh, 0.4, 0.2)).unwrap();
+        let snap = w.snapshot();
+        assert!(
+            w.restore(&snap).is_ok(),
+            "자기 월드가 만든 스냅샷이 복원되지 않음 (enqueue/restore 계약 불일치)"
+        );
+        assert_eq!(w.pending_commands(), 3);
+        w.step(DT);
+        assert!(w.is_alive(fresh));
+        assert_eq!(w.last_command_report().rejected, 0);
+    }
+
+    /// PARTIAL MAJOR: hull 재중심화로 엔진 pose ≠ 호스트가 준 원점이 된다 →
+    /// 렌더 오프셋을 조회할 수 있어야 시각 형상과 물리 형상이 어긋나지 않는다.
+    #[test]
+    fn hull_recenter_exposes_render_offset() {
+        let origin = pose(1.0, 2.0, 3.0);
+        let b = Body::new_dynamic(
+            Shape::Hull {
+                points: vec![Vec3::new(9.5, -0.5, -0.5), Vec3::new(10.5, 0.5, 0.5)],
+                radius: 0.0,
+            },
+            origin,
+            1.0,
+        );
+        // 질량중심은 원래 원점에서 (10,0,0) 떨어져 있다
+        assert!((b.pose().pos - Vec3::new(11.0, 2.0, 3.0)).length() < 1e-3);
+        // 호스트가 원래 정점 버퍼를 그릴 위치 = pose * offset → 원래 원점으로 돌아온다
+        let render = b.pose().pos + b.pose().rot.rotate(b.shape_origin_offset());
+        assert!(
+            (render - origin.pos).length() < 1e-3,
+            "렌더 오프셋이 원래 원점을 복원하지 못함: {render:?}"
+        );
+    }
+
+    /// PARTIAL MAJOR: 정상 슬라이딩에서 warm start가 매 프레임 끊기면 안 된다.
+    /// 허용치가 기하 척도만 쓰면 60Hz·1m/s(프레임당 16.7mm)가 반두께 허용치를 넘는다.
+    #[test]
+    fn sliding_contact_keeps_warm_start() {
+        let mut w = World::new(WorldParams::default());
+        // 얇은 판 위를 구가 미끄러진다 — 구·판 접점은 generic witness(위치 매칭 대상)
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(20.0, 0.01, 20.0),
+                radius: 0.0,
+            },
+            pose(0.0, -0.01, 0.0),
+        ));
+        let s = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(-5.0, 0.3, 0.0),
+            1.0,
+        ));
+        for _ in 0..60 {
+            w.step(DT); // 안착
+        }
+        w.set_linear_velocity(s, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+        // 진단은 **스텝별로 리셋**되므로 매 스텝 누적한다
+        let (mut hits, mut total) = (0usize, 0usize);
+        for _ in 0..180 {
+            w.step(DT);
+            let d = w.diagnostics();
+            hits += d.warm_hits;
+            total += d.warm_total;
+        }
+        assert!(total > 100, "접촉 표본이 부족: {total}");
+        let ratio = hits as f32 / total as f32;
+        assert!(
+            ratio > 0.8,
+            "슬라이딩 중 warm start 계승률 {ratio:.2} — 매 프레임 끊기고 있다"
+        );
     }
 }

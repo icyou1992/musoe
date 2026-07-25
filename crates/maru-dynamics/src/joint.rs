@@ -21,21 +21,62 @@ pub enum JointKind {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Joint {
-    pub body_a: BodyHandle,
-    pub body_b: BodyHandle,
+    pub(crate) body_a: BodyHandle,
+    pub(crate) body_b: BodyHandle,
     /// 질량중심 기준 로컬 앵커.
-    pub anchor_a: Vec3,
-    pub anchor_b: Vec3,
-    pub kind: JointKind,
+    pub(crate) anchor_a: Vec3,
+    pub(crate) anchor_b: Vec3,
+    pub(crate) kind: JointKind,
     /// 연결 바디 간 충돌 허용 여부 (기본 false — Box2D·Jolt 관행. 조인트 당김과 접촉 밀어냄이
     /// warm start로 맞서면 공진 발산한다: hinge 체인 접지 실증, step 390→420 inf).
-    pub collide_connected: bool,
+    pub(crate) collide_connected: bool,
     /// 누적 임펄스 (warm start — 스텝 간 유지).
-    pub linear_impulse: Vec3,
-    pub angular_impulse: [f32; 2],
+    pub(crate) linear_impulse: Vec3,
+    pub(crate) angular_impulse: [f32; 2],
 }
 
 impl Joint {
+    #[inline]
+    pub fn body_a(&self) -> BodyHandle {
+        self.body_a
+    }
+    #[inline]
+    pub fn body_b(&self) -> BodyHandle {
+        self.body_b
+    }
+    #[inline]
+    pub fn kind(&self) -> &JointKind {
+        &self.kind
+    }
+    #[inline]
+    pub fn collide_connected(&self) -> bool {
+        self.collide_connected
+    }
+
+    /// 조인트 자체의 불변식 — 삽입·역직렬화 경계에서 강제한다.
+    /// 비교는 **양성 조건**으로 쓴다: `!(x < 0.5)`는 NaN에서 참이 되어 통과시킨다.
+    pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
+        use crate::world::ApiError;
+        if !self.anchor_a.is_finite() || !self.anchor_b.is_finite() {
+            return Err(ApiError::InvalidValue);
+        }
+        if !self.linear_impulse.is_finite()
+            || !self.angular_impulse[0].is_finite()
+            || !self.angular_impulse[1].is_finite()
+        {
+            return Err(ApiError::InvalidValue);
+        }
+        if let JointKind::Hinge { axis_a, axis_b } = self.kind {
+            for a in [axis_a, axis_b] {
+                let l2 = a.length_sq();
+                if !(0.9..=1.1).contains(&l2) {
+                    return Err(ApiError::InvalidValue);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 슬롯 인덱스 (월드가 생존·세대를 이미 검증한 뒤의 핫패스 전용).
     #[inline]
     pub(crate) fn ia(&self) -> usize {
@@ -69,8 +110,13 @@ impl Joint {
     ) -> Self {
         Self {
             kind: JointKind::Hinge {
-                axis_a: axis_a.normalize_or_zero(),
-                axis_b: axis_b.normalize_or_zero(),
+                // 0/NaN 축을 조용히 0으로 남기면 각 제약이 사라진다 — 생성 경계에서 거부
+                axis_a: axis_a
+                    .try_normalize()
+                    .expect("hinge axis_a must be normalizable"),
+                axis_b: axis_b
+                    .try_normalize()
+                    .expect("hinge axis_b must be normalizable"),
             },
             ..Self::point(body_a, body_b, anchor_a, anchor_b)
         }

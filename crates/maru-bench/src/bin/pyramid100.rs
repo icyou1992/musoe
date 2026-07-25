@@ -86,9 +86,9 @@ fn main() {
             index: i as u32,
             generation: 0,
         });
-        finite &= b.pose.pos.y.is_finite() && b.linvel.length().is_finite();
-        vmax = vmax.max(b.linvel.length());
-        top_y = top_y.max(b.pose.pos.y);
+        finite &= b.pose().pos.y.is_finite() && b.linvel().length().is_finite();
+        vmax = vmax.max(b.linvel().length());
+        top_y = top_y.max(b.pose().pos.y);
     }
     println!(
         "{ms_per_step:.0} ms/step  finite={finite}  vmax={vmax:.4}  top_y={top_y:.2} (expect 99.5)"

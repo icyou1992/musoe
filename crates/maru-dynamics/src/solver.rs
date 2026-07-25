@@ -85,6 +85,8 @@ pub struct ContactConstraint {
     pub friction: f32,
     pub restitution: f32,
     pub points: Vec<ContactPointConstraint>,
+    /// 이번 스텝에 **실제로 warm load된** 접점 수 (진단 전용, 캐노니컬 상태 아님).
+    pub warm_matched: u32,
 }
 
 /// 법선에서 결정적 접선 기저.
@@ -117,11 +119,22 @@ fn effective_mass(
 }
 
 /// 캐시된 접점 임펄스 (스텝 간 warm start — 설계 §3 PCM).
-/// warm start 매칭 시 위치 근접 허용치 (**최소 특징 크기** 대비 비율).
-/// 접점이 이보다 멀리 "점프"하면 다른 접촉으로 보고 임펄스를 물려주지 않는다.
-/// 기준을 AABB 대각이 아니라 최소 두께로 잡는 이유는 `min_feature_size` 주석 참조 —
-/// 접점 매칭은 **접촉 국소** 판정이라 형상의 전체 크기가 아니라 얇은 쪽 두께가 척도다.
-const WARM_MATCH_REL: f32 = 0.25;
+/// generic witness 접점의 warm start 매칭 규칙 (리뷰 PARTIAL MAJOR).
+///
+/// 위치 근접 **하나만** 보면 양방향으로 틀린다: 기하 척도만 쓰면 반두께 1cm 판의 허용치가
+/// 2.5mm라 60Hz·1m/s 정상 슬라이딩(프레임당 16.7mm)에서 매 프레임 warm start가 끊기고,
+/// 반대로 큰 반지름 곡면에서는 같은 비율이 다른 feature로의 점프를 통과시킨다.
+/// 그래서 세 가지를 함께 쓴다:
+/// - **기하 바닥** = 최소 특징 크기의 이 비율 (정지 접촉의 수치 흔들림 흡수)
+const WARM_MATCH_GEO: f32 = 0.25;
+/// - **운동 항** = 접점이 이번 스텝에 **정당하게 움직일 수 있는 상한** × 여유.
+///   상대 슬립 속도를 쓰면 안 된다: 구가 구르면 슬립은 0인데 기하 접점은 구의 선속도만큼
+///   월드에서 이동한다(실측: 슬립 기준으로는 계승률 0.01). 상한은 두 바디의 선속도와
+///   회전이 접점에 만드는 이동량의 합이다.
+const WARM_MATCH_MOTION: f32 = 1.0;
+/// - **법선 게이트** = 캐시된 법선과의 정렬. 위치가 가까워도 접촉 면이 바뀌었으면
+///   다른 접촉이다 — 곡면에서 feature가 점프해도 법선은 크게 돈다.
+const WARM_MATCH_COS: f32 = 0.9;
 
 #[derive(Clone, Copy, Default)]
 pub struct CachedImpulse {
@@ -133,6 +146,9 @@ pub struct CachedImpulse {
     pub tangent_world: Vec3,
     /// 접점의 월드 위치 (generic witness 접점의 근접 매칭용).
     pub position: Vec3,
+    /// 캐시 시점의 접촉 **법선 방향**(`normal`은 법선 임펄스 크기라 이름을 구분한다).
+    /// 위치가 가까워도 면이 바뀌었으면 다른 접촉이다.
+    pub contact_normal: Vec3,
 }
 
 /// 매니폴드 → 제약 준비. `cache`는 전 스텝 (feature → 임펄스) — feature ID 일치 접점만 warm load.
@@ -142,14 +158,17 @@ pub fn prepare(
     b: usize,
     m: &Manifold,
     cache: &[(maru_collide::FeatureId, CachedImpulse)],
+    dt: f32,
 ) -> ContactConstraint {
-    // 위치 근접 허용치는 형상 크기에 비례해야 한다(절대 상수 금지 — 톨러런스 정책과 동일 원칙).
-    let match_tol =
-        WARM_MATCH_REL * maru_collide::min_feature_size(&bodies[a].shape, &bodies[b].shape);
-    let match_tol2 = match_tol * match_tol;
+    // 기하 바닥은 형상 크기에 비례해야 한다(절대 상수 금지 — 톨러런스 정책과 동일 원칙).
+    let geo_tol =
+        WARM_MATCH_GEO * maru_collide::min_feature_size(&bodies[a].shape, &bodies[b].shape);
     let (ba, bb) = (&bodies[a], &bodies[b]);
     let n = m.normal;
     let tangents = tangent_basis(n);
+    // **실제로 warm load된 접점 수**. 진단이 feature ID 일치만 세면 generic 접점의 위치·법선
+    // 게이트가 얼마나 자주 매칭을 끊는지 보이지 않는다 — 지표가 거짓이면 회귀 테스트도 거짓이다.
+    let mut warm_matched = 0u32;
     let (ia, ib) = (ba.inv_inertia_world(), bb.inv_inertia_world());
     let points = m
         .points
@@ -163,14 +182,27 @@ pub fn prepare(
             // - generic witness 접점: pair 안에서 ID를 공유하므로(구-박스 접점이 면→모서리로
             //   이동해도 같은 ID) **위치 근접**까지 요구한다. 점프하면 임펄스를 물려주지 않는다.
             let generic = p.feature.0 == maru_collide::FEATURE_GENERIC;
-            let warm = cache
+            // 허용치 = 기하 바닥 + 접점의 정당한 이동 상한. 정지 접촉은 기하 바닥만 쓴다.
+            let drift = ba.linvel.length()
+                + ba.angvel.length() * ra.length()
+                + bb.linvel.length()
+                + bb.angvel.length() * rb.length();
+            let match_tol = geo_tol + WARM_MATCH_MOTION * drift * dt;
+            let match_tol2 = match_tol * match_tol;
+            let hit = cache
                 .iter()
                 .find(|(f, c)| {
                     *f == p.feature
-                        && (!generic || (c.position - p.position).length_sq() <= match_tol2)
+                        && (!generic
+                            || ((c.position - p.position).length_sq() <= match_tol2
+                                // 면이 바뀌었으면 다른 접촉 (곡면 feature 점프 차단)
+                                && c.contact_normal.dot(n) >= WARM_MATCH_COS))
                 })
-                .map(|(_, c)| *c)
-                .unwrap_or_default();
+                .map(|(_, c)| *c);
+            if hit.is_some() {
+                warm_matched += 1;
+            }
+            let warm = hit.unwrap_or_default();
             // 월드 마찰 임펄스를 현재 접평면에 재투영 (기저 회전 대응)
             let warm_t = [
                 warm.tangent_world.dot(tangents[0]),
@@ -195,6 +227,7 @@ pub fn prepare(
         })
         .collect();
     ContactConstraint {
+        warm_matched,
         a,
         b,
         normal: n,
@@ -388,9 +421,11 @@ mod tests {
                 tangent: [0.0, 0.0],
                 tangent_world: Vec3::ZERO,
                 position: cached_at,
+                contact_normal: Vec3::new(0.0, 1.0, 0.0),
             },
         )];
-        // 특성 길이 = 작은 쪽(구, 대각 ≈ 1.73) → 허용치 ≈ 0.087
+        // 정지 상태이므로 허용치 = 기하 바닥만 (최소 특징 크기 = 구 반지름 0.5 → 0.125)
+        const DT: f32 = 1.0 / 60.0;
         // ① 근접(1cm 이동): 계승
         let near = prepare(
             &bodies,
@@ -398,6 +433,7 @@ mod tests {
             0,
             &manifold_at(cached_at + Vec3::new(0.01, 0.0, 0.0)),
             &cache,
+            DT,
         );
         assert_eq!(
             near.points[0].normal_impulse, 7.0,
@@ -410,10 +446,27 @@ mod tests {
             0,
             &manifold_at(cached_at + Vec3::new(1.0, 0.0, 0.0)),
             &cache,
+            DT,
         );
         assert_eq!(
             far.points[0].normal_impulse, 0.0,
             "점프한 접점에 이전 임펄스가 적용됨"
+        );
+        // ③ 법선이 뒤집힌 접점: 위치가 같아도 다른 접촉이다 (곡면 feature 점프 차단)
+        let flipped = vec![(
+            FeatureId(FEATURE_GENERIC),
+            CachedImpulse {
+                normal: 7.0,
+                tangent: [0.0, 0.0],
+                tangent_world: Vec3::ZERO,
+                position: cached_at,
+                contact_normal: Vec3::new(1.0, 0.0, 0.0),
+            },
+        )];
+        let turned = prepare(&bodies, 1, 0, &manifold_at(cached_at), &flipped, DT);
+        assert_eq!(
+            turned.points[0].normal_impulse, 0.0,
+            "법선이 바뀐 접촉에 이전 임펄스가 계승됨"
         );
     }
 
@@ -429,11 +482,12 @@ mod tests {
                 tangent: [0.0, 0.0],
                 tangent_world: Vec3::ZERO,
                 position: Vec3::new(0.0, 0.5, 0.0),
+                contact_normal: Vec3::new(0.0, 1.0, 0.0),
             },
         )];
         let mut m = manifold_at(Vec3::new(2.0, 0.5, 0.0));
         m.points[0].feature = fid;
-        let c = prepare(&bodies, 1, 0, &m, &cache);
+        let c = prepare(&bodies, 1, 0, &m, &cache, 1.0 / 60.0);
         assert_eq!(c.points[0].normal_impulse, 3.0);
     }
 }

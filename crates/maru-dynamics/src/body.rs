@@ -12,22 +12,129 @@ pub enum BodyType {
     Kinematic,
 }
 
-/// `#[non_exhaustive]`: **크레이트 밖에서 구조체 리터럴로 만들 수 없다**(리뷰 MAJOR).
-/// 생성자가 강제하는 불변식(유한 pose·양수 역질량·검증된 셰이프)을 우회하는 경로를
-/// 타입 수준에서 막는다. 읽기는 그대로 공개 필드로 한다(월드는 `&mut Body`를 밖에 주지 않는다).
+/// 크레이트 밖에서는 필드 대입이 **컴파일되지 않는다** (인코딩된 회귀 테스트):
+///
+/// ```compile_fail
+/// use maru_collide::{Pose, Shape};
+/// use maru_dynamics::Body;
+/// use maru_math::{Quat, Vec3};
+/// let mut b = Body::new_dynamic(
+///     Shape::Sphere { radius: 1.0 },
+///     Pose { pos: Vec3::ZERO, rot: Quat::IDENTITY },
+///     1.0,
+/// );
+/// b.inv_mass = 0.0; // ← private field: 컴파일 오류
+/// ```
+///
+/// **불변식 보유 필드는 전부 비공개**다(리뷰 BLOCKER). `#[non_exhaustive]`는 구조체 리터럴만
+/// 막을 뿐, 생성자로 얻은 값의 공개 필드는 밖에서 얼마든지 대입할 수 있다 —
+/// `Body::new_dynamic(...)` 뒤에 `b.shape = Shape::Hull { points: vec![], .. }`로 바꿔
+/// `add_body`하면 첫 `local_aabb()`에서 패닉한다. 읽기는 동명 게터로 제공한다
+/// (필드와 메서드는 네임스페이스가 달라 크레이트 안 코드는 그대로 필드를 쓴다).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Body {
-    pub body_type: BodyType,
-    pub pose: Pose,
-    pub linvel: Vec3,
-    pub angvel: Vec3,
-    pub shape: Shape,
-    pub inv_mass: f32,
+    pub(crate) body_type: BodyType,
+    pub(crate) pose: Pose,
+    pub(crate) linvel: Vec3,
+    pub(crate) angvel: Vec3,
+    pub(crate) shape: Shape,
+    pub(crate) inv_mass: f32,
     /// 로컬 역관성 대각 (월드 역관성은 매 서브스텝 회전).
-    pub inv_inertia_local: Vec3,
-    pub friction: f32,
-    pub restitution: f32,
+    pub(crate) inv_inertia_local: Vec3,
+    pub(crate) friction: f32,
+    pub(crate) restitution: f32,
+    /// 재중심화 보정: **원래 셰이프 원점**이 질량중심 로컬 좌표에서 어디였는가.
+    /// 호스트는 자기 정점 버퍼를 `pose.pos + pose.rot * shape_origin_offset`에 그린다.
+    /// hull이 아니거나 이미 중심이 맞으면 0 (설계: pose.pos = 질량중심).
+    pub(crate) shape_origin_offset: Vec3,
+}
+
+impl Body {
+    #[inline]
+    pub fn body_type(&self) -> BodyType {
+        self.body_type
+    }
+    #[inline]
+    pub fn pose(&self) -> Pose {
+        self.pose
+    }
+    #[inline]
+    pub fn linvel(&self) -> Vec3 {
+        self.linvel
+    }
+    #[inline]
+    pub fn angvel(&self) -> Vec3 {
+        self.angvel
+    }
+    #[inline]
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+    #[inline]
+    pub fn inv_mass(&self) -> f32 {
+        self.inv_mass
+    }
+    #[inline]
+    pub fn inv_inertia_local(&self) -> Vec3 {
+        self.inv_inertia_local
+    }
+    #[inline]
+    pub fn friction(&self) -> f32 {
+        self.friction
+    }
+    #[inline]
+    pub fn restitution(&self) -> f32 {
+        self.restitution
+    }
+    /// 바디 불변식 — **삽입 경계에서 다시** 강제한다. 생성자를 통과한 값이라도
+    /// 공개 API 밖에서 필드가 바뀌었을 수 있고, 역직렬화 경로는 생성자를 거치지 않는다.
+    pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
+        use crate::world::ApiError;
+        self.shape.validate().map_err(|_| ApiError::InvalidValue)?;
+        if !self.pose.pos.is_finite() || self.pose.rot.try_normalize().is_none() {
+            return Err(ApiError::InvalidValue);
+        }
+        if !self.linvel.is_finite() || !self.angvel.is_finite() {
+            return Err(ApiError::InvalidValue);
+        }
+        if !self.shape_origin_offset.is_finite() {
+            return Err(ApiError::InvalidValue);
+        }
+        // 비교는 양성 조건으로 — `!(x < 0.0)`은 NaN에서 참이라 통과시킨다
+        if !(self.friction >= 0.0 && self.friction.is_finite())
+            || !(0.0..=1.0).contains(&self.restitution)
+        {
+            return Err(ApiError::InvalidValue);
+        }
+        let inv_i = self.inv_inertia_local;
+        match self.body_type {
+            BodyType::Dynamic => {
+                if !(self.inv_mass > 0.0
+                    && self.inv_mass.is_finite()
+                    && inv_i.x > 0.0
+                    && inv_i.y > 0.0
+                    && inv_i.z > 0.0
+                    && inv_i.is_finite())
+                {
+                    return Err(ApiError::InvalidValue);
+                }
+            }
+            BodyType::Static | BodyType::Kinematic => {
+                if self.inv_mass != 0.0 || inv_i != Vec3::ZERO {
+                    return Err(ApiError::InvalidValue);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 엔진이 쓰는 셰이프의 원점이 **호스트가 준 원점과 다를 수 있다**(hull 재중심화).
+    /// 렌더러는 이 오프셋을 적용해야 시각 형상과 물리 형상이 일치한다.
+    #[inline]
+    pub fn shape_origin_offset(&self) -> Vec3 {
+        self.shape_origin_offset
+    }
 }
 
 impl Body {
@@ -39,16 +146,13 @@ impl Body {
             "density must be finite and positive, got {density}"
         );
         shape.validate().expect("invalid shape");
-        assert!(
-            pose.pos.is_finite() && pose.rot.is_finite(),
-            "pose must be finite"
-        );
+        let pose = normalized_pose(pose);
         // **hull 재중심화**: 솔버는 pose.pos를 질량중심으로 가정한다(r = 접점 − pose.pos).
         // 중심이 어긋난 hull은 평행축 항으로 대각 관성을 키워도 **관성곱(products of
         // inertia)**이 빠져 2축 이상 어긋나면 축이 틀린 텐서가 된다(리뷰 MAJOR).
         // 대각 텐서로 정확해지는 유일한 방법은 실제로 중심을 맞추는 것 — 점을 중심으로
         // 옮기고 pose를 같은 양만큼 월드에서 밀어 **같은 물체**를 유지한다.
-        let (shape, pose) = recenter_hull(shape, pose);
+        let (shape, pose, shape_origin_offset) = recenter_hull(shape, pose);
         let (mass, inertia) = mass_properties(&shape, density);
         assert!(
             mass.is_finite()
@@ -83,15 +187,13 @@ impl Body {
             inv_inertia_local: inv_inertia,
             friction: 0.6,
             restitution: 0.0,
+            shape_origin_offset,
         }
     }
 
     pub fn new_static(shape: Shape, pose: Pose) -> Self {
         shape.validate().expect("invalid shape");
-        assert!(
-            pose.pos.is_finite() && pose.rot.is_finite(),
-            "pose must be finite"
-        );
+        let pose = normalized_pose(pose);
         Self {
             body_type: BodyType::Static,
             pose,
@@ -102,6 +204,7 @@ impl Body {
             inv_inertia_local: Vec3::ZERO,
             friction: 0.6,
             restitution: 0.0,
+            shape_origin_offset: Vec3::ZERO,
         }
     }
 
@@ -134,11 +237,24 @@ impl Body {
     }
 }
 
+/// 유한하고 **정규화 가능한** 자세만 통과시키고, 정규화된 값을 저장한다.
+/// `is_finite`만 보면 `Quat{0,0,0,0}`이 통과해 support 방향·관성 회전이 무효화되고
+/// dynamic은 첫 적분에서 갑자기 identity로 튄다(리뷰 NEW MAJOR).
+fn normalized_pose(pose: Pose) -> Pose {
+    assert!(pose.pos.is_finite(), "pose.pos must be finite");
+    let rot = pose
+        .rot
+        .try_normalize()
+        .expect("pose.rot must be finite and normalizable (zero/NaN quaternion rejected)");
+    Pose { pos: pose.pos, rot }
+}
+
 /// hull의 AABB 중심을 원점으로 옮기고, 같은 양을 월드 자세에 반영한다(물체는 불변).
 /// 결과: 질량중심이 pose.pos와 일치 → 평행축 항 0 → 관성곱 0 → 대각 텐서가 정확해진다.
-fn recenter_hull(shape: Shape, pose: Pose) -> (Shape, Pose) {
+/// 셋째 반환값 = **원래 셰이프 원점**의 질량중심 로컬 좌표(렌더 오프셋, 리뷰 MAJOR).
+fn recenter_hull(shape: Shape, pose: Pose) -> (Shape, Pose, Vec3) {
     let Shape::Hull { points, radius } = shape else {
-        return (shape, pose);
+        return (shape, pose, Vec3::ZERO);
     };
     let (mut min, mut max) = (points[0], points[0]);
     for p in &points[1..] {
@@ -147,14 +263,14 @@ fn recenter_hull(shape: Shape, pose: Pose) -> (Shape, Pose) {
     }
     let c = (max + min) * 0.5;
     if c == Vec3::ZERO {
-        return (Shape::Hull { points, radius }, pose);
+        return (Shape::Hull { points, radius }, pose, Vec3::ZERO);
     }
     let points = points.iter().map(|p| *p - c).collect();
     let pose = Pose {
         pos: pose.pos + pose.rot.rotate(c),
         rot: pose.rot,
     };
-    (Shape::Hull { points, radius }, pose)
+    (Shape::Hull { points, radius }, pose, -c)
 }
 
 /// (질량, 관성 대각). 캡슐은 원통+반구 근사 대신 v1은 동체 실린더 근사(문서화된 가정).
