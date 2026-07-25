@@ -34,6 +34,15 @@ pub struct Manifold {
 /// 면 지배 판정 임계: |면법선·접촉법선| 이 이 값 이상이면 face contact로 취급.
 const FACE_DOT_MIN: f32 = 0.95;
 
+/// 클리핑 정점의 계보 (리뷰 MAJOR 반영 — 구 태그 재사용 인코딩은 다단 클리핑에서 서로 다른
+/// 계보가 같은 태그로 충돌했다): incident 원본 정점 비트합 ∪ 관여한 reference 측면 비트합.
+#[derive(Clone, Copy)]
+struct ClipVertex {
+    position: Vec3,
+    incident_mask: u8,
+    reference_mask: u8,
+}
+
 /// 접촉 생성 진입점. `margin` = speculative margin (양의 separation 허용 한계).
 pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<Manifold> {
     let (ra, rb) = (sa.radius(), sb.radius());
@@ -57,8 +66,18 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
     };
 
     // box-box + 면 지배 → 클리핑 매니폴드
-    if let (Shape::Box { half: ha, .. }, Shape::Box { half: hb, .. }) = (sa, sb) {
-        if let Some(m) = clip_box_box(*ha, pa, *hb, pb, normal, margin) {
+    if let (
+        Shape::Box {
+            half: ha,
+            radius: ra_box,
+        },
+        Shape::Box {
+            half: hb,
+            radius: rb_box,
+        },
+    ) = (sa, sb)
+    {
+        if let Some(m) = clip_box_box(*ha, *ra_box, pa, *hb, *rb_box, pb, normal, margin) {
             return Some(m);
         }
     }
@@ -91,24 +110,31 @@ fn box_face_normal(f: usize, rot: Quat) -> Vec3 {
 }
 
 /// 면 f의 4개 꼭짓점 (로컬, 바깥에서 볼 때 CCW — 결정적 순서).
-fn box_face_verts(f: usize, half: Vec3) -> [Vec3; 4] {
+/// rounded box(리뷰 MAJOR 반영): 실제 평면 패치는 접선 방향으로 radius만큼 수축되고
+/// 법선 방향은 겉면(half)에 놓인다 — 겉 코너를 접점으로 쓰면 곡면 밖 점이 솔버로 간다.
+fn box_face_verts(f: usize, half: Vec3, radius: f32) -> [Vec3; 4] {
     let axis = f / 2;
     let s = if f % 2 == 1 { 1.0 } else { -1.0 };
+    let core = Vec3::new(
+        (half.x - radius).max(0.0),
+        (half.y - radius).max(0.0),
+        (half.z - radius).max(0.0),
+    );
     let (h, u, v) = match axis {
         0 => (
-            half.x,
-            Vec3::new(0.0, half.y, 0.0),
-            Vec3::new(0.0, 0.0, half.z),
+            core.x,
+            Vec3::new(0.0, core.y, 0.0),
+            Vec3::new(0.0, 0.0, core.z),
         ),
         1 => (
-            half.y,
-            Vec3::new(0.0, 0.0, half.z),
-            Vec3::new(half.x, 0.0, 0.0),
+            core.y,
+            Vec3::new(0.0, 0.0, core.z),
+            Vec3::new(core.x, 0.0, 0.0),
         ),
         _ => (
-            half.z,
-            Vec3::new(half.x, 0.0, 0.0),
-            Vec3::new(0.0, half.y, 0.0),
+            core.z,
+            Vec3::new(core.x, 0.0, 0.0),
+            Vec3::new(0.0, core.y, 0.0),
         ),
     };
     let n = match axis {
@@ -116,7 +142,7 @@ fn box_face_verts(f: usize, half: Vec3) -> [Vec3; 4] {
         1 => Vec3::new(0.0, s, 0.0),
         _ => Vec3::new(0.0, 0.0, s),
     };
-    let c = n * h;
+    let c = n * (h + radius);
     // s<0이면 u,v 순서를 바꿔 CCW 유지
     if s > 0.0 {
         [c + u + v, c - u + v, c - u - v, c + u - v]
@@ -140,10 +166,13 @@ fn best_face(rot: Quat, want: Vec3) -> (usize, f32) {
 }
 
 /// box-box 면 클리핑. 법선이 면 지배적이 아니면 None(→ witness 폴백).
+#[allow(clippy::too_many_arguments)]
 fn clip_box_box(
     ha: Vec3,
+    ra: f32,
     pa: &Pose,
     hb: Vec3,
+    rb: f32,
     pb: &Pose,
     normal: Vec3,
     margin: f32,
@@ -156,30 +185,45 @@ fn clip_box_box(
     }
     // reference = 더 정렬된 쪽 (동률 = A — 결정론)
     let ref_is_a = da >= db;
-    let (rf, rh, rp, inf, ih, ip) = if ref_is_a {
-        (fa, ha, pa, fb, hb, pb)
+    let (rf, rh, rr, rp, ih, ir, ip) = if ref_is_a {
+        (fa, ha, ra, pa, hb, rb, pb)
     } else {
-        (fb, hb, pb, fa, ha, pa)
+        (fb, hb, rb, pb, ha, ra, pa)
     };
 
     let rn = box_face_normal(rf, rp.rot); // reference 바깥 법선 (월드)
-    let rverts: Vec<Vec3> = box_face_verts(rf, rh)
+    let rverts: Vec<Vec3> = box_face_verts(rf, rh, rr)
         .iter()
         .map(|v| rp.pos + rp.rot.rotate(*v))
         .collect();
     // incident = 상대 박스에서 rn과 가장 반대인 면
     let (inc_f, _) = best_face(ip.rot, -rn);
-    let iverts: Vec<Vec3> = box_face_verts(inc_f, ih)
+    let iverts: Vec<Vec3> = box_face_verts(inc_f, ih, ir)
         .iter()
         .map(|v| ip.pos + ip.rot.rotate(*v))
         .collect();
-    let _ = inf;
+    // radius가 half를 잠식해 평면 패치가 선/점으로 퇴화하면 클리핑 불가 → witness 폴백
+    if (rverts[1] - rverts[0])
+        .cross(rverts[2] - rverts[1])
+        .length_sq()
+        <= 1.0e-12
+        || (iverts[1] - iverts[0])
+            .cross(iverts[2] - iverts[1])
+            .length_sq()
+            <= 1.0e-12
+    {
+        return None;
+    }
 
     // Sutherland–Hodgman: incident 폴리곤을 reference 4 측면 평면으로 클리핑 (계보 추적)
-    let mut poly: Vec<(Vec3, u32)> = iverts
+    let mut poly: Vec<ClipVertex> = iverts
         .iter()
         .enumerate()
-        .map(|(i, v)| (*v, 0x100 | i as u32))
+        .map(|(i, v)| ClipVertex {
+            position: *v,
+            incident_mask: 1u8 << i,
+            reference_mask: 0,
+        })
         .collect();
     for side in 0..4 {
         let e0 = rverts[side];
@@ -190,20 +234,23 @@ fn clip_box_box(
         if pn.dot(center - e0) < 0.0 {
             pn = -pn;
         }
-        let mut out: Vec<(Vec3, u32)> = Vec::with_capacity(8);
+        let mut out: Vec<ClipVertex> = Vec::with_capacity(8);
         for i in 0..poly.len() {
-            let (v0, t0) = poly[i];
-            let (v1, _t1) = poly[(i + 1) % poly.len()];
-            let d0 = pn.dot(v0 - e0);
-            let d1 = pn.dot(v1 - e0);
+            let v0 = poly[i];
+            let v1 = poly[(i + 1) % poly.len()];
+            let d0 = pn.dot(v0.position - e0);
+            let d1 = pn.dot(v1.position - e0);
             if d0 >= 0.0 {
-                out.push((v0, t0));
+                out.push(v0);
             }
             if (d0 >= 0.0) != (d1 >= 0.0) {
                 let t = d0 / (d0 - d1);
-                let x = v0 + (v1 - v0) * t;
-                // 교점 feature = (원본 에지 시작 태그, 클리핑 측면) — 결정적
-                out.push((x, 0x200 | ((t0 & 0xFF) << 4) | side as u32));
+                let x = v0.position + (v1.position - v0.position) * t;
+                out.push(ClipVertex {
+                    position: x,
+                    incident_mask: v0.incident_mask | v1.incident_mask,
+                    reference_mask: v0.reference_mask | v1.reference_mask | (1u8 << side),
+                });
             }
         }
         poly = out;
@@ -214,16 +261,20 @@ fn clip_box_box(
 
     // reference 평면 아래(margin 이내)만 채택, separation = 평면까지 부호 거리
     let mut pts: Vec<ContactPoint> = Vec::with_capacity(8);
-    let ref_face_bits = ((ref_is_a as u32) << 31) | ((rf as u32) << 24);
-    for (v, tag) in poly {
-        let sep = rn.dot(v - rverts[0]);
+    for v in poly {
+        let sep = rn.dot(v.position - rverts[0]);
         if sep <= margin {
             // 접점 위치는 reference 면 위로 투영한 점과 incident 점의 중간
-            let proj = v - rn * sep;
+            let proj = v.position - rn * sep;
+            let feature = ((ref_is_a as u32) << 31)
+                | ((rf as u32) << 28)
+                | ((inc_f as u32) << 25)
+                | ((v.reference_mask as u32) << 4)
+                | v.incident_mask as u32;
             pts.push(ContactPoint {
-                position: (v + proj) * 0.5,
+                position: (v.position + proj) * 0.5,
                 separation: sep,
-                feature: FeatureId(ref_face_bits | tag),
+                feature: FeatureId(feature),
             });
         }
     }
@@ -243,60 +294,61 @@ fn clip_box_box(
     })
 }
 
-/// 최심점 고정 → 최원점 → 남은 점 중 삼각형 면적 최대 2점 (동률=낮은 feature — 결정론).
+/// 최심점 고정 → 나머지 3점 전수 조합으로 접촉 사각형 면적 최대 선택 (설계 §4.2 원문,
+/// 리뷰 MAJOR 반영 — 구 그리디(최원점 선고정)는 면적 최대 조합을 보장하지 않았다).
+/// pts는 클리핑 다각형의 순환 순서 — 인덱스 정렬로 부분집합의 순환 순서를 보존해 면적 계산.
 fn reduce_to_4(pts: Vec<ContactPoint>, n: Vec3) -> Vec<ContactPoint> {
+    use core::cmp::Ordering;
     let deepest = pts
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| {
             a.separation
-                .partial_cmp(&b.separation)
-                .unwrap()
+                .total_cmp(&b.separation)
                 .then(a.feature.cmp(&b.feature))
         })
         .map(|(i, _)| i)
         .unwrap();
-    let p0 = pts[deepest];
-    let farthest = pts
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != deepest)
-        .max_by(|(_, a), (_, b)| {
-            let da = (a.position - p0.position).length_sq();
-            let db = (b.position - p0.position).length_sq();
-            da.partial_cmp(&db).unwrap().then(b.feature.cmp(&a.feature))
-        })
-        .map(|(i, _)| i)
-        .unwrap();
-    let p1 = pts[farthest];
-    let mut best2 = (0.0f32, None::<usize>, None::<usize>);
-    for (i, ci) in pts.iter().enumerate() {
-        if i == deepest || i == farthest {
-            continue;
-        }
-        let area1 = (p1.position - p0.position)
-            .cross(ci.position - p0.position)
-            .dot(n)
-            .abs();
-        for (j, cj) in pts.iter().enumerate().skip(i + 1) {
-            if j == deepest || j == farthest {
-                continue;
-            }
-            let area2 = (ci.position - p0.position)
-                .cross(cj.position - p0.position)
-                .dot(n)
-                .abs();
-            let total = area1 + area2;
-            if total > best2.0 {
-                best2 = (total, Some(i), Some(j));
+    let candidates: Vec<usize> = (0..pts.len()).filter(|i| *i != deepest).collect();
+    let mut best_indices = [deepest, candidates[0], candidates[1], candidates[2]];
+    let mut best_area = -1.0f32;
+    let mut best_key = [FeatureId(u32::MAX); 4];
+
+    for a in 0..(candidates.len() - 2) {
+        for b in (a + 1)..(candidates.len() - 1) {
+            for c in (b + 1)..candidates.len() {
+                let mut indices = [deepest, candidates[a], candidates[b], candidates[c]];
+                indices.sort_unstable(); // 순환 순서 보존
+                let origin = pts[indices[0]].position;
+                let twice_area = (pts[indices[1]].position - origin)
+                    .cross(pts[indices[2]].position - origin)
+                    .dot(n)
+                    + (pts[indices[2]].position - origin)
+                        .cross(pts[indices[3]].position - origin)
+                        .dot(n);
+                let area = twice_area.abs();
+                let mut key = [
+                    pts[indices[0]].feature,
+                    pts[indices[1]].feature,
+                    pts[indices[2]].feature,
+                    pts[indices[3]].feature,
+                ];
+                key.sort_unstable();
+                let better = match area.total_cmp(&best_area) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => key < best_key,
+                    Ordering::Less => false,
+                };
+                if better {
+                    best_area = area;
+                    best_indices = indices;
+                    best_key = key;
+                }
             }
         }
     }
-    let mut out = vec![p0, p1];
-    if let (Some(i), Some(j)) = (best2.1, best2.2) {
-        out.push(pts[i]);
-        out.push(pts[j]);
-    }
+
+    let mut out: Vec<ContactPoint> = best_indices.iter().map(|&i| pts[i]).collect();
     out.sort_by_key(|p| p.feature);
     out
 }
@@ -343,6 +395,7 @@ mod tests {
         );
         // 4점의 feature는 서로 달라야 함
         let mut feats: Vec<_> = m.points.iter().map(|p| p.feature).collect();
+        feats.sort_unstable();
         feats.dedup();
         assert_eq!(feats.len(), 4);
     }
@@ -428,6 +481,33 @@ mod tests {
         assert_eq!(m.points.len(), 4);
         for p in &m.points {
             assert!((p.separation + 0.1).abs() < 1e-3, "sep={}", p.separation);
+        }
+    }
+
+    /// 리뷰 MAJOR 회귀: rounded box의 접점은 평면 패치(접선 ±(half−radius)) 안에 있어야 한다.
+    #[test]
+    fn rounded_box_face_points_stay_on_flat_patch() {
+        let top = Shape::Box {
+            half: Vec3::new(1.0, 1.0, 1.0),
+            radius: 0.25,
+        };
+        let ground = Shape::Box {
+            half: Vec3::new(4.0, 1.0, 4.0),
+            radius: 0.0,
+        };
+        let m = contact(
+            &top,
+            &pose(0.0, 2.0, 0.0),
+            &ground,
+            &pose(0.0, 0.0, 0.0),
+            0.05,
+        )
+        .unwrap();
+        assert_eq!(m.points.len(), 4);
+        for p in &m.points {
+            assert!(p.position.x.abs() <= 0.7501, "point={p:?}");
+            assert!(p.position.z.abs() <= 0.7501, "point={p:?}");
+            assert!(p.separation.abs() < 1.0e-4, "point={p:?}");
         }
     }
 

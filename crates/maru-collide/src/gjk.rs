@@ -66,6 +66,9 @@ pub fn gjk(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> GjkResult {
     let mut v = dir; // 현재 심플렉스에서 원점까지의 최근접 벡터(초기값은 임의 추정)
 
     for _ in 0..MAX_ITER {
+        // 깊이 0 접촉(v=0)에서 법선을 잃지 않도록 마지막 유효 탐색 방향을 승계한다
+        // (리뷰 BLOCKER: 동일 박스 정확 면접촉에서 첫 support가 w=0이면 +X 오답 법선).
+        let previous_v = v;
         let w = support(sa, pa, sb, pb, -v);
         // 진전 없음 → 분리 확정. 첫 반복(빈 심플렉스)은 v가 추정일 뿐이라 판정하지 않는다.
         let vv = v.length_sq();
@@ -79,16 +82,16 @@ pub fn gjk(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> GjkResult {
             // 퇴화(평면) 사면체는 EPA 시드가 될 수 없음 → 접촉(깊이≈0)으로 강등
             let (a, b, c, d) = (simplex[0].w, simplex[1].w, simplex[2].w, simplex[3].w);
             if (b - a).cross(c - a).dot(d - a).abs() < 1.0e-10 {
-                return separated(&simplex[..3], Vec3::ZERO);
+                return separated_with_normal(&simplex[..3], Vec3::ZERO, previous_v);
             }
             return GjkResult::Intersecting([simplex[0], simplex[1], simplex[2], simplex[3]]);
         }
-        v = new_v;
-        if v.length_sq() <= 1.0e-12 {
+        if new_v.length_sq() <= 1.0e-12 {
             // 원점이 심플렉스 위. 리덕션 루프를 계속 돌면 수직 확장이 매번 같은 심플렉스로
             // 되돌아와 순환한다(축 정렬 깊은 교차에서 실증) — 리덕션 없이 즉시 사면체를 완성.
-            return complete_on_boundary(&simplex, sa, pa, sb, pb);
+            return complete_on_boundary(&simplex, sa, pa, sb, pb, previous_v);
         }
+        v = new_v;
     }
     separated(&simplex, v)
 }
@@ -101,11 +104,12 @@ fn complete_on_boundary(
     pa: &Pose,
     sb: &Shape,
     pb: &Pose,
+    fallback_normal: Vec3,
 ) -> GjkResult {
     let sup = |d: Vec3| support(sa, pa, sb, pb, d);
     match simplex.len() {
-        // 원점이 support 정점과 일치 — 표면 접촉
-        1 => separated(simplex, Vec3::ZERO),
+        // 원점이 support 정점과 일치 — 표면 접촉 (법선은 마지막 유효 탐색 방향 승계)
+        1 => separated_with_normal(simplex, Vec3::ZERO, fallback_normal),
         2 => {
             let (a, b) = (simplex[0], simplex[1]);
             let ab = b.w - a.w;
@@ -128,13 +132,13 @@ fn complete_on_boundary(
                     }
                 }
             }
-            separated(simplex, Vec3::ZERO)
+            separated_with_normal(simplex, Vec3::ZERO, fallback_normal)
         }
         _ => {
             let (a, b, c) = (simplex[0], simplex[1], simplex[2]);
             let n = (b.w - a.w).cross(c.w - a.w);
             if n.length_sq() <= 1.0e-12 {
-                return separated(simplex, Vec3::ZERO);
+                return separated_with_normal(simplex, Vec3::ZERO, fallback_normal);
             }
             let s1 = sup(n);
             if (s1.w - a.w).dot(n).abs() > 1.0e-8 {
@@ -144,18 +148,27 @@ fn complete_on_boundary(
             if (s2.w - a.w).dot(n).abs() > 1.0e-8 {
                 return GjkResult::Intersecting([a, b, c, s2]);
             }
-            separated(simplex, Vec3::ZERO)
+            separated_with_normal(simplex, Vec3::ZERO, fallback_normal)
         }
     }
 }
 
 fn separated(simplex: &[SupportPoint], v: Vec3) -> GjkResult {
+    separated_with_normal(simplex, v, Vec3::new(1.0, 0.0, 0.0))
+}
+
+fn separated_with_normal(simplex: &[SupportPoint], v: Vec3, fallback: Vec3) -> GjkResult {
     let (on_a, on_b) = witness(simplex, v);
     let distance = v.length();
     let normal = if distance > 0.0 {
         v * (1.0 / distance)
     } else {
-        Vec3::new(1.0, 0.0, 0.0)
+        let l2 = fallback.length_sq();
+        if l2 > 0.0 {
+            fallback * (1.0 / l2.sqrt())
+        } else {
+            Vec3::new(1.0, 0.0, 0.0)
+        }
     };
     GjkResult::Separated {
         distance,
@@ -362,6 +375,24 @@ mod tests {
                 assert!((distance - 1.5).abs() < 1e-3, "{distance}")
             }
             r => panic!("expected separated: {r:?}"),
+        }
+    }
+
+    #[test]
+    fn identical_boxes_exact_face_touch_keeps_separating_axis() {
+        // 리뷰 BLOCKER 회귀: 동일 박스 정확 면접촉 — 법선이 +X로 무너지면 안 됨
+        let s = Shape::Box {
+            half: Vec3::new(1.0, 1.0, 1.0),
+            radius: 0.0,
+        };
+        match gjk(&s, &pose(0.0, 2.0, 0.0), &s, &pose(0.0, 0.0, 0.0)) {
+            GjkResult::Separated {
+                distance, normal, ..
+            } => {
+                assert!(distance < 1.0e-6, "distance={distance}");
+                assert!((normal.y - 1.0).abs() < 1.0e-6, "normal={normal:?}");
+            }
+            r => panic!("expected touching separation: {r:?}"),
         }
     }
 

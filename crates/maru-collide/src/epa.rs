@@ -63,6 +63,8 @@ pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose
             faces.push(f);
         }
     }
+    // 상한 종료 폴백용 — 마지막으로 확장을 시도한(=당시 최근접) 면
+    let mut last_best = faces[0];
 
     for _ in 0..MAX_ITER {
         // 최근접 면 (동률: 낮은 인덱스 — 결정론)
@@ -78,6 +80,7 @@ pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose
             break; // 방어: 면 소진
         }
         let f = faces[best];
+        last_best = f;
         let on_a = pa.support_core(sa, f.n);
         let on_b = pb.support_core(sb, -f.n);
         let w = SupportPoint {
@@ -117,14 +120,22 @@ pub fn epa(seed: [SupportPoint; 4], sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose
         }
     }
 
-    // 상한 도달: 현재 최근접 면으로 마감 (방어적 — 결정적이며 항상 유한)
-    let mut best = 0;
+    // 상한 도달: **alive 면 중** 최근접으로 마감 (리뷰 MAJOR 반영 — 구 코드는 best=0에서
+    // 시작해 죽은 face 0의 작은 d가 기준이 되면 어떤 alive 면도 선택되지 않아 제거된 면의
+    // depth/witness를 반환했다). alive가 하나도 없으면 마지막 확장 대상 면으로 폴백.
+    let mut best = usize::MAX;
+    let mut best_d = f32::INFINITY;
     for (fi, f) in faces.iter().enumerate() {
-        if f.alive && f.d < faces[best].d {
+        if f.alive && f.d < best_d {
+            best_d = f.d;
             best = fi;
         }
     }
-    finish(&verts, faces[best])
+    if best != usize::MAX {
+        finish(&verts, faces[best])
+    } else {
+        finish(&verts, last_best)
+    }
 }
 
 fn finish(verts: &[SupportPoint], f: Face) -> Penetration {

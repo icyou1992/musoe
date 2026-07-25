@@ -9,7 +9,11 @@ use crate::Aabb;
 use maru_math::{Aabbx4, Vec3, Vec3x4};
 use wide::f32x4;
 
-const EMPTY: i32 = i32::MIN;
+// leaf/node/empty 인코딩 (리뷰 MAJOR 반영 — 구 i32 보수 인코딩은 id 0x7fff_ffff가
+// EMPTY(i32::MIN)와 충돌해 해당 리프가 질의에서 소실됐다):
+// 최상위 비트 = leaf, EMPTY = LEAF_BIT-1 (node 인덱스 용량 상한으로 예약).
+const LEAF_BIT: u32 = 1 << 31;
+const EMPTY: u32 = LEAF_BIT - 1;
 
 #[derive(Clone, Copy, Debug)]
 enum Child {
@@ -21,17 +25,17 @@ enum Child {
 pub struct Tree {
     /// 노드별 자식 4개의 바운드(SoA). 빈 레인은 반전 AABB(항상 불일치).
     bounds: Vec<soa_bounds::AabbLanes>,
-    children: Vec<[i32; 4]>,
-    root: i32,
+    children: Vec<[u32; 4]>,
+    root: u32,
 }
 
-fn decode(c: i32) -> Child {
+fn decode(c: u32) -> Child {
     if c == EMPTY {
         Child::None
-    } else if c >= 0 {
-        Child::Node(c as u32)
+    } else if c & LEAF_BIT != 0 {
+        Child::Leaf(c & !LEAF_BIT)
     } else {
-        Child::Leaf(!(c) as u32)
+        Child::Node(c)
     }
 }
 
@@ -46,18 +50,23 @@ impl Tree {
         if items.is_empty() {
             return t;
         }
+        assert!(
+            items.iter().all(|(id, _)| id & LEAF_BIT == 0),
+            "tree leaf id 최상위 비트는 예약됨"
+        );
         let mut idx: Vec<usize> = (0..items.len()).collect();
         t.root = t.build_rec(items, &mut idx);
         t
     }
 
-    fn build_rec(&mut self, items: &[(u32, Aabb)], idx: &mut [usize]) -> i32 {
+    fn build_rec(&mut self, items: &[(u32, Aabb)], idx: &mut [usize]) -> u32 {
         if idx.len() == 1 {
-            return !(items[idx[0]].0 as i32);
+            return items[idx[0]].0 | LEAF_BIT;
         }
         // 4그룹: 최장축 2분할 → 각 절반을 그 절반의 최장축으로 재분할 (centroid 기준, id 동률 정렬)
         let groups = split4(items, idx);
         let node = self.children.len();
+        assert!(node < EMPTY as usize, "tree node index capacity exceeded");
         self.children.push([EMPTY; 4]);
         self.bounds.push(soa_bounds::AabbLanes::empty());
         for (lane, g) in groups.into_iter().enumerate() {
@@ -74,7 +83,7 @@ impl Tree {
             self.children[node][lane] = child;
             self.bounds[node].set_lane(lane, b);
         }
-        node as i32
+        node as u32
     }
 
     /// 질의 AABB와 겹칠 **가능성이 있는** 리프 id들(superset). 정렬·정밀 판정은 호출자 몫.
@@ -89,7 +98,7 @@ impl Tree {
         }
         let qmin = Vec3x4::splat(q.min);
         let qmax = Vec3x4::splat(q.max);
-        let mut stack: Vec<u32> = vec![root as u32];
+        let mut stack: Vec<u32> = vec![root];
         while let Some(n) = stack.pop() {
             let n = n as usize;
             let mask = self.bounds[n].overlaps_mask(qmin, qmax).to_array();
@@ -191,5 +200,43 @@ pub(crate) mod soa_bounds {
             }
             .overlaps(qmin, qmax)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 리뷰 MAJOR 회귀: 최대 31비트 id가 EMPTY와 앨리어싱되면 리프가 소실된다.
+    #[test]
+    fn max_31_bit_leaf_id_does_not_alias_empty() {
+        let id = 0x7fff_ffff;
+        let aabb = Aabb::from_center(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0));
+        let tree = Tree::build(&[(id, aabb)]);
+        let mut out = Vec::new();
+        tree.query_candidates(aabb, &mut out);
+        assert_eq!(out, vec![id]);
+    }
+
+    /// 내부 노드 인코딩까지 통과하는지: 다수 아이템 속의 최대 id.
+    #[test]
+    fn max_id_survives_inner_node_encoding() {
+        let mut items: Vec<(u32, Aabb)> = (0..16)
+            .map(|i| {
+                let c = Vec3::new(i as f32 * 3.0, 0.0, 0.0);
+                (i, Aabb::from_center(c, Vec3::new(1.0, 1.0, 1.0)))
+            })
+            .collect();
+        items.push((
+            0x7fff_ffff,
+            Aabb::from_center(Vec3::new(24.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0)),
+        ));
+        let tree = Tree::build(&items);
+        let mut out = Vec::new();
+        tree.query_candidates(
+            Aabb::from_center(Vec3::new(24.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            &mut out,
+        );
+        assert!(out.contains(&0x7fff_ffff), "{out:?}");
     }
 }
