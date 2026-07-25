@@ -149,16 +149,16 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<&Softness>) {
         let wb_axis = bodies[j.body_b].pose.rot.rotate(axis_b);
         let (u, v) = perp_basis(wa_axis);
         let wrel = bodies[j.body_a].angvel - bodies[j.body_b].angvel;
-        // 축 오차: axis_b의 u/v 성분 (정렬 시 0)
-        let err = wa_axis.cross(wb_axis);
+        // 축 오차. 부호는 임펄스 적용 규약(A += imp, B -= imp)과 맞아야 한다 —
+        // wa×wb를 쓰면 20° 어긋난 축이 정렬되는 대신 반대축(-1)으로 넘어간다(실증).
+        let err = wb_axis.cross(wa_axis);
         for (axis_i, dir) in [(0usize, u), (1usize, v)] {
             let k_ang = dir.dot(ia.mul_vec(dir)) + dir.dot(ib.mul_vec(dir));
             if k_ang <= 0.0 {
                 continue;
             }
             let cdot = dir.dot(wrel);
-            // 부호 유도: 소각 근사에서 (ωa−ωb)를 −bias_rate·err 로 구동하면 wa_axis가
-            // wb_axis 쪽으로 회전해 정렬된다 (dir·err가 채널별 위반량).
+            // (ωa−ωb)를 −bias_rate·err 로 구동하면 두 축이 서로를 향해 회전한다.
             let c = dir.dot(err);
             let (bias, ms, is_) = match soft {
                 Some(sf) => (c * sf.bias_rate, sf.mass_scale, sf.impulse_scale),

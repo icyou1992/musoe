@@ -27,8 +27,28 @@ pub struct Body {
 }
 
 impl Body {
+    /// 동적 바디 생성. 질량·관성이 유한 양수가 아니면 **생성 경계에서 거부**한다
+    /// (설계 §8 위생: inv_mass=∞는 0·∞=NaN으로 속도를 오염시킨다 — 리뷰 지적).
     pub fn new_dynamic(shape: Shape, pose: Pose, density: f32) -> Self {
+        assert!(
+            density.is_finite() && density > 0.0,
+            "density must be finite and positive, got {density}"
+        );
+        if let Shape::Hull { points, .. } = &shape {
+            assert!(!points.is_empty(), "dynamic hull must contain points");
+        }
         let (mass, inertia) = mass_properties(&shape, density);
+        assert!(
+            mass.is_finite()
+                && mass > 0.0
+                && inertia.x.is_finite()
+                && inertia.y.is_finite()
+                && inertia.z.is_finite()
+                && inertia.x > 0.0
+                && inertia.y > 0.0
+                && inertia.z > 0.0,
+            "dynamic shape must have finite positive mass/inertia (mass={mass}, inertia={inertia:?})"
+        );
         Self {
             body_type: BodyType::Dynamic,
             pose,

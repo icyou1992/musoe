@@ -242,6 +242,58 @@ mod tests {
         );
     }
 
+    /// 리뷰 지적 검증: hinge 각 제약의 **부호**. cross product는 반평행에서도 0이라
+    /// |cos|만 보면 부호를 판별할 수 없다 — 작은 초기 오차(20°)에서 시작해
+    /// **오차가 줄어드는지**로 판별한다(부호가 반대면 커져서 반대축으로 넘어간다).
+    #[test]
+    fn hinge_reduces_small_axis_error() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.05 },
+            pose(0.0, 0.0, 0.0),
+        ));
+        // B를 z축 기준 20° 돌려 놓고, hinge 축은 양쪽 다 +X로 지정
+        let tilt = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 20f32.to_radians());
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.1, 0.1),
+                radius: 0.0,
+            },
+            Pose {
+                pos: Vec3::ZERO,
+                rot: tilt,
+            },
+            1.0,
+        ));
+        w.add_joint(Joint::hinge(
+            anchor.index as usize,
+            b.index as usize,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+        ));
+        let align = |w: &World| {
+            w.body(b)
+                .pose
+                .rot
+                .rotate(Vec3::new(1.0, 0.0, 0.0))
+                .dot(Vec3::new(1.0, 0.0, 0.0))
+        };
+        let start = align(&w); // cos20° ≈ 0.94
+        for _ in 0..120 {
+            w.step(DT);
+        }
+        let end = align(&w);
+        assert!(
+            end > start && end > 0.999,
+            "hinge 축 오차가 줄지 않음: {start} → {end} (부호 반대 의심)"
+        );
+    }
+
     /// M2 수용 기준: hinge 체인 20링크 + 접촉 혼합 수렴 (설계 §11 M2).
     /// 체인을 **바닥에 눕힌 상태**로 검증한다 — 전 링크가 동시에 접촉 제약과 조인트 제약을
     /// 받는 결정적 시나리오. (공중에서 떨어뜨리면 혼돈계라 더미 형태가 플랫폼마다 달라

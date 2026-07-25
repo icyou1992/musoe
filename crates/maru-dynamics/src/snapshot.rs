@@ -125,7 +125,7 @@ fn read_shape(r: &mut Reader) -> Shape {
 }
 
 pub fn write_world(world: &World, w: &mut Writer) {
-    let (bodies, sleep_timer, asleep, joints, cache) = world.canonical_parts();
+    let (bodies, sleep_timer, asleep, island, joints, cache) = world.canonical_parts();
     w.u32(bodies.len() as u32);
     for (i, b) in bodies.iter().enumerate() {
         w.u8(match b.body_type {
@@ -144,6 +144,7 @@ pub fn write_world(world: &World, w: &mut Writer) {
         write_shape(w, &b.shape);
         w.f32(sleep_timer[i]);
         w.u8(asleep[i] as u8);
+        w.u32(island[i]); // 아일랜드 대표 — wake 전파가 restore 후에도 동일해야 L0 유지
     }
     w.u32(joints.len() as u32);
     for j in joints {
@@ -188,6 +189,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) {
     let mut bodies = Vec::with_capacity(nb);
     let mut sleep_timer = Vec::with_capacity(nb);
     let mut asleep = Vec::with_capacity(nb);
+    let mut island = Vec::with_capacity(nb);
     for _ in 0..nb {
         let body_type = match r.u8() {
             0 => BodyType::Static,
@@ -218,6 +220,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) {
         });
         sleep_timer.push(r.f32());
         asleep.push(r.u8() != 0);
+        island.push(r.u32());
     }
     let nj = r.u32() as usize;
     let mut joints = Vec::with_capacity(nj);
@@ -264,7 +267,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) {
             .collect();
         cache.insert(key, entry);
     }
-    world.restore_parts(bodies, sleep_timer, asleep, joints, cache);
+    world.restore_parts(bodies, sleep_timer, asleep, island, joints, cache);
 }
 
 /// FNV-1a 64 — 캐노니컬 상태 해시 (L0 CI 비교용).

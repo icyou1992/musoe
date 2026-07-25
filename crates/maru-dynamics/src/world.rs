@@ -45,6 +45,10 @@ pub struct World {
     contact_cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
     sleep_timer: Vec<f32>,
     asleep: Vec<bool>,
+    /// 직전 스텝의 아일랜드 대표(설계 §4.6): wake는 **아일랜드 단위**여야 한다.
+    /// 바디 단위 wake는 접촉/조인트 저장 순서에 따라 한 홉만 전파돼, 깨어난 이웃과
+    /// 아직 잠든 바디 사이에 제약이 걸리며 속도만 펌핑되는 경로가 생긴다(리뷰 BLOCKER).
+    island: Vec<u32>,
     joints: Vec<Joint>,
     /// [진단] 직전 스텝의 warm-start 적중/전체 접점 수, 최대 침투(음의 separation).
     pub warm_hits: usize,
@@ -61,6 +65,7 @@ impl World {
             contact_cache: HashMap::new(),
             sleep_timer: Vec::new(),
             asleep: Vec::new(),
+            island: Vec::new(),
             joints: Vec::new(),
             warm_hits: 0,
             warm_total: 0,
@@ -74,6 +79,7 @@ impl World {
         self.generations.push(0);
         self.sleep_timer.push(0.0);
         self.asleep.push(false);
+        self.island.push(u32::MAX);
         BodyHandle {
             index,
             generation: 0,
@@ -88,12 +94,21 @@ impl World {
         &self.bodies[h.index as usize]
     }
 
+    /// 가변 접근. **공개 변이는 edge/접촉 상태를 바꾸므로 반드시 깨우고 stale PCM을 버린다**
+    /// (리뷰 지적: 잠든 바디에 속도를 써도 계속 잠들어 적분이 생략됐다).
+    /// static은 설계 §9상 불변 — kinematic을 쓸 것.
     pub fn body_mut(&mut self, h: BodyHandle) -> &mut Body {
-        assert_eq!(
-            self.generations[h.index as usize], h.generation,
-            "stale handle"
+        let i = h.index as usize;
+        assert_eq!(self.generations[i], h.generation, "stale handle");
+        assert!(
+            self.bodies[i].body_type != BodyType::Static,
+            "static bodies are immutable (design §9) — use Kinematic"
         );
-        &mut self.bodies[h.index as usize]
+        self.wake(i);
+        let id = i as u32;
+        self.contact_cache
+            .retain(|(a, b), _| *a != id && (*b & !STATIC_BIT) != id);
+        &mut self.bodies[i]
     }
 
     pub fn body_count(&self) -> usize {
@@ -110,6 +125,7 @@ impl World {
         self.wake(joint.body_a);
         self.wake(joint.body_b);
         joint.linear_impulse = Vec3::ZERO;
+        joint.angular_impulse = [0.0, 0.0]; // 재사용 Joint 값의 잔여 임펄스 차단(리뷰 지적)
         self.joints.push(joint);
         self.joints.len() - 1
     }
@@ -122,6 +138,7 @@ impl World {
         &Vec<Body>,
         &Vec<f32>,
         &Vec<bool>,
+        &Vec<u32>,
         &Vec<Joint>,
         &HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
     ) {
@@ -129,6 +146,7 @@ impl World {
             &self.bodies,
             &self.sleep_timer,
             &self.asleep,
+            &self.island,
             &self.joints,
             &self.contact_cache,
         )
@@ -139,6 +157,7 @@ impl World {
         bodies: Vec<Body>,
         sleep_timer: Vec<f32>,
         asleep: Vec<bool>,
+        island: Vec<u32>,
         joints: Vec<Joint>,
         cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
     ) {
@@ -146,6 +165,7 @@ impl World {
         self.bodies = bodies;
         self.sleep_timer = sleep_timer;
         self.asleep = asleep;
+        self.island = island;
         self.joints = joints;
         self.contact_cache = cache;
     }
@@ -167,13 +187,28 @@ impl World {
         crate::snapshot::state_hash(&self.snapshot())
     }
 
+    /// 아일랜드 단위 wake (설계 §4.6). 직전 스텝의 아일랜드 대표가 같은 동적 바디를 모두 깨운다.
     fn wake(&mut self, i: usize) {
+        let island = self.island[i];
         self.asleep[i] = false;
         self.sleep_timer[i] = 0.0;
+        if island == u32::MAX {
+            return;
+        }
+        for k in 0..self.bodies.len() {
+            if self.island[k] == island && self.bodies[k].is_dynamic() {
+                self.asleep[k] = false;
+                self.sleep_timer[k] = 0.0;
+            }
+        }
     }
 
     /// 고정 틱 스텝. 호스트 프레임과 무결합 (설계 §4).
     pub fn step(&mut self, dt: f32) {
+        assert!(
+            dt.is_finite(),
+            "dt must be finite (NaN dt would poison all state)"
+        );
         if dt <= 0.0 || self.bodies.is_empty() {
             return;
         }
@@ -192,8 +227,14 @@ impl World {
         let mut static_items: Vec<(u32, Aabb)> = Vec::new();
         for (i, b) in self.bodies.iter().enumerate() {
             let local = b.shape.local_aabb();
-            // [가정] 회전 보수 AABB: 로컬 AABB의 외접구 반경으로 팽창 (타이트화는 성능 유닛에서)
-            let r = (local.max - local.min).length() * 0.5;
+            // 회전 보수 AABB: pose 원점 중심이므로 반경은 **로컬 원점에서** 가장 먼 코너까지.
+            // (max-min)/2로 잡으면 원점에서 벗어난 hull이 통째로 누락된다(리뷰 지적).
+            let far = Vec3::new(
+                local.min.x.abs().max(local.max.x.abs()),
+                local.min.y.abs().max(local.max.y.abs()),
+                local.min.z.abs().max(local.max.z.abs()),
+            );
+            let r = far.length();
             let world = Aabb::from_center(b.pose.pos, Vec3::new(r, r, r));
             match b.body_type {
                 BodyType::Static => static_items.push((i as u32, world)),
@@ -258,6 +299,14 @@ impl World {
                     }
                     if !is_static_pair && self.asleep[b_id] {
                         self.wake(b_id);
+                    }
+                    // 방어선: wake 후에도 잠든 동적 바디가 남아 있으면 제약을 만들지 않는다
+                    // (위치 적분 없이 속도만 펌핑되는 경로 차단 — 리뷰 BLOCKER)
+                    let a_still_asleep = self.bodies[a_id].is_dynamic() && self.asleep[a_id];
+                    let b_still_asleep =
+                        !is_static_pair && self.bodies[b_id].is_dynamic() && self.asleep[b_id];
+                    if a_still_asleep || b_still_asleep {
+                        continue;
                     }
                     let cached = self.contact_cache.get(&key).unwrap_or(&empty);
                     for p in &m.points {
@@ -447,6 +496,14 @@ impl World {
             if self.bodies[*a].is_dynamic() && self.bodies[*b].is_dynamic() {
                 union(&mut parent, *a, *b);
             }
+        }
+        // 아일랜드 대표를 다음 스텝의 wake 전파용으로 저장 (동적 바디만)
+        for i in 0..n {
+            self.island[i] = if self.bodies[i].is_dynamic() {
+                find(&mut parent, i) as u32
+            } else {
+                u32::MAX
+            };
         }
         let lin2 = self.params.sleep_linear_threshold * self.params.sleep_linear_threshold;
         let ang2 = self.params.sleep_angular_threshold * self.params.sleep_angular_threshold;

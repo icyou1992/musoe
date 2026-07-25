@@ -250,16 +250,29 @@ pub fn solve(
         apply_impulse(&mut bodies[c.a], imp, ra, &ia);
         apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
 
-        // --- 마찰 (축별 클램프) ---
+        // --- 마찰: 축별 **순차** 해석(GS) 후 누적 2D 임펄스를 Coulomb **원판**에 투영 ---
+        // 사각형 클램프는 대각 슬라이드에서 √2·μN까지 허용해 41% 과도 감속하고 기저 의존적이다.
+        // 단, 두 축을 동시(Jacobi)로 풀면 유효질량이 큰 접점에서 과잉 보정이 겹쳐 발산한다
+        // (낙하 체인 실증) — 순차 갱신을 유지한 채 마지막에 원판으로 되돌린다.
         let max_f = c.friction * p.normal_impulse;
         for axis in 0..2 {
             let t = c.tangents[axis];
             let vt = t.dot(bodies[c.a].velocity_at(ra) - bodies[c.b].velocity_at(rb));
-            let impulse = -p.tangent_mass[axis] * vt;
-            let new_total = (p.tangent_impulse[axis] + impulse).clamp(-max_f, max_f);
-            let applied = new_total - p.tangent_impulse[axis];
-            p.tangent_impulse[axis] = new_total;
-            let imp = t * applied;
+            let delta = -p.tangent_mass[axis] * vt;
+            p.tangent_impulse[axis] += delta;
+            let imp = t * delta;
+            apply_impulse(&mut bodies[c.a], imp, ra, &ia);
+            apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
+        }
+        let mag2 = p.tangent_impulse[0] * p.tangent_impulse[0]
+            + p.tangent_impulse[1] * p.tangent_impulse[1];
+        if mag2 > max_f * max_f && mag2 > 0.0 {
+            let scale = max_f / mag2.sqrt();
+            let corr0 = p.tangent_impulse[0] * (scale - 1.0);
+            let corr1 = p.tangent_impulse[1] * (scale - 1.0);
+            p.tangent_impulse[0] += corr0;
+            p.tangent_impulse[1] += corr1;
+            let imp = c.tangents[0] * corr0 + c.tangents[1] * corr1;
             apply_impulse(&mut bodies[c.a], imp, ra, &ia);
             apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
         }

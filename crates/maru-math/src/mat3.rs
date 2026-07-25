@@ -67,19 +67,38 @@ impl Mat3 {
     }
 
     /// 3×3 역행렬 (특이면 0 행렬 — NaN 생산 금지, 설계 §8).
+    /// **상대 판정**: 절대 임계는 질량 스케일에 취약하다 — 2만 kg 바디의 K=(1/m)I는
+    /// det≈1.2e-13이라 절대 1e-12 임계에서 특이로 오판되어 조인트가 죽는다(리뷰 지적).
     pub fn inverse(&self) -> Mat3 {
-        let a = self.c[0];
-        let b = self.c[1];
-        let c = self.c[2];
+        let scale = [
+            self.c[0].x,
+            self.c[0].y,
+            self.c[0].z,
+            self.c[1].x,
+            self.c[1].y,
+            self.c[1].z,
+            self.c[2].x,
+            self.c[2].y,
+            self.c[2].z,
+        ]
+        .iter()
+        .fold(0.0f32, |m, v| m.max(v.abs()));
+        if scale == 0.0 || !scale.is_finite() {
+            return Mat3::from_diagonal(Vec3::ZERO);
+        }
+        let inv_scale = 1.0 / scale;
+        let a = self.c[0] * inv_scale;
+        let b = self.c[1] * inv_scale;
+        let c = self.c[2] * inv_scale;
         let r0 = b.cross(c);
         let r1 = c.cross(a);
         let r2 = a.cross(b);
         let det = a.dot(r0);
-        if det.abs() < 1.0e-12 {
+        if !det.is_finite() || det.abs() < 1.0e-6 {
             return Mat3::from_diagonal(Vec3::ZERO);
         }
-        let inv = 1.0 / det;
-        // 역행렬 = adj/det, adj 행 = cofactor → 열로 전치
+        // M = scale·N → M⁻¹ = N⁻¹/scale
+        let inv = inv_scale / det;
         Mat3 {
             c: [
                 Vec3::new(r0.x, r1.x, r2.x) * inv,
@@ -134,6 +153,15 @@ mod tests {
                 assert!((v - expect).abs() < 1e-4, "[{i}][{j}]={v}");
             }
         }
+    }
+
+    /// 리뷰 회귀: 큰 질량(작은 역질량)의 K 행렬이 특이로 오판되면 조인트가 죽는다.
+    #[test]
+    fn inverse_handles_small_scale_matrix() {
+        let inv_m = 1.0 / 20000.0; // 20t 바디
+        let k = Mat3::from_diagonal(Vec3::new(inv_m, inv_m, inv_m));
+        let ki = k.inverse();
+        assert!((ki.c[0].x - 20000.0).abs() < 1.0, "{:?}", ki.c[0]);
     }
 
     #[test]
