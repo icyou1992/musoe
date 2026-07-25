@@ -21,6 +21,61 @@ pub enum Shape {
     Hull { points: Vec<Vec3>, radius: f32 },
 }
 
+/// 점 집합의 **회전 불변** 최소 두께 (평면에서 가장 먼 점까지의 거리).
+/// 세 단계 극점 절차 — 최장 축 → 직선에서 최원점 → 평면에서 최원점.
+fn hull_thickness(points: &[Vec3]) -> f32 {
+    if points.len() < 4 {
+        // 3점 이하는 항상 한 평면 위 → 두께 0 (convex radius로만 두꺼워진다)
+        return 0.0;
+    }
+    // ① 최장 축
+    let (mut a, mut b) = (points[0], points[0]);
+    let mut best = 0.0f32;
+    for (i, p) in points.iter().enumerate() {
+        for q in &points[i + 1..] {
+            let d = (*q - *p).length_sq();
+            if d > best {
+                best = d;
+                a = *p;
+                b = *q;
+            }
+        }
+    }
+    let ab = b - a;
+    if ab.length_sq() <= 0.0 {
+        return 0.0;
+    }
+    // ② 직선 ab에서 가장 먼 점
+    let inv = 1.0 / ab.length();
+    let mut c = a;
+    let mut wmax = 0.0f32;
+    for p in points {
+        let w = ab.cross(*p - a).length() * inv;
+        if w > wmax {
+            wmax = w;
+            c = *p;
+        }
+    }
+    if wmax <= 0.0 {
+        return 0.0;
+    }
+    // ③ 평면 abc에서 가장 먼 점 = 두께
+    let n = ab.cross(c - a);
+    let nl = n.length();
+    if nl <= 0.0 {
+        return 0.0;
+    }
+    let inv_n = 1.0 / nl;
+    let mut tmax = 0.0f32;
+    for p in points {
+        let t = n.dot(*p - a).abs() * inv_n;
+        if t > tmax {
+            tmax = t;
+        }
+    }
+    tmax
+}
+
 impl Shape {
     /// 형상 불변식 검증. **모든 바디 타입의 생성 경계에서 호출된다** — static/kinematic도
     /// 빈 hull이면 support/local_aabb가 `points[0]`에서 패닉한다(리뷰 지적).
@@ -70,21 +125,15 @@ impl Shape {
                 if !points.iter().all(|p| vec_extent_in_range(*p)) {
                     return Err("hull points must be finite and within MAX_SHAPE_EXTENT");
                 }
-                // **최소 특징 크기는 모든 셰이프에 적용된다**(리뷰 MAJOR: hull·capsule만
-                // 빠져 있었다). 축별 span + 2r가 최소 크기 미만이면 월드 경계에서 AABB가
-                // 좌표 반올림으로 퇴화해 충돌 판정이 무의미해진다.
-                let (mut min, mut max) = (points[0], points[0]);
-                for p in &points[1..] {
-                    min = Vec3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z));
-                    max = Vec3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z));
-                }
-                let span = max - min;
+                // **최소 특징 크기는 모든 셰이프에 적용된다**(리뷰 MAJOR: hull·capsule이
+                // 빠져 있었다). 축 정렬 AABB span만 보면 **회전된 퇴화 hull**이 통과한다 —
+                // 한 평면 위의 점들도 x/y/z span은 모두 크다. 회전 불변 두께를 재야 한다:
+                // 최장 축 → 그 직선에서 가장 먼 점(폭) → 그 평면에서 가장 먼 점(두께).
                 let thick = 2.0 * r;
-                if span.x + thick < MIN_SHAPE_EXTENT
-                    || span.y + thick < MIN_SHAPE_EXTENT
-                    || span.z + thick < MIN_SHAPE_EXTENT
-                {
-                    return Err("hull is thinner than MIN_SHAPE_EXTENT on some axis");
+                if hull_thickness(points) + thick < MIN_SHAPE_EXTENT {
+                    return Err(
+                        "hull is degenerate (thinner than MIN_SHAPE_EXTENT in some direction)",
+                    );
                 }
             }
         }

@@ -33,8 +33,10 @@ use maru_math::{Quat, Vec3};
 
 /// 포맷 매직·버전 — 다른 빌드/포맷의 바이트를 조용히 먹지 않기 위해.
 const MAGIC: u32 = 0x4d41_5255; // "MARU"
-/// v3: 슬롯 예약 플래그 · AddBody 핸들 · last_report · 셰이프 원점 오프셋.
-const VERSION: u32 = 3;
+/// v4: **WorldParams**(미래 동작을 바꾸는 mutable state) · OOB 플래그 · 앵커/최소 크기
+/// 정책 강화. v3와 같은 바이트라도 validator 정책이 달라졌으므로 버전을 올린다
+/// (리뷰 MAJOR: 정책 변경은 wire 의미 변경이다).
+const VERSION: u32 = 4;
 
 /// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
 /// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
@@ -51,8 +53,8 @@ mod min_bytes {
     const SHAPE: usize = 5;
     /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + offset12
     const BODY_CORE: usize = 1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + SHAPE;
-    /// 슬롯 레코드: alive1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
-    pub const SLOT: usize = 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
+    /// 슬롯 레코드: alive1 + oob1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
+    pub const SLOT: usize = 1 + 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
     /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang8
     pub const JOINT: usize = 8 + 8 + 24 + 1 + 1 + 12 + 8;
     /// 커맨드: 태그1 + 최소 페이로드(RemoveBody = 핸들8)
@@ -310,6 +312,48 @@ fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
     Ok(shape)
 }
 
+/// **WorldParams는 캐노니컬 상태다**(리뷰 BLOCKER): 미래 동작을 바꾸는 mutable state인데
+/// 스냅샷·해시에서 빠져 있어, gravity=0인 월드의 스냅샷을 기본 파라미터 월드에 복원하면
+/// 해시는 같은데 다음 스텝부터 분기했다.
+fn write_params(w: &mut Writer, p: &crate::world::WorldParams) {
+    w.vec3(p.gravity);
+    w.u32(p.substeps);
+    w.f32(p.speculative_margin);
+    w.f32(p.solver.contact_hertz);
+    w.f32(p.solver.contact_damping);
+    w.f32(p.solver.max_bias_speed);
+    w.f32(p.solver.restitution_threshold);
+    w.f32(p.sleep_linear_threshold);
+    w.f32(p.sleep_angular_threshold);
+    w.f32(p.time_to_sleep);
+    w.u32(p.max_pairs_per_body);
+    w.f32(p.max_linear_velocity);
+    w.f32(p.max_angular_velocity);
+}
+
+fn read_params(r: &mut Reader) -> Result<crate::world::WorldParams, SnapshotError> {
+    let p = crate::world::WorldParams {
+        gravity: r.vec3()?,
+        substeps: r.u32()?,
+        speculative_margin: r.f32()?,
+        solver: crate::solver::SolverParams {
+            contact_hertz: r.f32()?,
+            contact_damping: r.f32()?,
+            max_bias_speed: r.f32()?,
+            restitution_threshold: r.f32()?,
+        },
+        sleep_linear_threshold: r.f32()?,
+        sleep_angular_threshold: r.f32()?,
+        time_to_sleep: r.f32()?,
+        max_pairs_per_body: r.u32()?,
+        max_linear_velocity: r.f32()?,
+        max_angular_velocity: r.f32()?,
+    };
+    // 라이브 API와 **같은 검증**
+    crate::world::check_params(&p).map_err(|_| SnapshotError::InconsistentState)?;
+    Ok(p)
+}
+
 fn write_body(w: &mut Writer, b: &Body) {
     w.u8(match b.body_type {
         BodyType::Static => 0,
@@ -507,11 +551,11 @@ fn command_size(c: &PendingCommand) -> usize {
 
 /// 스냅샷 바이트 수 (할당 전 preflight).
 pub fn serialized_size(world: &World) -> usize {
-    let (bodies, _, _, _, _, _, _, joints, cache, commands, _) = world.canonical_parts();
-    let mut n = 4 + 4 + 4; // magic + version + slot count
+    let (_, bodies, _, _, _, _, _, _, _, joints, cache, commands, _) = world.canonical_parts();
+    let mut n = 4 + 4 + (12 + 4 + 4 + 16 + 12 + 4 + 4 + 4) + 4; // magic + version + params + count
     for (i, b) in bodies.iter().enumerate() {
         let _ = i;
-        n += 1 + 1 + 4 + body_size(b) + 4 + 1 + 4;
+        n += 1 + 1 + 1 + 4 + body_size(b) + 4 + 1 + 4;
     }
     n += 4 + joints.iter().map(joint_size).sum::<usize>();
     n += 4 + commands.iter().map(command_size).sum::<usize>();
@@ -543,8 +587,10 @@ fn write_world_bytes(world: &World, w: &mut Writer) {
     w.u32(MAGIC);
     w.u32(VERSION);
     let (
+        params,
         bodies,
         alive,
+        oob,
         reserved,
         generations,
         sleep_timer,
@@ -555,9 +601,11 @@ fn write_world_bytes(world: &World, w: &mut Writer) {
         commands,
         report,
     ) = world.canonical_parts();
+    write_params(w, params);
     w.u32(bodies.len() as u32);
     for (i, b) in bodies.iter().enumerate() {
         w.u8(alive[i] as u8);
+        w.u8(oob[i] as u8);
         w.u8(reserved[i] as u8);
         w.u32(generations[i]);
         write_body(w, b);
@@ -615,6 +663,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     if v != VERSION {
         return Err(SnapshotError::BadVersion(v));
     }
+    let params = read_params(&mut r)?;
     let nb = r.count(min_bytes::SLOT, decoded_size::slot())?;
     // **복원 컨테이너도 할당 실패를 오류로 표현한다**(리뷰 MAJOR): `with_capacity`는
     // 예산 안이라도 wasm 가용 메모리가 모자라면 allocator abort/trap이 된다.
@@ -623,10 +672,12 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     let mut asleep = try_vec(nb)?;
     let mut island = try_vec(nb)?;
     let mut alive = try_vec(nb)?;
+    let mut oob = try_vec(nb)?;
     let mut reserved = try_vec(nb)?;
     let mut generations = try_vec(nb)?;
     for _ in 0..nb {
         alive.push(r.u8()? != 0);
+        oob.push(r.u8()? != 0);
         reserved.push(r.u8()? != 0);
         generations.push(r.u32()?);
         bodies.push(read_body(&mut r)?);
@@ -758,6 +809,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     validate_structure(
         &bodies,
         &alive,
+        &oob,
         &reserved,
         &generations,
         &asleep,
@@ -769,8 +821,10 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
 
     // 여기까지 통과해야 월드를 교체한다 (원자적 복원)
     world.restore_parts(
+        params,
         bodies,
         alive,
+        oob,
         reserved,
         generations,
         sleep_timer,
@@ -790,6 +844,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
 fn validate_structure(
     bodies: &[Body],
     alive: &[bool],
+    oob: &[bool],
     reserved: &[bool],
     generations: &[u32],
     asleep: &[bool],
@@ -812,6 +867,13 @@ fn validate_structure(
         }
         // 잠듦은 살아있는 dynamic만의 상태다
         if asleep[i] && !live_dynamic(i) {
+            return Err(SnapshotError::InconsistentState);
+        }
+        // OOB는 살아있는 비-static만의 상태이고, sleep과 **겸할 수 없다**
+        if oob[i] && (!alive[i] || bodies[i].body_type == BodyType::Static || asleep[i]) {
+            return Err(SnapshotError::InconsistentState);
+        }
+        if oob[i] && island[i] != u32::MAX {
             return Err(SnapshotError::InconsistentState);
         }
         // 아일랜드 대표는 살아있는 dynamic이거나 없음(u32::MAX)
@@ -839,6 +901,12 @@ fn validate_structure(
         }
         if !j.anchor_a.is_finite() || !j.anchor_b.is_finite() {
             return Err(SnapshotError::NonFinite);
+        }
+        // 앵커가 **그 바디의 크기**에 비례하는지 — 라이브 `try_add_joint`와 같은 판정
+        if !crate::world::anchor_fits(&bodies[j.body_a.index as usize], j.anchor_a)
+            || !crate::world::anchor_fits(&bodies[j.body_b.index as usize], j.anchor_b)
+        {
+            return Err(SnapshotError::InconsistentState);
         }
     }
 

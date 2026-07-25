@@ -448,7 +448,14 @@ mod tests {
     /// 생성 경계에서 재중심화해 pose.pos = 질량중심 계약을 참으로 만든다.
     #[test]
     fn offset_hull_is_recentered_to_com() {
-        let pts = vec![Vec3::new(9.5, 19.5, 29.5), Vec3::new(10.5, 20.5, 30.5)];
+        // 3D 두께가 있어야 한다 (회전 불변 퇴화 검사)
+        let pts = vec![
+            Vec3::new(9.5, 19.5, 29.5),
+            Vec3::new(10.5, 19.5, 29.5),
+            Vec3::new(9.5, 20.5, 29.5),
+            Vec3::new(9.5, 19.5, 30.5),
+            Vec3::new(10.5, 20.5, 30.5),
+        ];
         let b = Body::new_dynamic(
             Shape::Hull {
                 points: pts,
@@ -466,7 +473,12 @@ mod tests {
         let Shape::Hull { ref points, .. } = b.shape else {
             panic!()
         };
-        let c = (points[0] + points[1]) * 0.5;
+        let (mut mn, mut mx) = (points[0], points[0]);
+        for p in &points[1..] {
+            mn = Vec3::new(mn.x.min(p.x), mn.y.min(p.y), mn.z.min(p.z));
+            mx = Vec3::new(mx.x.max(p.x), mx.y.max(p.y), mx.z.max(p.z));
+        }
+        let c = (mn + mx) * 0.5;
         assert!(c.length() < 1e-4, "재중심화 실패 {c:?}");
         // 관성은 1×1×1 중심 박스와 동일 — 평행축 항으로 부풀지 않는다
         let expect = 1.0f32 / 6.0;

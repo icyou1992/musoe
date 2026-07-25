@@ -39,6 +39,14 @@ impl Broadphase {
 
     /// canonical 페어 집합: 동적-동적 + 동적-정적. 정밀 판정 + 전순서 정렬 + dedup.
     pub fn canonical_pairs(&self) -> Vec<(u32, u32)> {
+        self.canonical_pairs_bounded(usize::MAX)
+            .expect("pair budget exceeded")
+    }
+
+    /// 페어 예산이 있는 버전 — 초과하면 **더 쌓지 않고** None을 돌려준다(리뷰 BLOCKER).
+    /// 같은 자리에 겹친 1만 개 바디는 5천만 페어를 만든다: 입력은 수 MB로 자원 정책을
+    /// 통과하지만 wasm에서는 `try_step`이 오류를 돌려주기 전에 allocator가 먼저 죽는다.
+    pub fn canonical_pairs_bounded(&self, budget: usize) -> Option<Vec<(u32, u32)>> {
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         let mut cand: Vec<u32> = Vec::new();
 
@@ -56,6 +64,9 @@ impl Broadphase {
                     continue; // self + 역방향 중복 제거
                 }
                 if aabb.overlaps(dyn_lookup[&other]) {
+                    if pairs.len() >= budget {
+                        return None;
+                    }
                     pairs.push((id, other));
                 }
             }
@@ -64,13 +75,16 @@ impl Broadphase {
             self.static_tree.query_candidates(aabb, &mut cand);
             for &s in &cand {
                 if aabb.overlaps(static_lookup[&s]) {
+                    if pairs.len() >= budget {
+                        return None;
+                    }
                     pairs.push((id, s | STATIC_BIT));
                 }
             }
         }
         pairs.sort_unstable();
         pairs.dedup();
-        pairs
+        Some(pairs)
     }
 }
 

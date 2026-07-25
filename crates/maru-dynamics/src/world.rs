@@ -22,6 +22,10 @@ pub struct WorldParams {
     pub sleep_linear_threshold: f32,
     pub sleep_angular_threshold: f32,
     pub time_to_sleep: f32,
+    /// 브로드페이즈 페어 예산 계수. 상한 = `max_pairs_per_body × 바디 수 + 1024`.
+    /// 같은 자리에 겹친 N개 바디는 N²/2 페어를 만든다 — 입력은 작아도 wasm 메모리를
+    /// 삼킬 수 있으므로 예산을 넘으면 `ResourceLimit`으로 스텝을 포기한다(리뷰 BLOCKER).
+    pub max_pairs_per_body: u32,
     /// **속도 상한 (물리 파라미터)** — Jolt `mMaxLinearVelocity`·Box2D `b2_maxTranslation`과
     /// 같은 역할이다. 터널링과 폭주를 막는 정상 기능이며, 도달은 오류가 아니다.
     /// 이것이 있어야 파생 상태(속도·임펄스)가 유계가 되어 정책이 step에 대해 닫힌다 —
@@ -40,6 +44,7 @@ impl Default for WorldParams {
             sleep_linear_threshold: 0.03,
             sleep_angular_threshold: 0.05,
             time_to_sleep: 0.5,
+            max_pairs_per_body: 64,
             max_linear_velocity: 500.0,
             max_angular_velocity: 100.0,
         }
@@ -55,6 +60,9 @@ pub enum ApiError {
     InvalidValue,
     /// static 바디는 불변 (설계 §9 — 움직이려면 Kinematic).
     ImmutableStatic,
+    /// 자원 예산 초과 (브로드페이즈 페어 등). 상태는 그대로 두고 스텝을 포기한다 —
+    /// wasm에서 allocator가 먼저 죽는 것보다 오류가 낫다.
+    ResourceLimit,
     /// 파생 상태가 상한을 넘어 포화됐다. **그 스텝의 물리는 신뢰할 수 없다**(리뷰 BLOCKER:
     /// 포화를 정상 처리로 삼키면 안 된다). 상태 자체는 안전하고 복원 가능하게 유지되므로
     /// 호스트는 계속 돌릴 수도, 되감을 수도 있다. 지원 범위 밖 입력의 신호다.
@@ -67,6 +75,12 @@ pub struct World {
     bodies: Vec<Body>,
     /// 슬롯 생존 여부. 죽은 슬롯은 재사용 대기(세대가 이미 증가한 상태).
     alive: Vec<bool>,
+    /// **월드 범위를 벗어나 시뮬레이션에서 제외된** 바디(리뷰 BLOCKER).
+    /// `asleep`과 섞으면 아일랜드 불변식이 깨진다 — 조인트로 연결된 둘 중 하나만
+    /// 경계를 넘으면 "부분 sleep" 상태가 되고, 다음 스텝의 joint wake 폐쇄가 즉시 깨워
+    /// 이동→고정→sleep→wake를 매 프레임 반복한다. OOB는 **자동 wake 대상이 아니며**,
+    /// 호스트가 `set_pose`로 월드 안에 되돌려야 해제된다.
+    oob: Vec<bool>,
     /// pending `AddBody`가 잡아둔 슬롯. `alive`도 `reserved`도 아닌 슬롯만 재사용한다.
     /// 예약 슬롯은 쿼리에 보이지 않지만 세대는 이미 증가해 옛 핸들이 되살아나지 않는다.
     reserved: Vec<bool>,
@@ -84,6 +98,8 @@ pub struct World {
     commands: Vec<PendingCommand>,
     last_report: CommandReport,
     diag: Diagnostics,
+    /// 직전 스텝이 자원 예산으로 중단됐는가 (비캐노니컬 — 복원 시 초기화).
+    resource_limit: bool,
 }
 
 /// 읽기 전용 진단 (엔진 캐노니컬 상태가 아니다 — 스냅샷·해시에 포함되지 않는다).
@@ -111,7 +127,7 @@ pub use maru_collide::{MAX_DT, MIN_DT};
 /// 각 스칼라를 **차원에 맞는 범위**로 검사한다: 속도 임계는 `MAX_SPEED`, 길이·일반
 /// 파라미터는 `MAX_INPUT`. NaN 임계는 비교가 항상 false라 게이트를 조용히 무력화하므로
 /// 유한성부터 요구한다.
-fn check_params(p: &WorldParams) -> Result<(), ApiError> {
+pub(crate) fn check_params(p: &WorldParams) -> Result<(), ApiError> {
     use maru_collide::{in_range, speed_in_range, vec_in_range};
     let ok = vec_in_range(p.gravity)
         && (1..=64).contains(&p.substeps)
@@ -134,7 +150,9 @@ fn check_params(p: &WorldParams) -> Result<(), ApiError> {
         && speed_in_range(p.max_linear_velocity)
         && p.max_linear_velocity > 0.0
         && maru_collide::angular_in_range(p.max_angular_velocity)
-        && p.max_angular_velocity > 0.0;
+        && p.max_angular_velocity > 0.0
+        && p.max_pairs_per_body >= 1
+        && p.max_pairs_per_body <= 4096;
     if ok {
         Ok(())
     } else {
@@ -165,6 +183,16 @@ fn validate_params(params: &WorldParams) {
     check_params(params).expect("invalid world params");
 }
 
+/// 앵커가 그 바디의 크기에 비례하는가. 마운트 포인트가 셰이프 밖에 있는 것은 정상이므로
+/// 바운딩 반경의 배수까지 허용한다.
+pub(crate) fn anchor_fits(b: &Body, anchor: Vec3) -> bool {
+    const ANCHOR_SCALE: f32 = 4.0;
+    let bb = b.shape.local_aabb();
+    let radius = (bb.max - bb.min).length() * 0.5;
+    let limit = (radius * ANCHOR_SCALE).max(maru_collide::MIN_SHAPE_EXTENT);
+    anchor.length() <= limit
+}
+
 impl World {
     /// 파라미터 불변식을 생성 경계에서 강제한다 (리뷰 MAJOR: 무검증 public 필드가
     /// dt/substeps·Softness 분모를 NaN/Inf로 만들 수 있었다).
@@ -185,6 +213,7 @@ impl World {
             params,
             bodies: Vec::new(),
             alive: Vec::new(),
+            oob: Vec::new(),
             reserved: Vec::new(),
             generations: Vec::new(),
             contact_cache: HashMap::new(),
@@ -195,6 +224,7 @@ impl World {
             commands: Vec::new(),
             last_report: CommandReport::default(),
             diag: Diagnostics::default(),
+            resource_limit: false,
         }
     }
 
@@ -225,6 +255,7 @@ impl World {
         let index = self.bodies.len() as u32;
         self.bodies.push(body);
         self.alive.push(alive);
+        self.oob.push(false);
         self.reserved.push(reserved);
         self.generations.push(0);
         self.sleep_timer.push(0.0);
@@ -240,6 +271,7 @@ impl World {
         body.validate().expect("invalid body");
         let index = if let Some(index) = self.free_slot() {
             self.reserved[index] = true;
+            self.oob[index] = false;
             // 슬롯 재사용 — 예약 시점에 세대를 올려 옛 핸들이 새 바디를 가리키지 못하게 한다
             self.generations[index] = self.generations[index].wrapping_add(1);
             self.sleep_timer[index] = 0.0;
@@ -263,6 +295,7 @@ impl World {
         if let Some(index) = self.free_slot() {
             self.bodies[index] = body;
             self.alive[index] = true;
+            self.oob[index] = false;
             self.sleep_timer[index] = 0.0;
             self.asleep[index] = false;
             self.island[index] = u32::MAX;
@@ -320,6 +353,7 @@ impl World {
         // ② 구조 변경
         self.alive[i] = false;
         self.reserved[i] = false;
+        self.oob[i] = false;
         self.generations[i] = self.generations[i].wrapping_add(1);
         self.asleep[i] = false;
         self.island[i] = u32::MAX;
@@ -390,6 +424,8 @@ impl World {
             pos: pose.pos,
             rot: pose.rot.normalize(),
         };
+        // 월드 안으로 되돌리는 것이 OOB 해제의 **유일한** 경로다(자동 복귀 없음).
+        self.oob[i] = false;
         Ok(())
     }
 
@@ -515,6 +551,7 @@ impl World {
                         self.bodies[i] = *b;
                         self.reserved[i] = false;
                         self.alive[i] = true;
+                        self.oob[i] = false;
                         self.sleep_timer[i] = 0.0;
                         self.asleep[i] = false;
                         self.island[i] = u32::MAX;
@@ -615,10 +652,11 @@ impl World {
             self.bodies[i].pose.pos = Vec3::new(clamp(p.x), clamp(p.y), clamp(p.z));
             self.bodies[i].linvel = Vec3::ZERO;
             self.bodies[i].angvel = Vec3::ZERO;
-            if self.bodies[i].is_dynamic() {
-                self.asleep[i] = true;
-                self.sleep_timer[i] = 0.0;
-            }
+            // `asleep`이 아니라 **별도 상태**다 — 자동 wake 경로에 걸리면 안 된다.
+            self.oob[i] = true;
+            self.asleep[i] = false;
+            self.sleep_timer[i] = 0.0;
+            self.island[i] = u32::MAX;
             self.diag.out_of_bounds += 1;
         }
     }
@@ -684,6 +722,11 @@ impl World {
 
     /// 잠들었는지. **stale 핸들은 false**(살아있지 않은 것은 잠든 것이 아니다).
     /// raw 인덱스 접근은 재사용된 슬롯의 남의 상태를 읽으므로 쓰지 않는다(리뷰 MAJOR).
+    /// 월드 범위를 벗어나 시뮬레이션에서 제외됐는가. `set_pose`로만 해제된다.
+    pub fn is_out_of_bounds(&self, h: BodyHandle) -> bool {
+        self.resolve(h).map(|i| self.oob[i]).unwrap_or(false)
+    }
+
     pub fn is_asleep(&self, h: BodyHandle) -> bool {
         self.resolve(h).map(|i| self.asleep[i]).unwrap_or(false)
     }
@@ -705,6 +748,16 @@ impl World {
         if a == b {
             return Err(ApiError::InvalidValue);
         }
+        // **앵커는 그 바디의 실제 크기에 비례해야 한다**(리뷰 BLOCKER). 전역 상한만 두면
+        // 반지름 1mm 구에 1000m 앵커를 붙일 수 있고, K 행렬의 고유 스케일이 2.4e4 : 6e16이
+        // 되어 Mat3::inverse의 상대 det가 임계 아래로 떨어져 **0 행렬**을 돌려준다 —
+        // 조인트가 오류 없이 조용히 풀린다. 레버암을 바디 크기에 묶으면 `r²·I⁻¹`가
+        // `m⁻¹`과 같은 자릿수에 남아 조건수가 형상 스케일과 무관해진다.
+        if !anchor_fits(&self.bodies[a], joint.anchor_a)
+            || !anchor_fits(&self.bodies[b], joint.anchor_b)
+        {
+            return Err(ApiError::InvalidValue);
+        }
         self.wake(a);
         self.wake(b);
         joint.linear_impulse = Vec3::ZERO;
@@ -718,7 +771,9 @@ impl World {
     pub(crate) fn canonical_parts(
         &self,
     ) -> (
+        &WorldParams,
         &Vec<Body>,
+        &Vec<bool>,
         &Vec<bool>,
         &Vec<bool>,
         &Vec<u32>,
@@ -731,8 +786,10 @@ impl World {
         CommandReport,
     ) {
         (
+            &self.params,
             &self.bodies,
             &self.alive,
+            &self.oob,
             &self.reserved,
             &self.generations,
             &self.sleep_timer,
@@ -748,8 +805,10 @@ impl World {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore_parts(
         &mut self,
+        params: WorldParams,
         bodies: Vec<Body>,
         alive: Vec<bool>,
+        oob: Vec<bool>,
         reserved: Vec<bool>,
         generations: Vec<u32>,
         sleep_timer: Vec<f32>,
@@ -760,7 +819,9 @@ impl World {
         commands: Vec<PendingCommand>,
         last_report: CommandReport,
     ) {
+        self.params = params;
         self.alive = alive;
+        self.oob = oob;
         self.reserved = reserved;
         self.generations = generations;
         self.bodies = bodies;
@@ -774,6 +835,8 @@ impl World {
         // 진단은 캐노니컬 상태가 아니다 — 복원 후 **미래 동작에 영향을 주면 안 된다**
         // (stale `state_saturations`가 다음 `try_step`을 StateOverflow로 만들던 경로).
         self.diag = Diagnostics::default();
+        self.resource_limit = false;
+        self.resource_limit = false;
     }
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
@@ -841,6 +904,9 @@ impl World {
             return Err(ApiError::InvalidValue);
         }
         self.step_inner(dt);
+        if self.resource_limit {
+            return Err(ApiError::ResourceLimit);
+        }
         if self.diag.state_saturations > 0 {
             return Err(ApiError::StateOverflow);
         }
@@ -906,7 +972,13 @@ impl World {
             }
         }
         let bp = Broadphase::build(dyn_items, static_items);
-        let pairs = bp.canonical_pairs();
+        let budget = (self.params.max_pairs_per_body as usize)
+            .saturating_mul(self.bodies.len())
+            .saturating_add(1024);
+        let Some(pairs) = bp.canonical_pairs_bounded(budget) else {
+            self.resource_limit = true;
+            return;
+        };
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
         let excluded: std::collections::HashSet<(u32, u32)> = self
             .joints
@@ -926,16 +998,23 @@ impl World {
         let joint_pairs: Vec<(usize, usize)> =
             self.joints.iter().map(|j| (j.ia(), j.ib())).collect();
         // kinematic은 **항상 활성**이다 — 처방 속도로 움직이므로 잠든 상대를 깨워야 한다.
-        let is_active = |i: usize, this: &Self| match this.bodies[i].body_type {
-            BodyType::Kinematic => true,
-            BodyType::Dynamic => !this.asleep[i],
-            BodyType::Static => false,
+        let is_active = |i: usize, this: &Self| {
+            !this.oob[i]
+                && match this.bodies[i].body_type {
+                    BodyType::Kinematic => true,
+                    BodyType::Dynamic => !this.asleep[i],
+                    BodyType::Static => false,
+                }
         };
         for _ in 0..=joint_pairs.len() {
             let mut changed = false;
             for &(a, b) in &joint_pairs {
                 for (x, y) in [(a, b), (b, a)] {
-                    if is_active(x, self) && self.bodies[y].is_dynamic() && self.asleep[y] {
+                    if is_active(x, self)
+                        && self.bodies[y].is_dynamic()
+                        && self.asleep[y]
+                        && !self.oob[y]
+                    {
                         self.wake(y);
                         changed = true;
                     }
@@ -957,13 +1036,17 @@ impl World {
                 continue;
             }
             let (a, b) = (a_id as usize, b_plain as usize);
-            let active = |i: usize, this: &Self| match this.bodies[i].body_type {
-                BodyType::Kinematic => true,
-                BodyType::Dynamic => !this.asleep[i],
-                BodyType::Static => false,
+            let active = |i: usize, this: &Self| {
+                !this.oob[i]
+                    && match this.bodies[i].body_type {
+                        BodyType::Kinematic => true,
+                        BodyType::Dynamic => !this.asleep[i],
+                        BodyType::Static => false,
+                    }
             };
-            let sleeping_dyn =
-                |i: usize, this: &Self| this.bodies[i].is_dynamic() && this.asleep[i];
+            let sleeping_dyn = |i: usize, this: &Self| {
+                this.bodies[i].is_dynamic() && this.asleep[i] && !this.oob[i]
+            };
             let a_sleep = sleeping_dyn(a, self);
             let b_sleep = !is_static_pair && sleeping_dyn(b, self);
             // static은 **비활성** anchor다(설계 §4.6). 정적 상대를 활성으로 치면 바닥에 얹힌
@@ -1010,16 +1093,18 @@ impl World {
             // 양쪽 모두 비활성이면 제약 없음. wake는 위 1.5에서 이미 끝났다.
             let a_asleep = !self.bodies[a_id].is_dynamic() || self.asleep[a_id];
             let b_asleep = is_static_pair || !self.bodies[b_id].is_dynamic() || self.asleep[b_id];
-            let a_inactive = match self.bodies[a_id].body_type {
-                BodyType::Kinematic => false,
-                BodyType::Dynamic => self.asleep[a_id],
-                BodyType::Static => true,
-            };
-            let b_inactive = match self.bodies[b_id].body_type {
-                BodyType::Kinematic => false,
-                BodyType::Dynamic => is_static_pair || self.asleep[b_id],
-                BodyType::Static => true,
-            };
+            let a_inactive = self.oob[a_id]
+                || match self.bodies[a_id].body_type {
+                    BodyType::Kinematic => false,
+                    BodyType::Dynamic => self.asleep[a_id],
+                    BodyType::Static => true,
+                };
+            let b_inactive = self.oob[b_id]
+                || match self.bodies[b_id].body_type {
+                    BodyType::Kinematic => false,
+                    BodyType::Dynamic => is_static_pair || self.asleep[b_id],
+                    BodyType::Static => true,
+                };
             if a_inactive && b_inactive {
                 live_keys.insert(key); // 잠든 페어의 PCM은 보존한다(아래 5))
                 continue;
@@ -1064,10 +1149,13 @@ impl World {
             .filter(|(_, j)| {
                 // kinematic도 활성 — 구동 중인 kinematic에 매달린 조인트를 스킵하면
                 // 체인이 처방 운동을 따라가지 못한다(리뷰 MAJOR).
-                let awake = |i: usize| match self.bodies[i].body_type {
-                    BodyType::Kinematic => true,
-                    BodyType::Dynamic => !self.asleep[i],
-                    BodyType::Static => false,
+                let awake = |i: usize| {
+                    !self.oob[i]
+                        && match self.bodies[i].body_type {
+                            BodyType::Kinematic => true,
+                            BodyType::Dynamic => !self.asleep[i],
+                            BodyType::Static => false,
+                        }
                 };
                 awake(j.ia()) || awake(j.ib())
             })
@@ -1198,7 +1286,8 @@ impl World {
         // 분해된 채 남아 wake가 다시 한 홉만 전파된다(리뷰 BLOCKER). 잠든 동안 멤버십은
         // 변할 수 없으므로(변하려면 깨어나야 한다) 보존이 곧 정답이다.
         for i in 0..n {
-            if !self.alive[i] || !self.bodies[i].is_dynamic() {
+            // OOB는 시뮬레이션에서 빠진 상태이므로 아일랜드에도 속하지 않는다
+            if !self.alive[i] || !self.bodies[i].is_dynamic() || self.oob[i] {
                 self.island[i] = u32::MAX;
             } else if !self.asleep[i] {
                 self.island[i] = find(&mut parent, i) as u32;
@@ -1207,7 +1296,7 @@ impl World {
         let lin2 = self.params.sleep_linear_threshold * self.params.sleep_linear_threshold;
         let ang2 = self.params.sleep_angular_threshold * self.params.sleep_angular_threshold;
         for i in 0..n {
-            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] {
+            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] && !self.oob[i] {
                 let low = self.bodies[i].linvel.length_sq() < lin2
                     && self.bodies[i].angvel.length_sq() < ang2;
                 self.sleep_timer[i] = if low { self.sleep_timer[i] + dt } else { 0.0 };

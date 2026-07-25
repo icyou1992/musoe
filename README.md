@@ -79,7 +79,15 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
   | 질량 | 1e-6 ~ 1e6 kg | 거부 |
   | 역관성 | 1e-10 ~ 1e12 | 거부 |
   | dt | `MIN_DT` 1e-4 ~ `MAX_DT` 0.25 s | 거부 |
+  | 조인트 앵커 (바디별) | 그 바디 바운딩 반경 × 4 | 거부 |
   | 파생 상태(위치·속도·임펄스·PCM) | `MAX_STATE` 1e15 | 포화 + `StateOverflow` |
+  | 브로드페이즈 페어 | `max_pairs_per_body × 바디 수 + 1024` | `ResourceLimit` |
+
+  **앵커가 바디별로도 묶이는 이유**: 전역 상한만 두면 반지름 1mm 구에 1000m 앵커를 붙일 수
+  있고, K 행렬의 고유 스케일이 2.4e4 : 6e16이 되어 상대 det가 임계 아래로 떨어져
+  `Mat3::inverse`가 0 행렬을 돌려준다 — 조인트가 **오류 없이 조용히 풀린다**.
+  레버암을 바디 크기에 묶으면 `r²·I⁻¹`이 `m⁻¹`과 같은 자릿수에 남아 조건수가
+  형상 스케일과 무관해진다.
 
   **앵커가 셰이프 범위인 이유**: 앵커는 레버암이고 점 속도는 `v + ω×r`다. 앵커를 월드
   범위까지 허용하면 각속도 100 rad/s × 앵커 1e4 m = 점 속도 1e6 m/s가 되어 임펄스 논증이
@@ -87,12 +95,20 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
   `MIN_SHAPE_EXTENT`(1mm) 이하여야 작은 물체가 좌표 반올림으로 퇴화하지 않는다.
   더 넓은 월드는 floating-origin(주기적 rebase)이 필요하며 v1의 계약이 아니다.
 - **월드 범위 이탈은 정의된 정책이다**: 적분으로 위치가 `MAX_INPUT`을 벗어나면 경계에
-  고정하고 속도를 0으로 만든 뒤 재운다(`Diagnostics::out_of_bounds`로 관측).
+  고정하고 속도를 0으로 만든 뒤 **시뮬레이션에서 제외**한다(`is_out_of_bounds`,
+  `Diagnostics::out_of_bounds`). 이는 sleep과 **다른 상태**다 — sleep으로 처리하면
+  조인트로 연결된 상대가 깨어 있을 때 wake 폐쇄가 매 프레임 되살려
+  이동→고정→sleep→wake를 반복한다. 해제는 호스트가 `set_pose`로 월드 안에
+  되돌리는 경로뿐이다(자동 복귀 없음).
   10km 밖에서는 f32 간격이 최소 특징 크기를 넘어 충돌 판정이 의미를 잃으므로,
   조용히 계속 계산하는 것이 가장 나쁜 선택이다.
 - **리더는 라이브 API와 같은 validator를 호출한다**(`Body::validate`/`Joint::validate`).
   필드마다 범위 검사를 따로 적으면 새 차원을 도입할 때마다 한쪽만 고쳐 비대칭이
   재생산된다 — 실제로 네 번 재발했다.
+- **`WorldParams`는 캐노니컬 상태**다(스냅샷 v4에 포함). 미래 동작을 바꾸는 mutable
+  state이므로, 빠지면 같은 스냅샷을 복원한 두 월드의 해시는 같은데 다음 스텝부터 갈린다.
+- hull은 **회전 불변** 최소 두께를 요구한다. 축 정렬 span만 보면 한 평면 위의 점들이
+  통과해 저차원 polytope가 GJK/EPA로 들어간다.
 - **속도 상한은 물리 파라미터다** (`WorldParams::max_linear_velocity` 500 m/s,
   `max_angular_velocity` 100 rad/s — Jolt `mMaxLinearVelocity` 계열). 터널링·폭주를 막는
   정상 기능이며 도달은 오류가 아니라 `Diagnostics::velocity_clamped`로 집계된다.

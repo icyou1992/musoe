@@ -23,6 +23,8 @@ mod tests {
     use maru_math::{Quat, Vec3};
 
     const DT: f32 = 1.0 / 60.0;
+    /// 스냅샷 헤더 = magic4 + version4 + WorldParams60. 슬롯 카운트는 그 뒤에 온다.
+    const HDR: usize = 4 + 4 + 60;
 
     fn pose(x: f32, y: f32, z: f32) -> Pose {
         Pose {
@@ -777,7 +779,7 @@ mod tests {
         assert_eq!(w.restore(&bad), Err(SnapshotError::BadVersion(99)));
         // 4) 거대한 바디 개수 (OOM 유도)
         let mut bad = good.clone();
-        bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        bad[HDR..HDR + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(w.restore(&bad), Err(SnapshotError::CountTooLarge));
         // 5) 잔여 바이트
         let mut bad = good.clone();
@@ -785,8 +787,8 @@ mod tests {
         assert_eq!(w.restore(&bad), Err(SnapshotError::TrailingBytes));
         // 6) 비유한 값 주입 (바디 위치 필드)
         let mut bad = good.clone();
-        // magic4+version4+count4 + alive1+reserved1+generation4+body_type1 = pos.x
-        let pos_off = 12 + 1 + 1 + 4 + 1;
+        // 헤더 + count4 + alive1+oob1+reserved1+generation4+body_type1 = pos.x
+        let pos_off = HDR + 4 + 1 + 1 + 1 + 4 + 1;
         bad[pos_off..pos_off + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(matches!(
             w.restore(&bad),
@@ -968,13 +970,13 @@ mod tests {
         let before = w.state_hash();
 
         // 헤더만 남기고 바디 100만 개를 주장 (고정 상한 1<<22 아래라 예전엔 통과했다)
-        let mut bad = good[..12].to_vec();
-        bad[8..12].copy_from_slice(&1_000_000u32.to_le_bytes());
+        let mut bad = good[..HDR + 4].to_vec();
+        bad[HDR..HDR + 4].copy_from_slice(&1_000_000u32.to_le_bytes());
         assert_eq!(w.restore(&bad), Err(SnapshotError::CountTooLarge));
 
         // 중첩 개수(hull 점)도 같은 규칙 — 총량 예산이 파일 크기에서 자동으로 나온다
         let mut bad = good.clone();
-        bad[8..12].copy_from_slice(&(good.len() as u32).to_le_bytes());
+        bad[HDR..HDR + 4].copy_from_slice(&(good.len() as u32).to_le_bytes());
         assert!(matches!(
             w.restore(&bad),
             Err(SnapshotError::CountTooLarge) | Err(SnapshotError::Truncated)
@@ -993,11 +995,9 @@ mod tests {
         let good = w.snapshot();
         let before = w.state_hash();
 
-        // 슬롯 레이아웃(Box 셰이프): alive1+reserved1+gen4 + 본문106 + sleep4+asleep1+island4 = 121
-        //   본문106 = type1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4
-        //            + shape_origin_offset12 + Box17
-        const SLOT: usize = 121;
-        let type_off = 12 + SLOT + 1 + 1 + 4; // 헤더 + 슬롯0(ground) + alive/reserved/gen
+        // 슬롯(Box): alive1+oob1+reserved1+gen4 + 본문106 + sleep4+asleep1+island4 = 122
+        const SLOT: usize = 122;
+        let type_off = HDR + 4 + SLOT + 1 + 1 + 1 + 4;
         assert_eq!(
             good[type_off], 1,
             "슬롯1이 dynamic이 아님 — 레이아웃 가정 붕괴"
@@ -1127,8 +1127,8 @@ mod tests {
         w.step(DT);
         let good = w.snapshot();
         let before = w.state_hash();
-        // 슬롯1의 inv_mass 자리 (SLOT 121 · alive1+reserved1+gen4 + type1+pos12+rot16+lin12+ang12)
-        let off = 12 + 121 + 1 + 1 + 4 + 1 + 12 + 16 + 12 + 12;
+        // 슬롯1의 inv_mass 자리
+        let off = HDR + 4 + 122 + 1 + 1 + 1 + 4 + 1 + 12 + 16 + 12 + 12;
         let mut bad = good.clone();
         bad[off..off + 4].copy_from_slice(&f32::MAX.to_le_bytes());
         assert_eq!(
@@ -1181,7 +1181,13 @@ mod tests {
         let origin = pose(1.0, 2.0, 3.0);
         let b = Body::new_dynamic(
             Shape::Hull {
-                points: vec![Vec3::new(9.5, -0.5, -0.5), Vec3::new(10.5, 0.5, 0.5)],
+                points: vec![
+                    Vec3::new(9.5, -0.5, -0.5),
+                    Vec3::new(10.5, -0.5, -0.5),
+                    Vec3::new(9.5, 0.5, -0.5),
+                    Vec3::new(9.5, -0.5, 0.5),
+                    Vec3::new(10.5, 0.5, 0.5),
+                ],
                 radius: 0.0,
             },
             origin,
@@ -1321,7 +1327,11 @@ mod tests {
             0.0,
             "이탈 바디가 동결되지 않음"
         );
-        assert!(w.is_asleep(h), "이탈 바디가 잠들지 않음");
+        assert!(w.is_out_of_bounds(h), "이탈 상태가 기록되지 않음");
+        assert!(
+            !w.is_asleep(h),
+            "OOB가 sleep과 섞이면 아일랜드 불변식이 깨진다"
+        );
         assert_eq!(w.diagnostics().out_of_bounds, 1, "이탈이 관측되지 않음");
         let snap = w.snapshot();
         let r = w.restore(&snap);
@@ -1407,8 +1417,10 @@ mod tests {
             Shape::Hull {
                 points: vec![
                     Vec3::new(-0.4, -0.4, -0.4),
+                    Vec3::new(0.4, -0.4, -0.4),
+                    Vec3::new(-0.4, 0.4, -0.4),
+                    Vec3::new(-0.4, -0.4, 0.4),
                     Vec3::new(0.4, 0.4, 0.4),
-                    Vec3::new(0.4, -0.4, 0.2),
                 ],
                 radius: 0.0,
             },
@@ -1745,7 +1757,8 @@ mod tests {
     /// 앵커를 셰이프 범위로 묶어 `ω×r` 점 속도를 유계로 만든다.
     #[test]
     fn large_anchor_with_spinning_kinematic_stays_in_policy() {
-        // 앵커는 레버암이므로 셰이프 범위를 넘을 수 없다
+        // 앵커는 레버암이므로 전역 상한을 넘을 수 없고,
+        // **그 바디의 실제 크기**에도 비례해야 한다(아래 try_add_joint에서 검증).
         assert!(Joint::try_point(
             BodyHandle {
                 index: 0,
@@ -1779,12 +1792,8 @@ mod tests {
         ));
         w.set_angular_velocity(k, Vec3::new(0.0, 100.0, 0.0))
             .unwrap();
-        w.add_joint(Joint::point(
-            k,
-            heavy,
-            Vec3::new(maru_collide::MAX_ANCHOR, 0.0, 0.0),
-            Vec3::ZERO,
-        ));
+        // 앵커는 그 바디 크기에 비례해야 한다 — kinematic 박스(half=1)의 허용 한계 근처
+        w.add_joint(Joint::point(k, heavy, Vec3::new(3.0, 0.0, 0.0), Vec3::ZERO));
         for _ in 0..30 {
             // 지원 범위 안의 합법 월드는 StateOverflow를 내면 안 된다
             assert_eq!(
@@ -2080,6 +2089,187 @@ mod tests {
             Shape::Hull {
                 points: vec![Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0)],
                 radius: maru_collide::MIN_SHAPE_EXTENT
+            },
+            pose(0.0, 0.0, 0.0)
+        )
+        .is_ok());
+    }
+
+    // ─────────── 리뷰 rev_23aba1ab 회귀 ───────────
+
+    /// BLOCKER: 전역 앵커 상한만으로는 부족하다 — 앵커는 **그 바디의 실제 크기**에
+    /// 비례해야 K 행렬 조건수가 형상 스케일과 무관해진다. 반지름 1mm 구에 1000m 앵커면
+    /// K의 고유 스케일이 2.4e4 : 6e16이 되어 상대 det가 임계 아래로 떨어지고
+    /// `Mat3::inverse`가 0 행렬을 돌려준다 — 조인트가 오류 없이 조용히 풀린다.
+    #[test]
+    fn anchor_must_scale_with_body() {
+        let mut w = World::new(WorldParams::default());
+        let tiny = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.001 },
+            pose(0.0, 1.0, 0.0),
+            1.0e4,
+        ));
+        let anchor = w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(1.0, 1.0, 1.0),
+                radius: 0.0,
+            },
+            pose(0.0, 3.0, 0.0),
+        ));
+        // 전역 상한(1000m) 안이지만 1mm 구에는 터무니없는 레버암
+        assert_eq!(
+            w.try_add_joint(Joint::point(
+                tiny,
+                anchor,
+                Vec3::new(500.0, 0.0, 0.0),
+                Vec3::ZERO
+            )),
+            Err(ApiError::InvalidValue),
+            "바디 크기를 무시한 앵커가 통과"
+        );
+        // 바디 크기에 비례하는 앵커는 정상
+        assert!(w
+            .try_add_joint(Joint::point(
+                tiny,
+                anchor,
+                Vec3::new(0.002, 0.0, 0.0),
+                Vec3::ZERO
+            ))
+            .is_ok());
+    }
+
+    /// BLOCKER: `WorldParams`는 미래 동작을 바꾸는 mutable state다 —
+    /// 스냅샷·해시에 없으면 같은 스냅샷의 미래가 인스턴스마다 달라진다.
+    #[test]
+    fn world_params_are_canonical_state() {
+        let mut zero_g = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            substeps: 1,
+            ..Default::default()
+        });
+        ground(&mut zero_g);
+        let h = dyn_box(&mut zero_g, 0.0, 5.0);
+        zero_g.step(DT);
+        let snap = zero_g.snapshot();
+
+        // 기본 파라미터(중력 있음) 월드에 복원한다
+        let mut other = World::new(WorldParams::default());
+        other.restore(&snap).unwrap();
+        assert_eq!(other.state_hash(), zero_g.state_hash());
+        // 파라미터까지 복원됐다면 이후 궤적도 같아야 한다
+        for _ in 0..30 {
+            zero_g.step(DT);
+            other.step(DT);
+        }
+        assert_eq!(
+            other.state_hash(),
+            zero_g.state_hash(),
+            "파라미터가 복원되지 않아 미래가 분기함"
+        );
+        assert!(
+            (other.body(h).pose().pos.y - 5.0).abs() < 1e-3,
+            "중력 0 파라미터가 복원되지 않음"
+        );
+    }
+
+    /// BLOCKER: 같은 자리에 겹친 N개 바디는 N²/2 페어를 만든다. 입력은 작아도
+    /// wasm에서는 오류 반환 전에 allocator가 죽으므로 **예산 초과는 오류**여야 한다.
+    #[test]
+    fn broadphase_pair_budget_is_an_error_not_a_trap() {
+        let mut w = World::new(WorldParams {
+            max_pairs_per_body: 1,
+            ..Default::default()
+        });
+        for _ in 0..200 {
+            w.add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.5 },
+                pose(0.0, 1.0, 0.0), // 전부 같은 자리 → 모든 페어가 겹친다
+                1.0,
+            ));
+        }
+        assert_eq!(
+            w.try_step(DT),
+            Err(ApiError::ResourceLimit),
+            "페어 폭발이 오류로 표현되지 않음"
+        );
+        // 상태는 손상되지 않고 스냅샷도 여전히 유효하다
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
+
+    /// BLOCKER: 월드 이탈 바디는 **일반 sleep과 분리**돼야 한다 — 조인트로 연결된
+    /// 상대가 깨어 있으면 wake 폐쇄가 매 프레임 되살려 이동→고정→sleep→wake를 반복한다.
+    #[test]
+    fn out_of_bounds_body_is_not_auto_woken() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..Default::default()
+        });
+        let edge = maru_collide::MAX_INPUT - 5.0;
+        let a = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(edge, 0.0, 0.0),
+            1.0,
+        ));
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(edge - 1.0, 0.0, 0.0),
+            1.0,
+        ));
+        w.add_joint(Joint::point(
+            a,
+            b,
+            Vec3::new(0.0, 0.5, 0.0),
+            Vec3::new(0.0, -0.5, 0.0),
+        ));
+        w.set_linear_velocity(a, Vec3::new(500.0, 0.0, 0.0))
+            .unwrap();
+        for _ in 0..20 {
+            let _ = w.try_step(crate::world::MAX_DT);
+        }
+        assert!(
+            w.is_out_of_bounds(a),
+            "경계를 넘은 바디가 OOB로 표시되지 않음"
+        );
+        // 여러 스텝이 지나도 자동으로 되살아나지 않는다
+        for _ in 0..20 {
+            let _ = w.try_step(DT);
+        }
+        assert!(w.is_out_of_bounds(a), "OOB 바디가 자동 wake됨 (진동 경로)");
+        assert!(w.restore(&w.snapshot()).is_ok());
+        // 호스트가 월드 안으로 되돌리면 해제된다
+        w.set_pose(a, pose(0.0, 0.0, 0.0)).unwrap();
+        assert!(!w.is_out_of_bounds(a), "set_pose로 OOB가 해제되지 않음");
+    }
+
+    /// MAJOR: 축 정렬 span만 보면 **회전된 퇴화 hull**이 통과한다 — 한 평면 위의 점들도
+    /// x/y/z span은 모두 크다. 회전 불변 두께를 재야 한다.
+    #[test]
+    fn rotated_coplanar_hull_is_rejected() {
+        // z = x + y 평면 위의 점들 — 3D 두께 0이지만 축별 span은 모두 1
+        let coplanar = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 2.0),
+        ];
+        assert!(
+            Body::try_new_static(
+                Shape::Hull {
+                    points: coplanar.clone(),
+                    radius: 0.0
+                },
+                pose(0.0, 0.0, 0.0)
+            )
+            .is_err(),
+            "회전된 평면 hull이 통과 (축 정렬 검사만 하고 있다)"
+        );
+        // 두께가 생기면 합법
+        let mut thick = coplanar;
+        thick.push(Vec3::new(0.5, 0.5, 0.0));
+        assert!(Body::try_new_static(
+            Shape::Hull {
+                points: thick,
+                radius: 0.0
             },
             pose(0.0, 0.0, 0.0)
         )
