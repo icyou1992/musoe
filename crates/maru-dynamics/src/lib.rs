@@ -2275,4 +2275,51 @@ mod tests {
         )
         .is_ok());
     }
+
+    /// 리뷰 권고(커버리지): 속도 상한은 **고반발·구동 kinematic**에서 실제로 닿는다.
+    /// 상한에 닿아도 상태가 정책 안에 남고 왕복이 성립하는지 확인한다.
+    #[test]
+    fn velocity_limit_with_restitution_and_kinematic() {
+        let mut w = World::new(WorldParams {
+            max_linear_velocity: 3.0, // 일부러 낮춰 상한에 닿게 한다
+            solver: crate::solver::SolverParams {
+                restitution_threshold: 0.1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        ground(&mut w);
+        // 완전 탄성에 가까운 공을 떨어뜨린다
+        let ball = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 4.0, 0.0),
+            1.0,
+        ));
+        w.set_material(ball, 0.2, 0.95).unwrap();
+        // 구동 kinematic 판이 아래에서 올라온다
+        let paddle = w.add_body(Body::new_kinematic(
+            Shape::Box {
+                half: Vec3::new(2.0, 0.2, 2.0),
+                radius: 0.0,
+            },
+            pose(0.0, 0.5, 0.0),
+        ));
+        w.set_linear_velocity(paddle, Vec3::new(0.0, 2.0, 0.0))
+            .unwrap();
+
+        let mut clamped_total = 0usize;
+        for _ in 0..240 {
+            // 상한에 닿는 것은 정상 기능이므로 오류가 아니다
+            assert_eq!(w.try_step(DT), Ok(()));
+            clamped_total += w.diagnostics().velocity_clamped;
+            let v = w.body(ball).linvel().length();
+            assert!(v <= 3.0 + 1e-3, "속도 상한을 넘김: {v}");
+            assert_eq!(w.diagnostics().state_saturations, 0);
+        }
+        assert!(
+            clamped_total > 0,
+            "시나리오가 상한에 닿지 않음 — 판별력 없음"
+        );
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
 }
