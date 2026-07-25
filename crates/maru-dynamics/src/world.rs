@@ -95,6 +95,8 @@ pub struct Diagnostics {
     /// 속도 상한에 걸린 바디 수. **정상 기능**이므로 오류가 아니지만, 지속적으로 크면
     /// 장면 구성이나 파라미터를 의심할 신호다.
     pub velocity_clamped: usize,
+    /// 이번 스텝에 **월드 범위를 벗어나 동결된** 바디 수. 정의된 정책이며 오류가 아니다.
+    pub out_of_bounds: usize,
     /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
     /// 0이 아니면 지원 범위 밖 입력이거나 엔진 버그이며, 그 스텝의 물리는 신뢰할 수 없다.
     /// 서로 다른 초과 상태가 같은 포화값으로 합쳐지므로 상태 해시만으로는 구분되지 않는다.
@@ -588,6 +590,39 @@ impl World {
         }
     }
 
+    /// 월드 범위를 벗어난 바디를 **경계에 고정하고 재운다**(리뷰 BLOCKER: 위치 정밀도
+    /// 계약이 step에 대해 닫혀 있지 않았다). 10km 밖에서는 f32 간격이 최소 특징 크기를
+    /// 넘어 충돌 판정이 의미를 잃으므로, 조용히 계속 계산하는 것이 가장 나쁘다.
+    /// 동결은 관측 가능하고(`Diagnostics::out_of_bounds`) 상태는 복원 가능하게 남는다.
+    /// 더 넓은 월드가 필요하면 호스트가 floating-origin으로 rebase해야 한다(v1 계약).
+    fn enforce_world_bounds(&mut self) {
+        let max = maru_collide::MAX_INPUT;
+        for i in 0..self.bodies.len() {
+            if !self.alive[i] || self.bodies[i].body_type == BodyType::Static {
+                continue;
+            }
+            let p = self.bodies[i].pose.pos;
+            if maru_collide::vec_in_range(p) {
+                continue;
+            }
+            let clamp = |v: f32| {
+                if v.is_nan() {
+                    0.0
+                } else {
+                    v.clamp(-max, max)
+                }
+            };
+            self.bodies[i].pose.pos = Vec3::new(clamp(p.x), clamp(p.y), clamp(p.z));
+            self.bodies[i].linvel = Vec3::ZERO;
+            self.bodies[i].angvel = Vec3::ZERO;
+            if self.bodies[i].is_dynamic() {
+                self.asleep[i] = true;
+                self.sleep_timer[i] = 0.0;
+            }
+            self.diag.out_of_bounds += 1;
+        }
+    }
+
     fn close_state_policy(&mut self) -> usize {
         use maru_collide::{saturate_state, saturate_state_vec};
         let mut hits = 0usize;
@@ -819,13 +854,16 @@ impl World {
         // ② 복원된 큰 속도가 브로드페이즈 sweep AABB를 부풀려 O(N²) 페어를 만든다 —
         //    `try_step`이 오류를 돌려주기 전에 wasm OOM이 먼저 온다.
         self.diag = Diagnostics::default();
-        self.clamp_velocities();
         // 0) 커맨드 적용 (설계 §4 파이프라인 0단계 — 쓰기의 정본 경로).
         //    **빈 월드 판정보다 먼저** 해야 한다: 빈 월드에 AddBody만 큐잉하면 영원히
         //    적용되지 않아 '다음 step에서 적용' 계약이 깨진다(리뷰 NOT_RESOLVED).
         if !self.commands.is_empty() {
             self.flush_commands();
         }
+        // 속도 클램프는 **flush 뒤·브로드페이즈 앞**이어야 한다(리뷰 BLOCKER): 스텝 시작에만
+        // 걸면 pending `SetLinearVelocity`가 그 뒤에 적용돼 sweep AABB를 부풀린 채
+        // 브로드페이즈로 들어간다(O(N²) 페어 → 오류 반환 전 OOM).
+        self.clamp_velocities();
         if self.bodies.is_empty() {
             return;
         }
@@ -1053,7 +1091,11 @@ impl World {
                 joint::solve(
                     &mut self.bodies,
                     &mut joints[ji],
-                    Some((&joint_soft, self.params.solver.max_bias_speed)),
+                    Some((
+                        &joint_soft,
+                        self.params.solver.max_bias_speed,
+                        self.params.max_angular_velocity,
+                    )),
                 );
             }
             for c in constraints.iter_mut() {
@@ -1208,6 +1250,11 @@ impl World {
                 );
             }
         }
+        // **스텝 말 최종 클램프**: 서브스텝 루프 뒤의 relax·restitution 패스가 속도를 다시
+        // 바꾸므로, 여기서 한 번 더 걸어야 저장되는 상태가 입력 범위 불변식을 만족한다
+        // (리더가 `Body::validate`를 그대로 쓰는 근거).
+        self.clamp_velocities();
+        self.enforce_world_bounds();
         self.diag.state_saturations = self.close_state_policy();
     }
 }

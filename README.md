@@ -77,7 +77,7 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
   | 선속도 | `MAX_SPEED` 1e4 m/s | 거부 |
   | 각속도 | `MAX_ANGULAR` 1e2 rad/s | 거부 |
   | 질량 | 1e-6 ~ 1e6 kg | 거부 |
-  | 역관성 | 1e-12 ~ 1e12 | 거부 |
+  | 역관성 | 1e-10 ~ 1e12 | 거부 |
   | dt | `MIN_DT` 1e-4 ~ `MAX_DT` 0.25 s | 거부 |
   | 파생 상태(위치·속도·임펄스·PCM) | `MAX_STATE` 1e15 | 포화 + `StateOverflow` |
 
@@ -86,6 +86,13 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
   깨진다. **월드 범위가 1e4인 이유**: 1e4 부근의 f32 간격(≈9.8e-4 m)이
   `MIN_SHAPE_EXTENT`(1mm) 이하여야 작은 물체가 좌표 반올림으로 퇴화하지 않는다.
   더 넓은 월드는 floating-origin(주기적 rebase)이 필요하며 v1의 계약이 아니다.
+- **월드 범위 이탈은 정의된 정책이다**: 적분으로 위치가 `MAX_INPUT`을 벗어나면 경계에
+  고정하고 속도를 0으로 만든 뒤 재운다(`Diagnostics::out_of_bounds`로 관측).
+  10km 밖에서는 f32 간격이 최소 특징 크기를 넘어 충돌 판정이 의미를 잃으므로,
+  조용히 계속 계산하는 것이 가장 나쁜 선택이다.
+- **리더는 라이브 API와 같은 validator를 호출한다**(`Body::validate`/`Joint::validate`).
+  필드마다 범위 검사를 따로 적으면 새 차원을 도입할 때마다 한쪽만 고쳐 비대칭이
+  재생산된다 — 실제로 네 번 재발했다.
 - **속도 상한은 물리 파라미터다** (`WorldParams::max_linear_velocity` 500 m/s,
   `max_angular_velocity` 100 rad/s — Jolt `mMaxLinearVelocity` 계열). 터널링·폭주를 막는
   정상 기능이며 도달은 오류가 아니라 `Diagnostics::velocity_clamped`로 집계된다.

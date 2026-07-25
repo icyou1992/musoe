@@ -46,7 +46,11 @@ pub const MAX_INV_MASS: f32 = 1.0e6;
 /// 역관성 범위 (1/(kg·m²)). 관성은 차원이 달라 질량과 같은 상한을 쓸 수 없다
 /// (반지름 1cm 구의 역관성은 이미 1e9 수준). 임펄스 상한 논증에는 들어가지 않는다 —
 /// `k ≥ inv_mass`라 유효질량은 회전 항과 무관하게 묶인다.
-pub const MIN_INV_INERTIA: f32 = 1.0e-12;
+/// 하한이 1e-10인 이유는 **힌지 각 임펄스**다(리뷰 BLOCKER): `imp ≈ bias / k_ang`이고
+/// `k_ang ≥ MIN_INV_INERTIA`이므로 `1/k_ang ≤ 1e10`. 각 bias를 각속도 상한(1e2)으로
+/// 묶으면 `imp ≤ 1e12`로 `MAX_STATE`의 1000분의 1이다.
+/// 관성 1e10 kg·m²는 반지름 100m·질량 1e6kg 물체(≈6.7e9)를 여전히 포함한다.
+pub const MIN_INV_INERTIA: f32 = 1.0e-10;
 pub const MAX_INV_INERTIA: f32 = 1.0e12;
 /// hull 정점 수 상한. support가 O(n) 선형 스캔이라 성능 상한이자 직렬화 자원 상한이다.
 /// 더 복잡한 메시는 convex decomposition으로 나눈다(v1 계약).
@@ -60,7 +64,11 @@ pub const MAX_HULL_POINTS: usize = 1024;
 /// - 조인트·접촉 bias 속도는 `max_bias_speed ≤ MAX_SPEED = 1e4`로 클램프된다
 ///   (bias를 안 묶으면 `c_pos × (1/h)`가 1e12까지 간다)
 ///
-/// 따라서 임펄스 ≤ `1e6 × (2·1.1e5 + 1e4) ≈ 2.3e11`. `MAX_STATE`는 그 **4000배 위**다.
+/// 따라서 선형 임펄스 ≤ `1e6 × (2·1.1e5 + 1e4) ≈ 2.3e11`.
+///
+/// **각 임펄스**는 별도 경로다: `imp ≈ bias_ang / k_ang`, `k_ang ≥ MIN_INV_INERTIA = 1e-10`,
+/// 각 bias는 각속도 상한(`MAX_ANGULAR = 1e2`)으로 클램프 → `imp ≤ 1e12`.
+/// 두 경로 모두 `MAX_STATE`(1e15) 아래 최소 1000배 여유를 둔다.
 pub const MAX_STATE: f32 = 1.0e15;
 
 /// 스텝 크기 범위. 하한이 필요한 이유: soft 계수의 `1/h`가 폭발해 조인트 bias가

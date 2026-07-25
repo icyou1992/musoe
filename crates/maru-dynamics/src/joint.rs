@@ -208,10 +208,11 @@ fn clamp_len(v: Vec3, max: f32) -> Vec3 {
 
 /// 서브스텝 해석. `soft`=(bias 파라미터, 최대 bias 속도), None=relax.
 ///
-/// **bias 속도를 클램프한다**(리뷰 BLOCKER): `c_pos × bias_rate`는 위치 오차가 크고 h가
-/// 작을 때 1e12까지 가고, 유효질량을 곱하면 파생 상태 상한을 넘긴다. 접촉이 이미
-/// `max_bias_speed`로 같은 방어를 하고 있었는데 조인트만 빠져 있었다.
-pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32)>) {
+/// **bias를 차원별로 클램프한다**(리뷰 BLOCKER ×2): 선형 bias는 `max_bias_speed`(m/s),
+/// **각 bias는 각속도 상한**(rad/s). `c × bias_rate`는 오차가 크고 h가 작을 때 1e12까지 가고,
+/// 유효(관성)질량을 곱하면 파생 상태 상한을 넘긴다. 접촉이 이미 선형 방어를 하고 있었는데
+/// 조인트는 선형·각 모두 빠져 있었다.
+pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32, f32)>) {
     let ia = bodies[j.ia()].inv_inertia_world();
     let ib = bodies[j.ib()].inv_inertia_world();
     let (inv_ma, inv_mb) = (bodies[j.ia()].inv_mass, bodies[j.ib()].inv_mass);
@@ -240,7 +241,7 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32)>)
     let c_pos = (bodies[j.ia()].pose.pos + ra) - (bodies[j.ib()].pose.pos + rb);
     let cdot = bodies[j.ia()].velocity_at(ra) - bodies[j.ib()].velocity_at(rb);
     let (bias, mass_scale, impulse_scale) = match soft {
-        Some((sf, max_bias)) => (
+        Some((sf, max_bias, _)) => (
             clamp_len(c_pos * sf.bias_rate, max_bias),
             sf.mass_scale,
             sf.impulse_scale,
@@ -271,8 +272,11 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32)>)
             // (ωa−ωb)를 −bias_rate·err 로 구동하면 두 축이 서로를 향해 회전한다.
             let c = dir.dot(err);
             let (bias, ms, is_) = match soft {
-                Some((sf, max_bias)) => (
-                    (c * sf.bias_rate).clamp(-max_bias, max_bias),
+                // **각 bias는 각속도**다 — 선형 상한(m/s)이 아니라 각속도 상한(rad/s)으로
+                // 묶어야 `imp = bias/k_ang`이 유계가 된다(리뷰 BLOCKER: 큰 관성에서
+                // 1/k_ang이 1e10까지 가므로 선형 상한 1e4로는 1e14를 넘긴다).
+                Some((sf, _, max_ang_bias)) => (
+                    (c * sf.bias_rate).clamp(-max_ang_bias, max_ang_bias),
                     sf.mass_scale,
                     sf.impulse_scale,
                 ),

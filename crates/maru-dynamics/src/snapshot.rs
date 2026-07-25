@@ -242,6 +242,14 @@ impl Reader<'_> {
     }
 }
 
+/// 할당 실패를 오류로 돌려주는 Vec 예약.
+fn try_vec<T>(n: usize) -> Result<Vec<T>, SnapshotError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|_| SnapshotError::CountTooLarge)?;
+    Ok(v)
+}
+
 fn write_shape(w: &mut Writer, s: &Shape) {
     match s {
         Shape::Sphere { radius } => {
@@ -286,7 +294,7 @@ fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
         3 => {
             // 점 개수도 남은 바이트로 묶인다 → 전체 파일 크기가 곧 총 점 예산이다
             let n = r.count(min_bytes::HULL_POINT, decoded_size::hull_point())?;
-            let mut points = Vec::with_capacity(n);
+            let mut points = try_vec(n)?;
             for _ in 0..n {
                 points.push(r.vec3()?);
             }
@@ -320,6 +328,10 @@ fn write_body(w: &mut Writer, b: &Body) {
     write_shape(w, &b.shape);
 }
 
+/// **리더는 라이브 API와 같은 validator를 호출한다**(리뷰 BLOCKER, 같은 비대칭의 4번째 재발).
+/// 필드마다 범위 검사를 따로 적으면 새 차원을 도입할 때마다 한쪽만 고쳐 비대칭이 재생산된다
+/// — 실제로 inv_mass·역관성·앵커에서 그렇게 됐다. 값은 유한/상태 범위로만 읽고,
+/// **불변식 판정은 `Body::validate`/`Joint::validate` 한 곳**에서 한다.
 fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
     let body_type = match r.u8()? {
         0 => BodyType::Static,
@@ -336,44 +348,14 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
     // 솔버 산술에 들어가기 전에 잡는다.
     let linvel = r.state_vec3()?;
     let angvel = r.state_vec3()?;
-    let inv_mass = r.f32()?;
-    let inv_inertia_local = r.vec3()?;
+    // 질량·관성은 차원이 달라 전용 범위를 쓴다 — 판정은 아래 validate()가 한다.
+    let inv_mass = r.state_f32()?;
+    let inv_inertia_local = r.state_vec3()?;
     let friction = r.f32()?;
     let restitution = r.f32()?;
     let shape_origin_offset = r.vec3()?;
     let shape = read_shape(r)?;
-    if inv_mass < 0.0
-        || friction < 0.0
-        || !(0.0..=1.0).contains(&restitution)
-        || inv_inertia_local.x < 0.0
-        || inv_inertia_local.y < 0.0
-        || inv_inertia_local.z < 0.0
-    {
-        return Err(SnapshotError::NonFinite);
-    }
-    // **타입과 질량의 관계**를 강제한다(리뷰 BLOCKER): inv_mass=0인 dynamic은 솔버에서
-    // 0으로 나뉘지는 않지만 중력만 받고 제약은 못 받는 유령이 되고, 질량을 가진 static은
-    // 임펄스를 흡수해 벽이 밀린다.
-    let zero_mass = inv_mass == 0.0 && inv_inertia_local == Vec3::ZERO;
-    match body_type {
-        BodyType::Dynamic => {
-            // 질량을 **양쪽**으로 묶는다: 너무 작은 inv_mass(=거대 질량)는 조인트 솔버의
-            // K⁻¹를 폭발시켜 중간 연산에서 Inf를 만든다(리뷰 BLOCKER 공격 시나리오).
-            if !(maru_collide::inv_mass_in_range(inv_mass)
-                && maru_collide::inv_inertia_in_range(inv_inertia_local.x)
-                && maru_collide::inv_inertia_in_range(inv_inertia_local.y)
-                && maru_collide::inv_inertia_in_range(inv_inertia_local.z))
-            {
-                return Err(SnapshotError::InconsistentState);
-            }
-        }
-        BodyType::Static | BodyType::Kinematic => {
-            if !zero_mass {
-                return Err(SnapshotError::InconsistentState);
-            }
-        }
-    }
-    Ok(Body {
+    let b = Body {
         body_type,
         pose,
         linvel,
@@ -384,7 +366,9 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
         friction,
         restitution,
         shape_origin_offset,
-    })
+    };
+    b.validate().map_err(|_| SnapshotError::InconsistentState)?;
+    Ok(b)
 }
 
 fn write_joint(w: &mut Writer, j: &Joint) {
@@ -409,26 +393,20 @@ fn write_joint(w: &mut Writer, j: &Joint) {
 fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
     let body_a = r.handle()?;
     let body_b = r.handle()?;
-    let anchor_a = r.vec3()?;
-    let anchor_b = r.vec3()?;
+    let anchor_a = r.state_vec3()?;
+    let anchor_b = r.state_vec3()?;
     let kind = match r.u8()? {
         0 => JointKind::Point,
-        1 => {
-            let (axis_a, axis_b) = (r.vec3()?, r.vec3()?);
-            // 축은 생성 경계에서 정규화된다 — 0이나 비정규 축은 각 제약을 조용히 없앤다
-            if !(0.9..=1.1).contains(&axis_a.length_sq())
-                || !(0.9..=1.1).contains(&axis_b.length_sq())
-            {
-                return Err(SnapshotError::InconsistentState);
-            }
-            JointKind::Hinge { axis_a, axis_b }
-        }
+        1 => JointKind::Hinge {
+            axis_a: r.vec3()?,
+            axis_b: r.vec3()?,
+        },
         _ => return Err(SnapshotError::BadShape),
     };
     let collide_connected = r.u8()? != 0;
     let linear_impulse = r.state_vec3()?;
     let angular_impulse = [r.state_f32()?, r.state_f32()?];
-    Ok(Joint {
+    let j = Joint {
         body_a,
         body_b,
         anchor_a,
@@ -437,7 +415,10 @@ fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
         collide_connected,
         linear_impulse,
         angular_impulse,
-    })
+    };
+    // 앵커(레버암)·축 정규성·임펄스 범위 — 전부 라이브 API와 같은 판정
+    j.validate().map_err(|_| SnapshotError::InconsistentState)?;
+    Ok(j)
 }
 
 fn write_command(w: &mut Writer, c: &PendingCommand) {
@@ -635,13 +616,15 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         return Err(SnapshotError::BadVersion(v));
     }
     let nb = r.count(min_bytes::SLOT, decoded_size::slot())?;
-    let mut bodies = Vec::with_capacity(nb);
-    let mut sleep_timer = Vec::with_capacity(nb);
-    let mut asleep = Vec::with_capacity(nb);
-    let mut island = Vec::with_capacity(nb);
-    let mut alive = Vec::with_capacity(nb);
-    let mut reserved = Vec::with_capacity(nb);
-    let mut generations = Vec::with_capacity(nb);
+    // **복원 컨테이너도 할당 실패를 오류로 표현한다**(리뷰 MAJOR): `with_capacity`는
+    // 예산 안이라도 wasm 가용 메모리가 모자라면 allocator abort/trap이 된다.
+    let mut bodies = try_vec(nb)?;
+    let mut sleep_timer = try_vec(nb)?;
+    let mut asleep = try_vec(nb)?;
+    let mut island = try_vec(nb)?;
+    let mut alive = try_vec(nb)?;
+    let mut reserved = try_vec(nb)?;
+    let mut generations = try_vec(nb)?;
     for _ in 0..nb {
         alive.push(r.u8()? != 0);
         reserved.push(r.u8()? != 0);
@@ -659,14 +642,14 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     }
 
     let nj = r.count(min_bytes::JOINT, decoded_size::joint())?;
-    let mut joints = Vec::with_capacity(nj);
+    let mut joints = try_vec(nj)?;
     for _ in 0..nj {
         joints.push(read_joint(&mut r)?);
     }
 
     // pending 커맨드 (enqueue 순서 보존 — 설계 §7)
     let ncmd = r.count(min_bytes::COMMAND, decoded_size::command())?;
-    let mut commands = Vec::with_capacity(ncmd);
+    let mut commands = try_vec(ncmd)?;
     for _ in 0..ncmd {
         let cmd = match r.u8()? {
             0 => {
@@ -732,11 +715,17 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     };
 
     let np = r.count(min_bytes::CACHE_PAIR, decoded_size::cache_pair())?;
-    let mut cache = std::collections::HashMap::with_capacity(np);
+    let mut cache: std::collections::HashMap<
+        (u32, u32),
+        Vec<(maru_collide::FeatureId, crate::solver::CachedImpulse)>,
+    > = std::collections::HashMap::new();
+    cache
+        .try_reserve(np)
+        .map_err(|_| SnapshotError::CountTooLarge)?;
     for _ in 0..np {
         let key = (r.u32()?, r.u32()?);
         let ne = r.count(min_bytes::CACHE_ENTRY, decoded_size::cache_entry())?;
-        let mut entry = Vec::with_capacity(ne);
+        let mut entry = try_vec(ne)?;
         for _ in 0..ne {
             let fid = maru_collide::FeatureId(r.u32()?);
             let imp = crate::solver::CachedImpulse {

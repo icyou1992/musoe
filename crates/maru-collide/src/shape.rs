@@ -42,8 +42,8 @@ impl Shape {
                 if !extent_in_range(*half_height) || *half_height < 0.0 {
                     return Err("capsule half_height must be finite and non-negative");
                 }
-                if r <= 0.0 {
-                    return Err("capsule radius must be positive");
+                if r < MIN_SHAPE_EXTENT {
+                    return Err("capsule radius must be at least MIN_SHAPE_EXTENT");
                 }
             }
             Shape::Box { half, .. } => {
@@ -69,6 +69,22 @@ impl Shape {
                 }
                 if !points.iter().all(|p| vec_extent_in_range(*p)) {
                     return Err("hull points must be finite and within MAX_SHAPE_EXTENT");
+                }
+                // **최소 특징 크기는 모든 셰이프에 적용된다**(리뷰 MAJOR: hull·capsule만
+                // 빠져 있었다). 축별 span + 2r가 최소 크기 미만이면 월드 경계에서 AABB가
+                // 좌표 반올림으로 퇴화해 충돌 판정이 무의미해진다.
+                let (mut min, mut max) = (points[0], points[0]);
+                for p in &points[1..] {
+                    min = Vec3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z));
+                    max = Vec3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z));
+                }
+                let span = max - min;
+                let thick = 2.0 * r;
+                if span.x + thick < MIN_SHAPE_EXTENT
+                    || span.y + thick < MIN_SHAPE_EXTENT
+                    || span.z + thick < MIN_SHAPE_EXTENT
+                {
+                    return Err("hull is thinner than MIN_SHAPE_EXTENT on some axis");
                 }
             }
         }

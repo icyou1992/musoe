@@ -1291,9 +1291,9 @@ mod tests {
         );
     }
 
-    /// BLOCKER: 입력 정책만으로는 step에 대해 닫히지 않는다 — 합법 경계값이 한 스텝 뒤
-    /// 정책을 벗어나면 그 상태는 자기 스냅샷을 복원하지 못한다.
-    /// 스텝 말 클램프로 "엔진이 만들 수 있는 상태 = 리더가 받는 상태"를 성립시킨다.
+    /// BLOCKER: 정책이 step에 대해 닫혀야 한다. 월드 범위 이탈은 **정의된 정책**으로
+    /// 처리한다 — 경계 고정 + 동결 + 진단. 조용히 계속 계산하면 좌표 정밀도가 최소
+    /// 특징 크기를 넘어 충돌 판정이 무의미해진다.
     #[test]
     fn legal_boundary_state_survives_step_and_roundtrip() {
         // 월드 경계 바로 안쪽에서 상한 속도로 나간다 — 한 스텝이면 월드를 벗어난다.
@@ -1307,18 +1307,22 @@ mod tests {
             1.0,
         ));
         w.set_linear_velocity(h, Vec3::new(fast, 0.0, 0.0)).unwrap();
-        // 위치가 **월드 범위**를 넘는다 (물체가 월드를 벗어났다).
-        // 상태 정책 안이라 시뮬레이션은 계속되고 스냅샷도 왕복한다.
+        // 월드 범위를 벗어나려 하면 **경계에 고정되고 동결**된다(정의된 정책).
+        // 10km 밖에서는 f32 간격이 최소 특징 크기를 넘어 충돌 판정이 의미를 잃으므로,
+        // 조용히 계속 계산하는 것이 가장 나쁘다.
         w.try_step(crate::world::MAX_DT).unwrap();
         let p = w.body(h).pose().pos.x;
         assert!(
-            p > maru_collide::MAX_INPUT,
-            "경계 시나리오가 성립하지 않음: {p}"
+            (p - maru_collide::MAX_INPUT).abs() < 1.0,
+            "월드 경계에 고정되지 않음: {p}"
         );
-        assert!(
-            maru_collide::in_state_range(p),
-            "상태가 상태 정책을 벗어남: {p}"
+        assert_eq!(
+            w.body(h).linvel().length(),
+            0.0,
+            "이탈 바디가 동결되지 않음"
         );
+        assert!(w.is_asleep(h), "이탈 바디가 잠들지 않음");
+        assert_eq!(w.diagnostics().out_of_bounds, 1, "이탈이 관측되지 않음");
         let snap = w.snapshot();
         let r = w.restore(&snap);
         assert!(
@@ -1790,7 +1794,8 @@ mod tests {
                 w.diagnostics().state_saturations
             );
         }
-        assert!(w.restore(&w.snapshot()).is_ok());
+        let r = w.restore(&w.snapshot());
+        assert!(r.is_ok(), "{r:?}");
     }
 
     /// BLOCKER: 복원된 큰 속도가 **브로드페이즈보다 먼저** 잡혀야 한다 —
@@ -1911,5 +1916,173 @@ mod tests {
             1.0
         )
         .is_err());
+    }
+
+    // ─────────── 리뷰 rev_22b699a7 회귀 ───────────
+
+    /// BLOCKER: 새 차원별 범위가 리더에 전파되지 않아 **정상 생성 가능한 경량 바디**가
+    /// 자기 스냅샷을 복원하지 못했다. 이제 리더가 라이브와 **같은 validator**를 호출한다.
+    #[test]
+    fn light_body_with_large_inverses_round_trips() {
+        // 반지름 1cm 구, 질량 ≈ 1e-5 kg → inv_mass ≈ 1e5, inv_inertia ≈ 2.5e9
+        let mut w = World::new(WorldParams::default());
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.01 },
+            pose(0.0, 1.0, 0.0),
+            2.4,
+        ));
+        let b = w.body(h);
+        assert!(b.inv_mass() > 1.0e4, "시나리오 전제 붕괴: {}", b.inv_mass());
+        assert!(
+            b.inv_inertia_local().x > 1.0e8,
+            "시나리오 전제 붕괴: {:?}",
+            b.inv_inertia_local()
+        );
+        let r = w.restore(&w.snapshot());
+        assert!(r.is_ok(), "경량 바디 왕복 실패 (차원별 범위 미전파): {r:?}");
+    }
+
+    /// BLOCKER: 힌지 각 임펄스는 별도 경로 — 큰 관성에서 `1/k_ang`이 커지므로
+    /// 각 bias를 **각속도 상한**으로 묶어야 한다(선형 상한 m/s가 아니라).
+    #[test]
+    fn misaligned_hinge_with_large_inertia_stays_in_policy() {
+        let mut w = World::new(WorldParams {
+            substeps: 64,
+            solver: crate::solver::SolverParams {
+                contact_hertz: 1.0e3,
+                max_bias_speed: maru_collide::MAX_SPEED,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let k = w.add_body(Body::new_kinematic(
+            Shape::Box {
+                half: Vec3::new(1.0, 1.0, 1.0),
+                radius: 0.0,
+            },
+            pose(0.0, 0.0, 0.0),
+        ));
+        // 관성 상한 근처의 무거운 바디 (역관성 하한 1e-10 부근)
+        let heavy = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(100.0, 100.0, 100.0),
+                radius: 0.0,
+            },
+            pose(200.0, 0.0, 0.0),
+            0.125, // 부피 8e6 × 0.125 = 1e6 kg (질량 상한)
+        ));
+        // 90° 어긋난 축으로 연결 — 각 제약이 최대 오차에서 출발한다
+        w.add_joint(Joint::hinge(
+            k,
+            heavy,
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-100.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ));
+        for i in 0..20 {
+            assert_eq!(
+                w.try_step(crate::world::MIN_DT),
+                Ok(()),
+                "합법 월드가 step {i}에서 StateOverflow (각 임펄스 경로)"
+            );
+        }
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
+
+    /// BLOCKER: 스냅샷이 공개 API가 거부하는 앵커를 주입할 수 없어야 한다.
+    /// 리더가 `Joint::validate`를 호출하므로 앵커 정책이 자동으로 따라온다.
+    #[test]
+    fn snapshot_cannot_inject_oversized_anchor() {
+        let mut w = World::new(WorldParams::default());
+        let a = dyn_box(&mut w, 0.0, 3.0);
+        let b = dyn_box(&mut w, 3.0, 3.0);
+        w.add_joint(Joint::point(a, b, Vec3::new(0.4, 0.0, 0.0), Vec3::ZERO));
+        w.step(DT);
+        let good = w.snapshot();
+        let before = w.state_hash();
+        // 조인트 앵커 성분을 MAX_ANCHOR의 5배로 바꾸면 거부돼야 한다
+        let target = (0.4f32).to_le_bytes();
+        let inject = (maru_collide::MAX_ANCHOR * 5.0).to_le_bytes();
+        let mut patched = 0;
+        for i in 0..good.len().saturating_sub(4) {
+            if good[i..i + 4] == target {
+                let mut bad = good.clone();
+                bad[i..i + 4].copy_from_slice(&inject);
+                if w.restore(&bad).is_err() {
+                    patched += 1;
+                }
+            }
+        }
+        assert!(patched > 0, "앵커 주입을 막는 지점이 없음");
+        assert_eq!(w.state_hash(), before, "거부된 restore가 월드를 오염시킴");
+    }
+
+    /// BLOCKER: pending 속도 커맨드는 **flush 뒤**에 적용되므로, 클램프도 flush 뒤·
+    /// 브로드페이즈 앞이어야 sweep AABB 폭발을 막는다.
+    #[test]
+    fn pending_velocity_is_clamped_before_broadphase() {
+        let mut w = World::new(WorldParams {
+            max_linear_velocity: 1.0,
+            ..Default::default()
+        });
+        ground(&mut w);
+        let hs: Vec<_> = (0..30)
+            .map(|i| dyn_box(&mut w, i as f32 * 3.0 - 45.0, 1.0))
+            .collect();
+        // 합법 입력 상한 속도를 pending으로 넣는다 (스텝 시작 클램프 **뒤**에 적용된다)
+        for h in &hs {
+            w.enqueue(Command::SetLinearVelocity(
+                *h,
+                Vec3::new(maru_collide::MAX_SPEED, 0.0, 0.0),
+            ))
+            .unwrap();
+        }
+        assert_eq!(w.try_step(crate::world::MAX_DT), Ok(()));
+        for h in &hs {
+            let v = w.body(*h).linvel().length();
+            assert!(v <= 1.0 + 1e-3, "pending 속도가 클램프되지 않음: {v}");
+        }
+    }
+
+    /// MAJOR: 최소 특징 크기는 **모든 셰이프**에 적용된다 (capsule·hull이 빠져 있었다).
+    #[test]
+    fn min_feature_size_applies_to_every_shape() {
+        let tiny = maru_collide::MIN_SHAPE_EXTENT * 0.1;
+        assert!(Body::try_new_static(
+            Shape::Capsule {
+                half_height: 1.0,
+                radius: tiny
+            },
+            pose(0.0, 0.0, 0.0)
+        )
+        .is_err());
+        // 반지름 0의 단일점 hull = 모든 축에서 퇴화
+        assert!(Body::try_new_static(
+            Shape::Hull {
+                points: vec![Vec3::ZERO],
+                radius: 0.0
+            },
+            pose(0.0, 0.0, 0.0)
+        )
+        .is_err());
+        // 한 축만 얇은 hull도 거부 (월드 경계에서 AABB가 반올림으로 퇴화)
+        assert!(Body::try_new_static(
+            Shape::Hull {
+                points: vec![Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0)],
+                radius: 0.0
+            },
+            pose(0.0, 0.0, 0.0)
+        )
+        .is_err());
+        // 두께가 반지름으로 채워지면 합법
+        assert!(Body::try_new_static(
+            Shape::Hull {
+                points: vec![Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0)],
+                radius: maru_collide::MIN_SHAPE_EXTENT
+            },
+            pose(0.0, 0.0, 0.0)
+        )
+        .is_ok());
     }
 }
