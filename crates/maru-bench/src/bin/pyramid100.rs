@@ -18,7 +18,11 @@ fn main() {
     let d = WorldParams::default();
     let mut w = World::new(WorldParams {
         substeps,
-        time_to_sleep: if no_sleep { 1.0e9 } else { 0.5 },
+        time_to_sleep: if no_sleep {
+            maru_collide::MAX_INPUT
+        } else {
+            0.5
+        },
         solver: maru_dynamics::SolverParams {
             contact_hertz: hertz,
             ..d.solver
@@ -90,8 +94,16 @@ fn main() {
         vmax = vmax.max(b.linvel().length());
         top_y = top_y.max(b.pose().pos.y);
     }
+    let d = w.diagnostics();
     println!(
-        "{ms_per_step:.0} ms/step  finite={finite}  vmax={vmax:.4}  top_y={top_y:.2} (expect 99.5)"
+        "{ms_per_step:.0} ms/step  finite={finite}  vmax={vmax:.4}  top_y={top_y:.2}\n\
+         pairs={} / budget={} ({:.1}%)  oob={}  vclamp={}  sat={}",
+        d.pairs,
+        d.pair_budget,
+        100.0 * d.pairs as f32 / d.pair_budget.max(1) as f32,
+        d.out_of_bounds,
+        d.velocity_clamped,
+        d.state_saturations
     );
     let expect_top = tiers as f32 - 0.5;
     let ok = finite && vmax < 0.2 && (top_y - expect_top).abs() < 0.3;

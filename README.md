@@ -83,6 +83,12 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
   | 파생 상태(위치·속도·임펄스·PCM) | `MAX_STATE` 1e15 | 포화 + `StateOverflow` |
   | 브로드페이즈 페어 | `max_pairs_per_body × 바디 수 + 1024` | `ResourceLimit` |
 
+  페어 예산 기본값(64/바디)의 여유는 실측했다 — 40단 피라미드(820 바디)가 예산의 **8.7%**,
+  50단이 8.8%를 쓴다(밀집 스택도 ~11배 여유). `Diagnostics::pairs`/`pair_budget`으로
+  호스트가 직접 확인할 수 있다.
+  `ResourceLimit`으로 스텝을 포기해도 **커맨드는 이미 적용된 상태**다(플러시가 브로드페이즈
+  앞이다) — "커맨드 적용됨, 물리 스텝 건너뜀"이 계약이며 상태는 손상되지 않는다.
+
   **앵커가 바디별로도 묶이는 이유**: 전역 상한만 두면 반지름 1mm 구에 1000m 앵커를 붙일 수
   있고, K 행렬의 고유 스케일이 2.4e4 : 6e16이 되어 상대 det가 임계 아래로 떨어져
   `Mat3::inverse`가 0 행렬을 돌려준다 — 조인트가 **오류 없이 조용히 풀린다**.

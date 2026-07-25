@@ -113,6 +113,10 @@ pub struct Diagnostics {
     pub velocity_clamped: usize,
     /// 이번 스텝에 **월드 범위를 벗어나 동결된** 바디 수. 정의된 정책이며 오류가 아니다.
     pub out_of_bounds: usize,
+    /// 이번 스텝의 브로드페이즈 페어 수와 예산 — 예산이 정상 장면을 거부하지 않는지
+    /// 호스트가 직접 확인할 수 있어야 한다.
+    pub pairs: usize,
+    pub pair_budget: usize,
     /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
     /// 0이 아니면 지원 범위 밖 입력이거나 엔진 버그이며, 그 스텝의 물리는 신뢰할 수 없다.
     /// 서로 다른 초과 상태가 같은 포화값으로 합쳐지므로 상태 해시만으로는 구분되지 않는다.
@@ -975,10 +979,12 @@ impl World {
         let budget = (self.params.max_pairs_per_body as usize)
             .saturating_mul(self.bodies.len())
             .saturating_add(1024);
+        self.diag.pair_budget = budget;
         let Some(pairs) = bp.canonical_pairs_bounded(budget) else {
             self.resource_limit = true;
             return;
         };
+        self.diag.pairs = pairs.len();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
         let excluded: std::collections::HashSet<(u32, u32)> = self
             .joints
