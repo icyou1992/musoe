@@ -35,6 +35,10 @@ pub struct Manifold {
 /// 면 지배 판정 임계: |면법선·접촉법선| 이 이 값 이상이면 face contact로 취급.
 const FACE_DOT_MIN: f32 = 0.95;
 
+/// 계보 없는 witness 접점 표식. 클리핑 접점의 feature 인코딩(상위 비트=ref_is_a, 면·계보)과
+/// 겹치지 않는 예약값이며, 솔버는 이 값을 보면 **위치 근접**으로 캐시를 매칭한다.
+pub const FEATURE_GENERIC: u32 = 0xFFFF_0000;
+
 /// 클리핑 정점의 계보 (리뷰 MAJOR 반영 — 구 태그 재사용 인코딩은 다단 클리핑에서 서로 다른
 /// 계보가 같은 태그로 충돌했다): incident 원본 정점 비트합 ∪ 관여한 reference 측면 비트합.
 #[derive(Clone, Copy)]
@@ -92,7 +96,9 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
         points: vec![ContactPoint {
             position: (surface_a + surface_b) * 0.5,
             separation: core_sep,
-            feature: FeatureId(0xFFFF_0000), // witness 단일점 feature (에지-에지/곡면)
+            // witness 단일점: 계보가 없다(곡면·에지-에지). 상위 비트로 **generic 표식**을 달아
+            // 솔버가 ID 대신 위치 근접으로 warm start를 매칭하게 한다(리뷰 MAJOR).
+            feature: FeatureId(FEATURE_GENERIC),
         }],
     })
 }

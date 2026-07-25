@@ -3,12 +3,14 @@
 //! 설계 계약(02-architecture.md): §4.4 TGS-soft, §4.6 슬리핑, §8 결정론·denormal 위생, §9 바디 3종.
 
 mod body;
+mod command;
 mod joint;
 mod snapshot;
 mod solver;
 mod world;
 
 pub use body::{Body, BodyHandle, BodyType};
+pub use command::{Command, CommandReport};
 pub use joint::{Joint, JointKind};
 pub use snapshot::SnapshotError;
 pub use solver::SolverParams;
@@ -532,9 +534,11 @@ mod tests {
     #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
     fn pyramid_40_tiers_stable_acceptance() {
         let mut w = World::new(WorldParams::default());
+        // 지면은 `maru-bench --bin pyramid100`과 **동일**해야 한다 — 같은 수용 기준이 서로 다른
+        // 씬을 재면 README 봉투 표와 CI 게이트가 어긋난다.
         w.add_body(Body::new_static(
             Shape::Box {
-                half: Vec3::new(60.0, 1.0, 20.0),
+                half: Vec3::new(120.0, 1.0, 20.0),
                 radius: 0.0,
             },
             pose(0.0, -1.0, 0.0),
@@ -544,6 +548,81 @@ mod tests {
             w.step(DT);
         }
         assert_pyramid_stable(&w, &hs, 40);
+    }
+
+    /// 설계 §7 계약: 쓰기는 커맨드 큐로, **enqueue 순서대로** 적용되고,
+    /// **쿼리는 pending을 보지 않는다**(암묵 플러시 없음). pending은 캐노니컬 상태다.
+    #[test]
+    fn command_buffer_contract() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 5.0, 0.0),
+            1.0,
+        ));
+
+        // ① 큐에 쌓아도 쿼리는 이전 상태를 본다
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(3.0, 0.0, 0.0)));
+        assert_eq!(w.pending_commands(), 1);
+        assert_eq!(w.body(b).linvel.x, 0.0, "pending이 쿼리에 보이면 안 된다");
+
+        // ② 명시 flush로만 반영된다
+        let rep = w.flush_commands();
+        assert_eq!(rep.applied, 1);
+        assert_eq!(w.body(b).linvel.x, 3.0);
+        assert_eq!(w.pending_commands(), 0);
+
+        // ③ 순서대로 적용된다 (마지막 값이 남는다)
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(1.0, 0.0, 0.0)));
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(2.0, 0.0, 0.0)));
+        w.flush_commands();
+        assert_eq!(w.body(b).linvel.x, 2.0, "enqueue 순서가 지켜지지 않음");
+
+        // ④ 잘못된 커맨드는 스텝을 중단시키지 않고 카운트된다
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(f32::NAN, 0.0, 0.0)));
+        w.enqueue(Command::SetMaterial(b, 0.5, 0.5));
+        let rep = w.flush_commands();
+        assert_eq!(rep.applied, 1);
+        assert_eq!(rep.rejected, 1);
+        assert!(w.body(b).linvel.is_finite());
+
+        // ⑤ step 0단계가 pending을 자동 적용한다
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(0.0, 0.0, 5.0)));
+        w.step(DT);
+        assert_eq!(w.pending_commands(), 0);
+        assert!(w.body(b).pose.pos.z > 0.0, "step이 커맨드를 적용하지 않음");
+
+        // ⑥ pending은 캐노니컬 상태: 스냅샷 왕복 후 재생이 일치한다
+        let mut w2 = World::new(WorldParams::default());
+        ground(&mut w2);
+        w2.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 5.0, 0.0),
+            1.0,
+        ));
+        w2.restore(&w.snapshot()).expect("restore");
+        w.enqueue(Command::SetLinearVelocity(b, Vec3::new(-2.0, 0.0, 0.0)));
+        w2.enqueue(Command::SetLinearVelocity(b, Vec3::new(-2.0, 0.0, 0.0)));
+        let snap_with_pending = w.snapshot();
+        let mut w3 = World::new(WorldParams::default());
+        ground(&mut w3);
+        w3.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 5.0, 0.0),
+            1.0,
+        ));
+        w3.restore(&snap_with_pending).expect("restore");
+        assert_eq!(w3.pending_commands(), 1, "pending이 스냅샷에 실리지 않음");
+        for _ in 0..10 {
+            w.step(DT);
+            w3.step(DT);
+        }
+        assert_eq!(
+            w.state_hash(),
+            w3.state_hash(),
+            "pending 포함 스냅샷 재생이 원 실행과 분기"
+        );
     }
 
     /// 리뷰 MAJOR 회귀: generational arena가 실제로 동작하는가 —

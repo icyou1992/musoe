@@ -11,7 +11,8 @@
 //! 짧거나 조작될 수 있다. 매직·버전·개수 상한·유한성·인덱스 범위·잔여 바이트를 모두 검증하고
 //! `Result`로 실패하며, 검증 전에는 월드를 건드리지 않는다(원자적 복원).
 
-use crate::body::{Body, BodyType};
+use crate::body::{Body, BodyHandle, BodyType};
+use crate::command::Command;
 use crate::joint::{Joint, JointKind};
 use crate::world::World;
 use maru_collide::{Pose, Shape};
@@ -179,10 +180,117 @@ fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
     Ok(shape)
 }
 
+fn write_body(w: &mut Writer, b: &Body) {
+    w.u8(match b.body_type {
+        BodyType::Static => 0,
+        BodyType::Dynamic => 1,
+        BodyType::Kinematic => 2,
+    });
+    w.vec3(b.pose.pos);
+    w.quat(b.pose.rot);
+    w.vec3(b.linvel);
+    w.vec3(b.angvel);
+    w.f32(b.inv_mass);
+    w.vec3(b.inv_inertia_local);
+    w.f32(b.friction);
+    w.f32(b.restitution);
+    write_shape(w, &b.shape);
+}
+
+fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
+    let body_type = match r.u8()? {
+        0 => BodyType::Static,
+        1 => BodyType::Dynamic,
+        2 => BodyType::Kinematic,
+        _ => return Err(SnapshotError::BadShape),
+    };
+    let pose = Pose {
+        pos: r.vec3()?,
+        rot: r.quat()?,
+    };
+    let linvel = r.vec3()?;
+    let angvel = r.vec3()?;
+    let inv_mass = r.f32()?;
+    let inv_inertia_local = r.vec3()?;
+    let friction = r.f32()?;
+    let restitution = r.f32()?;
+    let shape = read_shape(r)?;
+    if inv_mass < 0.0
+        || friction < 0.0
+        || !(0.0..=1.0).contains(&restitution)
+        || inv_inertia_local.x < 0.0
+        || inv_inertia_local.y < 0.0
+        || inv_inertia_local.z < 0.0
+    {
+        return Err(SnapshotError::NonFinite);
+    }
+    Ok(Body {
+        body_type,
+        pose,
+        linvel,
+        angvel,
+        shape,
+        inv_mass,
+        inv_inertia_local,
+        friction,
+        restitution,
+    })
+}
+
+fn write_joint(w: &mut Writer, j: &Joint) {
+    w.u32(j.body_a as u32);
+    w.u32(j.body_b as u32);
+    w.vec3(j.anchor_a);
+    w.vec3(j.anchor_b);
+    match &j.kind {
+        JointKind::Point => w.u8(0),
+        JointKind::Hinge { axis_a, axis_b } => {
+            w.u8(1);
+            w.vec3(*axis_a);
+            w.vec3(*axis_b);
+        }
+    }
+    w.u8(j.collide_connected as u8);
+    w.vec3(j.linear_impulse);
+    w.f32(j.angular_impulse[0]);
+    w.f32(j.angular_impulse[1]);
+}
+
+fn read_joint(r: &mut Reader, nb: usize) -> Result<Joint, SnapshotError> {
+    let body_a = r.u32()? as usize;
+    let body_b = r.u32()? as usize;
+    if body_a >= nb || body_b >= nb || body_a == body_b {
+        return Err(SnapshotError::BadIndex);
+    }
+    let anchor_a = r.vec3()?;
+    let anchor_b = r.vec3()?;
+    let kind = match r.u8()? {
+        0 => JointKind::Point,
+        1 => JointKind::Hinge {
+            axis_a: r.vec3()?,
+            axis_b: r.vec3()?,
+        },
+        _ => return Err(SnapshotError::BadShape),
+    };
+    let collide_connected = r.u8()? != 0;
+    let linear_impulse = r.vec3()?;
+    let angular_impulse = [r.f32()?, r.f32()?];
+    Ok(Joint {
+        body_a,
+        body_b,
+        anchor_a,
+        anchor_b,
+        kind,
+        collide_connected,
+        linear_impulse,
+        angular_impulse,
+    })
+}
+
 pub fn write_world(world: &World, w: &mut Writer) {
     w.u32(MAGIC);
     w.u32(VERSION);
-    let (bodies, alive, generations, sleep_timer, asleep, island, joints, cache) =
+    let (bodies, alive, generations, sleep_timer, asleep, island, joints, cache, commands) =
         world.canonical_parts();
     w.u32(bodies.len() as u32);
     for (i, b) in bodies.iter().enumerate() {
@@ -225,6 +333,52 @@ pub fn write_world(world: &World, w: &mut Writer) {
         w.f32(j.angular_impulse[0]);
         w.f32(j.angular_impulse[1]);
     }
+    // pending 커맨드 — **enqueue 순서 그대로** (순서가 결정론의 근거, 설계 §7)
+    w.u32(commands.len() as u32);
+    for c in commands {
+        match c {
+            Command::AddBody(b) => {
+                w.u8(0);
+                write_body(w, b);
+            }
+            Command::RemoveBody(h) => {
+                w.u8(1);
+                w.u32(h.index);
+                w.u32(h.generation);
+            }
+            Command::SetLinearVelocity(h, v) => {
+                w.u8(2);
+                w.u32(h.index);
+                w.u32(h.generation);
+                w.vec3(*v);
+            }
+            Command::SetAngularVelocity(h, v) => {
+                w.u8(3);
+                w.u32(h.index);
+                w.u32(h.generation);
+                w.vec3(*v);
+            }
+            Command::SetPose(h, p) => {
+                w.u8(4);
+                w.u32(h.index);
+                w.u32(h.generation);
+                w.vec3(p.pos);
+                w.quat(p.rot);
+            }
+            Command::SetMaterial(h, f, r) => {
+                w.u8(5);
+                w.u32(h.index);
+                w.u32(h.generation);
+                w.f32(*f);
+                w.f32(*r);
+            }
+            Command::AddJoint(j) => {
+                w.u8(6);
+                write_joint(w, j);
+            }
+        }
+    }
+
     // PCM 캐시 — canonical 키 정렬 직렬화 (설계 §8 결정론)
     let mut keys: Vec<(u32, u32)> = cache.keys().copied().collect();
     keys.sort_unstable();
@@ -240,6 +394,7 @@ pub fn write_world(world: &World, w: &mut Writer) {
             w.f32(imp.tangent[0]);
             w.f32(imp.tangent[1]);
             w.vec3(imp.tangent_world);
+            w.vec3(imp.position);
         }
     }
 }
@@ -264,43 +419,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     for _ in 0..nb {
         alive.push(r.u8()? != 0);
         generations.push(r.u32()?);
-        let body_type = match r.u8()? {
-            0 => BodyType::Static,
-            1 => BodyType::Dynamic,
-            2 => BodyType::Kinematic,
-            _ => return Err(SnapshotError::BadShape),
-        };
-        let pose = Pose {
-            pos: r.vec3()?,
-            rot: r.quat()?,
-        };
-        let linvel = r.vec3()?;
-        let angvel = r.vec3()?;
-        let inv_mass = r.f32()?;
-        let inv_inertia_local = r.vec3()?;
-        let friction = r.f32()?;
-        let restitution = r.f32()?;
-        let shape = read_shape(&mut r)?;
-        if inv_mass < 0.0
-            || friction < 0.0
-            || !(0.0..=1.0).contains(&restitution)
-            || inv_inertia_local.x < 0.0
-            || inv_inertia_local.y < 0.0
-            || inv_inertia_local.z < 0.0
-        {
-            return Err(SnapshotError::NonFinite);
-        }
-        bodies.push(Body {
-            body_type,
-            pose,
-            linvel,
-            angvel,
-            shape,
-            inv_mass,
-            inv_inertia_local,
-            friction,
-            restitution,
-        });
+        bodies.push(read_body(&mut r)?);
         let t = r.f32()?;
         if t < 0.0 {
             return Err(SnapshotError::NonFinite);
@@ -317,34 +436,48 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     let nj = r.count(MAX_JOINTS)?;
     let mut joints = Vec::with_capacity(nj.min(4096));
     for _ in 0..nj {
-        let body_a = r.u32()? as usize;
-        let body_b = r.u32()? as usize;
-        if body_a >= nb || body_b >= nb || body_a == body_b {
-            return Err(SnapshotError::BadIndex);
-        }
-        let anchor_a = r.vec3()?;
-        let anchor_b = r.vec3()?;
-        let kind = match r.u8()? {
-            0 => JointKind::Point,
-            1 => JointKind::Hinge {
-                axis_a: r.vec3()?,
-                axis_b: r.vec3()?,
-            },
+        joints.push(read_joint(&mut r, nb)?);
+    }
+
+    // pending 커맨드 (enqueue 순서 보존 — 설계 §7)
+    let ncmd = r.count(MAX_JOINTS)?;
+    let mut commands = Vec::with_capacity(ncmd.min(4096));
+    let handle = |r: &mut Reader| -> Result<BodyHandle, SnapshotError> {
+        Ok(BodyHandle {
+            index: r.u32()?,
+            generation: r.u32()?,
+        })
+    };
+    for _ in 0..ncmd {
+        let cmd = match r.u8()? {
+            0 => Command::AddBody(Box::new(read_body(&mut r)?)),
+            1 => Command::RemoveBody(handle(&mut r)?),
+            2 => {
+                let h = handle(&mut r)?;
+                Command::SetLinearVelocity(h, r.vec3()?)
+            }
+            3 => {
+                let h = handle(&mut r)?;
+                Command::SetAngularVelocity(h, r.vec3()?)
+            }
+            4 => {
+                let h = handle(&mut r)?;
+                Command::SetPose(
+                    h,
+                    Pose {
+                        pos: r.vec3()?,
+                        rot: r.quat()?,
+                    },
+                )
+            }
+            5 => {
+                let h = handle(&mut r)?;
+                Command::SetMaterial(h, r.f32()?, r.f32()?)
+            }
+            6 => Command::AddJoint(Box::new(read_joint(&mut r, nb)?)),
             _ => return Err(SnapshotError::BadShape),
         };
-        let collide_connected = r.u8()? != 0;
-        let linear_impulse = r.vec3()?;
-        let angular_impulse = [r.f32()?, r.f32()?];
-        joints.push(Joint {
-            body_a,
-            body_b,
-            anchor_a,
-            anchor_b,
-            kind,
-            collide_connected,
-            linear_impulse,
-            angular_impulse,
-        });
+        commands.push(cmd);
     }
 
     let nc = r.count(MAX_CACHE_ENTRIES)?;
@@ -364,6 +497,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
                 normal: r.f32()?,
                 tangent: [r.f32()?, r.f32()?],
                 tangent_world: r.vec3()?,
+                position: r.vec3()?,
             };
             entry.push((fid, imp));
         }
@@ -383,6 +517,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         island,
         joints,
         cache,
+        commands,
     );
     Ok(())
 }

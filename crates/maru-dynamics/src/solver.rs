@@ -60,6 +60,8 @@ impl Softness {
 pub struct ContactPointConstraint {
     /// PCM 캐시 매칭 키 (설계 §4.2 canonical feature ID — M1 클리핑 계보).
     pub feature: maru_collide::FeatureId,
+    /// prepare 시점 접점 월드 위치 (generic 접점 근접 매칭용).
+    pub position: Vec3,
     /// 질량중심 기준 로컬 앵커 (서브스텝마다 현재 자세로 재회전 — TGS의 위치 추적).
     pub anchor_a: Vec3,
     pub anchor_b: Vec3,
@@ -115,6 +117,10 @@ fn effective_mass(
 }
 
 /// 캐시된 접점 임펄스 (스텝 간 warm start — 설계 §3 PCM).
+/// warm start 매칭 시 위치 근접 허용치 (특성 길이 대비 비율).
+/// 접점이 이보다 멀리 "점프"하면 다른 접촉으로 보고 임펄스를 물려주지 않는다.
+const WARM_MATCH_REL: f32 = 0.05;
+
 #[derive(Clone, Copy, Default)]
 pub struct CachedImpulse {
     pub normal: f32,
@@ -123,6 +129,8 @@ pub struct CachedImpulse {
     /// **월드 공간 마찰 임펄스**. 접선 기저는 법선에서 유도되므로(0.707 분기) 법선이 회전하면
     /// 같은 성분이 다른 월드 방향으로 재적용된다 — 월드 벡터를 저장해 새 접평면에 투영한다.
     pub tangent_world: Vec3,
+    /// 접점의 월드 위치 (generic witness 접점의 근접 매칭용).
+    pub position: Vec3,
 }
 
 /// 매니폴드 → 제약 준비. `cache`는 전 스텝 (feature → 임펄스) — feature ID 일치 접점만 warm load.
@@ -133,6 +141,10 @@ pub fn prepare(
     m: &Manifold,
     cache: &[(maru_collide::FeatureId, CachedImpulse)],
 ) -> ContactConstraint {
+    // 위치 근접 허용치는 형상 크기에 비례해야 한다(절대 상수 금지 — 톨러런스 정책과 동일 원칙).
+    let match_tol =
+        WARM_MATCH_REL * maru_collide::characteristic_length(&bodies[a].shape, &bodies[b].shape);
+    let match_tol2 = match_tol * match_tol;
     let (ba, bb) = (&bodies[a], &bodies[b]);
     let n = m.normal;
     let tangents = tangent_basis(n);
@@ -144,12 +156,17 @@ pub fn prepare(
             let ra = p.position - ba.pose.pos;
             let rb = p.position - bb.pose.pos;
             let vn = n.dot(ba.velocity_at(ra) - bb.velocity_at(rb));
-            // warm start 매칭: feature ID + **위치 근접**. generic witness 접점은 pair 안에서
-            // 같은 ID를 공유하므로(구-박스 접점이 면→모서리로 이동해도 동일 ID) ID만으로는
-            // 다른 접점의 임펄스를 물려받는다(리뷰 지적).
+            // warm start 매칭 규칙 (리뷰 MAJOR):
+            // - 클리핑 접점: feature ID가 계보를 담아 안정적 → ID 일치
+            // - generic witness 접점: pair 안에서 ID를 공유하므로(구-박스 접점이 면→모서리로
+            //   이동해도 같은 ID) **위치 근접**까지 요구한다. 점프하면 임펄스를 물려주지 않는다.
+            let generic = p.feature.0 == maru_collide::FEATURE_GENERIC;
             let warm = cache
                 .iter()
-                .find(|(f, _)| *f == p.feature)
+                .find(|(f, c)| {
+                    *f == p.feature
+                        && (!generic || (c.position - p.position).length_sq() <= match_tol2)
+                })
                 .map(|(_, c)| *c)
                 .unwrap_or_default();
             // 월드 마찰 임펄스를 현재 접평면에 재투영 (기저 회전 대응)
@@ -159,6 +176,7 @@ pub fn prepare(
             ];
             ContactPointConstraint {
                 feature: p.feature,
+                position: p.position,
                 anchor_a: ba.pose.rot.conjugate().rotate(ra),
                 anchor_b: bb.pose.rot.conjugate().rotate(rb),
                 base_separation: p.separation,
@@ -317,5 +335,103 @@ pub fn apply_restitution(bodies: &mut [Body], c: &mut ContactConstraint, thresho
         let imp = c.normal * applied;
         apply_impulse(&mut bodies[c.a], imp, ra, &ia);
         apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::body::Body;
+    use maru_collide::{ContactPoint, FeatureId, Manifold, Pose, Shape, FEATURE_GENERIC};
+    use maru_math::Quat;
+
+    fn world_bodies() -> Vec<Body> {
+        let pose = |y: f32| Pose {
+            pos: Vec3::new(0.0, y, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        vec![
+            Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(5.0, 0.5, 5.0),
+                    radius: 0.0,
+                },
+                pose(0.0),
+            ),
+            Body::new_dynamic(Shape::Sphere { radius: 0.5 }, pose(1.0), 1.0),
+        ]
+    }
+
+    fn manifold_at(pos: Vec3) -> Manifold {
+        Manifold {
+            normal: Vec3::new(0.0, 1.0, 0.0),
+            points: vec![ContactPoint {
+                position: pos,
+                separation: -0.001,
+                feature: FeatureId(FEATURE_GENERIC),
+            }],
+        }
+    }
+
+    /// 계약(리뷰 MAJOR): 계보 없는 witness 접점은 ID를 공유하므로 **위치 근접**까지 맞을 때만
+    /// 이전 임펄스를 물려받는다. 접점이 점프하면(면→모서리) 물려받지 않는다.
+    #[test]
+    fn generic_contacts_warm_start_only_when_close() {
+        let bodies = world_bodies();
+        let cached_at = Vec3::new(0.0, 0.5, 0.0);
+        let cache = vec![(
+            FeatureId(FEATURE_GENERIC),
+            CachedImpulse {
+                normal: 7.0,
+                tangent: [0.0, 0.0],
+                tangent_world: Vec3::ZERO,
+                position: cached_at,
+            },
+        )];
+        // 특성 길이 = 작은 쪽(구, 대각 ≈ 1.73) → 허용치 ≈ 0.087
+        // ① 근접(1cm 이동): 계승
+        let near = prepare(
+            &bodies,
+            1,
+            0,
+            &manifold_at(cached_at + Vec3::new(0.01, 0.0, 0.0)),
+            &cache,
+        );
+        assert_eq!(
+            near.points[0].normal_impulse, 7.0,
+            "근접 접점은 warm start 계승"
+        );
+        // ② 점프(1m 이동): 차단
+        let far = prepare(
+            &bodies,
+            1,
+            0,
+            &manifold_at(cached_at + Vec3::new(1.0, 0.0, 0.0)),
+            &cache,
+        );
+        assert_eq!(
+            far.points[0].normal_impulse, 0.0,
+            "점프한 접점에 이전 임펄스가 적용됨"
+        );
+    }
+
+    /// 대조: 클리핑 접점(계보 있는 ID)은 위치와 무관하게 ID로 매칭된다.
+    #[test]
+    fn clipped_contacts_match_by_feature_id() {
+        let bodies = world_bodies();
+        let fid = FeatureId(0x8123_4567);
+        let cache = vec![(
+            fid,
+            CachedImpulse {
+                normal: 3.0,
+                tangent: [0.0, 0.0],
+                tangent_world: Vec3::ZERO,
+                position: Vec3::new(0.0, 0.5, 0.0),
+            },
+        )];
+        let mut m = manifold_at(Vec3::new(2.0, 0.5, 0.0));
+        m.points[0].feature = fid;
+        let c = prepare(&bodies, 1, 0, &m, &cache);
+        assert_eq!(c.points[0].normal_impulse, 3.0);
     }
 }

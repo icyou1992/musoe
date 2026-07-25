@@ -16,7 +16,7 @@ mod tree;
 pub use aabb::Aabb;
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
-pub use manifold::{contact, ContactPoint, FeatureId, Manifold};
+pub use manifold::{contact, ContactPoint, FeatureId, Manifold, FEATURE_GENERIC};
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, STATIC_BIT};
 pub use shape::Shape;

@@ -6,6 +6,7 @@
 //! M2a 범위: 바디 제거·아일랜드·슬리핑·조인트는 후속 유닛. 커맨드 버퍼는 M2f와 함께.
 
 use crate::body::{Body, BodyHandle, BodyType};
+use crate::command::{Command, CommandReport};
 use crate::joint::{self, Joint};
 use crate::solver::{self, CachedImpulse, ContactConstraint, Softness, SolverParams};
 use maru_collide::{contact, Aabb, Broadphase, FeatureId, STATIC_BIT};
@@ -63,6 +64,9 @@ pub struct World {
     /// 아직 잠든 바디 사이에 제약이 걸리며 속도만 펌핑되는 경로가 생긴다(리뷰 BLOCKER).
     island: Vec<u32>,
     joints: Vec<Joint>,
+    /// pending 쓰기 커맨드 (설계 §7). **캐노니컬 상태** — 스냅샷에 포함된다.
+    commands: Vec<Command>,
+    last_report: CommandReport,
     diag: Diagnostics,
 }
 
@@ -114,6 +118,8 @@ impl World {
             asleep: Vec::new(),
             island: Vec::new(),
             joints: Vec::new(),
+            commands: Vec::new(),
+            last_report: CommandReport::default(),
             diag: Diagnostics::default(),
         }
     }
@@ -285,6 +291,62 @@ impl World {
         self.bodies.len()
     }
 
+    /// 커맨드 큐에 쌓는다 (설계 §7 정본 쓰기 경로). 적용은 다음 step 0단계 또는 flush_commands().
+    /// **쿼리는 pending을 보지 않는다** — 즉시 반영이 필요하면 flush_commands()를 호출한다.
+    pub fn enqueue(&mut self, cmd: Command) {
+        self.commands.push(cmd);
+    }
+
+    pub fn pending_commands(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// 직전 커맨드 적용 결과(적용/거부 수). 거부는 스텝을 중단시키지 않는다.
+    pub fn last_command_report(&self) -> CommandReport {
+        self.last_report
+    }
+
+    /// pending 커맨드를 **enqueue 순서대로** 즉시 적용한다.
+    /// 각 커맨드는 자신의 pre-mutation 그래프를 기준으로 3단 원자 절차를 수행한다.
+    pub fn flush_commands(&mut self) -> CommandReport {
+        let cmds = std::mem::take(&mut self.commands);
+        let mut report = CommandReport::default();
+        for cmd in cmds {
+            let ok = match cmd {
+                Command::AddBody(b) => {
+                    self.add_body(*b);
+                    true
+                }
+                Command::RemoveBody(h) => self.remove_body(h).is_ok(),
+                Command::SetLinearVelocity(h, v) => self.set_linear_velocity(h, v).is_ok(),
+                Command::SetAngularVelocity(h, v) => self.set_angular_velocity(h, v).is_ok(),
+                Command::SetPose(h, p) => self.set_pose(h, p).is_ok(),
+                Command::SetMaterial(h, f, r) => self.set_material(h, f, r).is_ok(),
+                Command::AddJoint(j) => {
+                    let (a, b) = (j.body_a, j.body_b);
+                    if a < self.bodies.len()
+                        && b < self.bodies.len()
+                        && a != b
+                        && self.alive[a]
+                        && self.alive[b]
+                    {
+                        self.add_joint(*j);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if ok {
+                report.applied += 1;
+            } else {
+                report.rejected += 1;
+            }
+        }
+        self.last_report = report;
+        report
+    }
+
     /// 직전 스텝 진단 스냅샷.
     pub fn diagnostics(&self) -> Diagnostics {
         self.diag
@@ -325,6 +387,7 @@ impl World {
         &Vec<u32>,
         &Vec<Joint>,
         &HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+        &Vec<Command>,
     ) {
         (
             &self.bodies,
@@ -335,6 +398,7 @@ impl World {
             &self.island,
             &self.joints,
             &self.contact_cache,
+            &self.commands,
         )
     }
 
@@ -349,6 +413,7 @@ impl World {
         island: Vec<u32>,
         joints: Vec<Joint>,
         cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+        commands: Vec<Command>,
     ) {
         self.alive = alive;
         self.generations = generations;
@@ -358,6 +423,7 @@ impl World {
         self.island = island;
         self.joints = joints;
         self.contact_cache = cache;
+        self.commands = commands;
     }
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
@@ -401,6 +467,13 @@ impl World {
             "dt must be finite (NaN dt would poison all state)"
         );
         if dt <= 0.0 || self.bodies.is_empty() {
+            return;
+        }
+        // 0) 커맨드 적용 (설계 §4 파이프라인 0단계 — 쓰기의 정본 경로)
+        if !self.commands.is_empty() {
+            self.flush_commands();
+        }
+        if self.bodies.is_empty() {
             return;
         }
         let n_sub = self.params.substeps.max(1);
@@ -661,6 +734,7 @@ impl World {
                             tangent: p.tangent_impulse,
                             tangent_world: c.tangents[0] * p.tangent_impulse[0]
                                 + c.tangents[1] * p.tangent_impulse[1],
+                            position: p.position,
                         },
                     )
                 })
