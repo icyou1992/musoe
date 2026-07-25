@@ -243,7 +243,10 @@ fn clip_box_box(
             if d0 >= 0.0 {
                 out.push(v0);
             }
-            if (d0 >= 0.0) != (d1 >= 0.0) {
+            // 교점은 **엄격한 부호 반대**일 때만 생성 (확인 라운드 MAJOR 반영 — d0==0인 경계
+            // 정점은 위에서 이미 보존되므로 t=0 교점까지 만들면 같은 위치가 서로 다른 계보
+            // 마스크로 중복 진입해 솔버가 동일 지점에 제약을 중복 적용한다).
+            if (d0 > 0.0 && d1 < 0.0) || (d0 < 0.0 && d1 > 0.0) {
                 let t = d0 / (d0 - d1);
                 let x = v0.position + (v1.position - v0.position) * t;
                 out.push(ClipVertex {
@@ -481,6 +484,37 @@ mod tests {
         assert_eq!(m.points.len(), 4);
         for p in &m.points {
             assert!((p.separation + 0.1).abs() < 1e-3, "sep={}", p.separation);
+        }
+    }
+
+    /// 확인 라운드 MAJOR 회귀: 경계 정점이 클리핑 평면 위에 정확히 놓여도 중복 접점 금지.
+    #[test]
+    fn boundary_vertex_no_duplicate_points() {
+        // incident 꼭짓점이 reference 측면 평면(x=1) 위에 정확히 놓이는 45° 구성
+        let ground = Shape::Box {
+            half: Vec3::new(1.0, 1.0, 1.0),
+            radius: 0.0,
+        };
+        let top = Shape::Box {
+            half: Vec3::new(
+                core::f32::consts::FRAC_1_SQRT_2,
+                1.0,
+                core::f32::consts::FRAC_1_SQRT_2,
+            ),
+            radius: 0.0,
+        };
+        let rot = Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::FRAC_PI_4);
+        let pa = Pose {
+            pos: Vec3::new(1.0, 2.0, 0.0),
+            rot,
+        };
+        let m = contact(&top, &pa, &ground, &pose(0.0, 0.0, 0.0), 0.05).unwrap();
+        assert!(!m.points.is_empty() && m.points.len() <= 4);
+        for (i, p) in m.points.iter().enumerate() {
+            for q in m.points.iter().skip(i + 1) {
+                let d = (p.position - q.position).length_sq();
+                assert!(d > 1.0e-8, "중복 접점: {p:?} vs {q:?}");
+            }
         }
     }
 
