@@ -1,0 +1,10 @@
+[package]
+name = "maru-collide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Maru collision: shapes, broadphase dual tree, GJK/EPA, contact manifolds"
+
+[dependencies]
+maru-math = { path = "../maru-math" }
+wide = { workspace = true }

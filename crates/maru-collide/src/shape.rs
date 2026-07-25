@@ -1,0 +1,163 @@
+//! Convex 셰이프 — support 함수 기반 (설계 §4.2).
+//!
+//! **convex radius 계약(shrink-then-reinflate)**: `support_core()`는 radius를 뺀 코어 형상의
+//! support point를 반환하고, 접촉 생성이 radius를 다시 더한다. GJK/EPA는 코어에서 돌므로
+//! 침투 깊이가 얕게 유지되어 EPA 진입이 최소화된다. [근거: Jolt convex radius]
+//! Hull의 코어 포인트는 빌더가 이미 수축된 점을 준다는 계약(v1 — 문서화된 가정).
+
+use crate::Aabb;
+use maru_math::Vec3;
+
+#[derive(Clone, Debug)]
+pub enum Shape {
+    /// 코어=중심점, radius=반지름 (구 전체가 convex radius).
+    Sphere { radius: f32 },
+    /// Y축 정렬 세그먼트 코어 [-half_height, +half_height] + radius.
+    Capsule { half_height: f32, radius: f32 },
+    /// 코어=half에서 radius를 뺀 박스. half는 겉면 기준(사용자 관점 치수).
+    Box { half: Vec3, radius: f32 },
+    /// 코어 포인트 집합(이미 수축됨) + radius.
+    Hull { points: Vec<Vec3>, radius: f32 },
+}
+
+impl Shape {
+    /// 겉면과 코어를 가르는 convex radius.
+    #[inline]
+    pub fn radius(&self) -> f32 {
+        match *self {
+            Shape::Sphere { radius }
+            | Shape::Capsule { radius, .. }
+            | Shape::Box { radius, .. }
+            | Shape::Hull { radius, .. } => radius,
+        }
+    }
+
+    /// 방향 d(비정규화 허용, 0이면 임의점)의 **코어** support point (로컬 공간).
+    pub fn support_core(&self, d: Vec3) -> Vec3 {
+        match self {
+            Shape::Sphere { .. } => Vec3::ZERO,
+            Shape::Capsule { half_height, .. } => Vec3::new(
+                0.0,
+                if d.y >= 0.0 {
+                    *half_height
+                } else {
+                    -*half_height
+                },
+                0.0,
+            ),
+            Shape::Box { half, radius } => {
+                let c = Vec3::new(
+                    (half.x - radius).max(0.0),
+                    (half.y - radius).max(0.0),
+                    (half.z - radius).max(0.0),
+                );
+                Vec3::new(
+                    if d.x >= 0.0 { c.x } else { -c.x },
+                    if d.y >= 0.0 { c.y } else { -c.y },
+                    if d.z >= 0.0 { c.z } else { -c.z },
+                )
+            }
+            Shape::Hull { points, .. } => {
+                // 선형 스캔 (v1 — hill climbing은 벤치 증명 시 도입). 동률은 낮은 인덱스 우선(결정론).
+                let mut best = points[0];
+                let mut best_d = best.dot(d);
+                for p in &points[1..] {
+                    let pd = p.dot(d);
+                    if pd > best_d {
+                        best_d = pd;
+                        best = *p;
+                    }
+                }
+                best
+            }
+        }
+    }
+
+    /// 겉면 기준 로컬 AABB (코어 + radius 재팽창 포함).
+    pub fn local_aabb(&self) -> Aabb {
+        let r = self.radius();
+        match self {
+            Shape::Sphere { .. } => Aabb::from_center(Vec3::ZERO, Vec3::new(r, r, r)),
+            Shape::Capsule { half_height, .. } => {
+                Aabb::from_center(Vec3::ZERO, Vec3::new(r, half_height + r, r))
+            }
+            Shape::Box { half, .. } => Aabb::from_center(Vec3::ZERO, *half),
+            Shape::Hull { points, .. } => {
+                let mut min = points[0];
+                let mut max = points[0];
+                for p in &points[1..] {
+                    min = Vec3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z));
+                    max = Vec3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z));
+                }
+                let rv = Vec3::new(r, r, r);
+                Aabb::new(min - rv, max + rv)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn box_core_shrinks_by_radius() {
+        let s = Shape::Box {
+            half: Vec3::new(1.0, 2.0, 3.0),
+            radius: 0.05,
+        };
+        let p = s.support_core(Vec3::new(1.0, 1.0, 1.0));
+        assert_eq!(p, Vec3::new(0.95, 1.95, 2.95));
+        // 겉면 AABB는 사용자 치수 그대로
+        assert_eq!(s.local_aabb().max, Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn capsule_support_and_aabb() {
+        let s = Shape::Capsule {
+            half_height: 1.0,
+            radius: 0.5,
+        };
+        assert_eq!(
+            s.support_core(Vec3::new(0.3, -2.0, 0.1)),
+            Vec3::new(0.0, -1.0, 0.0)
+        );
+        assert_eq!(s.local_aabb().max, Vec3::new(0.5, 1.5, 0.5));
+    }
+
+    #[test]
+    fn hull_support_deterministic_tie() {
+        // 동률 꼭짓점 2개 — 낮은 인덱스가 이겨야 함(결정론 계약)
+        let s = Shape::Hull {
+            points: vec![
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+            ],
+            radius: 0.0,
+        };
+        let p = s.support_core(Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(p, Vec3::new(1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn support_is_extreme_point() {
+        // support의 정의 검증: 모든 점에 대해 dot(d, support) >= dot(d, p)
+        let s = Shape::Hull {
+            points: vec![
+                Vec3::new(1.0, 1.0, -1.0),
+                Vec3::new(-1.0, 2.0, 0.5),
+                Vec3::new(0.0, -1.0, 2.0),
+                Vec3::new(0.5, 0.5, 0.5),
+            ],
+            radius: 0.0,
+        };
+        let d = Vec3::new(0.3, -0.7, 0.9);
+        let sup = s.support_core(d);
+        if let Shape::Hull { points, .. } = &s {
+            for p in points {
+                assert!(sup.dot(d) >= p.dot(d) - 1e-6);
+            }
+        }
+    }
+}

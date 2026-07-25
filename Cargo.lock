@@ -17,6 +17,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "maru-collide"
+version = "0.1.0"
+dependencies = [
+ "maru-math",
+ "wide",
+]
+
+[[package]]
 name = "maru-math"
 version = "0.1.0"
 dependencies = [
