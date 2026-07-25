@@ -1,0 +1,10 @@
+[package]
+name = "maru-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Maru bench harness (M0: SIMD math microbenches, native + wasm)"
+
+[dependencies]
+maru-math = { path = "../maru-math" }
+wide = { workspace = true }

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/maru-math", "crates/maru-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+wide = "0.7"
+
+# 결정론 규율(설계 §8): 재결합 최적화 금지 — 기본 프로파일 유지, fast-math 계열 플래그 전면 배제.
+[profile.release]
+lto = "thin"
+codegen-units = 1
