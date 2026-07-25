@@ -10,6 +10,7 @@ mod world;
 
 pub use body::{Body, BodyHandle, BodyType};
 pub use joint::{Joint, JointKind};
+pub use snapshot::SnapshotError;
 pub use solver::SolverParams;
 pub use world::{World, WorldParams};
 
@@ -242,7 +243,7 @@ mod tests {
                 1.0,
             ));
         }
-        w2.restore(&snap);
+        w2.restore(&snap).expect("restore");
 
         // 맨 아래 바디만 건드린다 → 아일랜드 전원이 깨어나야 함
         w2.body_mut(hs[0]).linvel = Vec3::new(0.1, 0.0, 0.0);
@@ -539,6 +540,65 @@ mod tests {
             w.step(DT);
         }
         assert_pyramid_stable(&w, &hs, 40);
+    }
+
+    /// 리뷰 BLOCKER 회귀: 조작·손상된 스냅샷은 **패닉·OOM 없이 거부**되고 월드는 불변이어야 한다
+    /// (M3에서 JS가 임의 바이트를 넘길 수 있다).
+    #[test]
+    fn malformed_snapshot_is_rejected_without_panic() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 3.0, 0.0),
+            1.0,
+        ));
+        for _ in 0..10 {
+            w.step(DT);
+        }
+        let good = w.snapshot();
+        let before = w.state_hash();
+
+        // 1) 빈/짧은 입력
+        assert_eq!(w.restore(&[]), Err(SnapshotError::Truncated));
+        assert_eq!(
+            w.restore(&good[..good.len() / 2]),
+            Err(SnapshotError::Truncated)
+        );
+        // 2) 매직 훼손
+        let mut bad = good.clone();
+        bad[0] ^= 0xFF;
+        assert_eq!(w.restore(&bad), Err(SnapshotError::BadMagic));
+        // 3) 버전 훼손
+        let mut bad = good.clone();
+        bad[4] = 99;
+        assert_eq!(w.restore(&bad), Err(SnapshotError::BadVersion(99)));
+        // 4) 거대한 바디 개수 (OOM 유도)
+        let mut bad = good.clone();
+        bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(w.restore(&bad), Err(SnapshotError::CountTooLarge));
+        // 5) 잔여 바이트
+        let mut bad = good.clone();
+        bad.push(0);
+        assert_eq!(w.restore(&bad), Err(SnapshotError::TrailingBytes));
+        // 6) 비유한 값 주입 (바디 위치 필드)
+        let mut bad = good.clone();
+        let pos_off = 12 + 1; // magic+version+count, body_type 1바이트 뒤 = pos.x
+        bad[pos_off..pos_off + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(matches!(
+            w.restore(&bad),
+            Err(SnapshotError::NonFinite) | Err(SnapshotError::BadShape)
+        ));
+
+        // 전부 거부됐고 월드는 그대로여야 한다 (원자적 복원)
+        assert_eq!(w.state_hash(), before, "실패한 restore가 월드를 오염시킴");
+        assert!(w.body(b).pose.pos.y.is_finite());
+        // 정상 스냅샷은 여전히 복원된다
+        assert!(w.restore(&good).is_ok());
+        assert_eq!(w.state_hash(), before);
     }
 
     /// 결정론 L0 스모크: 같은 씬 2회 실행 → 비트 동일

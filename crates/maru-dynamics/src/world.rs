@@ -178,8 +178,9 @@ impl World {
     }
 
     /// 스냅샷 복원. 재생은 원 실행과 같은 타깃에서 L0 비트 동일.
-    pub fn restore(&mut self, bytes: &[u8]) {
-        crate::snapshot::read_world(self, bytes);
+    /// **신뢰하지 않는 바이트를 받는다** — 검증 실패 시 월드는 그대로 두고 오류를 반환한다.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<(), crate::snapshot::SnapshotError> {
+        crate::snapshot::read_world(self, bytes)
     }
 
     /// L0 상태 해시 (리플레이 CI 비교).
