@@ -63,13 +63,11 @@ pub fn gjk(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> GjkResult {
         dir = Vec3::new(1.0, 0.0, 0.0);
     }
     let mut simplex: Vec<SupportPoint> = Vec::with_capacity(4);
-    let mut v = dir; // 현재 심플렉스에서 원점까지의 최근접 벡터(초기값은 임의)
+    let mut v = dir; // 현재 심플렉스에서 원점까지의 최근접 벡터(초기값은 임의 추정)
 
     for _ in 0..MAX_ITER {
         let w = support(sa, pa, sb, pb, -v);
-        // 진전 없음 → 분리 확정: 현재 v가 최근접 벡터.
-        // 첫 반복은 v가 초기 추정일 뿐이므로 심플렉스가 비어 있으면 판정하지 않는다
-        // (빈 심플렉스로 witness를 만들면 오답 — sphere-sphere 정확 일치 케이스에서 실증).
+        // 진전 없음 → 분리 확정. 첫 반복(빈 심플렉스)은 v가 추정일 뿐이라 판정하지 않는다.
         let vv = v.length_sq();
         if !simplex.is_empty() && vv - v.dot(w.w) <= REL_EPS * vv {
             return separated(&simplex, v);
@@ -78,16 +76,77 @@ pub fn gjk(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose) -> GjkResult {
         let (new_v, contains) = closest_and_reduce(&mut simplex);
         if contains {
             debug_assert_eq!(simplex.len(), 4);
+            // 퇴화(평면) 사면체는 EPA 시드가 될 수 없음 → 접촉(깊이≈0)으로 강등
+            let (a, b, c, d) = (simplex[0].w, simplex[1].w, simplex[2].w, simplex[3].w);
+            if (b - a).cross(c - a).dot(d - a).abs() < 1.0e-10 {
+                return separated(&simplex[..3], Vec3::ZERO);
+            }
             return GjkResult::Intersecting([simplex[0], simplex[1], simplex[2], simplex[3]]);
         }
         v = new_v;
         if v.length_sq() <= 1.0e-12 {
-            // 원점이 심플렉스 경계 위 — 접촉(깊이 0 교차)으로 처리하려면 사면체가 필요하므로
-            // 미세 분리로 간주해 witness 반환(호출자에서 radius 재팽창 시 접촉이 됨).
-            return separated(&simplex, v);
+            // 원점이 심플렉스 위. 리덕션 루프를 계속 돌면 수직 확장이 매번 같은 심플렉스로
+            // 되돌아와 순환한다(축 정렬 깊은 교차에서 실증) — 리덕션 없이 즉시 사면체를 완성.
+            return complete_on_boundary(&simplex, sa, pa, sb, pb);
         }
     }
     separated(&simplex, v)
+}
+
+/// 원점이 현재 심플렉스 위에 있을 때: 리덕션 없이 결정적 방향들로 사면체를 완성해
+/// Intersecting(EPA 시드)으로 승격하거나, 폴리토프가 평면(진짜 접촉)이면 깊이 0 분리로 마감.
+fn complete_on_boundary(
+    simplex: &[SupportPoint],
+    sa: &Shape,
+    pa: &Pose,
+    sb: &Shape,
+    pb: &Pose,
+) -> GjkResult {
+    let sup = |d: Vec3| support(sa, pa, sb, pb, d);
+    match simplex.len() {
+        // 원점이 support 정점과 일치 — 표면 접촉
+        1 => separated(simplex, Vec3::ZERO),
+        2 => {
+            let (a, b) = (simplex[0], simplex[1]);
+            let ab = b.w - a.w;
+            let p0 = ab.cross(Vec3::new(1.0, 0.0, 0.0));
+            let p = if p0.length_sq() > 1.0e-12 {
+                p0
+            } else {
+                ab.cross(Vec3::new(0.0, 1.0, 0.0))
+            };
+            let q = ab.cross(p);
+            // 같은 probe의 ±support는 대칭 형상에서 세그먼트와 공면이 된다(축 정렬 박스 실증)
+            // — 서로 다른 직교 probe의 support를 섞어야 3차원을 스팬한다.
+            let cands = [sup(p), sup(-p), sup(q), sup(-q)];
+            for i in 0..cands.len() {
+                for s2 in cands.iter().skip(i + 1) {
+                    let s1 = cands[i];
+                    let vol = ab.cross(s1.w - a.w).dot(s2.w - a.w);
+                    if vol.abs() > 1.0e-10 {
+                        return GjkResult::Intersecting([a, b, s1, *s2]);
+                    }
+                }
+            }
+            separated(simplex, Vec3::ZERO)
+        }
+        _ => {
+            let (a, b, c) = (simplex[0], simplex[1], simplex[2]);
+            let n = (b.w - a.w).cross(c.w - a.w);
+            if n.length_sq() <= 1.0e-12 {
+                return separated(simplex, Vec3::ZERO);
+            }
+            let s1 = sup(n);
+            if (s1.w - a.w).dot(n).abs() > 1.0e-8 {
+                return GjkResult::Intersecting([a, b, c, s1]);
+            }
+            let s2 = sup(-n);
+            if (s2.w - a.w).dot(n).abs() > 1.0e-8 {
+                return GjkResult::Intersecting([a, b, c, s2]);
+            }
+            separated(simplex, Vec3::ZERO)
+        }
+    }
 }
 
 fn separated(simplex: &[SupportPoint], v: Vec3) -> GjkResult {
