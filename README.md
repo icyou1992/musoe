@@ -282,6 +282,35 @@ cd web && cp ../target/wasm32-unknown-unknown/release/maru_wasm.wasm . && python
 게이트에 `wasm32-unknown-unknown` 빌드도 넣었다: wasip1만 통과하면 WASI import가 딸린
 산출물이 브라우저에서 조용히 죽는다.
 
+## 조인트 · 감쇠 · 지형 (2026-07-27 신규)
+
+```rust
+Joint::try_point(..)      // 볼조인트 (3-DOF 위치)
+Joint::try_hinge(..)      // 경첩 — .with_limit(min, max)? / .with_motor(speed, max_impulse)?
+Joint::try_fixed(.., rel_rot)        // 완전 고정 (위치 + 자세)
+Joint::try_distance(.., min, max)    // 로프·막대·스프링
+
+Body::new_dynamic(..).with_damping(linear, angular)?   // 또는 World::set_damping
+```
+
+- **Distance는 부등식**이다: 구간 안에서는 자유롭고 벗어난 방향으로만 되돌린다.
+  `min == max`면 양방향 막대, `min = 0`이면 로프(당기기만).
+- **한계도 부등식**이라 같은 부호 게이트를 쓴다. **모터는 누적을 클램프**한다 —
+  증분만 자르면 스텝이 쌓이며 `max_impulse`를 넘는다.
+- 감쇠는 **암시적** `v ← v / (1 + h·d)`다. 명시적(`1 − h·d`)이면 `h·d > 1`에서 부호가
+  뒤집혀 발산한다 — 큰 값을 넣으면 폭발하는 대신 더 세게 멈춘다.
+
+**지형·레벨 메시는 삼각형 hull로 만든다** — 전용 셰이프가 아니다:
+
+```rust
+Shape::Hull { points: vec![a, b, c], radius: 0.02 }   // 두꺼운 삼각형
+```
+
+3점은 항상 한 평면 위라 두께가 0이고, 최소 특징 크기를 **convex radius로만** 얻는다.
+두께 0인 삼각형은 생성 경계에서 거부된다(퇴화 형상이 GJK/EPA를 깨뜨리지 않게).
+**전용 `TriMesh`(메시 내부 BVH)는 미구현**이라 큰 메시는 삼각형 수만큼 바디가 되고,
+브로드페이즈가 그 부담을 그대로 진다 — 아래 '알려진 한계' 참조.
+
 ## 알려진 한계 (미해결 — 원인 미확인)
 
 - **~~GJK 코어 거리 과소평가~~ — 2026-07-26 수정됨.** 수렴 직전 같은 support가 반복
@@ -302,12 +331,17 @@ cd web && cp ../target/wasm32-unknown-unknown/release/maru_wasm.wasm . && python
   서브스텝·마찰·감쇠 어느 것도 막지 못하고 시간만 번다. 근본 해법은 잔차 지터 자체를
   줄이는 것(수렴 개선)이고, 그것이 곧 SIMD로 확보한 여유를 반복 수에 되돌리는 길이다.
 
-- **바디 감쇠(damping)가 없다.** rapier는 `linear_damping`/`angular_damping`을 갖는데
-  Maru는 없다. 위 실험에서 감쇠는 성장 모드를 막지 못했지만(지연만) 호스트가 쓸 수 있어야
-  하는 표준 기능이다.
-  (**정정**: 앞선 커밋에서 "재질을 바꿀 방법이 아예 없었다"고 적었는데 틀렸다 —
-  `World::set_material`이 이미 있었다. `Body::with_friction`/`with_restitution`은
-  생성 시점에 지정하는 **편의 추가**지 결손을 메운 것이 아니다.)
+- **~~바디 감쇠 없음~~ — 2026-07-27 추가.** (위 실험에서 감쇠는 절벽의 성장 모드를
+  막지 못했지만 — 지연만 — 호스트가 쓸 수 있어야 하는 표준 기능이다.)
+
+- **전용 `TriMesh`·`Heightfield`가 없다.** 지형은 삼각형 hull 여러 개로 만들 수 있지만,
+  메시 내부 BVH가 없어 삼각형 수만큼 바디가 생기고 브로드페이즈가 그 부담을 진다.
+  중간 규모(수천 삼각형)까지는 쓸 만하고 그 이상은 전용 셰이프가 필요하다.
+
+- **복합 바디(한 바디에 여러 셰이프)가 없다.** 사람 모양처럼 캡슐 여러 개를 묶으려면
+  지금은 바디를 나누고 `Joint::try_fixed`로 붙여야 한다 — 동작하지만 솔버 비용이 더 든다.
+
+- **CCD 없음** (위 'API 계약' 참조). 빠른 물체가 얇은 벽을 통과할 수 있다.
 
 - **`Tree` 위상은 결정적이지 않다** (`select_nth_unstable_by`의 분할 내부 순서는
   규정되지 않는다). 이는 의도된 것이다: 페어 집합은 트리 위상에 비의존이고

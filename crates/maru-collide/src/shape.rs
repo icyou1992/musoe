@@ -261,6 +261,51 @@ impl Shape {
 mod tests {
     use super::*;
 
+    /// **삼각형은 전용 셰이프가 아니라 3점 hull이다.**
+    ///
+    /// 지형·레벨 메시를 삼각형 단위로 넣을 때 쓰는 정본 패턴이다. 3점은 항상 한 평면
+    /// 위이므로 두께가 0이고, 최소 특징 크기는 **convex radius로만** 얻는다 —
+    /// `hull_min_width`가 3점 이하에 0을 돌려주는 이유가 그것이다.
+    /// radius가 너무 얇으면 생성 경계에서 거부된다(퇴화 형상이 GJK/EPA를 깨뜨리지 않게).
+    #[test]
+    fn a_triangle_is_a_three_point_hull() {
+        let tri = |r: f32| Shape::Hull {
+            points: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 2.0),
+            ],
+            radius: r,
+        };
+        // 두께 = 2r 이 최소 특징 크기를 넘어야 통과한다
+        assert!(
+            tri(0.0).validate().is_err(),
+            "두께 0인 삼각형은 거부돼야 한다"
+        );
+        let ok = tri(0.02);
+        ok.validate().expect("두꺼운 삼각형은 유효하다");
+
+        // support: 각 꼭짓점이 자기 방향에서 극점이어야 한다
+        assert_eq!(
+            ok.support_core(Vec3::new(1.0, 0.0, 0.0)),
+            Vec3::new(2.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            ok.support_core(Vec3::new(0.0, 0.0, 1.0)),
+            Vec3::new(0.0, 0.0, 2.0)
+        );
+        assert_eq!(
+            ok.support_core(Vec3::new(-1.0, 0.0, -1.0)),
+            Vec3::new(0.0, 0.0, 0.0)
+        );
+
+        // AABB는 평면 방향으로도 radius만큼 부풀어야 한다 (겉면 기준)
+        let bb = ok.local_aabb();
+        assert!((bb.min.y - -0.02).abs() < 1e-6, "min.y={}", bb.min.y);
+        assert!((bb.max.y - 0.02).abs() < 1e-6, "max.y={}", bb.max.y);
+        assert!((bb.max.x - 2.02).abs() < 1e-6);
+    }
+
     /// 리뷰 회귀: 잘못된 형상은 생성 경계에서 거부되어야 한다(빈 hull은 첫 step에서 패닉했다).
     #[test]
     fn invalid_shapes_are_rejected() {
