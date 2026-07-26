@@ -1221,14 +1221,15 @@ mod sphere_box_tests {
         assert!(checked > 1000, "표본이 너무 적다: {checked}");
     }
 
-    /// **GJK가 틀린 실측 배치의 고정 회귀.**
+    /// **GJK 거리 과소평가 회귀 (2026-07-26 수정 완료).**
     ///
-    /// 위 무작위 대조를 처음엔 `gjk`를 기준으로 짰는데, 이 배치에서 `gjk`가
-    /// `Separated { distance: 0 }`을 돌려줬다 — 구 중심이 박스 코어 밖 0.0516에 있는데도.
-    /// 해석 경로와 독립 점-OBB 계산은 서로 일치하므로 어긋난 쪽은 gjk다.
-    /// gjk는 hull·capsule 쌍에서 여전히 쓰이므로 이 배치를 증거로 남겨둔다.
+    /// 이 배치에서 `gjk`가 `Separated { distance: 0 }`을 돌려줬다 — 구 중심이 박스 코어
+    /// 밖 0.0516에 있는데도. 원인은 둘이었다: ① 진전 판정 임계가 f32 상쇄 오차보다
+    /// 엄격해 종료하지 못하고 같은 support를 반복 삽입 ② 그렇게 생긴 영부피 사면체의
+    /// 복구 경로가 직전 최근접점을 버리고 거리 0을 **강제**(`Vec3::ZERO` 전달).
+    /// 이제 gjk도 독립 점-OBB 계산과 일치해야 한다 — 회귀가 다시 열리면 여기서 잡힌다.
     #[test]
-    fn gjk_underestimates_core_distance_on_this_config() {
+    fn gjk_core_distance_matches_independent_calculation() {
         let half = Vec3::new(0.4904285, 2.0158985, 1.071742);
         let rs = 1.4453597f32;
         let pb = Pose {
@@ -1272,12 +1273,13 @@ mod sphere_box_tests {
             pos: cs,
             rot: Quat::IDENTITY,
         };
-        if let GjkResult::Separated { distance, .. } = gjk(&ss, &ps, &sbx, &pb) {
-            assert!(
-                distance < core_dist - 0.04,
-                "gjk가 고쳐졌다면 이 회귀를 갱신하라 (distance={distance}, 참값={core_dist})"
-            );
-        }
+        let GjkResult::Separated { distance, .. } = gjk(&ss, &ps, &sbx, &pb) else {
+            panic!("코어가 분리돼 있으므로 Separated여야 한다");
+        };
+        assert!(
+            (distance - core_dist).abs() < 1e-4,
+            "gjk 코어 거리 {distance} 가 독립 계산 {core_dist} 와 다르다"
+        );
     }
 
     /// 부호·크기 자기일관성: 구를 법선 반대로 |sep|만큼 밀면 접촉이 정확히 풀려야 한다.
