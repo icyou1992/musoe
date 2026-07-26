@@ -375,16 +375,65 @@ pub fn refresh_anchors(st: &SolverState, c: &mut ContactConstraint) {
     }
 }
 
+/// 제약 하나를 푸는 동안 레지스터에 올려두는 바디 상태 (Box2D v3 `b2BodyState` 동형).
+///
+/// `st.apply`/`st.vel_at`을 접점마다 부르면 접점 1개당 `lin·ang·inv_m·inv_i·dynamic`
+/// 5개 배열을 바디 인덱스로 무작위 접근하고, 그걸 법선·마찰 2축·원판투영까지 4번 반복한다.
+/// 산술은 그대로 두고 **왕복만** 없앤다 — 제약 진입 시 1회 로드, 종료 시 1회 스토어.
+/// 갱신 순서가 동일하므로 결과는 비트 동일하다(스냅샷 해시 회귀가 이를 잠근다).
+#[derive(Clone, Copy)]
+struct BodyReg {
+    lin: Vec3,
+    ang: Vec3,
+    inv_m: f32,
+    inv_i: Mat3,
+    dynamic: bool,
+}
+
+impl BodyReg {
+    #[inline]
+    fn load(st: &SolverState, i: usize) -> Self {
+        Self {
+            lin: st.lin[i],
+            ang: st.ang[i],
+            inv_m: st.inv_m[i],
+            inv_i: st.inv_i[i],
+            dynamic: st.dynamic[i],
+        }
+    }
+    #[inline]
+    fn store(&self, st: &mut SolverState, i: usize) {
+        if self.dynamic {
+            st.lin[i] = self.lin;
+            st.ang[i] = self.ang;
+        }
+    }
+    #[inline]
+    fn vel_at(&self, r: Vec3) -> Vec3 {
+        self.lin + self.ang.cross(r)
+    }
+    #[inline]
+    fn apply(&mut self, imp: Vec3, r: Vec3) {
+        if self.dynamic {
+            self.lin += imp * self.inv_m;
+            self.ang += self.inv_i.mul_vec(r.cross(imp));
+        }
+    }
+}
+
 /// warm start: 누적 임펄스를 서브스텝 시작 추정으로 재적용 (Box2D v3 동형).
 pub fn warm_start(st: &mut SolverState, c: &ContactConstraint) {
+    let (mut ba, mut bb) = (BodyReg::load(st, c.a), BodyReg::load(st, c.b));
     for p in &c.points {
         let (ra, rb) = (p.ra, p.rb);
         let imp = c.normal * p.normal_impulse
             + c.tangents[0] * p.tangent_impulse[0]
             + c.tangents[1] * p.tangent_impulse[1];
-        st.apply(c.a, imp, ra);
-        st.apply(c.b, -imp, rb);
+        ba.apply(imp, ra);
+        bb.apply(-imp, rb);
     }
+    ba.store(st, c.a);
+    bb.store(st, c.b);
 }
 
 /// 속도 임펄스 해석. `soft`=bias 페이즈, `relax`(soft=None)=bias 제거 페이즈.
@@ -394,16 +443,18 @@ pub fn solve(
     inv_h: f32,
     soft: Option<(&Softness, f32)>, // (계수, max_bias_speed)
 ) {
+    let (mut ba, mut bb) = (BodyReg::load(st, c.a), BodyReg::load(st, c.b));
+    let (pos_a, pos_b) = (st.pos[c.a], st.pos[c.b]);
     for p in &mut c.points {
         let (ra, rb) = (p.ra, p.rb);
         // TGS: 현재 자세로 separation 추적. A가 +n로 이동하면 s 증가해야 하므로
         // s = n·(pa − pb) + base (prepare 시점엔 앵커가 같은 월드점 → s = base).
-        let pa = st.pos[c.a] + ra;
-        let pb = st.pos[c.b] + rb;
+        let pa = pos_a + ra;
+        let pb = pos_b + rb;
         let s = c.normal.dot(pa - pb) + p.base_separation;
 
         // --- 법선 ---
-        let vn = c.normal.dot(st.vel_at(c.a, ra) - st.vel_at(c.b, rb));
+        let vn = c.normal.dot(ba.vel_at(ra) - bb.vel_at(rb));
         let (bias, mass_scale, impulse_scale) = match soft {
             Some((sf, max_bias)) => {
                 if s > 0.0 {
@@ -433,8 +484,8 @@ pub fn solve(
         p.normal_impulse = new_total;
         p.max_normal_impulse = p.max_normal_impulse.max(new_total);
         let imp = c.normal * applied;
-        st.apply(c.a, imp, ra);
-        st.apply(c.b, -imp, rb);
+        ba.apply(imp, ra);
+        bb.apply(-imp, rb);
 
         // --- 마찰: 축별 **순차** 해석(GS) 후 누적 2D 임펄스를 Coulomb **원판**에 투영 ---
         // 사각형 클램프는 대각 슬라이드에서 √2·μN까지 허용해 41% 과도 감속하고 기저 의존적이다.
@@ -443,12 +494,12 @@ pub fn solve(
         let max_f = c.friction * p.normal_impulse;
         for axis in 0..2 {
             let t = c.tangents[axis];
-            let vt = t.dot(st.vel_at(c.a, ra) - st.vel_at(c.b, rb));
+            let vt = t.dot(ba.vel_at(ra) - bb.vel_at(rb));
             let delta = -p.tangent_mass[axis] * vt;
             p.tangent_impulse[axis] += delta;
             let imp = t * delta;
-            st.apply(c.a, imp, ra);
-            st.apply(c.b, -imp, rb);
+            ba.apply(imp, ra);
+            bb.apply(-imp, rb);
         }
         let mag2 = p.tangent_impulse[0] * p.tangent_impulse[0]
             + p.tangent_impulse[1] * p.tangent_impulse[1];
@@ -459,10 +510,12 @@ pub fn solve(
             p.tangent_impulse[0] += corr0;
             p.tangent_impulse[1] += corr1;
             let imp = c.tangents[0] * corr0 + c.tangents[1] * corr1;
-            st.apply(c.a, imp, ra);
-            st.apply(c.b, -imp, rb);
+            ba.apply(imp, ra);
+            bb.apply(-imp, rb);
         }
     }
+    ba.store(st, c.a);
+    bb.store(st, c.b);
     let _ = inv_h;
 }
 
