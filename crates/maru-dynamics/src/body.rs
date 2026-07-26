@@ -7,6 +7,9 @@ use maru_collide::{
 };
 use maru_math::{Mat3, Vec3};
 
+/// 기본 충돌 그룹 — 모든 비트가 켜져 있어 아무 설정 없이도 전부 부딪힌다.
+pub const ALL_GROUPS: u32 = u32::MAX;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyType {
     /// 불변. 아일랜드 미참여(anchor 전용 — 설계 §4.3).
@@ -59,6 +62,16 @@ pub struct Body {
     pub(crate) force: Vec3,
     /// 다음 스텝에 적용할 **월드 좌표 토크** 누적. 스텝 끝에 0으로 지워진다.
     pub(crate) torque: Vec3,
+    /// 이 물체가 **속한** 충돌 그룹 비트.
+    pub(crate) membership: u32,
+    /// 이 물체가 **부딪히려는** 그룹 비트.
+    ///
+    /// 충돌 조건은 **양방향**이다: `a.membership & b.filter != 0 && b.membership & a.filter != 0`.
+    /// 한 방향만 보면 "A는 B를 무시하는데 B는 A를 민다"가 되어 운동량이 새고,
+    /// 호스트 입장에서는 설정한 적 없는 비대칭이 생긴다.
+    pub(crate) filter: u32,
+    /// 감지 전용(트리거). 접촉 이벤트는 내지만 임펄스는 주고받지 않는다.
+    pub(crate) sensor: bool,
 }
 
 impl Body {
@@ -93,6 +106,32 @@ impl Body {
     #[inline]
     pub fn friction(&self) -> f32 {
         self.friction
+    }
+    /// 이 물체가 속한 충돌 그룹 비트.
+    #[inline]
+    pub fn membership(&self) -> u32 {
+        self.membership
+    }
+    /// 이 물체가 부딪히려는 그룹 비트.
+    #[inline]
+    pub fn filter(&self) -> u32 {
+        self.filter
+    }
+    /// 감지 전용(트리거)인가.
+    #[inline]
+    pub fn is_sensor(&self) -> bool {
+        self.sensor
+    }
+    /// 충돌 그룹을 바꾼 사본.
+    pub fn with_groups(mut self, membership: u32, filter: u32) -> Self {
+        self.membership = membership;
+        self.filter = filter;
+        self
+    }
+    /// 감지 전용으로 바꾼 사본.
+    pub fn as_sensor(mut self, sensor: bool) -> Self {
+        self.sensor = sensor;
+        self
     }
     /// 다음 스텝에 적용될 누적 힘 (월드 좌표).
     #[inline]
@@ -218,6 +257,9 @@ impl Body {
             shape_origin_offset,
             force: Vec3::ZERO,
             torque: Vec3::ZERO,
+            membership: ALL_GROUPS,
+            filter: ALL_GROUPS,
+            sensor: false,
         };
         b.validate()?;
         Ok(b)
@@ -263,6 +305,9 @@ impl Body {
             shape_origin_offset: Vec3::ZERO,
             force: Vec3::ZERO,
             torque: Vec3::ZERO,
+            membership: ALL_GROUPS,
+            filter: ALL_GROUPS,
+            sensor: false,
         };
         b.validate()?;
         Ok(b)
@@ -318,6 +363,9 @@ impl Body {
             shape_origin_offset,
             force: Vec3::ZERO,
             torque: Vec3::ZERO,
+            membership: ALL_GROUPS,
+            filter: ALL_GROUPS,
+            sensor: false,
         };
         // **생성자는 자기 삽입 정책을 위반한 값을 내보내지 않는다**(리뷰 NEW MAJOR):
         // density=1e-10인 반지름 1m 구는 위 검사를 다 통과하지만 inv_mass≈2.39e9로
@@ -343,6 +391,9 @@ impl Body {
             shape_origin_offset: Vec3::ZERO,
             force: Vec3::ZERO,
             torque: Vec3::ZERO,
+            membership: ALL_GROUPS,
+            filter: ALL_GROUPS,
+            sensor: false,
         };
         b.validate()
             .expect("constructed body violates the size policy");

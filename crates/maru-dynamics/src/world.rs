@@ -58,6 +58,25 @@ pub type IntBuild = std::hash::BuildHasherDefault<IntHasher>;
 pub type IntMap<K, V> = HashMap<K, V, IntBuild>;
 pub type IntSet<K> = std::collections::HashSet<K, IntBuild>;
 
+/// 접촉 이벤트 — 두 물체가 닿기 시작했거나 떨어졌다.
+///
+/// "닿았다"의 기준은 **접촉 매니폴드가 생겼는가**다(스펙큘레이티브 마진 안이면 생긴다).
+/// 정확히 침투했을 때만 세면 빠른 물체가 프레임을 건너뛰며 이벤트를 흘린다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContactEvent {
+    pub a: BodyHandle,
+    pub b: BodyHandle,
+    pub kind: ContactEventKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContactEventKind {
+    /// 이번 스텝에 새로 닿았다.
+    Started,
+    /// 이번 스텝에 떨어졌다 (한쪽이 사라진 경우도 포함).
+    Stopped,
+}
+
 /// 광선 질의 히트.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RayHit {
@@ -193,6 +212,15 @@ pub struct World {
     inv_inertia_local: Vec<Vec3>,
     /// 스텝 스크래치: 슬롯별 누적 (힘, 토크). 솔버 루프가 뚱뚱한 `Body`를 다시 훑지 않게 한다.
     ext_force: Vec<(Vec3, Vec3)>,
+    /// 이번 스텝의 접촉 이벤트. 스텝 시작에 비우고 스텝 안에서 채운다.
+    contact_events: Vec<ContactEvent>,
+    /// **직전 스텝에 닿아 있던 페어 집합** — 이벤트의 기준선.
+    ///
+    /// PCM 캐시 키에서 파생하려다 실패했다: `mutate`(텔레포트·속도 대입)가 그 바디의
+    /// 캐시 엔트리를 지우므로, 물체를 치워도 "원래 안 닿아 있었던 것"이 되어
+    /// **Stopped가 안 나갔다**. 이벤트 기준선은 캐시 무효화와 수명이 달라야 한다.
+    /// 캐노니컬 상태다 — 복원된 월드가 같은 이벤트를 내야 한다.
+    touching: IntSet<(u32, u32)>,
     integrate_gate: Vec<bool>,
     gravity_gate: Vec<bool>,
     island_parent: Vec<usize>,
@@ -361,6 +389,8 @@ impl World {
             solver_state: solver::SolverState::default(),
             inv_inertia_local: Vec::new(),
             ext_force: Vec::new(),
+            contact_events: Vec::new(),
+            touching: IntSet::default(),
             integrate_gate: Vec::new(),
             gravity_gate: Vec::new(),
             island_parent: Vec::new(),
@@ -1240,6 +1270,18 @@ impl World {
         Ok(self.joints.len() - 1)
     }
 
+    /// 접촉 이벤트 기준선 (정렬 — canonical 직렬화용).
+    pub(crate) fn touching_keys(&self) -> Vec<(u32, u32)> {
+        let mut v: Vec<(u32, u32)> = self.touching.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// 복원 경로 전용 — 기준선을 통째로 교체한다.
+    pub(crate) fn set_touching(&mut self, t: IntSet<(u32, u32)>) {
+        self.touching = t;
+    }
+
     /// 캐노니컬 상태 접근 (snapshot 모듈 전용).
     #[allow(clippy::type_complexity)]
     pub(crate) fn canonical_parts(
@@ -1387,7 +1429,16 @@ impl World {
         Ok(())
     }
 
+    /// 이번 스텝에 발생한 접촉 이벤트 (시작 → 종료, 각각 페어 키 오름차순).
+    ///
+    /// 다음 `step`이 비우므로 스텝 사이에 읽어야 한다.
+    pub fn contact_events(&self) -> &[ContactEvent] {
+        &self.contact_events
+    }
+
     fn step_inner(&mut self, dt: f32) {
+        // 이벤트는 **스텝 단위 출력**이다 — 매 스텝 비운다.
+        self.contact_events.clear();
         // 자원 초과 플래그는 **매 스텝 초기화**한다(리뷰 BLOCKER): 생성·복원에서만 지우면
         // 한 번 초과한 뒤 바디를 지우거나 예산을 올려 실제로 성공해도 계속
         // `ResourceLimit`을 돌려주면서 상태만 앞으로 나간다.
@@ -1642,10 +1693,21 @@ impl World {
                 continue;
             }
             let _ = (a_asleep, b_asleep);
+            // **충돌 그룹**: 양방향 조건이라 한쪽만 무시하는 비대칭이 생기지 않는다.
+            if !groups_collide(&self.bodies[a_id], &self.bodies[b_id]) {
+                continue;
+            }
             let (sa, pa) = (&self.bodies[a_id].shape, &self.bodies[a_id].pose);
             let (sb, pb) = (&self.bodies[b_id].shape, &self.bodies[b_id].pose);
             if let Some(m) = contact(sa, pa, sb, pb, self.params.speculative_margin) {
                 if !m.is_empty() {
+                    // **센서는 이벤트만 낸다** — 매니폴드는 만들되 제약을 만들지 않아
+                    // 임펄스를 주고받지 않는다. 아래 `live_keys`에는 넣으므로
+                    // 접촉 시작/종료 이벤트는 정상적으로 나간다.
+                    if self.bodies[a_id].sensor || self.bodies[b_id].sensor {
+                        live_keys.insert(key);
+                        continue;
+                    }
                     let cached = self.contact_cache.get(&key).unwrap_or(&empty);
                     for p in m.points() {
                         self.diag.max_penetration = self.diag.max_penetration.max(-p.separation);
@@ -1914,6 +1976,45 @@ impl World {
         self.bp_valid = !moved;
         self.bp_dt = dt;
 
+        // 5-a) **접촉 이벤트** = 직전 기준선(`touching`)과 이번 `live_keys`의 차집합.
+        //
+        // 잠든 페어도 `live_keys`에 들어가므로 수면이 종료 이벤트를 거짓 발생시키지 않는다.
+        // 순서는 전순서다(키 오름차순) — 이벤트 순서가 해시 순회에 의존하면 안 된다.
+        {
+            let mut started: Vec<(u32, u32)> = live_keys
+                .iter()
+                .filter(|k| !self.touching.contains(*k))
+                .copied()
+                .collect();
+            let mut stopped: Vec<(u32, u32)> = self
+                .touching
+                .iter()
+                .filter(|k| !live_keys.contains(*k))
+                .copied()
+                .collect();
+            started.sort_unstable();
+            stopped.sort_unstable();
+            for (k, kind) in started
+                .into_iter()
+                .map(|k| (k, ContactEventKind::Started))
+                .chain(stopped.into_iter().map(|k| (k, ContactEventKind::Stopped)))
+            {
+                let (ai, bi) = (k.0 as usize, (k.1 & !STATIC_BIT) as usize);
+                if ai >= self.bodies.len() || bi >= self.bodies.len() {
+                    continue;
+                }
+                self.contact_events.push(ContactEvent {
+                    a: self.handle_of(ai),
+                    b: self.handle_of(bi),
+                    kind,
+                });
+            }
+        }
+
+        // 기준선 갱신 — 다음 스텝의 이벤트가 이 집합과의 차집합이다.
+        self.touching.clear();
+        self.touching.extend(live_keys.iter().copied());
+
         // 5) PCM 캐시 갱신. **잠든 페어의 엔트리는 보존**한다 — 전체 clear는 첫 수면 스텝에
         //    지속 매니폴드를 날려, 나중에 깨어날 때 warm start 없이 거칠게 재정착한다(리뷰 지적).
         //    이번 스텝에 살아있지 않은(페어 소멸) 키만 폐기.
@@ -2044,4 +2145,13 @@ impl World {
         self.diag.state_saturations = self.close_state_policy();
         self.diag.phase_ns[4] = _t_post.elapsed().as_nanos() as u64;
     }
+}
+
+/// 두 물체가 충돌 그룹상 부딪히는가.
+///
+/// **양방향 조건**이다: 한 방향만 보면 "A는 B를 무시하는데 B는 A를 민다"가 되어
+/// 운동량이 새고, 호스트가 설정한 적 없는 비대칭이 생긴다.
+#[inline]
+fn groups_collide(a: &Body, b: &Body) -> bool {
+    (a.membership & b.filter) != 0 && (b.membership & a.filter) != 0
 }

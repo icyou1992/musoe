@@ -14,7 +14,9 @@ pub use command::{Command, CommandReport};
 pub use joint::{Joint, JointKind};
 pub use snapshot::SnapshotError;
 pub use solver::SolverParams;
-pub use world::{ApiError, Diagnostics, World, WorldParams};
+pub use world::{
+    ApiError, ContactEvent, ContactEventKind, Diagnostics, RayHit, World, WorldParams,
+};
 
 #[cfg(test)]
 mod tests {
@@ -384,6 +386,203 @@ mod tests {
             w.cast_ray(o, maru_math::Vec3::new(1.0, 0.0, 0.0), -1.0),
             Err(ApiError::InvalidValue)
         );
+    }
+
+    /// 떨어뜨리면 **닿는 순간** Started, 치우면 Stopped가 나와야 한다.
+    #[test]
+    fn contact_events_fire_on_touch_and_separation() {
+        let mut w = World::new(WorldParams::default());
+        let g = w.add_body(Body::new_static(
+            maru_collide::Shape::Box {
+                half: maru_math::Vec3::new(10.0, 1.0, 10.0),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, -1.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        let b = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 3.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        let mut started = 0usize;
+        for _ in 0..120 {
+            w.try_step(1.0 / 60.0).unwrap();
+            for e in w.contact_events() {
+                if e.kind == ContactEventKind::Started && e.a == g && e.b == b
+                    || e.kind == ContactEventKind::Started && e.a == b && e.b == g
+                {
+                    started += 1;
+                }
+            }
+            if started > 0 {
+                break;
+            }
+        }
+        assert_eq!(started, 1, "닿을 때 Started가 정확히 한 번");
+
+        // 치우면 Stopped
+        w.set_pose(
+            b,
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 50.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        )
+        .unwrap();
+        w.try_step(1.0 / 60.0).unwrap();
+        assert!(
+            w.contact_events()
+                .iter()
+                .any(|e| e.kind == ContactEventKind::Stopped),
+            "떨어지면 Stopped가 나와야 한다"
+        );
+    }
+
+    /// 이벤트는 **스텝 단위 출력**이다 — 다음 스텝이 비운다.
+    #[test]
+    fn contact_events_are_cleared_each_step() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            maru_collide::Shape::Box {
+                half: maru_math::Vec3::new(10.0, 1.0, 10.0),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, -1.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 0.5, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        w.try_step(1.0 / 60.0).unwrap();
+        assert!(!w.contact_events().is_empty(), "첫 스텝에 닿는다");
+        for _ in 0..5 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        assert!(
+            w.contact_events().is_empty(),
+            "계속 닿아 있는 동안은 새 이벤트가 없다"
+        );
+    }
+
+    /// 충돌 그룹이 다르면 **통과**해야 한다.
+    #[test]
+    fn collision_groups_filter_contacts() {
+        let make = |a_groups: (u32, u32), b_groups: (u32, u32)| -> f32 {
+            let mut w = World::new(WorldParams::default());
+            w.add_body(
+                Body::new_static(
+                    maru_collide::Shape::Box {
+                        half: maru_math::Vec3::new(10.0, 1.0, 10.0),
+                        radius: 0.0,
+                    },
+                    maru_collide::Pose {
+                        pos: maru_math::Vec3::new(0.0, -1.0, 0.0),
+                        rot: maru_math::Quat::IDENTITY,
+                    },
+                )
+                .with_groups(a_groups.0, a_groups.1),
+            );
+            let b = w.add_body(
+                Body::new_dynamic(
+                    maru_collide::Shape::Sphere { radius: 0.5 },
+                    maru_collide::Pose {
+                        pos: maru_math::Vec3::new(0.0, 2.0, 0.0),
+                        rot: maru_math::Quat::IDENTITY,
+                    },
+                    1.0,
+                )
+                .with_groups(b_groups.0, b_groups.1),
+            );
+            for _ in 0..90 {
+                w.try_step(1.0 / 60.0).unwrap();
+            }
+            w.body(b).pose().pos.y
+        };
+        let landed = make((1, 1), (1, 1));
+        assert!(landed > 0.3, "같은 그룹이면 바닥에 서야 한다: {landed}");
+        let fell = make((1, 1), (2, 2));
+        assert!(fell < -1.0, "다른 그룹이면 통과해야 한다: {fell}");
+        // **양방향**: 한쪽만 상대를 무시해도 통과해야 한다
+        let one_way = make((1, 1), (2, 1));
+        assert!(one_way < -1.0, "한쪽이 무시하면 양쪽 다 통과다: {one_way}");
+    }
+
+    /// 센서는 **이벤트만** 내고 밀지 않는다.
+    #[test]
+    fn sensors_report_but_do_not_push() {
+        let mut w = World::new(WorldParams::default());
+        let trigger = w.add_body(
+            Body::new_static(
+                maru_collide::Shape::Box {
+                    half: maru_math::Vec3::new(5.0, 0.5, 5.0),
+                    radius: 0.0,
+                },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::new(0.0, 1.0, 0.0),
+                    rot: maru_math::Quat::IDENTITY,
+                },
+            )
+            .as_sensor(true),
+        );
+        let b = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 4.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        let mut saw = false;
+        for _ in 0..120 {
+            w.try_step(1.0 / 60.0).unwrap();
+            saw |= w
+                .contact_events()
+                .iter()
+                .any(|e| e.kind == ContactEventKind::Started && (e.a == trigger || e.b == trigger));
+        }
+        assert!(saw, "센서를 지나가면 이벤트가 나와야 한다");
+        assert!(
+            w.body(b).pose().pos.y < -2.0,
+            "센서는 밀지 않는다 — 그대로 떨어져야 한다: {}",
+            w.body(b).pose().pos.y
+        );
+    }
+
+    /// 그룹·센서는 캐노니컬 상태다 — 스냅샷 왕복에서 살아남아야 한다.
+    #[test]
+    fn groups_and_sensor_survive_snapshot() {
+        let mut w = World::new(WorldParams::default());
+        let h = w.add_body(
+            Body::new_dynamic(
+                maru_collide::Shape::Sphere { radius: 0.5 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::ZERO,
+                    rot: maru_math::Quat::IDENTITY,
+                },
+                1.0,
+            )
+            .with_groups(0b1010, 0b0110)
+            .as_sensor(true),
+        );
+        let snap = w.try_snapshot().unwrap();
+        let mut r = World::new(WorldParams::default());
+        r.restore(&snap).unwrap();
+        assert_eq!(r.body(h).membership(), 0b1010);
+        assert_eq!(r.body(h).filter(), 0b0110);
+        assert!(r.body(h).is_sensor());
     }
 
     /// 재질 설정자는 다른 쓰기 경로와 같은 규율을 따른다 — 바꾼 뒤 `validate`를 다시 통과해야 한다.
@@ -1435,9 +1634,10 @@ mod tests {
         let good = w.snapshot();
         let before = w.state_hash();
 
-        // 슬롯(Box): alive1+oob1+reserved1+gen4 + 본문(106 + force12 + torque12 = 130)
-        //            + sleep4+asleep1+island4 = 146
-        const SLOT: usize = 146;
+        // 슬롯(Box): alive1+oob1+reserved1+gen4
+        //            + 본문(106 + force12 + torque12 + membership4 + filter4 + sensor1 = 139)
+        //            + sleep4+asleep1+island4 = 155
+        const SLOT: usize = 155;
         let type_off = HDR + 4 + SLOT + 1 + 1 + 1 + 4;
         assert_eq!(
             good[type_off], 1,

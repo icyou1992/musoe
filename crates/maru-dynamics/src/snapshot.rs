@@ -38,7 +38,7 @@ const MAGIC: u32 = 0x4d41_5255; // "MARU"
 /// **정책 변경은 wire 의미 변경이다.** v4 시절 빌드가 만든 33~1024점 스냅샷은 지금 거부되고,
 /// K-특이 조인트를 담은 v4도 거부된다 — 같은 버전 번호가 다른 계약을 뜻하면 안 되므로 올린다.
 /// (v4: WorldParams·OOB 플래그·앵커/최소 크기 / v3: 예약 슬롯·AddBody 핸들·last_report)
-const VERSION: u32 = 6;
+const VERSION: u32 = 8;
 
 /// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
 /// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
@@ -54,8 +54,9 @@ mod min_bytes {
     /// 셰이프 최소: 태그(1) + Sphere 반지름(4)
     const SHAPE: usize = 5;
     /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4
-    /// + offset12 + force12 + torque12
-    const BODY_CORE: usize = 1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + SHAPE;
+    /// + offset12 + force12 + torque12 + membership4 + filter4 + sensor1
+    const BODY_CORE: usize =
+        1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + SHAPE;
     /// 슬롯 레코드: alive1 + oob1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
     pub const SLOT: usize = 1 + 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
     /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang8
@@ -375,6 +376,9 @@ fn write_body(w: &mut Writer, b: &Body) {
     // 누적 힘·토크는 캐노니컬 상태다 — apply 뒤 step 전 스냅샷이 같은 미래를 만들려면 담겨야 한다.
     w.vec3(b.force);
     w.vec3(b.torque);
+    w.u32(b.membership);
+    w.u32(b.filter);
+    w.u8(b.sensor as u8);
     write_shape(w, &b.shape);
 }
 
@@ -407,6 +411,13 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
     // 힘·토크는 여러 번 더해져 자라므로 파생 상태 정책으로 읽는다(라이브 누적과 같은 규칙).
     let force = r.state_vec3()?;
     let torque = r.state_vec3()?;
+    let membership = r.u32()?;
+    let filter = r.u32()?;
+    let sensor = match r.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(SnapshotError::InconsistentState),
+    };
     let shape = read_shape(r)?;
     let b = Body {
         body_type,
@@ -421,6 +432,9 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
         shape_origin_offset,
         force,
         torque,
+        membership,
+        filter,
+        sensor,
     };
     b.validate().map_err(|_| SnapshotError::InconsistentState)?;
     Ok(b)
@@ -535,7 +549,8 @@ fn shape_size(s: &Shape) -> usize {
 fn body_size(b: &Body) -> usize {
     // 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + offset12
     // + force12 + torque12 + 셰이프
-    1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + shape_size(&b.shape)
+    // + membership4 + filter4 + sensor1
+    1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + shape_size(&b.shape)
 }
 
 fn joint_size(j: &Joint) -> usize {
@@ -566,6 +581,7 @@ fn command_size(c: &PendingCommand) -> usize {
 pub fn serialized_size(world: &World) -> usize {
     let (_, bodies, _, _, _, _, _, _, _, joints, cache, commands, _) = world.canonical_parts();
     let mut n = 4 + 4 + (12 + 4 + 4 + 16 + 12 + 4 + 4 + 4) + 4; // magic + version + params + count
+    n += 4 + world.touching_keys().len() * 8; // 접촉 기준선
     for (i, b) in bodies.iter().enumerate() {
         let _ = i;
         n += 1 + 1 + 1 + 4 + body_size(b) + 4 + 1 + 4;
@@ -656,6 +672,15 @@ fn write_world_bytes(world: &World, w: &mut Writer) {
             w.vec3(imp.position);
             w.vec3(imp.contact_normal);
         }
+    }
+
+    // 접촉 이벤트 기준선 — **캐노니컬 상태**다(복원된 월드가 같은 이벤트를 내야 한다).
+    // PCM 캐시와 따로 두는 이유는 수명이 다르기 때문이다(`World::touching` 주석 참조).
+    let touching = world.touching_keys();
+    w.u32(touching.len() as u32);
+    for k in touching {
+        w.u32(k.0);
+        w.u32(k.1);
     }
 }
 
@@ -815,6 +840,16 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         cache.insert(key, entry);
     }
 
+    // 접촉 이벤트 기준선. 개수는 페어와 같은 규칙으로 남은 바이트에서 유도한다.
+    let nt = r.count(8, 8)?;
+    let mut touching: crate::world::IntSet<(u32, u32)> = crate::world::IntSet::default();
+    touching
+        .try_reserve(nt)
+        .map_err(|_| SnapshotError::CountTooLarge)?;
+    for _ in 0..nt {
+        touching.insert((r.u32()?, r.u32()?));
+    }
+
     if r.at != bytes.len() {
         return Err(SnapshotError::TrailingBytes);
     }
@@ -848,6 +883,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         commands,
         report,
     );
+    world.set_touching(touching);
     Ok(())
 }
 
