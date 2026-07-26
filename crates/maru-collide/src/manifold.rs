@@ -208,8 +208,26 @@ fn box_box_axis(
     // 뒤바뀌므로, 그것으로 만든 스칼라 키의 대소가 뒤집힌다. 인덱스(월드마다 다름)가 아니라
     // 형상·자세에서 뽑으므로 소유자 무관이면서 교환 반대칭이다.
     // 두 키가 정확히 같은 경우는 구성 자체가 교환 대칭이므로 어느 쪽을 골라도 동등하다.
-    let body_key =
-        |h: Vec3, p: &Pose| -> [f32; 7] { [h.x, h.y, h.z, p.rot.x, p.rot.y, p.rot.z, p.rot.w] };
+    // **쿼터니언 부호를 정규화한다**: `q`와 `-q`는 같은 자세인데 키가 뒤집히면, 표현만 다른
+    // 동일 장면이 다른 법선을 고른다(자세는 같은데 물리가 달라진다 — 실측으로 확인했다).
+    // 대표원을 골라 표현 불변으로 만든다: 마지막 비영 성분이 음수면 전체 부호를 뒤집는다.
+    let canon = |q: Quat| -> [f32; 4] {
+        let v = [q.x, q.y, q.z, q.w];
+        let flip = v
+            .iter()
+            .rev()
+            .find(|c| **c != 0.0)
+            .is_some_and(|c| *c < 0.0);
+        if flip {
+            [-v[0], -v[1], -v[2], -v[3]]
+        } else {
+            v
+        }
+    };
+    let body_key = |h: Vec3, p: &Pose| -> [f32; 7] {
+        let q = canon(p.rot);
+        [h.x, h.y, h.z, q[0], q[1], q[2], q[3]]
+    };
     let (ka, kb) = (body_key(ha, pa), body_key(hb, pb));
     let tie_sign = {
         let mut s = 1.0f32;

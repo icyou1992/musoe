@@ -3022,6 +3022,29 @@ mod tests {
             }
             (w.body(a).pose().pos, w.body(b).pose().pos)
         };
+        // 같은 자세를 **부호가 뒤집힌 쿼터니언**으로 표현해도 결과가 같아야 한다
+        // (q와 -q는 같은 회전 — 표현이 물리를 바꾸면 안 된다).
+        {
+            let neg = |q: Quat| Quat {
+                x: -q.x,
+                y: -q.y,
+                z: -q.z,
+                w: -q.w,
+            };
+            let base = mk(Vec3::ZERO, rot_a, Vec3::new(0.02, 0.01, 0.0), rot_b);
+            let flipped = mk(
+                Vec3::ZERO,
+                neg(rot_a),
+                Vec3::new(0.02, 0.01, 0.0),
+                neg(rot_b),
+            );
+            assert!(
+                (base.0 - flipped.0).length() < 1e-3 && (base.1 - flipped.1).length() < 1e-3,
+                "쿼터니언 부호 표현이 물리를 바꾼다: {:?} vs {:?}",
+                base,
+                flipped
+            );
+        }
         for (label, pa, pb) in [
             // 일반 구성
             ("일반", Vec3::ZERO, Vec3::new(0.62, 0.31, 0.44)),
