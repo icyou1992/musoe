@@ -89,6 +89,13 @@ pub struct ContactConstraint {
     pub tangents: [Vec3; 2],
     pub friction: f32,
     pub restitution: f32,
+    /// **인라인 배열로 바꾸지 말 것** (2026-07-26 실측으로 기각).
+    /// "제약 배열을 스텝당 40번 훑으니 포인터 추적이 비쌀 것"이라는 가설로
+    /// `[ContactPointConstraint; 4] + count`(≈400B)로 바꿔봤다. 결과:
+    /// solve는 **변화 없음**(15.1 → 15.2 ms — 포인터 추적은 비용이 아니었다),
+    /// narrow는 **40% 악화**(3.52 → 4.93 ms — `prepare`가 큰 구조체를 값으로 돌려주고
+    /// `constraints.push`가 그걸 복사한다). `Manifold`의 같은 변경이 중립이었던 것과 달리
+    /// 여기서는 순손해다.
     pub points: Vec<ContactPointConstraint>,
     /// 이번 스텝에 **실제로 warm load된** 접점 수 (진단 전용, 캐노니컬 상태 아님).
     pub warm_matched: u32,
