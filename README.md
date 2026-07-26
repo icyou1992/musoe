@@ -9,7 +9,8 @@
 | `maru-math` | 스칼라 `Vec3`/`Quat`/`Mat3` + `Vec3x4`/`Aabbx4`(SoA 4-wide, 핫패스 정본 — 설계 §3) |
 | `maru-collide` | 셰이프(convex radius) · 듀얼 4-ary 트리 브로드페이즈(트리 비의존 canonical 페어) · GJK/EPA · 클리핑 매니폴드(feature ID) |
 | `maru-dynamics` | TGS-soft 솔버 · PCM warm-start · 아일랜드/슬리핑 · point·hinge 조인트 · 캐노니컬 스냅샷/L0 리플레이 해시 |
-| `maru-bench` | 마이크로벤치 + 피라미드 스택 벤치. native/wasm 동일 소스, 체크섬=결정론 스모크 |
+| `maru-bench` | 마이크로벤치 + 피라미드 스택 벤치 + 진단 계측기(broadsplit·narrowsplit·boxsplit·cliff·spin) |
+| `maru-wasm` | 브라우저 바인딩 — **flat buffer + C ABI**(wasm-bindgen 없음). 데모: `web/` |
 
 ### 스택 "안정 봉투"는 솔버 품질이 아니라 **수면과의 경주**다 (2026-07-27 규명)
 
@@ -279,6 +280,26 @@ Body::new_static(..).as_sensor(true)                    // 감지 전용(트리�
 - 이벤트 기준선(`touching`)은 **PCM 캐시와 따로 둔 캐노니컬 상태**다. 캐시에서
   파생하려다 실패했는데, `mutate`(텔레포트·속도 대입)가 그 바디의 캐시를 지워
   물체를 치워도 Stopped가 안 나갔다 — 기준선은 캐시 무효화와 수명이 달라야 한다.
+
+## 웹 바인딩 (2026-07-27 신규)
+
+```bash
+cargo build --release -p maru-wasm --target wasm32-unknown-unknown
+cd web && cp ../target/wasm32-unknown-unknown/release/maru_wasm.wasm . && python3 -m http.server 8080
+```
+
+설계 §5의 "JS↔WASM 경계가 제1 성능 변수"를 그대로 지킨다:
+- **핫패스는 버퍼로만 오간다.** 프레임당 `maru_step` 한 번 + `Float32Array` 한 번 읽기.
+  바디마다 함수를 부르지 않는다.
+- **호출당 객체를 만들지 않는다.** 반환은 전부 스칼라 아니면 미리 잡아둔 버퍼다.
+- **패닉이 경계를 넘지 않는다.** 엔진의 `try_*`만 쓰고 실패는 음수 오류 코드다 —
+  wasm에서 unwind는 곧 trap이라 호스트가 진단할 수 없다.
+- `maru_transforms_ptr`은 `maru_step` 뒤 **다시 물어봐야 한다**(재할당 시 무효화).
+
+`crate-type`에 `rlib`을 함께 둬서 **게이트가 같은 C ABI를 네이티브로 돈다** —
+바인딩만 브라우저에서 손으로 확인하는 층이 되면 조용히 썩는다.
+게이트에 `wasm32-unknown-unknown` 빌드도 넣었다: wasip1만 통과하면 WASI import가 딸린
+산출물이 브라우저에서 조용히 죽는다.
 
 ## 알려진 한계 (미해결 — 원인 미확인)
 

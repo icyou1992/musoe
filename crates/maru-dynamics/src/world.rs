@@ -1275,6 +1275,19 @@ impl World {
         Ok(self.joints.len() - 1)
     }
 
+    /// 슬롯 인덱스로 바디를 읽는다 (살아있지 않으면 `None`).
+    ///
+    /// 핸들 경로(`body`/`try_body`)와 달리 **세대를 보지 않는다**. flat buffer 바인딩이
+    /// 슬롯 순서로 자세를 훑을 때 쓰라고 둔 것이고, 그 경로는 애초에 "지금 살아있는
+    /// 슬롯의 현재 값"만 필요하다. 호스트가 핸들의 유효성을 물으려면 `is_alive`를 쓴다.
+    pub fn body_at_slot(&self, i: usize) -> Option<&Body> {
+        if i < self.bodies.len() && self.alive[i] {
+            Some(&self.bodies[i])
+        } else {
+            None
+        }
+    }
+
     /// 접촉 이벤트 기준선 (정렬 — canonical 직렬화용).
     pub(crate) fn touching_keys(&self) -> Vec<(u32, u32)> {
         let mut v: Vec<(u32, u32)> = self.touching.iter().copied().collect();

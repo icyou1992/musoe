@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>Maru — 웹 데모</title>
+<style>
+  body { margin: 0; background: #11131a; color: #cbd2e1; font: 13px/1.5 ui-monospace, monospace; }
+  #hud { position: fixed; top: 10px; left: 12px; white-space: pre; pointer-events: none; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="hud">불러오는 중…</div>
+<canvas id="c"></canvas>
+<script type="module">
+// Maru 웹 데모 — **wasm-bindgen 없이** 원시 C ABI를 직접 부른다.
+// 요점은 핫패스가 함수 호출이 아니라 **선형 메모리 뷰**라는 것이다:
+// 매 프레임 maru_step 한 번 + Float32Array 한 번 읽기가 전부다.
+const SHAPE_SPHERE = 0, SHAPE_BOX = 1;
+const BODY_STATIC = 0, BODY_DYNAMIC = 1;
+const STRIDE = 7;                 // pos3 + quat4
+const IDENT = [0, 0, 0, 1];
+
+const { instance } = await WebAssembly.instantiateStreaming(
+  fetch('./maru_wasm.wasm'), {}
+);
+const m = instance.exports;
+const mem = () => new Float32Array(m.memory.buffer);
+
+const world = m.maru_world_create(0, -9.81, 0, 0);
+
+// 바닥
+m.maru_add_body(world, BODY_STATIC, SHAPE_BOX, 20, 1, 20, 0, 0, -1, 0, ...IDENT, 1);
+
+// 공 무더기
+const balls = [];
+for (let i = 0; i < 120; i++) {
+  const x = (i % 6) * 1.2 - 3, z = ((i / 6) | 0) % 6 * 1.2 - 3, y = 1 + ((i / 36) | 0) * 1.4;
+  balls.push(m.maru_add_body(world, BODY_DYNAMIC, SHAPE_SPHERE, 0.5, 0, 0, 0, x, y, z, ...IDENT, 1));
+}
+
+// --- 아주 작은 3D: 원근 투영만 직접 한다 (렌더 라이브러리 없이 동작을 보이는 게 목적) ---
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const hud = document.getElementById('hud');
+const fit = () => { cv.width = innerWidth; cv.height = innerHeight; };
+addEventListener('resize', fit); fit();
+
+const CAM = { x: 0, y: 6, z: 18 };
+function project(x, y, z) {
+  const dx = x - CAM.x, dy = y - CAM.y, dz = CAM.z - z;
+  if (dz <= 0.1) return null;
+  const f = Math.min(cv.width, cv.height) * 0.9;
+  return [cv.width / 2 + (dx * f) / dz, cv.height / 2 - (dy * f) / dz, f / dz];
+}
+
+let last = performance.now(), acc = 0, frames = 0, stepMs = 0;
+function frame(now) {
+  // 고정 틱 accumulator — dt 계약(1e-4..0.25)은 **호스트 책임**이다(README 참조).
+  acc = Math.min(acc + (now - last) / 1000, 0.25);
+  last = now;
+  const t0 = performance.now();
+  while (acc >= 1 / 60) { m.maru_step(world, 1 / 60); acc -= 1 / 60; }
+  stepMs = stepMs * 0.9 + (performance.now() - t0) * 0.1;
+
+  // **핫패스는 여기가 전부다**: 포인터 한 번, 뷰 한 번.
+  const n = m.maru_slot_count(world);
+  const base = m.maru_transforms_ptr(world) >> 2;
+  const t = mem();
+
+  ctx.fillStyle = '#11131a';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  const drawn = [];
+  for (let i = 1; i < n; i++) {              // 0번은 바닥
+    const o = base + i * STRIDE;
+    const p = project(t[o], t[o + 1], t[o + 2]);
+    if (p) drawn.push(p);
+  }
+  drawn.sort((a, b) => a[2] - b[2]);          // 먼 것부터
+  for (const [sx, sy, s] of drawn) {
+    ctx.beginPath();
+    ctx.arc(sx, sy, Math.max(1, s * 0.5), 0, 6.283);
+    ctx.fillStyle = `hsl(${200 + s * 2} 60% ${30 + s * 3}%)`;
+    ctx.fill();
+  }
+  if ((frames++ & 15) === 0) {
+    hud.textContent =
+      `바디 ${n}   step ${stepMs.toFixed(2)} ms   접촉 이벤트 ${m.maru_events_len(world)}`;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// 클릭하면 그 방향으로 광선을 쏘고, 맞은 공을 위로 튕긴다 — 질의 + 충격 경로 확인용.
+addEventListener('pointerdown', (e) => {
+  const f = Math.min(cv.width, cv.height) * 0.9;
+  const dx = (e.clientX - cv.width / 2) / f, dy = -(e.clientY - cv.height / 2) / f;
+  const hit = m.maru_cast_ray(world, CAM.x, CAM.y, CAM.z, dx, dy, -1, 200);
+  if (hit === 1) m.maru_apply_impulse(world, m.maru_query_hit_handle(world), 0, 12, 0);
+});
+</script>
+</body>
+</html>

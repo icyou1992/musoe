@@ -13,6 +13,11 @@ cargo clippy --target wasm32-wasip1 --all-targets -- -D warnings
 echo "== test (wasm32-wasip1, Node WASI 러너) =="
 cargo test --target wasm32-wasip1
 
+echo "== 브라우저 wasm 빌드 (wasm32-unknown-unknown) =="
+# 바인딩은 **브라우저 타깃으로도 빌드돼야** 한다 — wasip1만 통과하면
+# WASI import가 딸린 산출물이 브라우저에서 조용히 죽는다.
+cargo build --release -p maru-wasm --target wasm32-unknown-unknown
+
 echo "== bench (wasm32-wasip1, SIMD128 on) =="
 cargo run --release --target wasm32-wasip1 -p maru-bench --bin maru-bench
 
