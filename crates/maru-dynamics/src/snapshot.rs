@@ -38,7 +38,7 @@ const MAGIC: u32 = 0x4d41_5255; // "MARU"
 /// **정책 변경은 wire 의미 변경이다.** v4 시절 빌드가 만든 33~1024점 스냅샷은 지금 거부되고,
 /// K-특이 조인트를 담은 v4도 거부된다 — 같은 버전 번호가 다른 계약을 뜻하면 안 되므로 올린다.
 /// (v4: WorldParams·OOB 플래그·앵커/최소 크기 / v3: 예약 슬롯·AddBody 핸들·last_report)
-const VERSION: u32 = 9;
+const VERSION: u32 = 10;
 
 /// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
 /// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
@@ -59,8 +59,8 @@ mod min_bytes {
         1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + 8 + SHAPE;
     /// 슬롯 레코드: alive1 + oob1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
     pub const SLOT: usize = 1 + 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
-    /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang8
-    pub const JOINT: usize = 8 + 8 + 24 + 1 + 1 + 12 + 8;
+    /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang12 + limit4 + motor4
+    pub const JOINT: usize = 8 + 8 + 24 + 1 + 1 + 12 + 12 + 4 + 4;
     /// 커맨드: 태그1 + 최소 페이로드(RemoveBody = 핸들8)
     pub const COMMAND: usize = 1 + 8;
     /// 캐시 페어: 키8 + 엔트리 수4
@@ -453,16 +453,63 @@ fn write_joint(w: &mut Writer, j: &Joint) {
     w.vec3(j.anchor_b);
     match &j.kind {
         JointKind::Point => w.u8(0),
-        JointKind::Hinge { axis_a, axis_b } => {
+        JointKind::Hinge {
+            axis_a,
+            axis_b,
+            limit,
+            motor,
+        } => {
             w.u8(1);
             w.vec3(*axis_a);
             w.vec3(*axis_b);
+            write_opt2(w, limit.as_ref().map(|l| [l[0], l[1]]));
+            write_opt2(w, motor.as_ref().map(|m| [m.target_speed, m.max_impulse]));
+        }
+        JointKind::Fixed { rel_rot } => {
+            w.u8(2);
+            w.quat(*rel_rot);
+        }
+        JointKind::Distance { min, max } => {
+            w.u8(3);
+            w.f32(*min);
+            w.f32(*max);
         }
     }
     w.u8(j.collide_connected as u8);
     w.vec3(j.linear_impulse);
-    w.f32(j.angular_impulse[0]);
-    w.f32(j.angular_impulse[1]);
+    for x in j.angular_impulse {
+        w.f32(x);
+    }
+    w.f32(j.limit_impulse);
+    w.f32(j.motor_impulse);
+}
+
+/// `Option<[f32;2]>` — 태그 1바이트 + 값 8바이트(없으면 0으로 채워 **길이를 고정**한다).
+/// 가변 길이면 `joint_size` preflight가 kind 안의 분기까지 알아야 해서 어긋나기 쉽다.
+fn write_opt2(w: &mut Writer, v: Option<[f32; 2]>) {
+    match v {
+        Some([a, b]) => {
+            w.u8(1);
+            w.f32(a);
+            w.f32(b);
+        }
+        None => {
+            w.u8(0);
+            w.f32(0.0);
+            w.f32(0.0);
+        }
+    }
+}
+
+fn read_opt2(r: &mut Reader) -> Result<Option<[f32; 2]>, SnapshotError> {
+    let tag = r.u8()?;
+    let a = r.f32()?;
+    let b = r.f32()?;
+    match tag {
+        0 => Ok(None),
+        1 => Ok(Some([a, b])),
+        _ => Err(SnapshotError::BadShape),
+    }
 }
 
 fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
@@ -472,15 +519,33 @@ fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
     let anchor_b = r.state_vec3()?;
     let kind = match r.u8()? {
         0 => JointKind::Point,
-        1 => JointKind::Hinge {
-            axis_a: r.vec3()?,
-            axis_b: r.vec3()?,
+        1 => {
+            let axis_a = r.vec3()?;
+            let axis_b = r.vec3()?;
+            let limit = read_opt2(r)?;
+            let motor = read_opt2(r)?.map(|m| crate::joint::Motor {
+                target_speed: m[0],
+                max_impulse: m[1],
+            });
+            JointKind::Hinge {
+                axis_a,
+                axis_b,
+                limit,
+                motor,
+            }
+        }
+        2 => JointKind::Fixed { rel_rot: r.quat()? },
+        3 => JointKind::Distance {
+            min: r.f32()?,
+            max: r.f32()?,
         },
         _ => return Err(SnapshotError::BadShape),
     };
     let collide_connected = r.u8()? != 0;
     let linear_impulse = r.state_vec3()?;
-    let angular_impulse = [r.state_f32()?, r.state_f32()?];
+    let angular_impulse = [r.state_f32()?, r.state_f32()?, r.state_f32()?];
+    let limit_impulse = r.state_f32()?;
+    let motor_impulse = r.state_f32()?;
     let j = Joint {
         body_a,
         body_b,
@@ -490,6 +555,8 @@ fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
         collide_connected,
         linear_impulse,
         angular_impulse,
+        limit_impulse,
+        motor_impulse,
     };
     // 앵커(레버암)·축 정규성·임펄스 범위 — 전부 라이브 API와 같은 판정
     j.validate().map_err(|_| SnapshotError::InconsistentState)?;
@@ -564,11 +631,15 @@ fn joint_size(j: &Joint) -> usize {
         + 24
         + match j.kind {
             JointKind::Point => 1,
-            JointKind::Hinge { .. } => 1 + 24,
+            // 축 24 + limit(태그1+8) + motor(태그1+8)
+            JointKind::Hinge { .. } => 1 + 24 + 9 + 9,
+            JointKind::Fixed { .. } => 1 + 16,
+            JointKind::Distance { .. } => 1 + 8,
         }
         + 1
         + 12
-        + 8
+        + 12 // angular_impulse[3]
+        + 8 // limit_impulse + motor_impulse
 }
 
 fn command_size(c: &PendingCommand) -> usize {

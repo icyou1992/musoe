@@ -1421,7 +1421,7 @@ impl World {
         self.wake(a);
         self.wake(b);
         joint.linear_impulse = Vec3::ZERO;
-        joint.angular_impulse = [0.0, 0.0]; // 재사용 Joint 값의 잔여 임펄스 차단(리뷰 지적)
+        joint.clear_impulses(); // 재사용 Joint 값의 잔여 임펄스 차단(리뷰 지적)
         self.joints.push(joint);
         Ok(self.joints.len() - 1)
     }

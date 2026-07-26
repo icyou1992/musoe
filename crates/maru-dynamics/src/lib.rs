@@ -11,7 +11,7 @@ mod world;
 
 pub use body::{Body, BodyHandle, BodyType};
 pub use command::{Command, CommandReport};
-pub use joint::{Joint, JointKind};
+pub use joint::{Joint, JointKind, Motor};
 pub use snapshot::SnapshotError;
 pub use solver::SolverParams;
 pub use world::{
@@ -790,6 +790,256 @@ mod tests {
             Some(trigger),
             "명시하면 맞는다"
         );
+    }
+
+    /// 앵커 하나로 매단 두 바디를 만든다 (A는 static, B는 dynamic).
+    fn hung_pair(w: &mut World, offset: maru_math::Vec3) -> (BodyHandle, BodyHandle) {
+        let a = w.add_body(Body::new_static(
+            maru_collide::Shape::Sphere { radius: 0.2 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 10.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        let b = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Box {
+                half: maru_math::Vec3::new(0.3, 0.3, 0.3),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 10.0, 0.0) + offset,
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        (a, b)
+    }
+
+    /// **고정 조인트는 자세까지 묶는다** — 중력이 걸려도 상대 회전이 안 생겨야 한다.
+    #[test]
+    fn fixed_joint_holds_relative_orientation() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        w.try_add_joint(
+            Joint::try_fixed(
+                a,
+                b,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Vec3::ZERO,
+                maru_math::Quat::IDENTITY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..300 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let q = w.body(b).pose().rot;
+        // 상대 자세가 항등이어야 하므로 |w| ≈ 1
+        assert!(
+            q.w.abs() > 0.995,
+            "고정인데 회전했다: {q:?} (|w|={})",
+            q.w.abs()
+        );
+        let p = w.body(b).pose().pos;
+        assert!(
+            (p - maru_math::Vec3::new(1.0, 10.0, 0.0)).length() < 0.1,
+            "위치도 붙어 있어야 한다: {p:?}"
+        );
+    }
+
+    /// 거리 조인트는 **부등식**이다: 구간 안에서는 자유롭고 max를 넘으면 당긴다.
+    #[test]
+    fn distance_joint_is_a_rope_not_a_rod() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(0.0, -0.5, 0.0));
+        w.try_add_joint(
+            Joint::try_distance(a, b, maru_math::Vec3::ZERO, maru_math::Vec3::ZERO, 0.0, 2.0)
+                .unwrap(),
+        )
+        .unwrap();
+        // 처음엔 0.5 떨어져 있으니 자유낙하해야 한다
+        w.try_step(1.0 / 60.0).unwrap();
+        assert!(
+            w.body(b).linvel().y < -0.05,
+            "구간 안에서는 자유낙하: {:?}",
+            w.body(b).linvel()
+        );
+        for _ in 0..600 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let d = (w.body(b).pose().pos - maru_math::Vec3::new(0.0, 10.0, 0.0)).length();
+        assert!(
+            (d - 2.0).abs() < 0.1,
+            "max에서 멈춰야 한다 (로프): 거리={d}"
+        );
+    }
+
+    /// `min == max`면 막대다 — 양방향으로 붙잡는다.
+    #[test]
+    fn distance_joint_with_equal_bounds_is_a_rod() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(0.0, -1.0, 0.0));
+        w.try_add_joint(
+            Joint::try_distance(a, b, maru_math::Vec3::ZERO, maru_math::Vec3::ZERO, 1.0, 1.0)
+                .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..600 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let d = (w.body(b).pose().pos - maru_math::Vec3::new(0.0, 10.0, 0.0)).length();
+        assert!((d - 1.0).abs() < 0.08, "막대 길이 유지: {d}");
+    }
+
+    /// hinge 한계는 문이 벽을 뚫고 가지 않게 한다.
+    #[test]
+    fn hinge_limit_stops_rotation() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        let axis = maru_math::Vec3::new(0.0, 0.0, 1.0);
+        w.try_add_joint(
+            Joint::try_hinge(
+                a,
+                b,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Vec3::ZERO,
+                axis,
+                axis,
+            )
+            .unwrap()
+            .with_limit(-0.3, 0.3)
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..600 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        // 한계가 없으면 중력에 끌려 크게 돌아간다. 한계 안에 머물러야 한다.
+        let q = w.body(b).pose().rot;
+        let ang = 2.0 * q.z.abs().atan2(q.w.abs());
+        assert!(ang < 0.6, "한계를 크게 넘었다: {ang} rad");
+    }
+
+    /// 모터는 목표 각속도를 추종하되 `max_impulse`를 넘지 않는다.
+    #[test]
+    fn hinge_motor_drives_toward_target_speed() {
+        let mut w = World::new(WorldParams {
+            gravity: maru_math::Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        let axis = maru_math::Vec3::new(0.0, 0.0, 1.0);
+        w.try_add_joint(
+            Joint::try_hinge(
+                a,
+                b,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Vec3::ZERO,
+                axis,
+                axis,
+            )
+            .unwrap()
+            .with_motor(3.0, 100.0)
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..240 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let wz = w.body(b).angvel().z;
+        assert!(
+            (wz + 3.0).abs() < 0.5 || (wz - 3.0).abs() < 0.5,
+            "목표 각속도 3 rad/s를 추종해야 한다: {wz}"
+        );
+    }
+
+    /// 새 조인트 종류·한계·모터가 전부 스냅샷을 왕복해야 한다.
+    #[test]
+    fn new_joint_kinds_survive_snapshot() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        let axis = maru_math::Vec3::new(0.0, 0.0, 1.0);
+        w.try_add_joint(
+            Joint::try_fixed(
+                a,
+                b,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Vec3::ZERO,
+                maru_math::Quat::IDENTITY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        w.try_add_joint(
+            Joint::try_distance(a, b, maru_math::Vec3::ZERO, maru_math::Vec3::ZERO, 0.5, 2.0)
+                .unwrap(),
+        )
+        .unwrap();
+        w.try_add_joint(
+            Joint::try_hinge(
+                a,
+                b,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Vec3::ZERO,
+                axis,
+                axis,
+            )
+            .unwrap()
+            .with_limit(-1.0, 1.0)
+            .unwrap()
+            .with_motor(2.0, 50.0)
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..30 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let snap = w.try_snapshot().unwrap();
+        let mut r = World::new(WorldParams::default());
+        r.restore(&snap).unwrap();
+        assert_eq!(r.try_state_hash().unwrap(), w.try_state_hash().unwrap());
+        for _ in 0..30 {
+            w.try_step(1.0 / 60.0).unwrap();
+            r.try_step(1.0 / 60.0).unwrap();
+        }
+        assert_eq!(
+            r.try_state_hash().unwrap(),
+            w.try_state_hash().unwrap(),
+            "복원 후 미래가 갈리면 안 된다"
+        );
+    }
+
+    /// 잘못된 조인트 파라미터는 거부한다.
+    #[test]
+    fn new_joint_parameters_are_validated() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        let z = maru_math::Vec3::ZERO;
+        // min > max
+        assert!(Joint::try_distance(a, b, z, z, 2.0, 1.0).is_err());
+        // 음수 거리
+        assert!(Joint::try_distance(a, b, z, z, -1.0, 1.0).is_err());
+        // NaN
+        assert!(Joint::try_distance(a, b, z, z, 0.0, f32::NAN).is_err());
+        // 비단위 쿼터니언
+        assert!(Joint::try_fixed(
+            a,
+            b,
+            z,
+            z,
+            maru_math::Quat {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 0.0
+            }
+        )
+        .is_err());
+        // 한계·모터는 hinge에만
+        let p = Joint::try_point(a, b, z, z).unwrap();
+        assert!(p.clone().with_limit(-1.0, 1.0).is_err());
+        assert!(p.with_motor(1.0, 1.0).is_err());
     }
 
     /// 재질 설정자는 다른 쓰기 경로와 같은 규율을 따른다 — 바꾼 뒤 `validate`를 다시 통과해야 한다.
