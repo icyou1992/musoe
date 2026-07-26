@@ -24,7 +24,7 @@ pub use limits::{
     vec_in_state_range, vec_speed_in_range, MAX_ANCHOR, MAX_ANGULAR, MAX_DT, MAX_HULL_POINTS,
     MAX_INPUT, MAX_SHAPE_EXTENT, MAX_SPEED, MAX_STATE, MIN_DT, MIN_INV_MASS, MIN_SHAPE_EXTENT,
 };
-pub use manifold::{contact, ContactPoint, FeatureId, Manifold, FEATURE_GENERIC};
+pub use manifold::{contact, ContactPoint, FeatureId, Manifold, FEATURE_ANALYTIC, FEATURE_GENERIC};
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};
 pub use shape::Shape;

@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "maru-compare"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Maru vs 외부 엔진 성능·안정성 대조 (엔진 워크스페이스 밖 — 의존성 격리)"
+
+[dependencies]
+maru-dynamics = { path = "../crates/maru-dynamics" }
+maru-collide = { path = "../crates/maru-collide" }
+maru-math = { path = "../crates/maru-math" }
+rapier3d = "0.34"
+
+# 엔진과 **같은 릴리스 프로파일**을 쓴다 — 재결합 최적화 없이 lto=thin, cgu=1.
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -38,6 +38,9 @@ const FACE_DOT_MIN: f32 = 0.95;
 /// 계보 없는 witness 접점 표식. 클리핑 접점의 feature 인코딩(상위 비트=ref_is_a, 면·계보)과
 /// 겹치지 않는 예약값이며, 솔버는 이 값을 보면 **위치 근접**으로 캐시를 매칭한다.
 pub const FEATURE_GENERIC: u32 = 0xFFFF_0000;
+/// 전용(analytic) 경로가 만든 **안정적 단일 접점** ID. generic과 달리 스텝 간 동일 접촉이
+/// 같은 ID를 유지하므로 솔버가 위치 근접 게이트 없이 ID로 warm start를 잇는다.
+pub const FEATURE_ANALYTIC: u32 = 0xFFFE_0000;
 
 /// 클리핑 정점의 계보 (리뷰 MAJOR 반영 — 구 태그 재사용 인코딩은 다단 클리핑에서 서로 다른
 /// 계보가 같은 태그로 충돌했다): incident 원본 정점 비트합 ∪ 관여한 reference 측면 비트합.
@@ -50,6 +53,13 @@ struct ClipVertex {
 
 /// 접촉 생성 진입점. `margin` = speculative margin (양의 separation 허용 한계).
 pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<Manifold> {
+    // **전용 경로 우선**: 구-구는 해석적으로 정확하고 5 flops면 끝난다. 이걸 GJK+EPA로
+    // 돌리면 페어당 마이크로초가 든다(대조 실측: 내로우페이즈가 스텝의 58%).
+    // 정확도도 전용 경로가 낫다 — 반복 수렴 오차가 없고 접점 ID가 스텝 간 안정적이라
+    // warm start가 위치 근접 게이트에 의존하지 않는다.
+    if let (Shape::Sphere { radius: ra }, Shape::Sphere { radius: rb }) = (sa, sb) {
+        return sphere_sphere(*ra, pa.pos, *rb, pb.pos, margin);
+    }
     let (ra, rb) = (sa.radius(), sb.radius());
     let (normal, core_sep, on_a, on_b) = match gjk(sa, pa, sb, pb) {
         GjkResult::Separated {
@@ -100,6 +110,34 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
             // witness 단일점: 계보가 없다(곡면·에지-에지). 상위 비트로 **generic 표식**을 달아
             // 솔버가 ID 대신 위치 근접으로 warm start를 매칭하게 한다(리뷰 MAJOR).
             feature: FeatureId(FEATURE_GENERIC),
+        }],
+    })
+}
+
+/// 구-구 해석 접촉. 중심이 겹친 퇴화는 결정적 축(+Y)으로 분리한다.
+fn sphere_sphere(ra: f32, ca: Vec3, rb: f32, cb: Vec3, margin: f32) -> Option<Manifold> {
+    let d = cb - ca;
+    let dist2 = d.length_sq();
+    let sum = ra + rb;
+    let reach = sum + margin;
+    if dist2 > reach * reach {
+        return None;
+    }
+    let dist = dist2.sqrt();
+    // A를 +normal로 밀면 분리 (maru-collide 관례) → normal은 B에서 A로 향한다
+    let normal = if dist > 0.0 {
+        -d * (1.0 / dist)
+    } else {
+        Vec3::new(0.0, 1.0, 0.0)
+    };
+    let surface_a = ca - normal * ra;
+    let surface_b = cb + normal * rb;
+    Some(Manifold {
+        normal,
+        points: vec![ContactPoint {
+            position: (surface_a + surface_b) * 0.5,
+            separation: dist - sum,
+            feature: FeatureId(FEATURE_ANALYTIC),
         }],
     })
 }
