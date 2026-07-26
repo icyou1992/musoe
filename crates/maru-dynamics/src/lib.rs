@@ -15,7 +15,7 @@ pub use joint::{Joint, JointKind};
 pub use snapshot::SnapshotError;
 pub use solver::SolverParams;
 pub use world::{
-    ApiError, ContactEvent, ContactEventKind, Diagnostics, RayHit, World, WorldParams,
+    ApiError, ContactEvent, ContactEventKind, Diagnostics, QueryFilter, RayHit, World, WorldParams,
 };
 
 #[cfg(test)]
@@ -628,6 +628,167 @@ mod tests {
             !w.contact_events().iter().any(|e| e.a == b || e.b == b),
             "새 물체는 아직 아무것도 안 닿았다: {:?}",
             w.contact_events()
+        );
+    }
+
+    /// 감쇠는 속도를 지수적으로 줄인다 — `v(t) = v0 / (1 + t·d)` 근사.
+    #[test]
+    fn damping_slows_a_body_without_gravity() {
+        let mut w = World::new(WorldParams {
+            gravity: maru_math::Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let free = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 10.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        let damped = w.add_body(
+            Body::new_dynamic(
+                maru_collide::Shape::Sphere { radius: 0.5 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::new(0.0, 30.0, 0.0),
+                    rot: maru_math::Quat::IDENTITY,
+                },
+                1.0,
+            )
+            .with_damping(2.0, 0.0)
+            .unwrap(),
+        );
+        for h in [free, damped] {
+            w.set_linear_velocity(h, maru_math::Vec3::new(10.0, 0.0, 0.0))
+                .unwrap();
+        }
+        for _ in 0..60 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let vf = w.body(free).linvel().x;
+        let vd = w.body(damped).linvel().x;
+        assert!(
+            (vf - 10.0).abs() < 1e-3,
+            "감쇠 없으면 그대로여야 한다: {vf}"
+        );
+        assert!(vd < 4.0 && vd > 0.0, "감쇠는 줄이되 뒤집지 않는다: {vd}");
+    }
+
+    /// **큰 감쇠에서 부호가 뒤집히면 안 된다** — 암시적 형태를 쓰는 이유.
+    #[test]
+    fn huge_damping_does_not_reverse_velocity() {
+        let mut w = World::new(WorldParams {
+            gravity: maru_math::Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let h = w.add_body(
+            Body::new_dynamic(
+                maru_collide::Shape::Sphere { radius: 0.5 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::ZERO,
+                    rot: maru_math::Quat::IDENTITY,
+                },
+                1.0,
+            )
+            // h = dt/substeps = 1/240 이므로 h·d = 4 ≫ 1 — 명시적이면 부호가 뒤집힌다
+            .with_damping(1000.0, 0.0)
+            .unwrap(),
+        );
+        w.set_linear_velocity(h, maru_math::Vec3::new(10.0, 0.0, 0.0))
+            .unwrap();
+        w.try_step(1.0 / 60.0).unwrap();
+        let v = w.body(h).linvel().x;
+        assert!((0.0..1.0).contains(&v), "줄되 뒤집히지 않아야 한다: {v}");
+    }
+
+    #[test]
+    fn damping_input_is_validated_and_survives_snapshot() {
+        let mut w = World::new(WorldParams::default());
+        let h = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::ZERO,
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        assert_eq!(w.set_damping(h, -1.0, 0.0), Err(ApiError::InvalidValue));
+        assert_eq!(w.set_damping(h, f32::NAN, 0.0), Err(ApiError::InvalidValue));
+        w.set_damping(h, 1.5, 2.5).unwrap();
+        let snap = w.try_snapshot().unwrap();
+        let mut r = World::new(WorldParams::default());
+        r.restore(&snap).unwrap();
+        assert_eq!(r.body(h).linear_damping(), 1.5);
+        assert_eq!(r.body(h).angular_damping(), 2.5);
+    }
+
+    /// 질의 필터는 **물리 충돌과 같은 양방향 규칙**이어야 한다.
+    #[test]
+    fn query_filter_matches_physics_group_rule() {
+        let mut w = World::new(WorldParams::default());
+        let a = w.add_body(
+            Body::new_static(
+                maru_collide::Shape::Sphere { radius: 1.0 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::new(0.0, 0.0, 0.0),
+                    rot: maru_math::Quat::IDENTITY,
+                },
+            )
+            .with_groups(0b01, 0b01),
+        );
+        let b = w.add_body(
+            Body::new_static(
+                maru_collide::Shape::Sphere { radius: 1.0 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::new(5.0, 0.0, 0.0),
+                    rot: maru_math::Quat::IDENTITY,
+                },
+            )
+            .with_groups(0b10, 0b10),
+        );
+        let o = maru_math::Vec3::new(-10.0, 0.0, 0.0);
+        let d = maru_math::Vec3::new(1.0, 0.0, 0.0);
+        // 필터 없이는 가장 가까운 a
+        assert_eq!(w.cast_ray(o, d, 100.0).unwrap().map(|h| h.body), Some(a));
+        // 그룹 0b10만 보면 b
+        assert_eq!(
+            w.cast_ray_filtered(o, d, 100.0, QueryFilter::ALL.groups(0b10))
+                .unwrap()
+                .map(|h| h.body),
+            Some(b)
+        );
+        // 자기 자신 제외
+        assert_eq!(
+            w.cast_ray_filtered(o, d, 100.0, QueryFilter::ALL.exclude(a))
+                .unwrap()
+                .map(|h| h.body),
+            Some(b)
+        );
+    }
+
+    /// 센서는 **기본적으로 광선에 안 맞는다** — 총알이 트리거에 막히면 안 된다.
+    #[test]
+    fn sensors_are_excluded_from_queries_by_default() {
+        let mut w = World::new(WorldParams::default());
+        let trigger = w.add_body(
+            Body::new_static(
+                maru_collide::Shape::Sphere { radius: 1.0 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::ZERO,
+                    rot: maru_math::Quat::IDENTITY,
+                },
+            )
+            .as_sensor(true),
+        );
+        let o = maru_math::Vec3::new(-10.0, 0.0, 0.0);
+        let d = maru_math::Vec3::new(1.0, 0.0, 0.0);
+        assert!(w.cast_ray(o, d, 100.0).unwrap().is_none(), "기본은 제외");
+        assert_eq!(
+            w.cast_ray_filtered(o, d, 100.0, QueryFilter::ALL.with_sensors())
+                .unwrap()
+                .map(|h| h.body),
+            Some(trigger),
+            "명시하면 맞는다"
         );
     }
 
@@ -1681,9 +1842,10 @@ mod tests {
         let before = w.state_hash();
 
         // 슬롯(Box): alive1+oob1+reserved1+gen4
-        //            + 본문(106 + force12 + torque12 + membership4 + filter4 + sensor1 = 139)
-        //            + sleep4+asleep1+island4 = 155
-        const SLOT: usize = 155;
+        //            + 본문(106 + force12 + torque12 + membership4 + filter4 + sensor1
+        //                   + damping8 = 147)
+        //            + sleep4+asleep1+island4 = 163
+        const SLOT: usize = 163;
         let type_off = HDR + 4 + SLOT + 1 + 1 + 1 + 4;
         assert_eq!(
             good[type_off], 1,

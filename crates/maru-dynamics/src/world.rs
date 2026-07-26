@@ -58,6 +58,47 @@ pub type IntBuild = std::hash::BuildHasherDefault<IntHasher>;
 pub type IntMap<K, V> = HashMap<K, V, IntBuild>;
 pub type IntSet<K> = std::collections::HashSet<K, IntBuild>;
 
+/// 질의 필터.
+///
+/// 물리 충돌과 **같은 양방향 그룹 규칙**을 쓴다 — 총알이 뚫고 지나가야 할 것은
+/// 광선에도 안 맞아야 자연스럽고, 규칙이 갈리면 호스트가 같은 개념을 두 벌로 관리한다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryFilter {
+    /// 질의자의 그룹 비트 (membership 겸 filter로 본다).
+    pub groups: u32,
+    /// 센서(트리거)도 맞힐 것인가. 기본은 **제외** — 총알이 트리거에 막히면 안 된다.
+    pub include_sensors: bool,
+    /// 이 물체는 건너뛴다 (자기 자신을 맞히는 것 방지).
+    pub exclude: Option<BodyHandle>,
+}
+
+impl QueryFilter {
+    /// 전부 통과 (센서 제외).
+    pub const ALL: Self = Self {
+        groups: u32::MAX,
+        include_sensors: false,
+        exclude: None,
+    };
+    pub fn groups(mut self, g: u32) -> Self {
+        self.groups = g;
+        self
+    }
+    pub fn with_sensors(mut self) -> Self {
+        self.include_sensors = true;
+        self
+    }
+    pub fn exclude(mut self, h: BodyHandle) -> Self {
+        self.exclude = Some(h);
+        self
+    }
+}
+
+impl Default for QueryFilter {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 /// 접촉 이벤트 — 두 물체가 닿기 시작했거나 떨어졌다.
 ///
 /// "닿았다"의 기준은 **접촉 매니폴드가 생겼는가**다(스펙큘레이티브 마진 안이면 생긴다).
@@ -212,6 +253,8 @@ pub struct World {
     inv_inertia_local: Vec<Vec3>,
     /// 스텝 스크래치: 슬롯별 누적 (힘, 토크). 솔버 루프가 뚱뚱한 `Body`를 다시 훑지 않게 한다.
     ext_force: Vec<(Vec3, Vec3)>,
+    /// 스텝 스크래치: 슬롯별 (선형 감쇠, 각 감쇠).
+    damping: Vec<(f32, f32)>,
     /// 이번 스텝의 접촉 이벤트. 스텝 시작에 비우고 스텝 안에서 채운다.
     contact_events: Vec<ContactEvent>,
     /// **직전 스텝에 닿아 있던 페어 집합** — 이벤트의 기준선.
@@ -389,6 +432,7 @@ impl World {
             solver_state: solver::SolverState::default(),
             inv_inertia_local: Vec::new(),
             ext_force: Vec::new(),
+            damping: Vec::new(),
             contact_events: Vec::new(),
             touching: IntSet::default(),
             integrate_gate: Vec::new(),
@@ -718,9 +762,27 @@ impl World {
         dir: Vec3,
         max_toi: f32,
     ) -> Result<Option<RayHit>, ApiError> {
+        self.cast_ray_filtered(origin, dir, max_toi, QueryFilter::ALL)
+    }
+
+    /// 필터를 받는 광선 질의.
+    ///
+    /// 물리 충돌과 **같은 양방향 그룹 규칙**을 쓴다(`QueryFilter::groups`). 총알이
+    /// 뚫고 지나가야 할 것은 광선에도 안 맞아야 자연스럽다 — 두 규칙이 갈리면
+    /// 호스트가 같은 개념을 두 벌로 관리하게 된다.
+    pub fn cast_ray_filtered(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_toi: f32,
+        filter: QueryFilter,
+    ) -> Result<Option<RayHit>, ApiError> {
         let (origin, dir, max_toi) = Self::check_ray(origin, dir, max_toi)?;
         let mut best: Option<RayHit> = None;
         for i in 0..self.bodies.len() {
+            if !self.passes(i, filter) {
+                continue;
+            }
             let Some(hit) = self.ray_body(i, origin, dir, max_toi) else {
                 continue;
             };
@@ -740,12 +802,27 @@ impl World {
         max_toi: f32,
         out: &mut Vec<RayHit>,
     ) -> Result<(), ApiError> {
+        self.cast_ray_all_filtered(origin, dir, max_toi, QueryFilter::ALL, out)
+    }
+
+    /// 필터를 받는 전체 광선 질의.
+    pub fn cast_ray_all_filtered(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_toi: f32,
+        filter: QueryFilter,
+        out: &mut Vec<RayHit>,
+    ) -> Result<(), ApiError> {
         let (origin, dir, max_toi) = Self::check_ray(origin, dir, max_toi)?;
         out.clear();
         if out.try_reserve(self.bodies.len()).is_err() {
             return Err(ApiError::ResourceLimit);
         }
         for i in 0..self.bodies.len() {
+            if !self.passes(i, filter) {
+                continue;
+            }
             if let Some(hit) = self.ray_body(i, origin, dir, max_toi) {
                 out.push(hit);
             }
@@ -757,6 +834,16 @@ impl World {
 
     /// AABB와 겹치는 물체들 (슬롯 오름차순). 광역 검색·에디터 박스 선택용.
     pub fn query_aabb(&self, aabb: Aabb, out: &mut Vec<BodyHandle>) -> Result<(), ApiError> {
+        self.query_aabb_filtered(aabb, QueryFilter::ALL, out)
+    }
+
+    /// 필터를 받는 AABB 질의.
+    pub fn query_aabb_filtered(
+        &self,
+        aabb: Aabb,
+        filter: QueryFilter,
+        out: &mut Vec<BodyHandle>,
+    ) -> Result<(), ApiError> {
         if !maru_collide::vec_in_range(aabb.min) || !maru_collide::vec_in_range(aabb.max) {
             return Err(ApiError::InvalidValue);
         }
@@ -765,7 +852,7 @@ impl World {
             return Err(ApiError::ResourceLimit);
         }
         for i in 0..self.bodies.len() {
-            if !self.query_visible(i) {
+            if !self.passes(i, filter) {
                 continue;
             }
             if aabb.overlaps(self.body_aabb(i)) {
@@ -777,6 +864,16 @@ impl World {
 
     /// 점을 품은 물체들 (슬롯 오름차순). 겉면 기준 — convex radius를 포함한다.
     pub fn query_point(&self, p: Vec3, out: &mut Vec<BodyHandle>) -> Result<(), ApiError> {
+        self.query_point_filtered(p, QueryFilter::ALL, out)
+    }
+
+    /// 필터를 받는 점 질의.
+    pub fn query_point_filtered(
+        &self,
+        p: Vec3,
+        filter: QueryFilter,
+        out: &mut Vec<BodyHandle>,
+    ) -> Result<(), ApiError> {
         if !maru_collide::vec_in_range(p) {
             return Err(ApiError::InvalidValue);
         }
@@ -785,7 +882,7 @@ impl World {
             return Err(ApiError::ResourceLimit);
         }
         for i in 0..self.bodies.len() {
-            if !self.query_visible(i) {
+            if !self.passes(i, filter) {
                 continue;
             }
             let b = &self.bodies[i];
@@ -817,6 +914,28 @@ impl World {
     /// 최적화지 부재가 아니다.
     fn query_visible(&self, i: usize) -> bool {
         self.alive[i] && !self.oob[i]
+    }
+
+    /// 질의 필터 통과 판정 (가시성 + 그룹 + 센서 + 제외 핸들).
+    fn passes(&self, i: usize, f: QueryFilter) -> bool {
+        if !self.query_visible(i) {
+            return false;
+        }
+        let b = &self.bodies[i];
+        if b.sensor && !f.include_sensors {
+            return false;
+        }
+        // 물리 충돌과 **같은 양방향 규칙**. 질의자를 membership=`groups`,
+        // filter=`groups`인 가상의 물체로 본다.
+        if (f.groups & b.filter) == 0 || (b.membership & f.groups) == 0 {
+            return false;
+        }
+        if let Some(ex) = f.exclude {
+            if ex.index as usize == i {
+                return false;
+            }
+        }
+        true
     }
 
     /// 슬롯의 월드 AABB (sweep 없음 — 질의용 정지 경계).
@@ -861,6 +980,24 @@ impl World {
             normal: rc.normal,
             started_inside: rc.started_inside,
         })
+    }
+
+    /// 감쇠 설정 (1/s). 음수·NaN·상한 초과는 거부한다.
+    pub fn set_damping(
+        &mut self,
+        h: BodyHandle,
+        linear: f32,
+        angular: f32,
+    ) -> Result<(), ApiError> {
+        if !(linear >= 0.0 && maru_collide::in_range(linear))
+            || !(angular >= 0.0 && maru_collide::in_range(angular))
+        {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.resolve(h)?;
+        self.bodies[i].linear_damping = linear;
+        self.bodies[i].angular_damping = angular;
+        Ok(())
     }
 
     pub fn set_linear_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
@@ -1854,6 +1991,13 @@ impl World {
         let ext_force = &mut self.ext_force;
         ext_force.clear();
         ext_force.extend(self.bodies.iter().map(|b| (b.force, b.torque)));
+        let damping = &mut self.damping;
+        damping.clear();
+        damping.extend(
+            self.bodies
+                .iter()
+                .map(|b| (b.linear_damping, b.angular_damping)),
+        );
         // 적분 대상 게이트도 스크래치에 재사용한다(루프에서 매번 판정하지 않는다).
         let integrate = &mut self.integrate_gate;
         let gravity_on = &mut self.gravity_gate;
@@ -1869,6 +2013,7 @@ impl World {
         }
         let inv_i_local = &self.inv_inertia_local;
         let ext_force = &self.ext_force;
+        let damping = &self.damping;
         let integrate = &self.integrate_gate;
         let gravity_on = &self.gravity_gate;
         let (max_lin, max_ang) = (
@@ -1902,6 +2047,15 @@ impl World {
                 }
                 if t != Vec3::ZERO {
                     st.ang[i] += st.inv_i[i].mul_vec(t) * h;
+                }
+                // **암시적 감쇠**: v ← v / (1 + h·d). 명시적(`1 - h·d`)이면 `h·d > 1`에서
+                // 부호가 뒤집혀 발산한다 — 호스트가 큰 값을 넣으면 폭발하는 대신 더 세게 멈춘다.
+                let (dl, da) = damping[i];
+                if dl > 0.0 {
+                    st.lin[i] = st.lin[i] * (1.0 / (1.0 + h * dl));
+                }
+                if da > 0.0 {
+                    st.ang[i] = st.ang[i] * (1.0 / (1.0 + h * da));
                 }
             }
             st.refresh_inv_i_active(inv_i_local, &active);

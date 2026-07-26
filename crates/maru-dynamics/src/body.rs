@@ -72,6 +72,13 @@ pub struct Body {
     pub(crate) filter: u32,
     /// 감지 전용(트리거). 접촉 이벤트는 내지만 임펄스는 주고받지 않는다.
     pub(crate) sensor: bool,
+    /// 선형 감쇠 (1/s). 매 서브스텝 `v ← v / (1 + h·d)`로 **암시적**으로 적용한다.
+    ///
+    /// 명시적(`v *= 1 - h·d`)이면 `h·d > 1`에서 부호가 뒤집혀 발산한다 —
+    /// 호스트가 큰 값을 넣었을 때 조용히 폭발하는 대신 그냥 더 강하게 멈춘다.
+    pub(crate) linear_damping: f32,
+    /// 각 감쇠 (1/s). 같은 암시적 형태.
+    pub(crate) angular_damping: f32,
 }
 
 impl Body {
@@ -133,6 +140,23 @@ impl Body {
         self.sensor = sensor;
         self
     }
+    /// 선형 감쇠 (1/s).
+    #[inline]
+    pub fn linear_damping(&self) -> f32 {
+        self.linear_damping
+    }
+    /// 각 감쇠 (1/s).
+    #[inline]
+    pub fn angular_damping(&self) -> f32 {
+        self.angular_damping
+    }
+    /// 감쇠를 바꾼 사본. 음수·NaN·상한 초과는 오류다.
+    pub fn with_damping(mut self, linear: f32, angular: f32) -> Result<Self, ApiError> {
+        self.linear_damping = linear;
+        self.angular_damping = angular;
+        self.validate()?;
+        Ok(self)
+    }
     /// 다음 스텝에 적용될 누적 힘 (월드 좌표).
     #[inline]
     pub fn force(&self) -> Vec3 {
@@ -172,6 +196,12 @@ impl Body {
         // (입력 한 건은 setter가 입력 범위로 거르고, 누적분은 포화시킨다).
         if !maru_collide::vec_in_state_range(self.force)
             || !maru_collide::vec_in_state_range(self.torque)
+        {
+            return Err(ApiError::InvalidValue);
+        }
+        // 감쇠는 비음수 유한값 (양성 조건으로 비교 — `!(x < 0)`은 NaN을 통과시킨다)
+        if !(self.linear_damping >= 0.0 && in_range(self.linear_damping))
+            || !(self.angular_damping >= 0.0 && in_range(self.angular_damping))
         {
             return Err(ApiError::InvalidValue);
         }
@@ -260,6 +290,8 @@ impl Body {
             membership: ALL_GROUPS,
             filter: ALL_GROUPS,
             sensor: false,
+            linear_damping: 0.0,
+            angular_damping: 0.0,
         };
         b.validate()?;
         Ok(b)
@@ -308,6 +340,8 @@ impl Body {
             membership: ALL_GROUPS,
             filter: ALL_GROUPS,
             sensor: false,
+            linear_damping: 0.0,
+            angular_damping: 0.0,
         };
         b.validate()?;
         Ok(b)
@@ -366,6 +400,8 @@ impl Body {
             membership: ALL_GROUPS,
             filter: ALL_GROUPS,
             sensor: false,
+            linear_damping: 0.0,
+            angular_damping: 0.0,
         };
         // **생성자는 자기 삽입 정책을 위반한 값을 내보내지 않는다**(리뷰 NEW MAJOR):
         // density=1e-10인 반지름 1m 구는 위 검사를 다 통과하지만 inv_mass≈2.39e9로
@@ -394,6 +430,8 @@ impl Body {
             membership: ALL_GROUPS,
             filter: ALL_GROUPS,
             sensor: false,
+            linear_damping: 0.0,
+            angular_damping: 0.0,
         };
         b.validate()
             .expect("constructed body violates the size policy");
