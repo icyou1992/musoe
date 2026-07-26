@@ -144,7 +144,7 @@ pub struct SolverState {
 impl SolverState {
     /// 바디에서 상태를 **제자리로** 채운다. 매 스텝 새 Vec을 만들면 할당 비용이
     /// 솔버 이득을 먹는다(실측: SoA 전환이 되레 1.3ms 느려졌다) — 버퍼는 월드가 보관한다.
-    pub fn sync_from(&mut self, bodies: &[Body], alive: &[bool]) {
+    pub fn sync_from(&mut self, bodies: &[Body], alive: &[bool], oob: &[bool]) {
         let n = bodies.len();
         macro_rules! fit {
             ($v:expr, $d:expr) => {
@@ -162,12 +162,15 @@ impl SolverState {
         fit!(self.dynamic, false);
         for i in 0..n {
             let b = &bodies[i];
-            self.lin[i] = b.linvel;
-            self.ang[i] = b.angvel;
+            // **OOB는 솔버에서도 비활성**이다(리뷰 BLOCKER: `dynamic`을 타입만 보고 정해서
+            // OOB에 임펄스가 들어가고 그 속도가 바디로 되쓰였다). 적분 게이트만으로는 부족하다.
+            let active = alive[i] && !oob[i];
+            self.lin[i] = if active { b.linvel } else { Vec3::ZERO };
+            self.ang[i] = if active { b.angvel } else { Vec3::ZERO };
             self.pos[i] = b.pose.pos;
             self.rot[i] = b.pose.rot;
-            self.inv_m[i] = b.inv_mass;
-            self.dynamic[i] = alive[i] && b.is_dynamic();
+            self.inv_m[i] = if active { b.inv_mass } else { 0.0 };
+            self.dynamic[i] = active && b.is_dynamic();
         }
     }
 

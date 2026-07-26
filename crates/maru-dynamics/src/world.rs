@@ -205,9 +205,13 @@ fn validate_params(params: &WorldParams) {
 pub(crate) fn anchor_fits(b: &Body, anchor: Vec3) -> bool {
     const ANCHOR_SCALE: f32 = 4.0;
     let bb = b.shape.local_aabb();
-    // **바디 원점에서 가장 먼 AABB 코너까지의 거리**를 쓴다(리뷰 MAJOR).
-    // 반대각선(크기)만 쓰면 원점에서 100m 떨어진 1m 크기 static hull의 정상 표면 앵커가
-    // 거부된다 — 앵커는 원점 기준 좌표이므로 척도도 원점 기준이어야 한다.
+    // **바디 원점에서 가장 먼 AABB 코너까지의 거리**를 쓴다. 앵커는 원점 기준 좌표이므로
+    // 척도도 원점 기준이어야 한다(원점에서 떨어진 hull의 정상 표면 앵커 허용).
+    //
+    // 이 스칼라 한계만으로는 **이방성 바디의 조건수**를 막지 못한다
+    // (`Box{half:(1000,1e-3,1e-3)}` + 앵커 `(0,1000,0)`). 그래서 축별로 더 조이는 대신
+    // — 축별 결합은 로드형 진자(작은 추가 1m 밖에 매달림) 같은 정상 구성을 막는다 —
+    // `try_add_joint`가 **실제 K 행렬의 역행렬 가능성**을 직접 확인한다(`joint_k_is_solvable`).
     let far = Vec3::new(
         bb.min.x.abs().max(bb.max.x.abs()),
         bb.min.y.abs().max(bb.max.y.abs()),
@@ -792,6 +796,14 @@ impl World {
         {
             return Err(ApiError::InvalidValue);
         }
+        // **실제 K 행렬이 풀리는지 확인한다**(리뷰 BLOCKER). 형상·앵커 휴리스틱으로는
+        // 이방성 조합을 다 막을 수 없다: `Box{half:(1000,1e-3,1e-3)}`에 앵커 `(0,1000,0)`이면
+        // K가 `diag(4, 1, 1.5e12)`가 되어 정규화 det가 1e-24로 떨어지고 `Mat3::inverse`가
+        // 0 행렬을 돌려준다 — 조인트가 **오류 없이 조용히 풀린다**.
+        // 솔버가 쓰는 것과 **같은 함수**로 K를 만들어 같은 판정을 한다(휴리스틱이 아니라 실측).
+        if !crate::joint::k_is_solvable(&self.bodies, &joint) {
+            return Err(ApiError::InvalidValue);
+        }
         self.wake(a);
         self.wake(b);
         joint.linear_impulse = Vec3::ZERO;
@@ -997,12 +1009,16 @@ impl World {
             );
             let r = far.length();
             let world = Aabb::from_center(b.pose.pos, Vec3::new(r, r, r));
-            // OOB는 **모든 시뮬레이션 경로에서 빠진다**(리뷰 BLOCKER: 플래그만 분리하고
-            // 중력·적분·브로드페이즈에는 그대로 들어가 있었다). static anchor처럼 취급한다 —
-            // 다른 바디는 여전히 이 바디에 부딪힐 수 있지만 자신은 움직이지 않는다.
+            // OOB는 **시뮬레이션에서 완전히 빠진다** — 브로드페이즈에도 넣지 않는다.
+            // static tree에 넣으면 PCM 키에 STATIC_BIT가 붙는데 실제 타입은 Dynamic이라
+            // 스냅샷 구조 검증(`STATIC_BIT == (type==Static)`)이 **자기 스냅샷을 거부**한다
+            // (리뷰 BLOCKER). 월드 밖 물체와의 접촉을 흉내 내는 것보다 계약을 하나로 두는 편이
+            // 정직하다: OOB는 없는 것처럼 취급되고, 호스트가 `set_pose`로 되돌려야 살아난다.
+            if self.oob[i] {
+                continue;
+            }
             match b.body_type {
                 BodyType::Static => static_items.push((i as u32, world)),
-                _ if self.oob[i] => static_items.push((i as u32, world)),
                 _ => {
                     let vel_dt = b.linvel * dt;
                     dyn_items.push((
@@ -1208,7 +1224,9 @@ impl World {
                             BodyType::Static => false,
                         }
                 };
-                awake(j.ia()) || awake(j.ib())
+                // 한쪽이라도 OOB면 조인트 자체를 비활성화한다 — OOB에 임펄스를 주면
+                // "시뮬레이션에서 빠진다"는 계약이 깨지고, 상대만 끌려간다.
+                !self.oob[j.ia()] && !self.oob[j.ib()] && (awake(j.ia()) || awake(j.ib()))
             })
             .map(|(i, _)| i)
             .collect();
@@ -1218,7 +1236,7 @@ impl World {
         // 뽑아 돌리고 루프가 끝난 뒤 한 번만 되쓴다.
         let n_bodies = self.bodies.len();
         let mut st = std::mem::take(&mut self.solver_state);
-        st.sync_from(&self.bodies, &self.alive);
+        st.sync_from(&self.bodies, &self.alive, &self.oob);
         let inv_i_local = &mut self.inv_inertia_local;
         inv_i_local.clear();
         inv_i_local.extend(self.bodies.iter().map(|b| b.inv_inertia_local));

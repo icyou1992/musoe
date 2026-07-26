@@ -52,9 +52,14 @@ pub const MAX_INV_MASS: f32 = 1.0e6;
 /// 관성 1e10 kg·m²는 반지름 100m·질량 1e6kg 물체(≈6.7e9)를 여전히 포함한다.
 pub const MIN_INV_INERTIA: f32 = 1.0e-10;
 pub const MAX_INV_INERTIA: f32 = 1.0e12;
-/// hull 정점 수 상한. support가 O(n) 선형 스캔이라 성능 상한이자 직렬화 자원 상한이다.
-/// 더 복잡한 메시는 convex decomposition으로 나눈다(v1 계약).
-pub const MAX_HULL_POINTS: usize = 1024;
+/// hull 정점 수 상한.
+///
+/// **정확히 검증할 수 있는 범위로 낮췄다**(리뷰 MAJOR). 최소 폭은 삼중조합 전수 열거로만
+/// 정확하고, 그 비용이 감당되는 구간이 32점이다. 1024점을 허용하면 고정 support 방향에
+/// 걸리지 않는 얇은 면(0.5mm bevel 등)이 스크린을 통과해 `MIN_SHAPE_EXTENT` 계약이
+/// 깨진다 — **검증할 수 없는 것을 지원한다고 말하지 않는다.**
+/// 더 복잡한 메시는 convex decomposition으로 여러 hull로 나눈다(v1 계약).
+pub const MAX_HULL_POINTS: usize = 32;
 
 /// 파생 상태 상한 (위치·속도·누적 임펄스·PCM).
 ///

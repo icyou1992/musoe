@@ -529,7 +529,7 @@ mod tests {
         assert_pyramid_stable(&w, &hs, 10);
     }
 
-    /// **M2 수용 기준 (2026-07-26 장기창 재보정)**: 피라미드 28단(406박스) 50초 안정.
+    /// **M2 수용 기준 (2026-07-26 장기창 재보정)**: 피라미드 29단(435박스) 50초 안정.
     ///
     /// # 창 길이가 기준의 일부다
     /// 이전 기준은 40단 × 600스텝(10초)이었고 통과했다. 같은 장면을 3000스텝(50초) 돌리면
@@ -538,7 +538,7 @@ mod tests {
     /// 실수를 창 길이에서 반복**했다.
     ///
     /// 실측 장기 봉투(4 서브스텝·30Hz 접촉, 50초):
-    /// 10·20·22·24·26·**28단 안정**(전부 잠듦, vmax 0.000) / **29단부터 붕괴**(vmax 195+).
+    /// 10·20·22·26·28·**29단 안정**(전부 잠듦, vmax 0.000) / **30단부터 붕괴**(vmax 320).
     /// 경계는 재현적이다(반복 간 비트 동일 — L0 결정론 유지).
     ///
     /// # 안정의 실질 판정은 '잠들었는가'다
@@ -549,8 +549,8 @@ mod tests {
     /// release 전용 — debug는 수 분 걸린다. `cargo test --release -- --ignored`
     #[test]
     #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
-    fn pyramid_28_tiers_long_run_acceptance() {
-        const TIERS: usize = 28;
+    fn pyramid_29_tiers_long_run_acceptance() {
+        const TIERS: usize = 29;
         let mut w = World::new(WorldParams::default());
         // 지면은 `maru-bench --bin pyramid100`과 **동일**해야 한다 — 같은 수용 기준이 서로 다른
         // 씬을 재면 README 봉투 표와 CI 게이트가 어긋난다.
@@ -575,11 +575,11 @@ mod tests {
         );
     }
 
-    /// 봉투 **밖**(29단)은 실제로 붕괴한다 — 기준이 판별력을 갖는지 잠근다.
+    /// 봉투 **밖**(30단)은 실제로 붕괴한다 — 기준이 판별력을 갖는지 잠근다.
     /// 이 테스트가 실패하면 봉투가 넓어진 것이므로 위 기준을 다시 재야 한다.
     #[test]
     #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
-    fn pyramid_29_tiers_is_outside_the_envelope() {
+    fn pyramid_30_tiers_is_outside_the_envelope() {
         let mut w = World::new(WorldParams::default());
         w.add_body(Body::new_static(
             Shape::Box {
@@ -588,14 +588,14 @@ mod tests {
             },
             pose(0.0, -1.0, 0.0),
         ));
-        let hs = pyramid(&mut w, 29);
+        let hs = pyramid(&mut w, 30);
         for _ in 0..3000 {
             w.step(DT);
         }
         let top = w.body(*hs.last().unwrap()).pose.pos.y;
         assert!(
-            top < 0.99 * (0.5 + 28.0),
-            "29단이 버텼다 — 봉투가 넓어졌으니 수용 기준을 재측정할 것 (top_y={top:.2})"
+            top < 0.99 * (0.5 + 29.0),
+            "30단이 버텼다 — 봉투가 넓어졌으니 수용 기준을 재측정할 것 (top_y={top:.2})"
         );
     }
 
@@ -2536,5 +2536,185 @@ mod tests {
             .is_err(),
             "sliver hull이 통과 (단일 평면 높이만 재고 있다)"
         );
+    }
+
+    // ─────────── 리뷰 rev_c18c4dc0 회귀 ───────────
+
+    /// BLOCKER: 형상·앵커 휴리스틱으로는 **이방성** 조합의 K 특이화를 막을 수 없다.
+    /// 리뷰가 제시한 구성(길쭉한 박스 + 얇은 축 방향 앵커)은 전역·반경 한계를 모두
+    /// 통과하지만 K가 diag(4, 1, 1.5e12)가 되어 `Mat3::inverse`가 0 행렬을 돌려준다.
+    /// 이제 삽입 시 **실제 K**를 만들어 풀리는지 확인한다.
+    #[test]
+    fn anisotropic_body_with_long_anchor_is_rejected_by_k_check() {
+        let mut w = World::new(WorldParams::default());
+        let rod = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(1000.0, 0.001, 0.001),
+                radius: 0.0,
+            },
+            pose(0.0, 0.0, 0.0),
+            125.0,
+        ));
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.1 },
+            pose(0.0, 1000.0, 0.0),
+        ));
+        assert_eq!(
+            w.try_add_joint(Joint::point(
+                rod,
+                anchor,
+                Vec3::new(0.0, 1000.0, 0.0),
+                Vec3::ZERO
+            )),
+            Err(ApiError::InvalidValue),
+            "K가 특이해지는 조인트가 통과 — 조용히 풀린다"
+        );
+        // 같은 바디라도 **긴 축** 방향 앵커는 조건수가 멀쩡하므로 허용돼야 한다
+        assert!(w
+            .try_add_joint(Joint::point(
+                rod,
+                anchor,
+                Vec3::new(1000.0, 0.0, 0.0),
+                Vec3::ZERO
+            ))
+            .is_ok());
+    }
+
+    /// 로드형 진자(작은 추가 1m 밖에 매달림)는 **정상 구성**이다 —
+    /// 축별 결합 같은 과잉 제약으로 막으면 안 된다.
+    #[test]
+    fn rod_style_pendulum_anchor_is_allowed() {
+        let mut w = World::new(WorldParams::default());
+        let a = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.1 },
+            pose(0.0, 5.0, 0.0),
+        ));
+        let bob = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.2, 0.2, 0.2),
+                radius: 0.0,
+            },
+            pose(1.0, 5.0, 0.0),
+            1.0,
+        ));
+        assert!(w
+            .try_add_joint(Joint::point(a, bob, Vec3::ZERO, Vec3::new(-1.0, 0.0, 0.0)))
+            .is_ok());
+    }
+
+    /// BLOCKER: OOB는 **솔버에서도** 비활성이어야 한다. 적분 게이트만 막으면 정상 바디와
+    /// 접촉·조인트를 통해 임펄스를 받고 그 속도가 바디로 되쓰인다.
+    /// 그리고 OOB 접촉이 만든 PCM 키(STATIC_BIT + Dynamic 타입)는 **자기 스냅샷을 거부**했다.
+    #[test]
+    fn out_of_bounds_body_takes_no_impulse_and_roundtrips() {
+        let mut w = World::new(WorldParams::default());
+        let edge = maru_collide::MAX_INPUT - 5.0;
+        // 경계 밖으로 날려 OOB로 만든다
+        let ghost = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(edge, 0.0, 0.0),
+            1.0,
+        ));
+        w.set_linear_velocity(ghost, Vec3::new(500.0, 0.0, 0.0))
+            .unwrap();
+        for _ in 0..10 {
+            let _ = w.try_step(crate::world::MAX_DT);
+        }
+        assert!(w.is_out_of_bounds(ghost));
+        let frozen = w.body(ghost).pose().pos;
+
+        // 정상 바디를 그 자리로 떨어뜨린다 — 접촉이 생기면 OOB가 밀려나면 안 된다
+        let live = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            Pose {
+                pos: frozen + Vec3::new(0.0, 3.0, 0.0),
+                rot: Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        for _ in 0..200 {
+            let _ = w.try_step(DT);
+            // 매 스텝 자기 스냅샷이 복원돼야 한다 (PCM 키 계약)
+            let snap = w.snapshot();
+            assert!(
+                w.restore(&snap).is_ok(),
+                "OOB 접촉이 복원 불가 PCM 키를 만들었다"
+            );
+        }
+        let now = w.body(ghost).pose().pos;
+        assert!(
+            (now - frozen).length() < 1e-3,
+            "OOB가 임펄스를 받아 움직였다: {frozen:?} → {now:?}"
+        );
+        assert_eq!(w.body(ghost).linvel().length(), 0.0);
+        let _ = live;
+    }
+
+    /// MAJOR: SAT 동률이 A/B **대칭**이어야 한다 — 같은 두 박스의 삽입 순서를 뒤집었다고
+    /// 반력·마찰 방향이 달라지면 물리가 인덱스에 의존하는 것이다.
+    #[test]
+    fn sat_tie_break_is_symmetric_under_body_order() {
+        let half = Vec3::new(0.5, 0.5, 0.5);
+        let mk = |first_at: Vec3, second_at: Vec3| {
+            let mut w = World::new(WorldParams {
+                gravity: Vec3::ZERO,
+                ..Default::default()
+            });
+            let a = w.add_body(Body::new_dynamic(
+                Shape::Box { half, radius: 0.0 },
+                Pose {
+                    pos: first_at,
+                    rot: Quat::IDENTITY,
+                },
+                1.0,
+            ));
+            let b = w.add_body(Body::new_dynamic(
+                Shape::Box { half, radius: 0.0 },
+                Pose {
+                    pos: second_at,
+                    rot: Quat::IDENTITY,
+                },
+                1.0,
+            ));
+            for _ in 0..30 {
+                w.step(DT);
+            }
+            (w.body(a).pose().pos, w.body(b).pose().pos)
+        };
+        // 코너 접촉(세 축의 분리가 근소 동률) — 동률 정책이 실제로 개입하는 구성
+        let p = Vec3::new(0.0, 0.0, 0.0);
+        let q = Vec3::new(0.94, 0.94, 0.94);
+        let (a1, b1) = mk(p, q);
+        let (b2, a2) = mk(q, p); // 순서를 뒤집어 같은 장면을 만든다
+        assert!(
+            (a1 - a2).length() < 1e-4 && (b1 - b2).length() < 1e-4,
+            "삽입 순서에 따라 결과가 다르다: {a1:?}/{a2:?}, {b1:?}/{b2:?}"
+        );
+    }
+
+    /// MAJOR: hull 지원 상한은 **정확히 검증 가능한 범위**여야 한다.
+    #[test]
+    fn hull_support_limit_matches_exact_verification() {
+        assert_eq!(maru_collide::MAX_HULL_POINTS, 32);
+        let too_many: Vec<Vec3> = (0..33)
+            .map(|i| {
+                let f = i as f32 * 0.1;
+                Vec3::new(f.sin(), f.cos(), (f * 0.7).sin())
+            })
+            .collect();
+        assert!(Body::try_new_static(
+            Shape::Hull {
+                points: too_many,
+                radius: 0.0
+            },
+            pose(0.0, 0.0, 0.0)
+        )
+        .is_err());
     }
 }

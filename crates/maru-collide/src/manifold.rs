@@ -248,11 +248,31 @@ fn box_box_axis(
     // 미세하게 흔들리면 A의 Y축과 B의 Y축 분리값이 1e-7 수준으로 엎치락뒤치락하고,
     // 그때마다 클리퍼의 참조면이 바뀌어 feature ID가 갈린다 → warm start 단절 → 지터.
     // (40단 피라미드에서 z축 잔류속도로 실측됐다. 법선 자체는 GJK/EPA와 0.44° 안에서 일치한다.)
+    // **A/B 대칭 동률**(리뷰 MAJOR): "A면 우선"은 같은 두 박스의 삽입 순서를 뒤집으면
+    // 다른 법선을 고르게 만든다(결정론은 유지되지만 물리가 인덱스에 의존한다).
+    // 동률 구간에서는 소유자가 아니라 **법선 자체의 캐노니컬 키**로 고른다.
+    // 동률 키는 **중심 방향과의 정렬**이다. `d`와 법선이 A/B 교환에서 함께 부호가 뒤집히므로
+    // `|n·d|`는 교환 불변이고(대칭성), 바디가 흔들려도 매끄럽게 변한다(안정성).
+    // 성분 사전식 키는 대칭이지만 **불연속**이라 근소 동률에서 축이 튀어 봉투가 28→22단으로
+    // 좁아졌다(실측) — 대칭성과 안정성을 동시에 만족하는 키가 필요하다.
+    let align = |n: Vec3| n.dot(d).abs();
+    let better = |sep_new: f32, n_new: Vec3, sep_cur: f32, n_cur: Vec3| -> bool {
+        if sep_new > sep_cur + tol {
+            return true;
+        }
+        if sep_cur > sep_new + tol {
+            return false;
+        }
+        align(n_new) > align(n_cur)
+    };
     let (mut best_sep, mut best_axis) = (a_sep, a_axis);
-    if b_axis != Vec3::ZERO && b_sep > best_sep + tol {
+    if b_axis != Vec3::ZERO
+        && (best_axis == Vec3::ZERO || better(b_sep, b_axis, best_sep, best_axis))
+    {
         best_sep = b_sep;
         best_axis = b_axis;
     }
+    // 에지 축은 면 축과 **동률이면 면을 유지**한다(정지 스택 안정성 — 위 주석).
     if edge_axis != Vec3::ZERO && edge_sep > best_sep + tol {
         best_axis = edge_axis;
     }

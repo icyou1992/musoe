@@ -3,7 +3,7 @@
 //! 서브스텝마다 TGS 방식으로 현재 자세에서 위치 오차 C를 재계산하고 soft bias로 해석.
 //! [근거: Box2D v3가 조인트까지 soft-step 단일 솔버로 처리 — 01 §2 정정 반영]
 
-use crate::body::BodyHandle;
+use crate::body::{Body, BodyHandle};
 use crate::solver::Softness;
 use maru_collide::{in_state_range, vec_anchor_in_range, vec_in_state_range};
 use maru_math::{Mat3, Vec3};
@@ -148,6 +148,38 @@ impl Joint {
         j.validate()?;
         Ok(j)
     }
+}
+
+/// 선형 3-DOF의 K 행렬. 솔버와 삽입 검증이 **같은 식**을 쓴다.
+pub(crate) fn linear_k(inv_ma: f32, inv_mb: f32, ia: &Mat3, ib: &Mat3, ra: Vec3, rb: Vec3) -> Mat3 {
+    let mut m = Mat3::from_diagonal(Vec3::new(inv_ma + inv_mb, inv_ma + inv_mb, inv_ma + inv_mb));
+    let e = [
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    ];
+    for (mat, r) in [(ia, ra), (ib, rb)] {
+        for (ji, ej) in e.iter().enumerate() {
+            let col = r.cross(mat.mul_vec(ej.cross(r)));
+            m.c[ji] = m.c[ji] - col;
+        }
+    }
+    m
+}
+
+/// 삽입 시점의 K가 실제로 역행렬을 가지는가. `Mat3::inverse`는 실패하면 **0 행렬**을
+/// 돌려주므로(조용한 실패), 그 값을 직접 확인한다.
+pub(crate) fn k_is_solvable(bodies: &[Body], j: &Joint) -> bool {
+    let (a, b) = (j.ia(), j.ib());
+    let (ia, ib) = (bodies[a].inv_inertia_world(), bodies[b].inv_inertia_world());
+    let ra = bodies[a].pose.rot.rotate(j.anchor_a);
+    let rb = bodies[b].pose.rot.rotate(j.anchor_b);
+    let k = linear_k(bodies[a].inv_mass, bodies[b].inv_mass, &ia, &ib, ra, rb);
+    let inv = k.inverse();
+    let any = [inv.c[0], inv.c[1], inv.c[2]]
+        .iter()
+        .any(|c| c.x != 0.0 || c.y != 0.0 || c.z != 0.0);
+    any && inv.c[0].is_finite() && inv.c[1].is_finite() && inv.c[2].is_finite()
 }
 
 /// warm start (서브스텝 시작마다 — 접촉과 동일 패턴).

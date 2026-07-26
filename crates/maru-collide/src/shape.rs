@@ -52,13 +52,10 @@ fn hull_min_width(points: &[Vec3]) -> f32 {
     // 점이 적으면 **전수 열거**가 정확하다(사면체의 최소 폭 = 최소 높이).
     // 극점 집합만 쓰면 어떤 support 방향에서도 극점이 아닌 정점이 빠져 그 정점이 만드는
     // 얇은 면을 놓친다(리뷰가 제시한 sliver가 정확히 그 경우 — 0.575mm를 1.1mm로 오판).
-    const EXHAUSTIVE_MAX: usize = 32;
-    let mut ext: Vec<Vec3> = if points.len() <= EXHAUSTIVE_MAX {
-        points.to_vec()
-    } else {
-        Vec::new()
-    };
-    let use_support = ext.is_empty();
+    // 지원 상한(MAX_HULL_POINTS=32) 안에서는 **항상 전수 열거**다 — 사면체의 최소 폭은
+    // 최소 높이이므로 삼중조합 전수가 정확한 답을 준다. 스크린이 아니라 증명이다.
+    let mut ext: Vec<Vec3> = points.to_vec();
+    let use_support = false;
     let push_unique = |ext: &mut Vec<Vec3>, p: Vec3| {
         if !ext.iter().any(|q| (*q - p).length_sq() == 0.0) {
             ext.push(p);
