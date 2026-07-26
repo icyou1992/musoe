@@ -58,6 +58,19 @@ pub type IntBuild = std::hash::BuildHasherDefault<IntHasher>;
 pub type IntMap<K, V> = HashMap<K, V, IntBuild>;
 pub type IntSet<K> = std::collections::HashSet<K, IntBuild>;
 
+/// 광선 질의 히트.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RayHit {
+    pub body: BodyHandle,
+    /// 광선 파라미터. 맞은 지점 = `origin + dir * toi`.
+    pub toi: f32,
+    pub point: Vec3,
+    /// 맞은 지점의 바깥쪽 단위 법선.
+    pub normal: Vec3,
+    /// 광선 시작점이 이 물체 안이었는가 (그 경우 `toi == 0`).
+    pub started_inside: bool,
+}
+
 pub struct WorldParams {
     pub gravity: Vec3,
     pub substeps: u32,
@@ -643,6 +656,162 @@ impl World {
     /// 값은 정책대로 포화시키되 `StateOverflow`를 **그 자리에서** 돌려준다.
     fn saturate_derived(v: Vec3) -> (Vec3, bool) {
         maru_collide::saturate_state_vec(v)
+    }
+
+    /// 광선 질의 결과.
+    ///
+    /// `point`는 월드 좌표의 맞은 지점, `normal`은 그 지점의 **바깥쪽** 단위 법선이다.
+    /// 광선이 물체 안에서 시작했으면 `toi == 0`이고 `started_inside`가 참이다 —
+    /// "이미 안에 있다"를 못 맞은 것으로 처리하면 지면 판정이 조용히 실패한다.
+    pub fn cast_ray(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_toi: f32,
+    ) -> Result<Option<RayHit>, ApiError> {
+        let (origin, dir, max_toi) = Self::check_ray(origin, dir, max_toi)?;
+        let mut best: Option<RayHit> = None;
+        for i in 0..self.bodies.len() {
+            let Some(hit) = self.ray_body(i, origin, dir, max_toi) else {
+                continue;
+            };
+            // 동률은 **낮은 슬롯**이 이긴다 — 결과가 순회 순서에 의존하지 않게 한다.
+            if best.as_ref().is_none_or(|b| hit.toi < b.toi) {
+                best = Some(hit);
+            }
+        }
+        Ok(best)
+    }
+
+    /// 광선이 지나는 **모든** 물체. `toi` 오름차순, 동률은 슬롯 오름차순(전순서).
+    pub fn cast_ray_all(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_toi: f32,
+        out: &mut Vec<RayHit>,
+    ) -> Result<(), ApiError> {
+        let (origin, dir, max_toi) = Self::check_ray(origin, dir, max_toi)?;
+        out.clear();
+        if out.try_reserve(self.bodies.len()).is_err() {
+            return Err(ApiError::ResourceLimit);
+        }
+        for i in 0..self.bodies.len() {
+            if let Some(hit) = self.ray_body(i, origin, dir, max_toi) {
+                out.push(hit);
+            }
+        }
+        // 슬롯 순서로 채웠으므로 toi만 안정 정렬하면 동률이 슬롯 순서로 남는다.
+        out.sort_by(|a, b| a.toi.total_cmp(&b.toi));
+        Ok(())
+    }
+
+    /// AABB와 겹치는 물체들 (슬롯 오름차순). 광역 검색·에디터 박스 선택용.
+    pub fn query_aabb(&self, aabb: Aabb, out: &mut Vec<BodyHandle>) -> Result<(), ApiError> {
+        if !maru_collide::vec_in_range(aabb.min) || !maru_collide::vec_in_range(aabb.max) {
+            return Err(ApiError::InvalidValue);
+        }
+        out.clear();
+        if out.try_reserve(self.bodies.len()).is_err() {
+            return Err(ApiError::ResourceLimit);
+        }
+        for i in 0..self.bodies.len() {
+            if !self.query_visible(i) {
+                continue;
+            }
+            if aabb.overlaps(self.body_aabb(i)) {
+                out.push(self.handle_of(i));
+            }
+        }
+        Ok(())
+    }
+
+    /// 점을 품은 물체들 (슬롯 오름차순). 겉면 기준 — convex radius를 포함한다.
+    pub fn query_point(&self, p: Vec3, out: &mut Vec<BodyHandle>) -> Result<(), ApiError> {
+        if !maru_collide::vec_in_range(p) {
+            return Err(ApiError::InvalidValue);
+        }
+        out.clear();
+        if out.try_reserve(self.bodies.len()).is_err() {
+            return Err(ApiError::ResourceLimit);
+        }
+        for i in 0..self.bodies.len() {
+            if !self.query_visible(i) {
+                continue;
+            }
+            let b = &self.bodies[i];
+            if maru_collide::contains_point(&b.shape, &b.pose, p) {
+                out.push(self.handle_of(i));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_ray(origin: Vec3, dir: Vec3, max_toi: f32) -> Result<(Vec3, Vec3, f32), ApiError> {
+        if !maru_collide::vec_in_range(origin)
+            || !maru_collide::vec_in_range(dir)
+            || !(max_toi.is_finite() && max_toi >= 0.0)
+        {
+            return Err(ApiError::InvalidValue);
+        }
+        if dir.length_sq() <= 0.0 {
+            return Err(ApiError::InvalidValue);
+        }
+        Ok((origin, dir, max_toi))
+    }
+
+    /// 질의에 보이는 슬롯인가.
+    ///
+    /// **OOB는 보이지 않는다** — 월드 범위를 벗어난 물체는 "시뮬레이션에서 완전히
+    /// 빠진다"가 계약이고(위 `is_out_of_bounds`), 질의만 다르게 취급하면 호스트가
+    /// 충돌하지 않는 것을 광선으로 맞히게 된다. **잠든 물체는 보인다** — 자는 것은
+    /// 최적화지 부재가 아니다.
+    fn query_visible(&self, i: usize) -> bool {
+        self.alive[i] && !self.oob[i]
+    }
+
+    /// 슬롯의 월드 AABB (sweep 없음 — 질의용 정지 경계).
+    ///
+    /// 스텝의 브로드페이즈 AABB와 **같은 식**을 쓴다: 중심 `pos + R·c`, 반크기 `|R|·h`.
+    /// 두 곳에 따로 적으면 하나만 고쳐지는 비대칭이 생긴다(이 저장소의 반복 결함 계열).
+    pub(crate) fn body_aabb(&self, i: usize) -> Aabb {
+        let b = &self.bodies[i];
+        let local = b.shape.local_aabb();
+        let c = (local.max + local.min) * 0.5;
+        let hl = (local.max - local.min) * 0.5;
+        let (ax, ay, az) = (
+            b.pose.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
+            b.pose.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
+            b.pose.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
+        );
+        let ext = Vec3::new(
+            ax.x.abs() * hl.x + ay.x.abs() * hl.y + az.x.abs() * hl.z,
+            ax.y.abs() * hl.x + ay.y.abs() * hl.y + az.y.abs() * hl.z,
+            ax.z.abs() * hl.x + ay.z.abs() * hl.y + az.z.abs() * hl.z,
+        );
+        Aabb::from_center(b.pose.pos + b.pose.rot.rotate(c), ext)
+    }
+
+    fn handle_of(&self, i: usize) -> BodyHandle {
+        BodyHandle {
+            index: i as u32,
+            generation: self.generations[i],
+        }
+    }
+
+    fn ray_body(&self, i: usize, origin: Vec3, dir: Vec3, max_toi: f32) -> Option<RayHit> {
+        if !self.query_visible(i) {
+            return None;
+        }
+        let b = &self.bodies[i];
+        let rc = maru_collide::cast_ray(&b.shape, &b.pose, origin, dir, max_toi)?;
+        Some(RayHit {
+            body: self.handle_of(i),
+            toi: rc.toi,
+            point: origin + dir * rc.toi,
+            normal: rc.normal,
+            started_inside: rc.started_inside,
+        })
     }
 
     pub fn set_linear_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
@@ -1260,27 +1429,8 @@ impl World {
             if !self.alive[i] {
                 continue; // 제거된 슬롯
             }
-            let local = b.shape.local_aabb();
-            // **회전된 AABB를 제대로 계산한다.** 예전에는 로컬 원점에서 가장 먼 코너까지의
-            // 거리를 세 축 모두에 썼는데(회전 불변이지만 매우 헐겁다), 반지름 0.5 구가
-            // 반크기 0.866 큐브가 되어 축당 1.73배·부피 5.2배로 부풀었다.
-            // 실측: 3000구 더미에서 페어 44,240개인데 실제 접점은 3,640개 — 12배 과잉이었다.
-            //
-            // 정확한 계산: 중심은 `pos + R·c`, 반크기는 `|R|·h` (|R|=성분별 절대값).
-            // 원점에서 벗어난 hull도 중심을 함께 옮기므로 누락되지 않는다.
-            let c = (local.max + local.min) * 0.5;
-            let hl = (local.max - local.min) * 0.5;
-            let (ax, ay, az) = (
-                b.pose.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
-                b.pose.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
-                b.pose.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
-            );
-            let ext = Vec3::new(
-                ax.x.abs() * hl.x + ay.x.abs() * hl.y + az.x.abs() * hl.z,
-                ax.y.abs() * hl.x + ay.y.abs() * hl.y + az.y.abs() * hl.z,
-                ax.z.abs() * hl.x + ay.z.abs() * hl.y + az.z.abs() * hl.z,
-            );
-            let world = Aabb::from_center(b.pose.pos + b.pose.rot.rotate(c), ext);
+            // 스텝과 질의가 **같은 AABB 정의**를 쓴다 (헬퍼가 정본).
+            let world = self.body_aabb(i);
             // OOB는 **시뮬레이션에서 완전히 빠진다** — 브로드페이즈에도 넣지 않는다.
             // static tree에 넣으면 PCM 키에 STATIC_BIT가 붙는데 실제 타입은 Dynamic이라
             // 스냅샷 구조 검증(`STATIC_BIT == (type==Static)`)이 **자기 스냅샷을 거부**한다

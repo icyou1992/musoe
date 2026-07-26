@@ -210,6 +210,182 @@ mod tests {
         );
     }
 
+    fn query_world() -> (World, Vec<BodyHandle>) {
+        let mut w = World::new(WorldParams::default());
+        let mut hs = Vec::new();
+        // x = 0, 5, 10 에 반지름 1 구 세 개
+        for k in 0..3 {
+            hs.push(w.add_body(Body::new_dynamic(
+                maru_collide::Shape::Sphere { radius: 1.0 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::new(k as f32 * 5.0, 0.0, 0.0),
+                    rot: maru_math::Quat::IDENTITY,
+                },
+                1.0,
+            )));
+        }
+        (w, hs)
+    }
+
+    /// 가장 가까운 물체를 맞히고, 맞은 지점·법선이 일관돼야 한다.
+    #[test]
+    fn ray_hits_the_nearest_body() {
+        let (w, hs) = query_world();
+        let hit = w
+            .cast_ray(
+                maru_math::Vec3::new(-10.0, 0.0, 0.0),
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                100.0,
+            )
+            .unwrap()
+            .expect("맞아야 한다");
+        assert_eq!(hit.body, hs[0], "가장 가까운 것은 x=0의 구다");
+        assert!((hit.toi - 9.0).abs() < 1e-3, "toi={}", hit.toi);
+        assert!((hit.point.x - (-1.0)).abs() < 1e-3, "point={:?}", hit.point);
+        assert!(
+            hit.normal.x < -0.99,
+            "바깥 법선은 광선 반대편을 본다: {:?}",
+            hit.normal
+        );
+        assert!(!hit.started_inside);
+    }
+
+    /// 모든 히트는 toi 오름차순이고 개수가 맞아야 한다.
+    #[test]
+    fn ray_all_is_sorted_by_toi() {
+        let (w, hs) = query_world();
+        let mut out = Vec::new();
+        w.cast_ray_all(
+            maru_math::Vec3::new(-10.0, 0.0, 0.0),
+            maru_math::Vec3::new(1.0, 0.0, 0.0),
+            100.0,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.windows(2).all(|p| p[0].toi <= p[1].toi),
+            "toi 정렬 위반"
+        );
+        assert_eq!(
+            out.iter().map(|h| h.body).collect::<Vec<_>>(),
+            hs,
+            "가까운 순서여야 한다"
+        );
+    }
+
+    /// `max_toi`는 존중돼야 한다.
+    #[test]
+    fn ray_respects_max_toi() {
+        let (w, _) = query_world();
+        let mut out = Vec::new();
+        w.cast_ray_all(
+            maru_math::Vec3::new(-10.0, 0.0, 0.0),
+            maru_math::Vec3::new(1.0, 0.0, 0.0),
+            10.0,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1, "10 안에는 첫 구만 있다");
+    }
+
+    /// 물체 **안에서** 쏘면 맞은 것으로 나와야 한다 — 지면 판정이 여기 걸린다.
+    #[test]
+    fn ray_from_inside_reports_a_hit() {
+        let (w, hs) = query_world();
+        let hit = w
+            .cast_ray(
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                100.0,
+            )
+            .unwrap()
+            .expect("안에서 시작해도 맞은 것이다");
+        assert_eq!(hit.body, hs[0]);
+        assert_eq!(hit.toi, 0.0);
+        assert!(hit.started_inside);
+    }
+
+    /// AABB·점 질의는 슬롯 오름차순으로 결정적이어야 한다.
+    #[test]
+    fn aabb_and_point_queries_are_deterministic() {
+        let (w, hs) = query_world();
+        let mut out = Vec::new();
+        w.query_aabb(
+            maru_collide::Aabb::new(
+                maru_math::Vec3::new(-2.0, -2.0, -2.0),
+                maru_math::Vec3::new(7.0, 2.0, 2.0),
+            ),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, vec![hs[0], hs[1]], "x=0,5 두 개만 겹친다");
+
+        let mut pts = Vec::new();
+        w.query_point(maru_math::Vec3::new(5.2, 0.0, 0.0), &mut pts)
+            .unwrap();
+        assert_eq!(pts, vec![hs[1]]);
+        w.query_point(maru_math::Vec3::new(2.5, 0.0, 0.0), &mut pts)
+            .unwrap();
+        assert!(pts.is_empty(), "빈틈에는 아무것도 없다");
+    }
+
+    /// 잠든 물체는 **보인다**(자는 것은 최적화지 부재가 아니다).
+    #[test]
+    fn queries_see_sleeping_bodies() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            maru_collide::Shape::Box {
+                half: maru_math::Vec3::new(10.0, 1.0, 10.0),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, -1.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        let h = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 0.5, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        for _ in 0..240 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        assert!(w.is_asleep(h), "먼저 잠들어야 의미 있는 테스트다");
+        let hit = w
+            .cast_ray(
+                maru_math::Vec3::new(-5.0, 0.5, 0.0),
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                100.0,
+            )
+            .unwrap();
+        assert_eq!(hit.map(|x| x.body), Some(h), "잠든 물체도 맞아야 한다");
+    }
+
+    /// 잘못된 입력은 거부한다 (0 방향·NaN·음수 max_toi).
+    #[test]
+    fn ray_input_is_validated() {
+        let (w, _) = query_world();
+        let o = maru_math::Vec3::ZERO;
+        assert_eq!(
+            w.cast_ray(o, maru_math::Vec3::ZERO, 10.0),
+            Err(ApiError::InvalidValue),
+            "0 방향은 광선이 아니다"
+        );
+        assert_eq!(
+            w.cast_ray(o, maru_math::Vec3::new(f32::NAN, 0.0, 0.0), 10.0),
+            Err(ApiError::InvalidValue)
+        );
+        assert_eq!(
+            w.cast_ray(o, maru_math::Vec3::new(1.0, 0.0, 0.0), -1.0),
+            Err(ApiError::InvalidValue)
+        );
+    }
+
     /// 재질 설정자는 다른 쓰기 경로와 같은 규율을 따른다 — 바꾼 뒤 `validate`를 다시 통과해야 한다.
     #[test]
     fn material_setters_validate() {

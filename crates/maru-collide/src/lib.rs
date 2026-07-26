@@ -6,10 +6,11 @@
 
 mod aabb;
 mod epa;
-mod gjk;
+pub(crate) mod gjk;
 mod limits;
 mod manifold;
 mod pairs;
+mod ray;
 mod shape;
 mod tolerance;
 mod tree;
@@ -27,6 +28,7 @@ pub use limits::{
 pub use manifold::{contact, ContactPoint, FeatureId, Manifold, FEATURE_ANALYTIC, FEATURE_GENERIC};
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};
+pub use ray::{cast_ray, contains_point, RayCast};
 pub use shape::Shape;
 pub use tolerance::{
     area_eps, bary_denom_eps, characteristic_length, length_eps, length_sq_eps, min_feature_size,
