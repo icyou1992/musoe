@@ -13,6 +13,51 @@ use maru_collide::{contact, Aabb, Broadphase, FeatureId, STATIC_BIT};
 use maru_math::Vec3;
 use std::collections::HashMap;
 
+/// 정수 키 전용 결정적 해셔 (FxHash 계열 곱셈-시프트).
+///
+/// 기본 SipHash가 **페어당 5회** 돈다: `excluded.contains` · `contact_cache.get` ·
+/// `live_keys.insert` · 스텝 끝의 `retain` · `insert`. 구 더미 3000(페어 33k)에서
+/// 이것만으로 narrow의 절반 가까이를 먹었다 — 정작 구-구 접촉 산술은 20 flops다.
+/// 키는 (u32,u32) 64비트 정수쌍이라 곱셈 한 번이면 분포가 충분하다.
+///
+/// HashDoS는 대상이 아니다: 키는 **엔진이 부여한 바디 슬롯 인덱스**이고 호스트가 값을
+/// 직접 정하지 못한다(핸들은 slot+generation이고 슬롯은 순차 할당이다).
+/// 결정성: 해셔가 바뀌면 이터레이션 순서가 바뀌지만, 순서에 의존하는 두 지점
+/// (스냅샷 PCM 직렬화 · `remove_body`의 이웃 수집)은 이미 사용 전에 정렬한다.
+#[derive(Default, Clone, Copy)]
+pub struct IntHasher(u64);
+
+impl std::hash::Hasher for IntHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u32(b as u32);
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(K);
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.write_u32(n as u32);
+        self.write_u32((n >> 32) as u32);
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+pub type IntBuild = std::hash::BuildHasherDefault<IntHasher>;
+pub type IntMap<K, V> = HashMap<K, V, IntBuild>;
+pub type IntSet<K> = std::collections::HashSet<K, IntBuild>;
+
 pub struct WorldParams {
     pub gravity: Vec3,
     pub substeps: u32,
@@ -99,7 +144,7 @@ pub struct World {
     reserved: Vec<bool>,
     generations: Vec<u32>,
     /// PCM 임펄스 캐시: canonical 페어 → (feature, 임펄스). 스텝 간 warm start (설계 §3).
-    contact_cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+    contact_cache: IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
     sleep_timer: Vec<f32>,
     asleep: Vec<bool>,
     /// 직전 스텝의 아일랜드 대표(설계 §4.6): wake는 **아일랜드 단위**여야 한다.
@@ -278,7 +323,7 @@ impl World {
             oob: Vec::new(),
             reserved: Vec::new(),
             generations: Vec::new(),
-            contact_cache: HashMap::new(),
+            contact_cache: IntMap::default(),
             sleep_timer: Vec::new(),
             asleep: Vec::new(),
             island: Vec::new(),
@@ -910,7 +955,7 @@ impl World {
         &Vec<bool>,
         &Vec<u32>,
         &Vec<Joint>,
-        &HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+        &IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
         &Vec<PendingCommand>,
         CommandReport,
     ) {
@@ -944,7 +989,7 @@ impl World {
         asleep: Vec<bool>,
         island: Vec<u32>,
         joints: Vec<Joint>,
-        cache: HashMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+        cache: IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
         commands: Vec<PendingCommand>,
         last_report: CommandReport,
     ) {
@@ -1156,7 +1201,7 @@ impl World {
         };
         self.diag.pairs = pairs.len();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
-        let mut excluded: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let mut excluded: IntSet<(u32, u32)> = IntSet::default();
         if excluded.try_reserve(self.joints.len()).is_err() {
             self.resource_limit = true;
             return;
@@ -1220,7 +1265,8 @@ impl World {
         for &(a_id, b_raw) in &pairs {
             let is_static_pair = b_raw & STATIC_BIT != 0;
             let b_plain = b_raw & !STATIC_BIT;
-            if excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
+            // 조인트가 없으면 집합이 비어 있다 — 빈 집합에도 해시는 도는다.
+            if !excluded.is_empty() && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
                 continue;
             }
             let (a, b) = (a_id as usize, b_plain as usize);
@@ -1280,7 +1326,7 @@ impl World {
             return;
         }
         let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
-        let mut live_keys: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        let mut live_keys: IntSet<(u32, u32)> = IntSet::default();
         if live_keys.try_reserve(pairs.len()).is_err() {
             self.bp_pairs = pairs;
             self.resource_limit = true;
@@ -1290,7 +1336,8 @@ impl World {
             let key = (a_id, b_raw);
             let is_static_pair = b_raw & STATIC_BIT != 0;
             let b_plain = b_raw & !STATIC_BIT;
-            if excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
+            // 조인트가 없으면 집합이 비어 있다 — 빈 집합에도 해시는 도는다.
+            if !excluded.is_empty() && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
                 continue;
             }
             let (a_id, b_id) = (a_id as usize, b_plain as usize);
@@ -1644,7 +1691,7 @@ impl World {
             }
         }
         // island 전원이 임계 시간을 넘겨야 일괄 sleep (부분 sleep 금지)
-        let mut island_min: HashMap<usize, f32> = HashMap::new();
+        let mut island_min: IntMap<usize, f32> = IntMap::default();
         for i in 0..n {
             if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] && !self.oob[i] {
                 let root = find(&mut parent, i);

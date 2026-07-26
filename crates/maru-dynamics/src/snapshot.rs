@@ -768,10 +768,10 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     };
 
     let np = r.count(min_bytes::CACHE_PAIR, decoded_size::cache_pair())?;
-    let mut cache: std::collections::HashMap<
+    let mut cache: crate::world::IntMap<
         (u32, u32),
         Vec<(maru_collide::FeatureId, crate::solver::CachedImpulse)>,
-    > = std::collections::HashMap::new();
+    > = crate::world::IntMap::default();
     cache
         .try_reserve(np)
         .map_err(|_| SnapshotError::CountTooLarge)?;
@@ -853,7 +853,7 @@ fn validate_structure(
     island: &[u32],
     joints: &[Joint],
     commands: &[PendingCommand],
-    cache: &std::collections::HashMap<
+    cache: &crate::world::IntMap<
         (u32, u32),
         Vec<(maru_collide::FeatureId, crate::solver::CachedImpulse)>,
     >,
