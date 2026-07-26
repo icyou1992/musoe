@@ -16,6 +16,10 @@ pub struct Broadphase {
 }
 
 /// 페어의 상대가 정적임을 표시하는 비트 (id 공간 분리 — canonical 키의 일부).
+/// 브로드페이즈 페어의 **절대 상한**. 1M 페어 = 8MB 벡터 + 후속 constraints/키/HashSet.
+/// wasm 선형 메모리에서 통제된 오류가 allocator abort보다 먼저 오게 하는 마지막 방어선이다.
+pub const MAX_PAIRS: usize = 1 << 20;
+
 pub const STATIC_BIT: u32 = 1 << 31;
 
 impl Broadphase {
@@ -47,7 +51,13 @@ impl Broadphase {
     /// 같은 자리에 겹친 1만 개 바디는 5천만 페어를 만든다: 입력은 수 MB로 자원 정책을
     /// 통과하지만 wasm에서는 `try_step`이 오류를 돌려주기 전에 allocator가 먼저 죽는다.
     pub fn canonical_pairs_bounded(&self, budget: usize) -> Option<Vec<(u32, u32)>> {
+        // 예산 자체를 **절대 상한**으로 한 번 더 자른다: 계수형 예산은 메모리 예산이 아니다
+        // (계수 4096 × 5000 바디 = 2천만 페어가 "예산 안"이지만 벡터만 160MB다).
+        let budget = budget.min(MAX_PAIRS);
         let mut pairs: Vec<(u32, u32)> = Vec::new();
+        // 재할당 중 abort를 피하려면 **미리 fallible로 잡는다**. 예산에서 멈추므로
+        // 이 용량을 넘길 일이 없다.
+        pairs.try_reserve_exact(budget.min(1 << 16)).ok()?;
         let mut cand: Vec<u32> = Vec::new();
 
         let static_lookup: std::collections::HashMap<u32, Aabb> =

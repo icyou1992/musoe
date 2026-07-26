@@ -60,8 +60,14 @@ pub enum ApiError {
     InvalidValue,
     /// static 바디는 불변 (설계 §9 — 움직이려면 Kinematic).
     ImmutableStatic,
-    /// 자원 예산 초과 (브로드페이즈 페어 등). 상태는 그대로 두고 스텝을 포기한다 —
-    /// wasm에서 allocator가 먼저 죽는 것보다 오류가 낫다.
+    /// 자원 예산 초과 (브로드페이즈 페어 등). wasm에서 allocator가 먼저 죽는 것보다 낫다.
+    ///
+    /// **실패 계약(중요)**: 페어 수는 커맨드 적용 **뒤**의 배치에서만 알 수 있으므로,
+    /// 이 오류가 나기 전에 pending 커맨드는 이미 적용되고 속도 클램프도 반영된다.
+    /// 즉 "**커맨드는 적용됨, 물리 스텝은 건너뜀**"이 계약이다 — 재시도해도 커맨드가
+    /// 사라지지는 않는다(이미 반영됐다). 롤백이 필요한 호스트는 `try_snapshot()`으로
+    /// 스텝 전 상태를 잡아두고 실패 시 `restore`해야 한다. 엔진은 스텝마다 스냅샷을
+    /// 뜨는 비용을 강제하지 않는다.
     ResourceLimit,
     /// 파생 상태가 상한을 넘어 포화됐다. **그 스텝의 물리는 신뢰할 수 없다**(리뷰 BLOCKER:
     /// 포화를 정상 처리로 삼키면 안 된다). 상태 자체는 안전하고 복원 가능하게 유지되므로
@@ -192,8 +198,15 @@ fn validate_params(params: &WorldParams) {
 pub(crate) fn anchor_fits(b: &Body, anchor: Vec3) -> bool {
     const ANCHOR_SCALE: f32 = 4.0;
     let bb = b.shape.local_aabb();
-    let radius = (bb.max - bb.min).length() * 0.5;
-    let limit = (radius * ANCHOR_SCALE).max(maru_collide::MIN_SHAPE_EXTENT);
+    // **바디 원점에서 가장 먼 AABB 코너까지의 거리**를 쓴다(리뷰 MAJOR).
+    // 반대각선(크기)만 쓰면 원점에서 100m 떨어진 1m 크기 static hull의 정상 표면 앵커가
+    // 거부된다 — 앵커는 원점 기준 좌표이므로 척도도 원점 기준이어야 한다.
+    let far = Vec3::new(
+        bb.min.x.abs().max(bb.max.x.abs()),
+        bb.min.y.abs().max(bb.max.y.abs()),
+        bb.min.z.abs().max(bb.max.z.abs()),
+    );
+    let limit = (far.length() * ANCHOR_SCALE).max(maru_collide::MIN_SHAPE_EXTENT);
     anchor.length() <= limit
 }
 
@@ -840,7 +853,6 @@ impl World {
         // (stale `state_saturations`가 다음 `try_step`을 StateOverflow로 만들던 경로).
         self.diag = Diagnostics::default();
         self.resource_limit = false;
-        self.resource_limit = false;
     }
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
@@ -918,6 +930,10 @@ impl World {
     }
 
     fn step_inner(&mut self, dt: f32) {
+        // 자원 초과 플래그는 **매 스텝 초기화**한다(리뷰 BLOCKER): 생성·복원에서만 지우면
+        // 한 번 초과한 뒤 바디를 지우거나 예산을 올려 실제로 성공해도 계속
+        // `ResourceLimit`을 돌려주면서 상태만 앞으로 나간다.
+        self.resource_limit = false;
         // 진단 초기화와 속도 클램프는 **무엇보다 먼저** 한다(리뷰 BLOCKER ×2):
         // ① stale diagnostics가 남으면 restore 후 `try_step` 반환값이 달라져 L0가 깨진다
         //    (빈 월드 조기 반환 경로 포함).
@@ -964,8 +980,12 @@ impl World {
             );
             let r = far.length();
             let world = Aabb::from_center(b.pose.pos, Vec3::new(r, r, r));
+            // OOB는 **모든 시뮬레이션 경로에서 빠진다**(리뷰 BLOCKER: 플래그만 분리하고
+            // 중력·적분·브로드페이즈에는 그대로 들어가 있었다). static anchor처럼 취급한다 —
+            // 다른 바디는 여전히 이 바디에 부딪힐 수 있지만 자신은 움직이지 않는다.
             match b.body_type {
                 BodyType::Static => static_items.push((i as u32, world)),
+                _ if self.oob[i] => static_items.push((i as u32, world)),
                 _ => {
                     let vel_dt = b.linvel * dt;
                     dyn_items.push((
@@ -976,9 +996,12 @@ impl World {
             }
         }
         let bp = Broadphase::build(dyn_items, static_items);
+        // 예산은 **살아있는 바디 수** 기준이다(슬롯 수가 아니라) + 절대 상한.
+        let live = self.alive.iter().filter(|a| **a).count();
         let budget = (self.params.max_pairs_per_body as usize)
-            .saturating_mul(self.bodies.len())
-            .saturating_add(1024);
+            .saturating_mul(live)
+            .saturating_add(1024)
+            .min(maru_collide::MAX_PAIRS);
         self.diag.pair_budget = budget;
         let Some(pairs) = bp.canonical_pairs_bounded(budget) else {
             self.resource_limit = true;
@@ -1170,7 +1193,7 @@ impl World {
         for _ in 0..n_sub {
             // 속도 적분 (sleeping 제외)
             for (i, b) in self.bodies.iter_mut().enumerate() {
-                if self.alive[i] && b.is_dynamic() && !self.asleep[i] {
+                if self.alive[i] && b.is_dynamic() && !self.asleep[i] && !self.oob[i] {
                     b.linvel += g * h;
                 }
             }
@@ -1209,7 +1232,11 @@ impl World {
             self.clamp_velocities();
             // 위치 적분 (dynamic + kinematic, sleeping 제외)
             for (i, b) in self.bodies.iter_mut().enumerate() {
-                if self.alive[i] && b.body_type != BodyType::Static && !self.asleep[i] {
+                if self.alive[i]
+                    && b.body_type != BodyType::Static
+                    && !self.asleep[i]
+                    && !self.oob[i]
+                {
                     b.pose.pos += b.linvel * h;
                     b.pose.rot = b.pose.rot.integrate(b.angvel, h);
                 }
@@ -1311,14 +1338,16 @@ impl World {
         // island 전원이 임계 시간을 넘겨야 일괄 sleep (부분 sleep 금지)
         let mut island_min: HashMap<usize, f32> = HashMap::new();
         for i in 0..n {
-            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] {
+            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] && !self.oob[i] {
                 let root = find(&mut parent, i);
                 let e = island_min.entry(root).or_insert(f32::INFINITY);
                 *e = e.min(self.sleep_timer[i]);
             }
         }
         for i in 0..n {
-            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] {
+            // OOB는 sleep 대상이 아니다 — `oob ⇒ !asleep`이 v4 복원 불변식이다
+            // (time_to_sleep=0인 합법 월드에서 같은 스텝에 둘 다 참이 되던 경로).
+            if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] && !self.oob[i] {
                 let root = find(&mut parent, i);
                 if island_min[&root] >= self.params.time_to_sleep {
                     self.asleep[i] = true;

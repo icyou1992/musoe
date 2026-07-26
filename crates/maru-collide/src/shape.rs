@@ -21,59 +21,104 @@ pub enum Shape {
     Hull { points: Vec<Vec3>, radius: f32 },
 }
 
-/// 점 집합의 **회전 불변** 최소 두께 (평면에서 가장 먼 점까지의 거리).
-/// 세 단계 극점 절차 — 최장 축 → 직선에서 최원점 → 평면에서 최원점.
-fn hull_thickness(points: &[Vec3]) -> f32 {
+/// 점 집합의 **회전 불변** 최소 폭 **하한 추정**.
+///
+/// 정확한 최소 폭은 볼록 껍질의 모든 면 법선에 대해 재야 한다(껍질 빌더가 필요하다 —
+/// v1 계약: hull 점은 빌더가 준다). 여기서는 생성·복원 경계의 **퇴화 스크린**으로,
+/// 후보 방향 집합에 대한 폭의 최소값을 쓴다. 한 평면의 높이만 재면(직경 축 → 그 직선의
+/// 최원점 → 그 평면의 최원점) 다른 면 방향의 더 얇은 폭을 놓치므로(리뷰 MAJOR),
+/// 극점들의 모든 삼중조합 법선까지 후보에 넣어 추정을 낮춘다.
+/// 이 값은 실제 최소 폭보다 **크지 않다고 보장되지 않는다** — 스크린이지 증명이 아니다.
+fn hull_min_width(points: &[Vec3]) -> f32 {
     if points.len() < 4 {
-        // 3점 이하는 항상 한 평면 위 → 두께 0 (convex radius로만 두꺼워진다)
-        return 0.0;
+        return 0.0; // 3점 이하는 항상 한 평면 위 (convex radius로만 두꺼워진다)
     }
-    // ① 최장 축
-    let (mut a, mut b) = (points[0], points[0]);
-    let mut best = 0.0f32;
-    for (i, p) in points.iter().enumerate() {
-        for q in &points[i + 1..] {
-            let d = (*q - *p).length_sq();
-            if d > best {
-                best = d;
-                a = *p;
-                b = *q;
+    // 후보 극점: 13방향 support + 직경 쌍
+    const DIRS: [Vec3; 13] = [
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(1.0, 1.0, 0.0),
+        Vec3::new(1.0, -1.0, 0.0),
+        Vec3::new(1.0, 0.0, 1.0),
+        Vec3::new(1.0, 0.0, -1.0),
+        Vec3::new(0.0, 1.0, 1.0),
+        Vec3::new(0.0, 1.0, -1.0),
+        Vec3::new(1.0, 1.0, 1.0),
+        Vec3::new(1.0, 1.0, -1.0),
+        Vec3::new(1.0, -1.0, 1.0),
+        Vec3::new(-1.0, 1.0, 1.0),
+    ];
+    // 점이 적으면 **전수 열거**가 정확하다(사면체의 최소 폭 = 최소 높이).
+    // 극점 집합만 쓰면 어떤 support 방향에서도 극점이 아닌 정점이 빠져 그 정점이 만드는
+    // 얇은 면을 놓친다(리뷰가 제시한 sliver가 정확히 그 경우 — 0.575mm를 1.1mm로 오판).
+    const EXHAUSTIVE_MAX: usize = 32;
+    let mut ext: Vec<Vec3> = if points.len() <= EXHAUSTIVE_MAX {
+        points.to_vec()
+    } else {
+        Vec::new()
+    };
+    let use_support = ext.is_empty();
+    let push_unique = |ext: &mut Vec<Vec3>, p: Vec3| {
+        if !ext.iter().any(|q| (*q - p).length_sq() == 0.0) {
+            ext.push(p);
+        }
+    };
+    for d in DIRS.iter().filter(|_| use_support) {
+        let (mut lo, mut hi) = (points[0], points[0]);
+        let (mut lo_v, mut hi_v) = (d.dot(points[0]), d.dot(points[0]));
+        for p in &points[1..] {
+            let v = d.dot(*p);
+            if v < lo_v {
+                lo_v = v;
+                lo = *p;
+            }
+            if v > hi_v {
+                hi_v = v;
+                hi = *p;
+            }
+        }
+        push_unique(&mut ext, lo);
+        push_unique(&mut ext, hi);
+    }
+    // 후보 법선: 극점 삼중조합 + 좌표축
+    let width_along = |n: Vec3| -> f32 {
+        let l = n.length();
+        if l <= 0.0 {
+            return f32::INFINITY;
+        }
+        let inv = 1.0 / l;
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in points {
+            let v = n.dot(*p) * inv;
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        hi - lo
+    };
+    let mut w = f32::INFINITY;
+    for d in [
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    ] {
+        w = w.min(width_along(d));
+    }
+    for i in 0..ext.len() {
+        for j in (i + 1)..ext.len() {
+            for k in (j + 1)..ext.len() {
+                let n = (ext[j] - ext[i]).cross(ext[k] - ext[i]);
+                if n.length_sq() > 0.0 {
+                    w = w.min(width_along(n));
+                }
             }
         }
     }
-    let ab = b - a;
-    if ab.length_sq() <= 0.0 {
-        return 0.0;
+    if w.is_finite() {
+        w
+    } else {
+        0.0
     }
-    // ② 직선 ab에서 가장 먼 점
-    let inv = 1.0 / ab.length();
-    let mut c = a;
-    let mut wmax = 0.0f32;
-    for p in points {
-        let w = ab.cross(*p - a).length() * inv;
-        if w > wmax {
-            wmax = w;
-            c = *p;
-        }
-    }
-    if wmax <= 0.0 {
-        return 0.0;
-    }
-    // ③ 평면 abc에서 가장 먼 점 = 두께
-    let n = ab.cross(c - a);
-    let nl = n.length();
-    if nl <= 0.0 {
-        return 0.0;
-    }
-    let inv_n = 1.0 / nl;
-    let mut tmax = 0.0f32;
-    for p in points {
-        let t = n.dot(*p - a).abs() * inv_n;
-        if t > tmax {
-            tmax = t;
-        }
-    }
-    tmax
 }
 
 impl Shape {
@@ -130,7 +175,7 @@ impl Shape {
                 // 한 평면 위의 점들도 x/y/z span은 모두 크다. 회전 불변 두께를 재야 한다:
                 // 최장 축 → 그 직선에서 가장 먼 점(폭) → 그 평면에서 가장 먼 점(두께).
                 let thick = 2.0 * r;
-                if hull_thickness(points) + thick < MIN_SHAPE_EXTENT {
+                if hull_min_width(points) + thick < MIN_SHAPE_EXTENT {
                     return Err(
                         "hull is degenerate (thinner than MIN_SHAPE_EXTENT in some direction)",
                     );

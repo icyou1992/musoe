@@ -2322,4 +2322,172 @@ mod tests {
         );
         assert!(w.restore(&w.snapshot()).is_ok());
     }
+
+    // ─────────── 리뷰 rev_826db6d8 회귀 ───────────
+
+    /// BLOCKER: 앵커를 형상에 묶어도 **질량·관성이 셰이프와 무관**하면 K가 조용히 특이해진다.
+    /// 리뷰가 제시한 조합(1mm 구 + inv_mass=1e-6 + inv_inertia=1e12)을 거부해야 한다.
+    #[test]
+    fn snapshot_rejects_inertia_inconsistent_with_shape() {
+        let mut w = World::new(WorldParams::default());
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.001 },
+            pose(0.0, 1.0, 0.0),
+            1000.0,
+        ));
+        let good = w.snapshot();
+        let before = w.state_hash();
+        // 슬롯0의 inv_mass·inv_inertia를 비물리적 조합으로 바꾼다
+        let off = HDR + 4 + 1 + 1 + 1 + 4 + 1 + 12 + 16 + 12 + 12;
+        let mut bad = good.clone();
+        bad[off..off + 4].copy_from_slice(&1.0e-6f32.to_le_bytes());
+        for k in 0..3 {
+            let o = off + 4 + k * 4;
+            bad[o..o + 4].copy_from_slice(&1.0e12f32.to_le_bytes());
+        }
+        assert_eq!(
+            w.restore(&bad),
+            Err(SnapshotError::InconsistentState),
+            "셰이프와 무관한 질량·관성이 통과 (K가 조용히 특이해진다)"
+        );
+        assert_eq!(w.state_hash(), before);
+        assert!(w.is_alive(h));
+    }
+
+    /// BLOCKER: `ResourceLimit` 플래그가 스텝마다 초기화되지 않으면 **영구 고착**된다 —
+    /// 원인을 없앤 뒤에도 계속 오류를 돌려주면서 상태만 앞으로 나간다.
+    #[test]
+    fn resource_limit_flag_clears_next_step() {
+        let mut w = World::new(WorldParams {
+            max_pairs_per_body: 1,
+            ..Default::default()
+        });
+        let hs: Vec<_> = (0..200)
+            .map(|_| {
+                w.add_body(Body::new_dynamic(
+                    Shape::Sphere { radius: 0.5 },
+                    pose(0.0, 1.0, 0.0),
+                    1.0,
+                ))
+            })
+            .collect();
+        assert_eq!(w.try_step(DT), Err(ApiError::ResourceLimit));
+        // 원인을 제거하면 다음 스텝은 성공해야 한다
+        for h in hs.iter().skip(3) {
+            w.remove_body(*h).unwrap();
+        }
+        assert_eq!(w.try_step(DT), Ok(()), "플래그가 고착됨");
+        assert_eq!(w.try_step(DT), Ok(()));
+    }
+
+    /// BLOCKER: OOB는 **모든 시뮬레이션 경로**에서 빠져야 한다. 플래그만 분리하고
+    /// 중력·적분에 그대로 두면 경계에 고정된 바디가 다음 스텝부터 아래로 떨어진다.
+    /// (직전 테스트는 gravity=0이라 이 결함을 못 봤다.)
+    #[test]
+    fn out_of_bounds_body_is_excluded_from_simulation() {
+        let mut w = World::new(WorldParams::default()); // **중력 있음**
+        let edge = maru_collide::MAX_INPUT - 5.0;
+        let flyer = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(edge, 100.0, 0.0),
+            1.0,
+        ));
+        w.set_linear_velocity(flyer, Vec3::new(500.0, 0.0, 0.0))
+            .unwrap();
+        for _ in 0..10 {
+            let _ = w.try_step(crate::world::MAX_DT);
+        }
+        assert!(w.is_out_of_bounds(flyer));
+        let frozen = w.body(flyer).pose().pos;
+        // 중력이 있어도 움직이지 않는다
+        for _ in 0..120 {
+            let _ = w.try_step(DT);
+        }
+        let now = w.body(flyer).pose().pos;
+        assert!(
+            (now - frozen).length() < 1e-3,
+            "OOB 바디가 중력으로 이동함: {frozen:?} → {now:?}"
+        );
+        assert_eq!(w.body(flyer).linvel().length(), 0.0, "OOB가 속도를 얻음");
+        assert!(!w.is_asleep(flyer), "oob ⇒ !asleep 불변식 위반");
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
+
+    /// MAJOR: `time_to_sleep=0`인 합법 월드에서 OOB가 같은 스텝에 asleep이 되면
+    /// v4 복원 불변식(`oob ⇒ !asleep`)이 깨져 자기 스냅샷이 복원되지 않는다.
+    #[test]
+    fn oob_and_zero_time_to_sleep_keep_the_invariant() {
+        let mut w = World::new(WorldParams {
+            time_to_sleep: 0.0,
+            ..Default::default()
+        });
+        ground(&mut w);
+        let edge = maru_collide::MAX_INPUT - 5.0;
+        let flyer = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(edge, 50.0, 0.0),
+            1.0,
+        ));
+        w.set_linear_velocity(flyer, Vec3::new(500.0, 0.0, 0.0))
+            .unwrap();
+        for _ in 0..30 {
+            let _ = w.try_step(crate::world::MAX_DT);
+            assert!(
+                w.restore(&w.snapshot()).is_ok(),
+                "oob/asleep 불변식이 깨짐 (time_to_sleep=0)"
+            );
+        }
+        assert!(w.is_out_of_bounds(flyer));
+    }
+
+    /// MAJOR: 앵커 척도는 **바디 원점 기준**이어야 한다 — AABB 크기만 쓰면 원점에서
+    /// 떨어진 static hull의 정상 표면 앵커가 거부된다.
+    #[test]
+    fn anchor_scale_uses_origin_distance_not_size() {
+        let mut w = World::new(WorldParams::default());
+        // local x≈100m에 놓인 1m 크기 static hull (원점에서 멀지만 합법)
+        let far = w.add_body(Body::new_static(
+            Shape::Hull {
+                points: vec![
+                    Vec3::new(99.5, -0.5, -0.5),
+                    Vec3::new(100.5, -0.5, -0.5),
+                    Vec3::new(99.5, 0.5, -0.5),
+                    Vec3::new(99.5, -0.5, 0.5),
+                    Vec3::new(100.5, 0.5, 0.5),
+                ],
+                radius: 0.0,
+            },
+            pose(0.0, 0.0, 0.0),
+        ));
+        let b = dyn_box(&mut w, 0.0, 3.0);
+        // 그 hull의 실제 표면 앵커
+        assert!(
+            w.try_add_joint(Joint::point(far, b, Vec3::new(100.0, 0.0, 0.0), Vec3::ZERO))
+                .is_ok(),
+            "원점에서 떨어진 셰이프의 정상 앵커가 거부됨"
+        );
+    }
+
+    /// MAJOR: 최소 폭 스크린은 **한 평면의 높이**가 아니라 여러 면 방향을 봐야 한다.
+    /// 리뷰가 제시한 sliver(현 계산 1.1mm, 다른 면 기준 0.575mm)를 거부해야 한다.
+    #[test]
+    fn sliver_hull_is_rejected_by_multi_face_screen() {
+        let pts = vec![
+            Vec3::new(-0.684779, 0.439397, 0.415335),
+            Vec3::new(-2.926032, 1.807456, 1.821069),
+            Vec3::new(-0.745893, 0.486453, 0.446511),
+            Vec3::new(-0.655741, 0.426129, 0.392909),
+        ];
+        assert!(
+            Body::try_new_static(
+                Shape::Hull {
+                    points: pts,
+                    radius: 0.0
+                },
+                pose(0.0, 0.0, 0.0)
+            )
+            .is_err(),
+            "sliver hull이 통과 (단일 평면 높이만 재고 있다)"
+        );
+    }
 }

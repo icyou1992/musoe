@@ -125,6 +125,18 @@ impl Body {
                 {
                     return Err(ApiError::InvalidValue);
                 }
+                // **질량·관성이 셰이프와 물리적으로 정합**해야 한다(리뷰 BLOCKER).
+                // 범위만 따로 보면 반지름 1mm 구에 inv_mass=1e-6·inv_I=1e12 같은 조합이
+                // 통과하고, 그 조인트 K는 diag(1e-6, 1.6e7, 1.6e7)이 되어 정규화 det가
+                // 임계 아래로 떨어져 `Mat3::inverse`가 0 행렬을 돌려준다 —
+                // 조인트가 오류 없이 조용히 풀린다.
+                //
+                // 균질 강체는 축별로 `I ≈ k·m·(수직 두 방향 반크기의 제곱합)`이고
+                // 우리 생성자의 k는 1/3(박스)·0.4(구) 수준이다. 넉넉한 [0.1, 1000] 띠로
+                // 형상 다양성(막대·판)은 허용하면서 비물리적 주입만 막는다.
+                if !inertia_matches_shape(self) {
+                    return Err(ApiError::InvalidValue);
+                }
             }
             BodyType::Static | BodyType::Kinematic => {
                 if self.inv_mass != 0.0 || inv_i != Vec3::ZERO {
@@ -320,6 +332,38 @@ impl Body {
     pub fn velocity_at(&self, r: Vec3) -> Vec3 {
         self.linvel + self.angvel.cross(r)
     }
+}
+
+/// 축별 `inv_I · (수직 반크기 제곱합) / inv_m`이 물리적으로 그럴듯한 띠 안인가.
+fn inertia_matches_shape(b: &Body) -> bool {
+    const LO: f32 = 0.1;
+    const HI: f32 = 1000.0;
+    let bb = b.shape.local_aabb();
+    let h = Vec3::new(
+        bb.min.x.abs().max(bb.max.x.abs()),
+        bb.min.y.abs().max(bb.max.y.abs()),
+        bb.min.z.abs().max(bb.max.z.abs()),
+    );
+    let perp = [
+        h.y * h.y + h.z * h.z,
+        h.x * h.x + h.z * h.z,
+        h.x * h.x + h.y * h.y,
+    ];
+    let inv_i = [
+        b.inv_inertia_local.x,
+        b.inv_inertia_local.y,
+        b.inv_inertia_local.z,
+    ];
+    for (ii, p) in inv_i.iter().zip(perp.iter()) {
+        if *p <= 0.0 {
+            return false;
+        }
+        let ratio = ii * p / b.inv_mass;
+        if !(ratio.is_finite() && (LO..=HI).contains(&ratio)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// 유한하고 **정규화 가능한** 자세만 통과시키고, 정규화된 값을 저장한다.
