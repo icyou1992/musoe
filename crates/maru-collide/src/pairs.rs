@@ -5,6 +5,7 @@
 //! 이 집합에 영향을 줄 수 없다 — L0 결정론의 초석.
 
 use crate::{Aabb, Tree};
+use maru_math::Vec3;
 
 /// 듀얼 트리 브로드페이즈: 동적/정적 아이템과 각 트리에서 canonical 페어 집합 산출.
 /// 반환: 정렬된 (동적 id, 상대 id) — 동적-동적은 (min,max), 동적-정적은 (dyn, static|FLAG).
@@ -61,14 +62,37 @@ impl Broadphase {
         pairs.try_reserve_exact(budget).ok()?;
         let mut cand: Vec<u32> = Vec::new();
 
-        // lookup 맵도 fallible로 잡는다(암묵 성장 금지).
-        let mut static_lookup: std::collections::HashMap<u32, Aabb> =
-            std::collections::HashMap::new();
-        static_lookup.try_reserve(self.static_items.len()).ok()?;
-        static_lookup.extend(self.static_items.iter().copied());
-        let mut dyn_lookup: std::collections::HashMap<u32, Aabb> = std::collections::HashMap::new();
-        dyn_lookup.try_reserve(self.dynamic_items.len()).ok()?;
-        dyn_lookup.extend(self.dynamic_items.iter().copied());
+        // **슬롯 색인 배열**로 상대 AABB를 찾는다. 전에는 `HashMap<u32, Aabb>` 두 개를
+        // 매 스텝 새로 채우고 **후보마다** 조회했다 — 구 더미 3000에서 스텝당 10만 회를
+        // 넘는 SipHash다. id는 호출부가 부여하는 조밀한 인덱스이고 아이템 수로 유계이므로
+        // (max_id+1) 크기 배열이 곧 완전한 색인이다.
+        //
+        // 동적과 정적은 **별개 id 공간**이다(같은 정수가 양쪽에서 서로 다른 물체를 가리킬 수
+        // 있다 — STATIC_BIT이 존재하는 이유가 그것이다). 배열을 하나로 합치면 안 된다.
+        let slots = |items: &[(u32, Aabb)]| -> Option<Vec<Aabb>> {
+            let n = items
+                .iter()
+                .map(|(id, _)| *id)
+                .max()
+                .map_or(0, |m| m as usize + 1);
+            let mut v: Vec<Aabb> = Vec::new();
+            v.try_reserve_exact(n).ok()?;
+            // 빈 슬롯은 어떤 질의와도 겹치지 않는 역전 AABB — 조밀하지 않은 id를 받아도
+            // 페어를 만들지 않는다.
+            v.resize(
+                n,
+                Aabb::new(
+                    Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+                    Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+                ),
+            );
+            for &(id, a) in items {
+                v[id as usize] = a;
+            }
+            Some(v)
+        };
+        let dyn_by_slot = slots(&self.dynamic_items)?;
+        let static_by_slot = slots(&self.static_items)?;
 
         for &(id, aabb) in &self.dynamic_items {
             // 동적-동적 (self-pair 제거, canonical (min,max)로 절반만 채택해 중복 원천 차단)
@@ -78,7 +102,7 @@ impl Broadphase {
                 if other <= id {
                     continue; // self + 역방향 중복 제거
                 }
-                if aabb.overlaps(dyn_lookup[&other]) {
+                if aabb.overlaps(dyn_by_slot[other as usize]) {
                     if pairs.len() >= budget {
                         return None;
                     }
@@ -89,7 +113,7 @@ impl Broadphase {
             cand.clear();
             self.static_tree.query_candidates(aabb, &mut cand);
             for &s in &cand {
-                if aabb.overlaps(static_lookup[&s]) {
+                if aabb.overlaps(static_by_slot[s as usize]) {
                     if pairs.len() >= budget {
                         return None;
                     }
@@ -106,7 +130,6 @@ impl Broadphase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maru_math::Vec3;
 
     /// 고정 시드 xorshift — 재현 가능한 무작위 박스.
     struct Rng(u64);
