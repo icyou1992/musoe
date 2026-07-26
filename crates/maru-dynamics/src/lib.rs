@@ -19,6 +19,197 @@ pub use world::{ApiError, Diagnostics, World, WorldParams};
 #[cfg(test)]
 mod tests {
 
+    fn unit_sphere_world() -> (World, BodyHandle) {
+        let mut w = World::new(WorldParams {
+            gravity: maru_math::Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let h = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 10.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            2.0,
+        ));
+        (w, h)
+    }
+
+    /// 힘은 **가속도**로 들어간다: F=ma 이므로 dt 동안 Δv = F·dt/m 이어야 한다.
+    /// (`new_dynamic`의 셋째 인자는 질량이 아니라 **밀도**다 — 질량은 역질량에서 되찾는다.)
+    #[test]
+    fn applied_force_integrates_as_acceleration() {
+        let (mut w, h) = unit_sphere_world();
+        let m = 1.0 / w.body(h).inv_mass();
+        w.apply_force(h, maru_math::Vec3::new(10.0, 0.0, 0.0))
+            .unwrap();
+        let dt = 1.0 / 60.0;
+        w.try_step(dt).unwrap();
+        let v = w.body(h).linvel();
+        let want = 10.0 / m * dt;
+        assert!((v.x - want).abs() < 1e-4, "Δv={} 인데 F·dt/m = {want}", v.x);
+        // **한 스텝이 소비하고 지운다** — 다음 스텝에 다시 가속되면 안 된다.
+        assert_eq!(w.body(h).force(), maru_math::Vec3::ZERO);
+        w.try_step(dt).unwrap();
+        assert!(
+            (w.body(h).linvel().x - want).abs() < 1e-4,
+            "힘이 두 번 먹혔다"
+        );
+    }
+
+    /// 여러 번 부르면 더해진다.
+    #[test]
+    fn forces_accumulate_until_the_step() {
+        let (mut w, h) = unit_sphere_world();
+        for _ in 0..4 {
+            w.apply_force(h, maru_math::Vec3::new(1.0, 0.0, 0.0))
+                .unwrap();
+        }
+        assert!((w.body(h).force().x - 4.0).abs() < 1e-6);
+        let m = 1.0 / w.body(h).inv_mass();
+        w.try_step(1.0 / 60.0).unwrap();
+        let want = 4.0 / m * (1.0 / 60.0);
+        assert!((w.body(h).linvel().x - want).abs() < 1e-4);
+    }
+
+    /// 충격은 즉시 속도를 바꾼다 (스텝을 기다리지 않는다).
+    #[test]
+    fn impulse_changes_velocity_immediately() {
+        let (mut w, h) = unit_sphere_world();
+        let m = 1.0 / w.body(h).inv_mass();
+        w.apply_impulse(h, maru_math::Vec3::new(6.0, 0.0, 0.0))
+            .unwrap();
+        assert!((w.body(h).linvel().x - 6.0 / m).abs() < 1e-5, "Δv = J/m");
+    }
+
+    /// 질량중심에서 벗어난 점을 때리면 **회전도** 생긴다.
+    #[test]
+    fn off_center_impulse_creates_spin() {
+        let (mut w, h) = unit_sphere_world();
+        let com = w.body(h).pose().pos;
+        // 중심에서 +y로 0.5 떨어진 점을 +x로 때린다 → z축 각속도가 생겨야 한다
+        w.apply_impulse_at_point(
+            h,
+            maru_math::Vec3::new(4.0, 0.0, 0.0),
+            com + maru_math::Vec3::new(0.0, 0.5, 0.0),
+        )
+        .unwrap();
+        let m = 1.0 / w.body(h).inv_mass();
+        let b = w.body(h);
+        assert!(
+            (b.linvel().x - 4.0 / m).abs() < 1e-5,
+            "선속도는 중심 타격과 같다"
+        );
+        assert!(
+            b.angvel().z < -1e-3,
+            "r×J 의 z가 음수여야 한다: {:?}",
+            b.angvel()
+        );
+        assert!(b.angvel().x.abs() < 1e-6 && b.angvel().y.abs() < 1e-6);
+    }
+
+    /// 잠든 바디에 힘을 주면 깨어나야 한다 — 안 그러면 "왜 안 움직이지"가 된다.
+    #[test]
+    fn applying_force_wakes_a_sleeping_body() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            maru_collide::Shape::Box {
+                half: maru_math::Vec3::new(10.0, 1.0, 10.0),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, -1.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        let h = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 0.5, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        for _ in 0..240 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        assert!(w.is_asleep(h), "먼저 잠들어야 의미 있는 테스트다");
+        w.apply_impulse(h, maru_math::Vec3::new(0.0, 3.0, 0.0))
+            .unwrap();
+        assert!(!w.is_asleep(h), "힘을 받으면 깨어나야 한다");
+    }
+
+    /// static·kinematic은 힘을 **조용히 무시하지 않고** 거부한다.
+    #[test]
+    fn forces_are_rejected_on_non_dynamic_bodies() {
+        let mut w = World::new(WorldParams::default());
+        let s = w.add_body(Body::new_static(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::ZERO,
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        assert_eq!(
+            w.apply_force(s, maru_math::Vec3::new(1.0, 0.0, 0.0)),
+            Err(ApiError::ImmutableStatic)
+        );
+        assert_eq!(
+            w.apply_impulse(s, maru_math::Vec3::new(1.0, 0.0, 0.0)),
+            Err(ApiError::ImmutableStatic)
+        );
+    }
+
+    /// 힘 입력은 **입력 범위**로 거른다 (NaN·Inf·상한 초과).
+    ///
+    /// 누적분에 파생 상한(포화 + `StateOverflow`)을 두긴 하지만, 라이브 API로는 사실상
+    /// 도달하지 않는다 — 한 번의 입력이 `MAX_INPUT`(1e4)으로 막혀 있어 `MAX_STATE`(1e15)에
+    /// 닿으려면 1e11번을 불러야 한다. 그 검사의 실제 수요자는 **스냅샷 리더**다(악의적
+    /// 스냅샷이 거대한 힘을 담을 수 있다). 그래서 여기서는 입력 경계만 확인하고,
+    /// 복원 경계는 `read_body`가 라이브와 같은 상태 정책으로 읽는 것으로 보장한다.
+    #[test]
+    fn force_input_is_validated() {
+        let (mut w, h) = unit_sphere_world();
+        for bad in [
+            maru_math::Vec3::new(f32::NAN, 0.0, 0.0),
+            maru_math::Vec3::new(f32::INFINITY, 0.0, 0.0),
+            maru_math::Vec3::new(1e30, 0.0, 0.0),
+        ] {
+            assert_eq!(w.apply_force(h, bad), Err(ApiError::InvalidValue));
+            assert_eq!(w.apply_torque(h, bad), Err(ApiError::InvalidValue));
+            assert_eq!(w.apply_impulse(h, bad), Err(ApiError::InvalidValue));
+        }
+        assert_eq!(
+            w.body(h).force(),
+            maru_math::Vec3::ZERO,
+            "거부는 상태를 남기지 않는다"
+        );
+    }
+
+    /// 누적 힘은 **캐노니컬 상태**다 — 스냅샷 왕복이 같은 미래를 만들어야 한다.
+    #[test]
+    fn pending_forces_survive_snapshot_roundtrip() {
+        let (mut w, h) = unit_sphere_world();
+        w.apply_force(h, maru_math::Vec3::new(7.0, 0.0, 3.0))
+            .unwrap();
+        w.apply_torque(h, maru_math::Vec3::new(0.0, 2.0, 0.0))
+            .unwrap();
+        let snap = w.try_snapshot().unwrap();
+        let mut restored = World::new(WorldParams::default());
+        restored.restore(&snap).unwrap();
+        assert_eq!(restored.body(h).force(), w.body(h).force());
+        assert_eq!(restored.body(h).torque(), w.body(h).torque());
+        for _ in 0..5 {
+            w.try_step(1.0 / 60.0).unwrap();
+            restored.try_step(1.0 / 60.0).unwrap();
+        }
+        assert_eq!(
+            w.try_state_hash().unwrap(),
+            restored.try_state_hash().unwrap(),
+            "힘이 빠지면 해시는 같은데 미래가 갈린다"
+        );
+    }
+
     /// 재질 설정자는 다른 쓰기 경로와 같은 규율을 따른다 — 바꾼 뒤 `validate`를 다시 통과해야 한다.
     #[test]
     fn material_setters_validate() {
@@ -1068,8 +1259,9 @@ mod tests {
         let good = w.snapshot();
         let before = w.state_hash();
 
-        // 슬롯(Box): alive1+oob1+reserved1+gen4 + 본문106 + sleep4+asleep1+island4 = 122
-        const SLOT: usize = 122;
+        // 슬롯(Box): alive1+oob1+reserved1+gen4 + 본문(106 + force12 + torque12 = 130)
+        //            + sleep4+asleep1+island4 = 146
+        const SLOT: usize = 146;
         let type_off = HDR + 4 + SLOT + 1 + 1 + 1 + 4;
         assert_eq!(
             good[type_off], 1,

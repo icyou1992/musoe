@@ -52,6 +52,13 @@ pub struct Body {
     /// 호스트는 자기 정점 버퍼를 `pose.pos + pose.rot * shape_origin_offset`에 그린다.
     /// hull이 아니거나 이미 중심이 맞으면 0 (설계: pose.pos = 질량중심).
     pub(crate) shape_origin_offset: Vec3,
+    /// 다음 스텝에 적용할 **월드 좌표 힘** 누적. 스텝 끝에 0으로 지워진다.
+    ///
+    /// 캐노니컬 상태다 — `apply_force` 뒤 `step` 전에 스냅샷을 뜨면 그 힘까지 담겨야
+    /// 복원된 월드가 같은 미래를 만든다(빠지면 해시는 같은데 다음 스텝이 갈린다).
+    pub(crate) force: Vec3,
+    /// 다음 스텝에 적용할 **월드 좌표 토크** 누적. 스텝 끝에 0으로 지워진다.
+    pub(crate) torque: Vec3,
 }
 
 impl Body {
@@ -87,7 +94,16 @@ impl Body {
     pub fn friction(&self) -> f32 {
         self.friction
     }
+    /// 다음 스텝에 적용될 누적 힘 (월드 좌표).
     #[inline]
+    pub fn force(&self) -> Vec3 {
+        self.force
+    }
+    /// 다음 스텝에 적용될 누적 토크 (월드 좌표).
+    #[inline]
+    pub fn torque(&self) -> Vec3 {
+        self.torque
+    }
     pub fn restitution(&self) -> f32 {
         self.restitution
     }
@@ -110,6 +126,13 @@ impl Body {
         // 비교는 양성 조건으로 — `!(x < 0.0)`은 NaN에서 참이라 통과시킨다
         if !(self.friction >= 0.0 && in_range(self.friction))
             || !(0.0..=1.0).contains(&self.restitution)
+        {
+            return Err(ApiError::InvalidValue);
+        }
+        // 힘·토크는 여러 번 더해져 자라므로 **파생 상태 범위**로 본다
+        // (입력 한 건은 setter가 입력 범위로 거르고, 누적분은 포화시킨다).
+        if !maru_collide::vec_in_state_range(self.force)
+            || !maru_collide::vec_in_state_range(self.torque)
         {
             return Err(ApiError::InvalidValue);
         }
@@ -193,6 +216,8 @@ impl Body {
             friction: 0.6,
             restitution: 0.0,
             shape_origin_offset,
+            force: Vec3::ZERO,
+            torque: Vec3::ZERO,
         };
         b.validate()?;
         Ok(b)
@@ -236,6 +261,8 @@ impl Body {
             friction: 0.6,
             restitution: 0.0,
             shape_origin_offset: Vec3::ZERO,
+            force: Vec3::ZERO,
+            torque: Vec3::ZERO,
         };
         b.validate()?;
         Ok(b)
@@ -289,6 +316,8 @@ impl Body {
             friction: 0.6,
             restitution: 0.0,
             shape_origin_offset,
+            force: Vec3::ZERO,
+            torque: Vec3::ZERO,
         };
         // **생성자는 자기 삽입 정책을 위반한 값을 내보내지 않는다**(리뷰 NEW MAJOR):
         // density=1e-10인 반지름 1m 구는 위 검사를 다 통과하지만 inv_mass≈2.39e9로
@@ -312,6 +341,8 @@ impl Body {
             friction: 0.6,
             restitution: 0.0,
             shape_origin_offset: Vec3::ZERO,
+            force: Vec3::ZERO,
+            torque: Vec3::ZERO,
         };
         b.validate()
             .expect("constructed body violates the size policy");

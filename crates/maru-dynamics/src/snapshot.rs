@@ -38,7 +38,7 @@ const MAGIC: u32 = 0x4d41_5255; // "MARU"
 /// **정책 변경은 wire 의미 변경이다.** v4 시절 빌드가 만든 33~1024점 스냅샷은 지금 거부되고,
 /// K-특이 조인트를 담은 v4도 거부된다 — 같은 버전 번호가 다른 계약을 뜻하면 안 되므로 올린다.
 /// (v4: WorldParams·OOB 플래그·앵커/최소 크기 / v3: 예약 슬롯·AddBody 핸들·last_report)
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 
 /// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
 /// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
@@ -53,8 +53,9 @@ const MAX_DECODED_BYTES: usize = 192 << 20;
 mod min_bytes {
     /// 셰이프 최소: 태그(1) + Sphere 반지름(4)
     const SHAPE: usize = 5;
-    /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + offset12
-    const BODY_CORE: usize = 1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + SHAPE;
+    /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4
+    /// + offset12 + force12 + torque12
+    const BODY_CORE: usize = 1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + SHAPE;
     /// 슬롯 레코드: alive1 + oob1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
     pub const SLOT: usize = 1 + 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
     /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang8
@@ -371,6 +372,9 @@ fn write_body(w: &mut Writer, b: &Body) {
     w.f32(b.friction);
     w.f32(b.restitution);
     w.vec3(b.shape_origin_offset);
+    // 누적 힘·토크는 캐노니컬 상태다 — apply 뒤 step 전 스냅샷이 같은 미래를 만들려면 담겨야 한다.
+    w.vec3(b.force);
+    w.vec3(b.torque);
     write_shape(w, &b.shape);
 }
 
@@ -400,6 +404,9 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
     let friction = r.f32()?;
     let restitution = r.f32()?;
     let shape_origin_offset = r.vec3()?;
+    // 힘·토크는 여러 번 더해져 자라므로 파생 상태 정책으로 읽는다(라이브 누적과 같은 규칙).
+    let force = r.state_vec3()?;
+    let torque = r.state_vec3()?;
     let shape = read_shape(r)?;
     let b = Body {
         body_type,
@@ -412,6 +419,8 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
         friction,
         restitution,
         shape_origin_offset,
+        force,
+        torque,
     };
     b.validate().map_err(|_| SnapshotError::InconsistentState)?;
     Ok(b)
@@ -524,7 +533,9 @@ fn shape_size(s: &Shape) -> usize {
 }
 
 fn body_size(b: &Body) -> usize {
-    1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + shape_size(&b.shape)
+    // 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + offset12
+    // + force12 + torque12 + 셰이프
+    1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + shape_size(&b.shape)
 }
 
 fn joint_size(j: &Joint) -> usize {

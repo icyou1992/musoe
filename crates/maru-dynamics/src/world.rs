@@ -178,6 +178,8 @@ pub struct World {
     /// 솔버 핫패스 스크래치 (비캐노니컬). 매 스텝 재할당하지 않으려고 월드가 보관한다.
     solver_state: solver::SolverState,
     inv_inertia_local: Vec<Vec3>,
+    /// 스텝 스크래치: 슬롯별 누적 (힘, 토크). 솔버 루프가 뚱뚱한 `Body`를 다시 훑지 않게 한다.
+    ext_force: Vec<(Vec3, Vec3)>,
     integrate_gate: Vec<bool>,
     gravity_gate: Vec<bool>,
     island_parent: Vec<usize>,
@@ -345,6 +347,7 @@ impl World {
             bp_dt: 0.0,
             solver_state: solver::SolverState::default(),
             inv_inertia_local: Vec::new(),
+            ext_force: Vec::new(),
             integrate_gate: Vec::new(),
             gravity_gate: Vec::new(),
             island_parent: Vec::new(),
@@ -520,6 +523,126 @@ impl World {
         self.contact_cache
             .retain(|(a, b), _| *a != id && (*b & !STATIC_BIT) != id);
         Ok(i)
+    }
+
+    /// 힘·충격 경로 전용 해석기.
+    ///
+    /// `mutate`와 달리 **PCM 캐시를 버리지 않는다** — 힘을 준다고 접촉이 사라진 것이
+    /// 아니므로 warm start를 끊으면 스택이 근거 없이 흔들린다(`mutate`가 캐시를 버리는
+    /// 것은 텔레포트·속도 대입처럼 접촉 이력이 무의미해지는 변경 때문이다).
+    /// 동적 바디만 받는다 — static·kinematic에 힘은 의미가 없고, 조용히 무시하면
+    /// 호스트가 "왜 안 움직이지"를 진단할 수 없다.
+    fn accept_force(&mut self, h: BodyHandle) -> Result<usize, ApiError> {
+        let i = self.resolve(h)?;
+        if self.bodies[i].body_type != BodyType::Dynamic {
+            return Err(ApiError::ImmutableStatic);
+        }
+        self.wake(i);
+        Ok(i)
+    }
+
+    /// 누적 힘에 더한다 (월드 좌표, 뉴턴). 스텝이 소비하고 스텝 끝에 지워진다.
+    ///
+    /// 여러 번 부르면 더해진다. 한 번의 입력은 **입력 범위**로 거르고, 누적분이
+    /// 파생 상한을 넘으면 포화시키고 `StateOverflow`를 올린다(다른 파생 상태와 같은 규칙).
+    pub fn apply_force(&mut self, h: BodyHandle, force: Vec3) -> Result<(), ApiError> {
+        if !maru_collide::vec_in_range(force) {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.accept_force(h)?;
+        let (sat, clipped) = Self::saturate_derived(self.bodies[i].force + force);
+        self.bodies[i].force = sat;
+        if clipped {
+            return Err(ApiError::StateOverflow);
+        }
+        Ok(())
+    }
+
+    /// 누적 토크에 더한다 (월드 좌표, N·m).
+    pub fn apply_torque(&mut self, h: BodyHandle, torque: Vec3) -> Result<(), ApiError> {
+        if !maru_collide::vec_in_range(torque) {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.accept_force(h)?;
+        let (sat, clipped) = Self::saturate_derived(self.bodies[i].torque + torque);
+        self.bodies[i].torque = sat;
+        if clipped {
+            return Err(ApiError::StateOverflow);
+        }
+        Ok(())
+    }
+
+    /// 질량중심에 **즉시** 선형 충격을 준다 (N·s). 속도가 그 자리에서 바뀐다.
+    pub fn apply_impulse(&mut self, h: BodyHandle, impulse: Vec3) -> Result<(), ApiError> {
+        if !maru_collide::vec_in_range(impulse) {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.accept_force(h)?;
+        let dv = impulse * self.bodies[i].inv_mass;
+        let (sat, clipped) = Self::saturate_derived(self.bodies[i].linvel + dv);
+        self.bodies[i].linvel = sat;
+        if clipped {
+            return Err(ApiError::StateOverflow);
+        }
+        Ok(())
+    }
+
+    /// **즉시** 각충격을 준다 (N·m·s).
+    pub fn apply_angular_impulse(&mut self, h: BodyHandle, impulse: Vec3) -> Result<(), ApiError> {
+        if !maru_collide::vec_in_range(impulse) {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.accept_force(h)?;
+        let dw = self.bodies[i].inv_inertia_world().mul_vec(impulse);
+        let (sat, clipped) = Self::saturate_derived(self.bodies[i].angvel + dw);
+        self.bodies[i].angvel = sat;
+        if clipped {
+            return Err(ApiError::StateOverflow);
+        }
+        Ok(())
+    }
+
+    /// 월드 좌표의 한 **점**에 즉시 충격을 준다 — 질량중심에서 벗어난 만큼 회전도 생긴다.
+    /// 폭발·타격처럼 "어디를 맞았는가"가 중요한 경우의 정본 경로다.
+    pub fn apply_impulse_at_point(
+        &mut self,
+        h: BodyHandle,
+        impulse: Vec3,
+        point: Vec3,
+    ) -> Result<(), ApiError> {
+        if !maru_collide::vec_in_range(impulse) || !maru_collide::vec_in_range(point) {
+            return Err(ApiError::InvalidValue);
+        }
+        let i = self.accept_force(h)?;
+        // 레버암은 **질량중심 기준**이다 (설계 계약: pose.pos = COM).
+        let r = point - self.bodies[i].pose.pos;
+        let dv = impulse * self.bodies[i].inv_mass;
+        let dw = self.bodies[i].inv_inertia_world().mul_vec(r.cross(impulse));
+        let (sv, cv) = Self::saturate_derived(self.bodies[i].linvel + dv);
+        let (sw, cw) = Self::saturate_derived(self.bodies[i].angvel + dw);
+        self.bodies[i].linvel = sv;
+        self.bodies[i].angvel = sw;
+        if cv || cw {
+            return Err(ApiError::StateOverflow);
+        }
+        Ok(())
+    }
+
+    /// 누적 힘·토크를 지운다 (스텝을 돌리지 않고 취소할 때).
+    pub fn clear_forces(&mut self, h: BodyHandle) -> Result<(), ApiError> {
+        let i = self.resolve(h)?;
+        self.bodies[i].force = Vec3::ZERO;
+        self.bodies[i].torque = Vec3::ZERO;
+        Ok(())
+    }
+
+    /// 파생 상태 포화 — 상한을 넘으면 자른 값과 "잘렸다"를 함께 준다.
+    ///
+    /// 진단 카운터로 올리지 않는 이유: `apply_*`는 스텝 **전에** 불리는데 진단은
+    /// 스텝마다 초기화되므로 그 경로로 올리면 포화가 조용히 사라진다.
+    /// 값은 정책대로 포화시키되 `StateOverflow`를 **그 자리에서** 돌려준다.
+    fn saturate_derived(v: Vec3) -> (Vec3, bool) {
+        maru_collide::saturate_state_vec(v)
     }
 
     pub fn set_linear_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
@@ -1483,6 +1606,10 @@ impl World {
         let inv_i_local = &mut self.inv_inertia_local;
         inv_i_local.clear();
         inv_i_local.extend(self.bodies.iter().map(|b| b.inv_inertia_local));
+        // 누적 힘·토크도 압축 배열로 뽑는다 — 솔버 루프에서 뚱뚱한 Body를 다시 훑지 않는다.
+        let ext_force = &mut self.ext_force;
+        ext_force.clear();
+        ext_force.extend(self.bodies.iter().map(|b| (b.force, b.torque)));
         // 적분 대상 게이트도 스크래치에 재사용한다(루프에서 매번 판정하지 않는다).
         let integrate = &mut self.integrate_gate;
         let gravity_on = &mut self.gravity_gate;
@@ -1497,6 +1624,7 @@ impl World {
             gravity_on.push(ok && self.bodies[i].is_dynamic());
         }
         let inv_i_local = &self.inv_inertia_local;
+        let ext_force = &self.ext_force;
         let integrate = &self.integrate_gate;
         let gravity_on = &self.gravity_gate;
         let (max_lin, max_ang) = (
@@ -1516,8 +1644,21 @@ impl World {
             .filter(|&i| gravity_on[i as usize])
             .collect();
         for _ in 0..n_sub {
+            // 역관성 갱신을 **외력보다 먼저** — 토크는 현재 자세의 월드 역관성을 쓴다
+            // (뒤에 두면 첫 서브스텝에서 `inv_i`가 아직 0이라 토크가 통째로 사라진다).
+            st.refresh_inv_i_active(inv_i_local, &active);
             for &i in &grav_active {
-                st.lin[i as usize] += g * h;
+                let i = i as usize;
+                st.lin[i] += g * h;
+                // 외력은 **중력과 같은 자리**에서 가속도로 들어간다: dv = F/m · h.
+                // 토크는 현재 자세의 월드 역관성을 쓴다(자세가 서브스텝마다 바뀐다).
+                let (f, t) = ext_force[i];
+                if f != Vec3::ZERO {
+                    st.lin[i] += f * (st.inv_m[i] * h);
+                }
+                if t != Vec3::ZERO {
+                    st.ang[i] += st.inv_i[i].mul_vec(t) * h;
+                }
             }
             st.refresh_inv_i_active(inv_i_local, &active);
             for c in constraints.iter_mut() {
@@ -1608,6 +1749,13 @@ impl World {
         let _t_post = std::time::Instant::now();
         st.write_back(&mut self.bodies, &self.alive);
         self.solver_state = st;
+
+        // **외력은 이번 스텝이 소비했다** — 지운다. 힘은 프레임 단위 입력이고,
+        // 남겨두면 호스트가 매 프레임 다시 주는 순간 두 배로 쌓인다(모든 엔진의 관례).
+        for b in self.bodies.iter_mut() {
+            b.force = Vec3::ZERO;
+            b.torque = Vec3::ZERO;
+        }
 
         // 이번 스텝에 **적분된 바디가 하나도 없으면** 자세가 그대로이므로 페어 집합도 그대로다.
         // (kinematic도 적분 대상이라 구동 중이면 자연히 무효화된다.)
