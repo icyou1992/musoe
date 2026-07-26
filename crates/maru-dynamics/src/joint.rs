@@ -175,6 +175,31 @@ pub(crate) fn linear_k(inv_ma: f32, inv_mb: f32, ia: &Mat3, ib: &Mat3, ra: Vec3,
     m
 }
 
+/// K의 역행렬. 특이하면 **정규화(Tikhonov)** 해서 반드시 풀리게 만든다.
+///
+/// 삽입·복원·`set_pose`에서 조건수를 검사해도 **정상 적분 중 자유 회전**으로 조건수가
+/// 임계 아래로 내려갈 수 있다(리뷰 BLOCKER: point joint는 회전을 구속하지 않는다).
+/// 그때 `Mat3::inverse`가 0 행렬을 돌려주면 제약이 **조용히 풀린다** — 가장 나쁜 실패다.
+/// 대각에 미세 항을 더하면 조건수가 유계가 되고, 물리적으로는 그 축만 아주 약간
+/// 무르게 만드는 것이라 잘 조건화된 K에서는 측정 가능한 차이가 없다.
+pub(crate) fn solve_k(k: &Mat3) -> Mat3 {
+    let inv = k.inverse();
+    let nonzero = [inv.c[0], inv.c[1], inv.c[2]]
+        .iter()
+        .any(|c| c.x != 0.0 || c.y != 0.0 || c.z != 0.0);
+    if nonzero {
+        return inv;
+    }
+    // 대각 규모에 비례한 정규화 — 스케일 무관(절대 상수 금지, 톨러런스 정책과 동일 원칙)
+    let scale = (k.c[0].x.abs() + k.c[1].y.abs() + k.c[2].z.abs()) / 3.0;
+    let eps = if scale > 0.0 { scale * 1.0e-4 } else { 1.0e-12 };
+    let mut r = *k;
+    r.c[0].x += eps;
+    r.c[1].y += eps;
+    r.c[2].z += eps;
+    r.inverse()
+}
+
 /// 삽입 시점의 K가 실제로 역행렬을 가지는가. `Mat3::inverse`는 실패하면 **0 행렬**을
 /// 돌려주므로(조용한 실패), 그 값을 직접 확인한다.
 pub(crate) fn k_is_solvable(bodies: &[Body], j: &Joint) -> bool {
@@ -248,6 +273,7 @@ pub fn solve(
     // --- 선형 3-DOF: K = (1/ma+1/mb)I + skew(ra)ᵀIa⁻¹skew(ra) + skew(rb)ᵀIb⁻¹skew(rb) ---
     // **삽입 검증과 같은 함수**를 쓴다. 중복 구현이 있으면 둘이 갈라져 검증이 무의미해진다.
     let k = linear_k(inv_ma, inv_mb, &ia, &ib, ra, rb);
+    let k_inv = solve_k(&k);
     let c_pos = (st.pos[j.ia()] + ra) - (st.pos[j.ib()] + rb);
     let cdot = st.vel_at_pub(j.ia(), ra) - st.vel_at_pub(j.ib(), rb);
     let (bias, mass_scale, impulse_scale) = match soft {
@@ -258,8 +284,7 @@ pub fn solve(
         ),
         None => (Vec3::ZERO, 1.0, 0.0),
     };
-    let impulse =
-        k.inverse().mul_vec(-(cdot + bias)) * mass_scale - j.linear_impulse * impulse_scale;
+    let impulse = k_inv.mul_vec(-(cdot + bias)) * mass_scale - j.linear_impulse * impulse_scale;
     j.linear_impulse += impulse;
     st.apply_pub(j.ia(), impulse, ra);
     st.apply_pub(j.ib(), -impulse, rb);

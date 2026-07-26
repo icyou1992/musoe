@@ -224,14 +224,19 @@ fn box_box_axis(
             v
         }
     };
-    let body_key = |h: Vec3, p: &Pose| -> [f32; 7] {
+    // 키에 **convex radius와 위치**까지 넣는다(리뷰 PARTIAL): half/rotation만 쓰면
+    // `ra=0` vs `rb=0.1`인 rounded-box 쌍이나 미세하게 다른 위치가 같은 키를 가져
+    // 교환에서 부호가 뒤집히지 않는다.
+    let body_key = |h: Vec3, r: f32, p: &Pose| -> [f32; 11] {
         let q = canon(p.rot);
-        [h.x, h.y, h.z, q[0], q[1], q[2], q[3]]
+        [
+            h.x, h.y, h.z, r, q[0], q[1], q[2], q[3], p.pos.x, p.pos.y, p.pos.z,
+        ]
     };
-    let (ka, kb) = (body_key(ha, pa), body_key(hb, pb));
+    let (ka, kb) = (body_key(ha, ra, pa), body_key(hb, rb, pb));
     let tie_sign = {
         let mut s = 1.0f32;
-        for i in 0..7 {
+        for i in 0..11 {
             if ka[i] != kb[i] {
                 s = if ka[i] > kb[i] { 1.0 } else { -1.0 };
                 break;
@@ -314,7 +319,18 @@ fn box_box_axis(
     // `n → -n`으로 뒤집히는데 signed 사전식은 대소 순서가 보존되지 않아 다른 축을 고른다.
     // 성분 절대값 사전식은 교환에 불변이므로 **같은 축(직선)** 을 고르고, 방향은 `d` 규칙이
     // 정한다(d=0에서는 임의이지만 결정적이다).
-    let lex = |n: Vec3| (n.x.abs(), n.y.abs(), n.z.abs());
+    // **부호 정준 방향**으로 만든 뒤 전 성분을 비교한다(리뷰 PARTIAL): 성분 절대값만 쓰면
+    // `(1,1,0)`과 `(1,-1,0)`처럼 **서로 다른 축 직선**이 같은 키를 가져 전순서가 되지 않는다.
+    // 첫 비영 성분이 양수가 되도록 뒤집으면 `n`과 `-n`만 같은 키를 갖는다.
+    let lex = |n: Vec3| -> (f32, f32, f32) {
+        let v = [n.x, n.y, n.z];
+        let flip = v.iter().find(|c| **c != 0.0).is_some_and(|c| *c < 0.0);
+        if flip {
+            (-v[0], -v[1], -v[2])
+        } else {
+            (v[0], v[1], v[2])
+        }
+    };
     let align_tie = ALIGN_TIE_REL * scale;
     let better = |sep_new: f32, n_new: Vec3, sep_cur: f32, n_cur: Vec3| -> bool {
         if sep_new > sep_cur + tol {

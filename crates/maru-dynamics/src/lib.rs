@@ -3134,4 +3134,41 @@ mod tests {
         });
         assert_eq!(w.try_step(DT), Ok(()));
     }
+
+    /// BLOCKER: 삽입 시 조건수를 검사해도 **정상 적분 중 자유 회전**으로 K가 특이해질 수
+    /// 있다(point joint는 회전을 구속하지 않는다). 그때 `inverse`가 0 행렬이면 제약이
+    /// **조용히 풀린다** — 가장 나쁜 실패다. 솔브 시점 정규화로 항상 풀리게 만든다.
+    #[test]
+    fn joint_survives_free_rotation_without_silent_release() {
+        let mut w = World::new(WorldParams::default());
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.1 },
+            pose(0.0, 6.0, 0.0),
+        ));
+        // 이방성 판 — 자유 회전으로 조건수가 크게 변한다
+        let plate = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(3.0, 0.05, 0.4),
+                radius: 0.0,
+            },
+            pose(1.5, 6.0, 0.0),
+            50.0,
+        ));
+        w.try_add_joint(Joint::point(
+            anchor,
+            plate,
+            Vec3::ZERO,
+            Vec3::new(-1.5, 0.0, 0.0),
+        ))
+        .unwrap();
+        // 회전을 크게 넣어 자세를 계속 바꾼다
+        w.set_angular_velocity(plate, Vec3::new(0.0, 0.0, 8.0))
+            .unwrap();
+        for i in 0..1200 {
+            w.step(DT);
+            let d = (w.body(plate).pose().pos - Vec3::new(0.0, 6.0, 0.0)).length();
+            assert!(d < 4.0, "스텝 {i}에서 조인트가 풀렸다 (앵커 거리 {d:.2})");
+        }
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
 }
