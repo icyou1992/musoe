@@ -95,6 +95,12 @@ fn main() {
         top_y = top_y.max(b.pose().pos.y);
     }
     let d = w.diagnostics();
+    let warm_ratio = if d.warm_total > 0 {
+        d.warm_hits as f32 / d.warm_total as f32
+    } else {
+        -1.0
+    };
+    println!("warm={warm_ratio:.3} ({}/{})", d.warm_hits, d.warm_total);
     println!(
         "{ms_per_step:.0} ms/step  finite={finite}  vmax={vmax:.4}  top_y={top_y:.2}\n\
          pairs={} / budget={} ({:.1}%)  oob={}  vclamp={}  sat={}",

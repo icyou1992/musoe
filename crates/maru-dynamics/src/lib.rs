@@ -529,12 +529,28 @@ mod tests {
         assert_pyramid_stable(&w, &hs, 10);
     }
 
-    /// M2 수용 기준(2026-07-25 실측 재보정): 피라미드 40단(820박스) 안정.
+    /// **M2 수용 기준 (2026-07-26 장기창 재보정)**: 피라미드 28단(406박스) 50초 안정.
+    ///
+    /// # 창 길이가 기준의 일부다
+    /// 이전 기준은 40단 × 600스텝(10초)이었고 통과했다. 같은 장면을 3000스텝(50초) 돌리면
+    /// **1200스텝 부근에서 붕괴한다**(top_y 39.3 → 5.5). "안정"이 아니라 "아직 안 무너짐"을
+    /// 재고 있었다 — 설계의 무근거 목표(100단)를 실측으로 40단으로 내렸던 것과 **같은 계열의
+    /// 실수를 창 길이에서 반복**했다.
+    ///
+    /// 실측 장기 봉투(4 서브스텝·30Hz 접촉, 50초):
+    /// 10·20·22·24·26·**28단 안정**(전부 잠듦, vmax 0.000) / **29단부터 붕괴**(vmax 195+).
+    /// 경계는 재현적이다(반복 간 비트 동일 — L0 결정론 유지).
+    ///
+    /// # 안정의 실질 판정은 '잠들었는가'다
+    /// 이 엔진에서 장기 안정과 수면은 같은 사건이다: 잔류 속도가 임계 아래로 떨어지면
+    /// 아일랜드가 얼어 영구 안정이 되고, 떨어지지 않으면 지터가 수십 초에 걸쳐 자라 붕괴한다.
+    /// 그래서 속도·형상뿐 아니라 **수면**을 함께 요구한다.
+    ///
     /// release 전용 — debug는 수 분 걸린다. `cargo test --release -- --ignored`
-    /// 봉투 전체(20~100단 침하·ms/step)는 `maru-bench --bin pyramid100` + README 표.
     #[test]
     #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
-    fn pyramid_40_tiers_stable_acceptance() {
+    fn pyramid_28_tiers_long_run_acceptance() {
+        const TIERS: usize = 28;
         let mut w = World::new(WorldParams::default());
         // 지면은 `maru-bench --bin pyramid100`과 **동일**해야 한다 — 같은 수용 기준이 서로 다른
         // 씬을 재면 README 봉투 표와 CI 게이트가 어긋난다.
@@ -545,11 +561,42 @@ mod tests {
             },
             pose(0.0, -1.0, 0.0),
         ));
-        let hs = pyramid(&mut w, 40);
-        for _ in 0..600 {
+        let hs = pyramid(&mut w, TIERS);
+        for _ in 0..3000 {
             w.step(DT);
         }
-        assert_pyramid_stable(&w, &hs, 40);
+        assert_pyramid_stable(&w, &hs, TIERS);
+        let asleep = hs.iter().filter(|h| w.is_asleep(**h)).count();
+        assert_eq!(
+            asleep,
+            hs.len(),
+            "{asleep}/{} 만 잠듦 — 잠들지 않은 스택은 장기적으로 발산한다",
+            hs.len()
+        );
+    }
+
+    /// 봉투 **밖**(29단)은 실제로 붕괴한다 — 기준이 판별력을 갖는지 잠근다.
+    /// 이 테스트가 실패하면 봉투가 넓어진 것이므로 위 기준을 다시 재야 한다.
+    #[test]
+    #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
+    fn pyramid_29_tiers_is_outside_the_envelope() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(120.0, 1.0, 20.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        ));
+        let hs = pyramid(&mut w, 29);
+        for _ in 0..3000 {
+            w.step(DT);
+        }
+        let top = w.body(*hs.last().unwrap()).pose.pos.y;
+        assert!(
+            top < 0.99 * (0.5 + 28.0),
+            "29단이 버텼다 — 봉투가 넓어졌으니 수용 기준을 재측정할 것 (top_y={top:.2})"
+        );
     }
 
     /// 설계 §7 계약: 쓰기는 커맨드 큐로, **enqueue 순서대로** 적용되고,
