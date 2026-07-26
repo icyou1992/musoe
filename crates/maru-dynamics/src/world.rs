@@ -2072,8 +2072,19 @@ impl World {
                 if t != Vec3::ZERO {
                     st.ang[i] += st.inv_i[i].mul_vec(t) * h;
                 }
-                // **암시적 감쇠**: v ← v / (1 + h·d). 명시적(`1 - h·d`)이면 `h·d > 1`에서
-                // 부호가 뒤집혀 발산한다 — 호스트가 큰 값을 넣으면 폭발하는 대신 더 세게 멈춘다.
+            }
+
+            // **암시적 감쇠**: v ← v / (1 + h·d). 명시적(`1 − h·d`)이면 `h·d > 1`에서
+            // 부호가 뒤집혀 발산한다 — 큰 값을 넣으면 폭발하는 대신 더 세게 멈춘다.
+            //
+            // 중력 루프에 얹지 않고 **여기서** 따로 돈다. 오늘은 두 게이트의 집합이 같아
+            // 결과가 맞지만, 바디별 중력 배율·비활성이 중력 게이트에 들어오는 날
+            // 감쇠가 조용히 같이 꺼진다(검수 MINOR). 감쇠는 활성 dynamic의 성질이다.
+            for &i in &active {
+                let i = i as usize;
+                if !st.dynamic[i] {
+                    continue;
+                }
                 let (dl, da) = damping[i];
                 if dl > 0.0 {
                     st.lin[i] = st.lin[i] * (1.0 / (1.0 + h * dl));
@@ -2082,7 +2093,7 @@ impl World {
                     st.ang[i] = st.ang[i] * (1.0 / (1.0 + h * da));
                 }
             }
-            st.refresh_inv_i_active(inv_i_local, &active);
+
             for c in constraints.iter_mut() {
                 solver::refresh_anchors(&st, c);
             }

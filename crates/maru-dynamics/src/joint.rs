@@ -33,7 +33,7 @@ pub enum JointKind {
 /// 조인트 모터 — 목표 속도를 최대 힘/토크까지 추종한다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Motor {
-    /// 목표 상대 각속도 (rad/s).
+    /// 목표 상대 각속도 (rad/s) — **A 기준 B**의 각속도(`ω_b − ω_a`).
     pub target_speed: f32,
     /// 이 모터가 낼 수 있는 **최대 토크** (N·m).
     ///
@@ -121,10 +121,11 @@ impl Joint {
                     if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
                         return Err(ApiError::InvalidValue);
                     }
-                    // 각도 한계는 ±2π 안에서만 의미가 있다(축 둘레 각은 atan2 치역).
-                    if !(-core::f32::consts::TAU..=core::f32::consts::TAU).contains(&lo)
-                        || !(-core::f32::consts::TAU..=core::f32::consts::TAU).contains(&hi)
-                    {
+                    // **치역은 [−π, π]다** (이중피복 정규화 뒤의 `2·atan2`).
+                    // 그 밖의 한계는 도달 불가라 제약이 **영구 위반** 상태로 고정된다 —
+                    // 받아주는 대신 거부한다. 여러 바퀴 도는 한계는 v1 범위 밖이다.
+                    let pi = core::f32::consts::PI;
+                    if !(-pi..=pi).contains(&lo) || !(-pi..=pi).contains(&hi) {
                         return Err(ApiError::InvalidValue);
                     }
                 }
@@ -411,11 +412,31 @@ fn distance_axis(st: &crate::solver::SolverState, j: &Joint) -> Option<Vec3> {
     let rb = st.rot[j.ib()].rotate(j.anchor_b);
     let d = (st.pos[j.ia()] + ra) - (st.pos[j.ib()] + rb);
     let len = d.length();
-    if len > 1e-6 {
+    if len > axis_eps(st, j) {
         Some(d * (1.0 / len))
     } else {
         None
     }
+}
+
+/// 축 퇴화 판정 임계 — **스케일에서 유도한다**.
+///
+/// 절대 상수(1e-6)를 쓰면 월드 가장자리에서 깨진다: `MAX_INPUT = 1e4` 부근의 f32 ULP가
+/// ~1e-3이라 `d`가 순수 상쇄 잡음인데도 `len > 1e-6`이 참이 되고, 제약이 쓰레기 방향으로
+/// 풀린다(설계 §8·`tolerance.rs` 정책 — 이 저장소가 세 번 재발시킨 계열이다).
+/// 척도는 이 조인트가 실제로 다루는 길이: 앵커 레버암과 거리 상한 중 큰 쪽.
+fn axis_eps(st: &crate::solver::SolverState, j: &Joint) -> f32 {
+    let bound = match j.kind {
+        JointKind::Distance { max, .. } => max,
+        _ => 0.0,
+    };
+    let scale = j
+        .anchor_a
+        .length()
+        .max(j.anchor_b.length())
+        .max(bound)
+        .max(st.pos[j.ia()].length().max(st.pos[j.ib()].length()));
+    maru_collide::length_eps(scale.max(1.0))
 }
 
 /// 축에 수직인 결정적 2축 기저.
@@ -536,7 +557,11 @@ pub fn solve(
 
             // 모터: 목표 상대 각속도를 최대 토크까지 추종한다(등식 제약 + 클램프).
             if let Some(m) = motor {
-                let want = -(wrel - m.target_speed) / k_ang;
+                // `target_speed`는 **A 기준 B**의 각속도다(`ω_b − ω_a`) — 호스트가
+                // "문을 +방향으로 연다"고 쓸 때 기대하는 방향이다. `wrel = ω_a − ω_b`이므로
+                // 목표는 `wrel → −target`이고, 따라서 부호가 이렇게 붙는다.
+                // (부호를 안 보는 테스트 때문에 반대로 도는 것을 놓치고 있었다.)
+                let want = -(wrel + m.target_speed) / k_ang;
                 let old = j.motor_impulse;
                 // **누적을 서브스텝 간격으로 스케일한 상한에 클램프한다.**
                 // 증분만 자르면 상한을 넘고, 상한을 임펄스로 두면 전달량이 서브스텝
@@ -651,8 +676,11 @@ pub fn solve(
 fn hinge_angle(st: &crate::solver::SolverState, j: &Joint, axis_a: Vec3, _axis_b: Vec3) -> f32 {
     // `q_rel` = A 프레임에서 본 B의 자세. `axis_a`도 A 로컬이라 그대로 투영한다.
     let q_rel = st.rot[j.ia()].conjugate() * st.rot[j.ib()];
-    let s = q_rel.x * axis_a.x + q_rel.y * axis_a.y + q_rel.z * axis_a.z;
-    2.0 * s.atan2(q_rel.w)
+    // **이중피복 정규화**: q와 −q는 같은 자세인데 `2·atan2`가 2π 다른 값을 준다.
+    // 정규화하지 않으면 twist가 ±π 부근에서 튀어 한계 판정이 뒤집힌다.
+    let sgn = if q_rel.w < 0.0 { -1.0 } else { 1.0 };
+    let s = (q_rel.x * axis_a.x + q_rel.y * axis_a.y + q_rel.z * axis_a.z) * sgn;
+    2.0 * s.atan2(q_rel.w * sgn)
 }
 
 /// Distance: 두 앵커 거리를 `[min, max]`로 묶는다.
@@ -674,8 +702,12 @@ fn solve_distance(
 ) {
     let d = (st.pos[j.ia()] + ra) - (st.pos[j.ib()] + rb);
     let len = d.length();
-    if len <= 1e-6 {
-        return; // 축이 퇴화 — 이번 서브스텝은 건너뛴다
+    if len <= axis_eps(st, j) {
+        // 축이 퇴화 — 이번 서브스텝은 건너뛴다. 다만 **저장소는 정규화한다**:
+        // Distance는 스칼라를 `.x`에만 담으므로 `.y/.z`에 남은 값은 행동에 영향이
+        // 없으면서 `state_hash`만 갈라놓는다(같은 미래, 다른 해시).
+        j.linear_impulse = Vec3::new(j.linear_impulse.x, 0.0, 0.0);
+        return;
     }
     let n = d * (1.0 / len);
     let (c, gate) = if len < min {
@@ -692,7 +724,7 @@ fn solve_distance(
             st.apply_pub(j.ia(), imp, ra);
             st.apply_pub(j.ib(), -imp, rb);
         }
-        j.limit_impulse = 0.0;
+        // Distance는 `limit_impulse`를 읽지 않는다 — 죽은 쓰기를 남기지 않는다.
         j.linear_impulse = Vec3::ZERO;
         return;
     };

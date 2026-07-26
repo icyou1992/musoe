@@ -816,6 +816,11 @@ mod tests {
     }
 
     /// **고정 조인트는 자세까지 묶는다** — 중력이 걸려도 상대 회전이 안 생겨야 한다.
+    ///
+    /// 앵커를 B의 **무게중심에서 떨어뜨린다**(레버암). 앵커가 무게중심에 있으면 중력이
+    /// 토크를 만들지 않아, 각 제약이 아예 없는 Point 조인트로도 이 테스트가 통과한다 —
+    /// 실제로 그랬고, 그래서 부호가 뒤집힌 Fixed가 녹색으로 통과했다
+    /// (검수 `review_existing_joint_tests_pass_without_any_angular_constraint`).
     #[test]
     fn fixed_joint_holds_relative_orientation() {
         let mut w = World::new(WorldParams::default());
@@ -825,7 +830,8 @@ mod tests {
                 a,
                 b,
                 maru_math::Vec3::new(1.0, 0.0, 0.0),
-                maru_math::Vec3::ZERO,
+                // B의 무게중심이 아니라 **끝단**을 잡는다 → 중력이 토크를 만든다
+                maru_math::Vec3::new(-0.3, 0.0, 0.0),
                 maru_math::Quat::IDENTITY,
             )
             .unwrap(),
@@ -843,7 +849,7 @@ mod tests {
         );
         let p = w.body(b).pose().pos;
         assert!(
-            (p - maru_math::Vec3::new(1.0, 10.0, 0.0)).length() < 0.1,
+            (p - maru_math::Vec3::new(1.3, 10.0, 0.0)).length() < 0.1,
             "위치도 붙어 있어야 한다: {p:?}"
         );
     }
@@ -912,6 +918,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // 초기 각속도를 줘서 한계에 **부딪히게** 만든다 — 앵커가 무게중심에 있으면
+        // 중력만으로는 토크가 안 생겨 한계가 시험되지 않는다.
+        w.set_angular_velocity(b, maru_math::Vec3::new(0.0, 0.0, 6.0))
+            .unwrap();
         for _ in 0..600 {
             w.try_step(1.0 / 60.0).unwrap();
         }
@@ -948,9 +958,10 @@ mod tests {
             w.try_step(1.0 / 60.0).unwrap();
         }
         let wz = w.body(b).angvel().z;
+        // **부호까지 본다.** `|wz∓3|` 둘 중 하나만 보면 모터 방향 규약이 시험되지 않는다.
         assert!(
-            (wz + 3.0).abs() < 0.5 || (wz - 3.0).abs() < 0.5,
-            "목표 각속도 3 rad/s를 추종해야 한다: {wz}"
+            (wz - 3.0).abs() < 0.5,
+            "목표 각속도 +3 rad/s를 부호까지 추종해야 한다: {wz}"
         );
     }
 
@@ -4272,6 +4283,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // 초기 각속도를 줘서 한계에 **부딪히게** 만든다 — 앵커가 무게중심에 있으면
+        // 중력만으로는 토크가 안 생겨 한계가 시험되지 않는다.
+        w.set_angular_velocity(b, maru_math::Vec3::new(0.0, 0.0, 6.0))
+            .unwrap();
         let mut worst: f32 = 0.0;
         for _ in 0..300 {
             w.try_step(1.0 / 60.0).unwrap();
