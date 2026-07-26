@@ -15,6 +15,11 @@ fn main() {
     // arg4: sleep 비활성화 플래그 (진단용)
     let no_sleep = args.get(4).map(|s| s == "nosleep").unwrap_or(false);
     let hertz: f32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(30.0);
+    // arg6: 수면 선속도 임계 (절벽 = 잔류속도가 이 임계를 건너는 지점인지 가리는 실험용)
+    let sleep_lin: f32 = args
+        .get(6)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(WorldParams::default().sleep_linear_threshold);
     let d = WorldParams::default();
     let mut w = World::new(WorldParams {
         substeps,
@@ -23,6 +28,8 @@ fn main() {
         } else {
             0.5
         },
+        sleep_linear_threshold: sleep_lin,
+        sleep_angular_threshold: sleep_lin * 1.667,
         solver: maru_dynamics::SolverParams {
             contact_hertz: hertz,
             ..d.solver
