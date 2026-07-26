@@ -248,12 +248,6 @@ pub(crate) fn anchor_fits(b: &Body, anchor: Vec3) -> bool {
     anchor.length() <= limit
 }
 
-/// 게이트 슬라이스를 인덱스와 함께 순회한다 (clippy: 루프 변수로 인덱싱하지 말 것).
-#[inline]
-fn gravity_gate_iter(g: &[bool]) -> impl Iterator<Item = (usize, bool)> + '_ {
-    g.iter().copied().enumerate()
-}
-
 impl World {
     /// 파라미터 불변식을 생성 경계에서 강제한다 (리뷰 MAJOR: 무검증 public 필드가
     /// dt/substeps·Softness 분모를 NaN/Inf로 만들 수 있었다).
@@ -743,6 +737,9 @@ impl World {
     fn enforce_world_bounds(&mut self) {
         let max = maru_collide::MAX_INPUT;
         for i in 0..self.bodies.len() {
+            // 여기는 **스텝당 1회**라 활성 필터를 넣지 않는다 — 잠든 바디를 건너뛰면
+            // `oob ⇒ !asleep` 불변식과 상호작용해 경계 이탈이 기록되지 않는 경로가 생긴다
+            // (실측으로 회귀에 걸렸다). 비용은 서브스텝 루프에 비하면 무시할 만하다.
             if !self.alive[i] || self.bodies[i].body_type == BodyType::Static {
                 continue;
             }
@@ -1409,13 +1406,23 @@ impl World {
             self.params.max_linear_velocity,
             self.params.max_angular_velocity,
         );
+        // **활성 바디만 훑는다.** 전원이 잠든 40단에서도 서브스텝 루프가 8회 × O(바디)
+        // 패스를 그대로 돌고 있었다(중력·역관성 갱신·속도 클램프·위치 적분) — 820 바디면
+        // 수만 번의 무의미한 순회다. 압축 인덱스 목록을 만들어 그것만 순회한다.
+        let active: Vec<u32> = (0..n_bodies)
+            .filter(|&i| integrate[i])
+            .map(|i| i as u32)
+            .collect();
+        let grav_active: Vec<u32> = active
+            .iter()
+            .copied()
+            .filter(|&i| gravity_on[i as usize])
+            .collect();
         for _ in 0..n_sub {
-            for (i, on) in gravity_gate_iter(gravity_on) {
-                if on {
-                    st.lin[i] += g * h;
-                }
+            for &i in &grav_active {
+                st.lin[i as usize] += g * h;
             }
-            st.refresh_inv_i(inv_i_local);
+            st.refresh_inv_i_active(inv_i_local, &active);
             for c in constraints.iter_mut() {
                 solver::refresh_anchors(&st, c);
             }
@@ -1451,10 +1458,8 @@ impl World {
                 );
             }
             // 속도 상한 — 위치 적분 **전에** 걸어야 변위도 유계가 된다
-            for (i, on) in gravity_gate_iter(integrate) {
-                if !on {
-                    continue;
-                }
+            for &i in &active {
+                let i = i as usize;
                 let l2 = st.lin[i].length_sq();
                 #[allow(clippy::neg_cmp_op_on_partial_ord)]
                 if !(l2 <= max_lin * max_lin) {
@@ -1479,14 +1484,13 @@ impl World {
                 }
             }
             // 위치 적분 (dynamic + kinematic, sleeping 제외)
-            for (i, on) in gravity_gate_iter(integrate) {
-                if on {
-                    st.pos[i] += st.lin[i] * h;
-                    st.rot[i] = st.rot[i].integrate(st.ang[i], h);
-                }
+            for &i in &active {
+                let i = i as usize;
+                st.pos[i] += st.lin[i] * h;
+                st.rot[i] = st.rot[i].integrate(st.ang[i], h);
             }
             // relax — bias 에너지 제거 (위치 적분으로 자세가 바뀌었으므로 갱신)
-            st.refresh_inv_i(inv_i_local);
+            st.refresh_inv_i_active(inv_i_local, &active);
             for c in constraints.iter_mut() {
                 solver::refresh_anchors(&st, c);
             }

@@ -233,11 +233,12 @@ impl SolverState {
     pub fn apply_ang_pub(&mut self, i: usize, ang: Vec3) {
         self.apply_ang(i, ang)
     }
-    /// 자세가 바뀐 뒤 월드 역관성을 갱신한다 (바디당 1회).
-    pub fn refresh_inv_i(&mut self, local: &[Vec3]) {
-        for (i, l) in local.iter().enumerate() {
+    /// **활성 바디만** 갱신한다 — 잠든 바디는 자세가 변하지 않아 값이 그대로다.
+    pub fn refresh_inv_i_active(&mut self, local: &[Vec3], active: &[u32]) {
+        for &i in active {
+            let i = i as usize;
             if self.dynamic[i] {
-                self.inv_i[i] = Mat3::rotate_inertia(*l, self.rot[i]);
+                self.inv_i[i] = Mat3::rotate_inertia(local[i], self.rot[i]);
             }
         }
     }
