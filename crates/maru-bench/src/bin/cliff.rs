@@ -28,6 +28,11 @@ fn main() {
         .nth(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(40);
+    // arg4: 마찰 계수 (판별 실험 — 성장 모드가 마찰이 만드는 것인지 가른다)
+    let friction: f32 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.6);
 
     let d = WorldParams::default();
     let mut w = World::new(WorldParams {
@@ -38,33 +43,43 @@ fn main() {
         ..d
     });
     let half = 0.5f32;
-    w.add_body(Body::new_static(
-        Shape::Box {
-            half: Vec3::new(120.0, 1.0, 20.0),
-            radius: 0.0,
-        },
-        Pose {
-            pos: Vec3::new(0.0, -1.0, 0.0),
-            rot: Quat::IDENTITY,
-        },
-    ));
+    w.add_body(
+        Body::new_static(
+            Shape::Box {
+                half: Vec3::new(120.0, 1.0, 20.0),
+                radius: 0.0,
+            },
+            Pose {
+                pos: Vec3::new(0.0, -1.0, 0.0),
+                rot: Quat::IDENTITY,
+            },
+        )
+        .with_friction(friction)
+        .expect("유효 마찰"),
+    );
     let mut handles = Vec::new();
     for tier in 0..tiers {
         let count = tiers - tier;
         let y = half + tier as f32 * 2.0 * half;
         let x0 = -(count as f32 - 1.0) * half;
         for i in 0..count {
-            handles.push(w.add_body(Body::new_dynamic(
-                Shape::Box {
-                    half: Vec3::new(half, half, half),
-                    radius: 0.0,
-                },
-                Pose {
-                    pos: Vec3::new(x0 + i as f32 * 2.0 * half, y, 0.0),
-                    rot: Quat::IDENTITY,
-                },
-                1.0,
-            )));
+            handles.push(
+                w.add_body(
+                    Body::new_dynamic(
+                        Shape::Box {
+                            half: Vec3::new(half, half, half),
+                            radius: 0.0,
+                        },
+                        Pose {
+                            pos: Vec3::new(x0 + i as f32 * 2.0 * half, y, 0.0),
+                            rot: Quat::IDENTITY,
+                        },
+                        1.0,
+                    )
+                    .with_friction(friction)
+                    .expect("유효 마찰"),
+                ),
+            );
         }
     }
 
@@ -80,20 +95,37 @@ fn main() {
         }
         e
     };
-    let vmax = |w: &World, hs: &[BodyHandle]| -> (f32, f32) {
-        let (mut vl, mut va) = (0.0f32, 0.0f32);
-        for h in hs {
+    // 바디 인덱스 → 단(tier). 성장 모드가 **어디에** 사는지 가른다.
+    let tier_of: Vec<usize> = {
+        let mut v = Vec::with_capacity(handles.len());
+        for t in 0..tiers {
+            for _ in 0..(tiers - t) {
+                v.push(t);
+            }
+        }
+        v
+    };
+    let vmax = |w: &World, hs: &[BodyHandle]| -> (f32, f32, usize) {
+        let (mut vl, mut va, mut at) = (0.0f32, 0.0f32, 0usize);
+        for (i, h) in hs.iter().enumerate() {
             let b = w.body(*h);
-            vl = vl.max(b.linvel().length());
+            let l = b.linvel().length();
+            if l > vl {
+                vl = l;
+                at = tier_of[i];
+            }
             va = va.max(b.angvel().length());
         }
-        (vl, va)
+        (vl, va, at)
     };
 
-    println!("substeps={substeps} tiers={tiers} bodies={}", handles.len());
+    println!(
+        "substeps={substeps} tiers={tiers} friction={friction} bodies={}",
+        handles.len()
+    );
     println!(
         "{:>5} {:>7} {:>7} {:>6} {:>9} {:>8} {:>8} {:>12} {:>9}",
-        "step", "warm", "hits", "pairs", "max_pen", "vlin", "vang", "E", "dE"
+        "step", "warm", "hits", "pairs", "max_pen", "vlin", "tier", "E", "dE"
     );
     let mut prev_e = energy(&w, &handles);
     let e0 = prev_e;
@@ -101,7 +133,7 @@ fn main() {
     for i in 0..steps {
         let _ = w.try_step(1.0 / 60.0);
         let d = w.diagnostics();
-        let (vl, va) = vmax(&w, &handles);
+        let (vl, _va, at) = vmax(&w, &handles);
         let e = energy(&w, &handles);
         let warm = if d.warm_total > 0 {
             d.warm_hits as f64 / d.warm_total as f64
@@ -124,7 +156,7 @@ fn main() {
                 d.pairs,
                 d.max_penetration,
                 vl,
-                va,
+                at as f32,
                 e,
                 e - prev_e
             );

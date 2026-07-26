@@ -18,6 +18,29 @@ pub use world::{ApiError, Diagnostics, World, WorldParams};
 
 #[cfg(test)]
 mod tests {
+
+    /// 재질 설정자는 다른 쓰기 경로와 같은 규율을 따른다 — 바꾼 뒤 `validate`를 다시 통과해야 한다.
+    #[test]
+    fn material_setters_validate() {
+        let mk = || {
+            Body::new_dynamic(
+                maru_collide::Shape::Sphere { radius: 0.5 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::ZERO,
+                    rot: maru_math::Quat::IDENTITY,
+                },
+                1.0,
+            )
+        };
+        assert_eq!(mk().with_friction(0.0).unwrap().friction(), 0.0);
+        assert_eq!(mk().with_friction(1.5).unwrap().friction(), 1.5);
+        assert_eq!(mk().with_restitution(1.0).unwrap().restitution(), 1.0);
+        // 범위 밖은 거부한다 (음수·NaN·반발 1 초과)
+        assert!(mk().with_friction(-0.1).is_err());
+        assert!(mk().with_friction(f32::NAN).is_err());
+        assert!(mk().with_restitution(1.1).is_err());
+        assert!(mk().with_restitution(-0.001).is_err());
+    }
     use super::*;
     use maru_collide::{Pose, Shape};
     use maru_math::{Quat, Vec3};

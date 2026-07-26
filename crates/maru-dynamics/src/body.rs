@@ -198,6 +198,24 @@ impl Body {
         Ok(b)
     }
 
+    /// 마찰 계수를 바꾼 사본. 범위 밖(음수·NaN·`MAX_INPUT` 초과)이면 오류다.
+    ///
+    /// 재질은 생성 시점에 0.6/0.0으로 고정돼 있었고 호스트가 바꿀 방법이 없었다 —
+    /// 물리엔진의 API 결손이다. 다른 쓰기 경로와 같은 규율을 따른다:
+    /// **바꾼 뒤 `validate`를 다시 통과해야 값이 확정된다.**
+    pub fn with_friction(mut self, friction: f32) -> Result<Self, ApiError> {
+        self.friction = friction;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// 반발 계수를 바꾼 사본. `0.0..=1.0` 밖이면 오류다.
+    pub fn with_restitution(mut self, restitution: f32) -> Result<Self, ApiError> {
+        self.restitution = restitution;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// 정적 바디 생성 (오류 반환형).
     pub fn try_new_static(shape: Shape, pose: Pose) -> Result<Self, ApiError> {
         shape.validate().map_err(|_| ApiError::InvalidValue)?;
