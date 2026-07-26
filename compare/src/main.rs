@@ -144,16 +144,42 @@ mod maru_side {
             let _ = w.try_step(DT);
         }
         let t0 = Instant::now();
+        let mut acc = [0u64; 4];
+        let mut reused = 0usize;
+        let mut pairs_acc = 0usize;
+        let mut pts_acc = 0usize;
         for _ in 0..steps {
             let _ = w.try_step(DT);
+            let d = w.diagnostics();
+            for k in 0..4 {
+                acc[k] += d.phase_ns[k];
+            }
+            reused += d.bp_reused as usize;
+            pairs_acc += d.pairs;
+            pts_acc += d.warm_total;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
-        let (mut lowest, mut finite) = (f32::MAX, true);
+        let (mut lowest, mut finite, mut asleep) = (f32::MAX, true, 0usize);
         for h in &handles {
             let b = w.body(*h);
             lowest = lowest.min(b.pose().pos.y);
             finite &= b.pose().pos.y.is_finite();
+            asleep += w.is_asleep(*h) as usize;
         }
+        eprintln!(
+            "    [maru pile] broad={:.0} narrow={:.0} solve={:.0} book={:.0} us  수면 {asleep}/{}  bp재사용 {reused}/{steps}",
+            acc[0] as f64 / 1000.0 / steps as f64,
+            acc[1] as f64 / 1000.0 / steps as f64,
+            acc[2] as f64 / 1000.0 / steps as f64,
+            acc[3] as f64 / 1000.0 / steps as f64,
+            handles.len()
+        );
+        eprintln!(
+            "    [maru pile] 페어 {}  접점 {}  → 페어당 narrow {:.2} us",
+            pairs_acc / steps,
+            pts_acc / steps,
+            acc[1] as f64 / 1000.0 / steps as f64 / (pairs_acc / steps).max(1) as f64
+        );
         let stable = finite && lowest > -0.5;
         Result_ {
             ms_per_step: ms,

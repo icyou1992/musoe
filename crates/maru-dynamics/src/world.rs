@@ -1057,15 +1057,26 @@ impl World {
                 continue; // 제거된 슬롯
             }
             let local = b.shape.local_aabb();
-            // 회전 보수 AABB: pose 원점 중심이므로 반경은 **로컬 원점에서** 가장 먼 코너까지.
-            // (max-min)/2로 잡으면 원점에서 벗어난 hull이 통째로 누락된다(리뷰 지적).
-            let far = Vec3::new(
-                local.min.x.abs().max(local.max.x.abs()),
-                local.min.y.abs().max(local.max.y.abs()),
-                local.min.z.abs().max(local.max.z.abs()),
+            // **회전된 AABB를 제대로 계산한다.** 예전에는 로컬 원점에서 가장 먼 코너까지의
+            // 거리를 세 축 모두에 썼는데(회전 불변이지만 매우 헐겁다), 반지름 0.5 구가
+            // 반크기 0.866 큐브가 되어 축당 1.73배·부피 5.2배로 부풀었다.
+            // 실측: 3000구 더미에서 페어 44,240개인데 실제 접점은 3,640개 — 12배 과잉이었다.
+            //
+            // 정확한 계산: 중심은 `pos + R·c`, 반크기는 `|R|·h` (|R|=성분별 절대값).
+            // 원점에서 벗어난 hull도 중심을 함께 옮기므로 누락되지 않는다.
+            let c = (local.max + local.min) * 0.5;
+            let hl = (local.max - local.min) * 0.5;
+            let (ax, ay, az) = (
+                b.pose.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
+                b.pose.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
+                b.pose.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
             );
-            let r = far.length();
-            let world = Aabb::from_center(b.pose.pos, Vec3::new(r, r, r));
+            let ext = Vec3::new(
+                ax.x.abs() * hl.x + ay.x.abs() * hl.y + az.x.abs() * hl.z,
+                ax.y.abs() * hl.x + ay.y.abs() * hl.y + az.y.abs() * hl.z,
+                ax.z.abs() * hl.x + ay.z.abs() * hl.y + az.z.abs() * hl.z,
+            );
+            let world = Aabb::from_center(b.pose.pos + b.pose.rot.rotate(c), ext);
             // OOB는 **시뮬레이션에서 완전히 빠진다** — 브로드페이즈에도 넣지 않는다.
             // static tree에 넣으면 PCM 키에 STATIC_BIT가 붙는데 실제 타입은 Dynamic이라
             // 스냅샷 구조 검증(`STATIC_BIT == (type==Static)`)이 **자기 스냅샷을 거부**한다
