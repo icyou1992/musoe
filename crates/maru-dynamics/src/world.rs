@@ -90,11 +90,19 @@ impl Default for WorldParams {
             // 비용이 0에 수렴하고(브로드페이즈 캐시), 못 자는 스택은 영원히 전부 계산한다.
             // 안정 봉투도 29단 → 60단으로 넓어진다.
             // 대가: **정착하지 않는 장면**(계속 움직이는 씬)에서는 2배 비용이 그대로 남는다.
-            substeps: 8,
+            // 서브스텝 4 (2026-07-27, owner 지시 "속도 우선"). 8이었던 이유는
+            // 40단 피라미드가 8에서만 버텨서였는데, 그 원인이 솔버 수렴이 아니라
+            // **수면 임계가 rapier의 13분의 1이라 못 자는 것**이었음이 밝혀졌다
+            // (README '수면과의 경주'). 임계를 아래처럼 맞추면 4로도 40단이 버틴다.
+            // 대가: 봉투가 60단 → 40단으로 좁아진다. 활성 스텝 비용은 −37%.
+            substeps: 4,
             speculative_margin: 0.05,
             solver: SolverParams::default(),
-            sleep_linear_threshold: 0.03,
-            sleep_angular_threshold: 0.05,
+            // rapier 0.34 기본은 0.4 m/s · 0.5 rad/s(`time_until_sleep` 2초)다.
+            // 우리는 그보다 4배 엄격하되, 예전 0.03(13배 엄격)은 스택이 영원히 못 자게
+            // 만들어 서브스텝 8을 강요하고 있었다.
+            sleep_linear_threshold: 0.1,
+            sleep_angular_threshold: 0.15,
             time_to_sleep: 0.5,
             max_pairs_per_body: 64,
             max_linear_velocity: 500.0,

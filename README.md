@@ -260,8 +260,10 @@ rapier 0.34 기본은 0.4 m/s(`time_until_sleep` 2초)로 **13배** 차이였다
 
 - **바디 감쇠(damping)가 없다.** rapier는 `linear_damping`/`angular_damping`을 갖는데
   Maru는 없다. 위 실험에서 감쇠는 성장 모드를 막지 못했지만(지연만) 호스트가 쓸 수 있어야
-  하는 표준 기능이다. 재질(`with_friction`/`with_restitution`)은 2026-07-27에 열었다 —
-  그 전에는 마찰 0.6·반발 0.0이 생성 시점에 고정이라 호스트가 바꿀 방법이 아예 없었다.
+  하는 표준 기능이다.
+  (**정정**: 앞선 커밋에서 "재질을 바꿀 방법이 아예 없었다"고 적었는데 틀렸다 —
+  `World::set_material`이 이미 있었다. `Body::with_friction`/`with_restitution`은
+  생성 시점에 지정하는 **편의 추가**지 결손을 메운 것이 아니다.)
 
 - **`Tree` 위상은 결정적이지 않다** (`select_nth_unstable_by`의 분할 내부 순서는
   규정되지 않는다). 이는 의도된 것이다: 페어 집합은 트리 위상에 비의존이고
