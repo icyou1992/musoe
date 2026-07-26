@@ -94,6 +94,33 @@ fn main() {
         vmax = vmax.max(b.linvel().length());
         top_y = top_y.max(b.pose().pos.y);
     }
+    // 단(tier)별 속도 분포 — 지터가 하중 쪽(아래)인지 전파 끝(위)인지 가른다
+    {
+        let mut per_tier: Vec<(f32, usize)> = vec![(0.0, 0); tiers];
+        let mut idx = 0usize;
+        for (t, slot) in per_tier.iter_mut().enumerate() {
+            let count = tiers - t;
+            for _ in 0..count {
+                let h = BodyHandle {
+                    index: (idx + 1) as u32,
+                    generation: 0,
+                };
+                if w.is_alive(h) {
+                    let v = w.body(h).linvel().length();
+                    slot.0 = slot.0.max(v);
+                    slot.1 += w.is_asleep(h) as usize;
+                }
+                idx += 1;
+            }
+        }
+        let mut line = String::new();
+        for (t, (vmax_t, slept)) in per_tier.iter().enumerate() {
+            if t % 3 == 0 || *vmax_t > 0.01 {
+                line.push_str(&format!("t{t}:{vmax_t:.3}/{slept} "));
+            }
+        }
+        println!("tier vmax/slept: {line}");
+    }
     let d = w.diagnostics();
     let warm_ratio = if d.warm_total > 0 {
         d.warm_hits as f32 / d.warm_total as f32

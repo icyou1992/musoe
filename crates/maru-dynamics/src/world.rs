@@ -38,7 +38,14 @@ impl Default for WorldParams {
     fn default() -> Self {
         Self {
             gravity: Vec3::new(0.0, -9.81, 0.0),
-            substeps: 4,
+            // **8 서브스텝이 기본이다** (2026-07-26 실측 재보정). 4는 현실적인 스택의
+            // 안정성 임계 **아래**였고, 그래서 성능까지 나빴다:
+            //   40단 피라미드  substeps=4 → 8 ms/step (붕괴) / substeps=8 → 2 ms/step (안정)
+            // 서브스텝 2배 비용은 **수면으로 인한 절감에 완전히 묻힌다** — 정착한 스택은
+            // 비용이 0에 수렴하고(브로드페이즈 캐시), 못 자는 스택은 영원히 전부 계산한다.
+            // 안정 봉투도 29단 → 60단으로 넓어진다.
+            // 대가: **정착하지 않는 장면**(계속 움직이는 씬)에서는 2배 비용이 그대로 남는다.
+            substeps: 8,
             speculative_margin: 0.05,
             solver: SolverParams::default(),
             sleep_linear_threshold: 0.03,

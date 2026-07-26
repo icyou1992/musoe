@@ -529,7 +529,7 @@ mod tests {
         assert_pyramid_stable(&w, &hs, 10);
     }
 
-    /// **M2 수용 기준 (2026-07-26 장기창 재보정)**: 피라미드 29단(435박스) 50초 안정.
+    /// **M2 수용 기준 (2026-07-26 서브스텝 재보정)**: 피라미드 40단(820박스) 50초 안정.
     ///
     /// # 창 길이가 기준의 일부다
     /// 이전 기준은 40단 × 600스텝(10초)이었고 통과했다. 같은 장면을 3000스텝(50초) 돌리면
@@ -538,8 +538,11 @@ mod tests {
     /// 실수를 창 길이에서 반복**했다.
     ///
     /// 실측 장기 봉투(4 서브스텝·30Hz 접촉, 50초):
-    /// 10·20·22·26·28·**29단 안정**(전부 잠듦, vmax 0.000) / **30단부터 붕괴**(vmax 320).
-    /// 경계는 재현적이다(반복 간 비트 동일 — L0 결정론 유지).
+    /// 실측 장기 봉투는 **서브스텝에 묶여 있었다**(hertz가 아니라):
+    /// substeps=4에서 29단이 한계였고 30단부터 붕괴했다. 기본값을 8로 올리자 **60단**까지
+    /// 안정이다(80단 붕괴). 경계 근처(60~63)는 **비단조**다 — 61 붕괴·62 안정 —
+    /// 임계 근처의 전형적 거동이므로 기준은 여유 있는 40단에 둔다.
+    /// 각 측정은 재현적이다(반복 간 비트 동일 — L0 결정론 유지).
     ///
     /// # 안정의 실질 판정은 '잠들었는가'다
     /// 이 엔진에서 장기 안정과 수면은 같은 사건이다: 잔류 속도가 임계 아래로 떨어지면
@@ -549,8 +552,8 @@ mod tests {
     /// release 전용 — debug는 수 분 걸린다. `cargo test --release -- --ignored`
     #[test]
     #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
-    fn pyramid_29_tiers_long_run_acceptance() {
-        const TIERS: usize = 29;
+    fn pyramid_40_tiers_long_run_acceptance() {
+        const TIERS: usize = 40;
         let mut w = World::new(WorldParams::default());
         // 지면은 `maru-bench --bin pyramid100`과 **동일**해야 한다 — 같은 수용 기준이 서로 다른
         // 씬을 재면 README 봉투 표와 CI 게이트가 어긋난다.
@@ -575,11 +578,11 @@ mod tests {
         );
     }
 
-    /// 봉투 **밖**(30단)은 실제로 붕괴한다 — 기준이 판별력을 갖는지 잠근다.
+    /// 봉투 **밖**(65단)은 실제로 붕괴한다 — 기준이 판별력을 갖는지 잠근다.
     /// 이 테스트가 실패하면 봉투가 넓어진 것이므로 위 기준을 다시 재야 한다.
     #[test]
     #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
-    fn pyramid_30_tiers_is_outside_the_envelope() {
+    fn pyramid_65_tiers_is_outside_the_envelope() {
         let mut w = World::new(WorldParams::default());
         w.add_body(Body::new_static(
             Shape::Box {
@@ -588,14 +591,14 @@ mod tests {
             },
             pose(0.0, -1.0, 0.0),
         ));
-        let hs = pyramid(&mut w, 30);
+        let hs = pyramid(&mut w, 65);
         for _ in 0..3000 {
             w.step(DT);
         }
         let top = w.body(*hs.last().unwrap()).pose.pos.y;
         assert!(
-            top < 0.99 * (0.5 + 29.0),
-            "30단이 버텼다 — 봉투가 넓어졌으니 수용 기준을 재측정할 것 (top_y={top:.2})"
+            top < 0.99 * (0.5 + 64.0),
+            "65단이 버텼다 — 봉투가 넓어졌으니 수용 기준을 재측정할 것 (top_y={top:.2})"
         );
     }
 
