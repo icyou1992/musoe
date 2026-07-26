@@ -585,6 +585,52 @@ mod tests {
         assert!(r.body(h).is_sensor());
     }
 
+    /// 슬롯이 재사용돼도 **닿은 적 없는 물체에 종료 이벤트가 나가면 안 된다**.
+    #[test]
+    fn removed_body_does_not_leak_events_to_a_reused_slot() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            maru_collide::Shape::Box {
+                half: maru_math::Vec3::new(10.0, 1.0, 10.0),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, -1.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        let a = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 0.5, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        w.try_step(1.0 / 60.0).unwrap();
+        assert!(
+            !w.contact_events().is_empty(),
+            "먼저 닿아야 의미 있는 테스트다"
+        );
+
+        w.remove_body(a).unwrap();
+        // 같은 슬롯을 재사용하는 새 물체 — 바닥에서 멀리 띄워 닿지 않게 둔다
+        let b = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 40.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        w.try_step(1.0 / 60.0).unwrap();
+        assert!(
+            !w.contact_events().iter().any(|e| e.a == b || e.b == b),
+            "새 물체는 아직 아무것도 안 닿았다: {:?}",
+            w.contact_events()
+        );
+    }
+
     /// 재질 설정자는 다른 쓰기 경로와 같은 규율을 따른다 — 바꾼 뒤 `validate`를 다시 통과해야 한다.
     #[test]
     fn material_setters_validate() {

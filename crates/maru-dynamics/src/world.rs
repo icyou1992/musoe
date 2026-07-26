@@ -527,6 +527,11 @@ impl World {
         self.alive[i] = false;
         self.reserved[i] = false;
         self.oob[i] = false;
+        // 접촉 이벤트 기준선에서도 지운다 — 남겨두면 다음 스텝에 죽은 슬롯 키가
+        // 종료 이벤트를 만들고, 슬롯이 재사용됐으면 엉뚱한 물체를 가리킨다.
+        let id = i as u32;
+        self.touching
+            .retain(|(a, b)| *a != id && (*b & !STATIC_BIT) != id);
         self.generations[i] = self.generations[i].wrapping_add(1);
         self.asleep[i] = false;
         self.island[i] = u32::MAX;
@@ -2001,6 +2006,12 @@ impl World {
             {
                 let (ai, bi) = (k.0 as usize, (k.1 & !STATIC_BIT) as usize);
                 if ai >= self.bodies.len() || bi >= self.bodies.len() {
+                    continue;
+                }
+                // **죽은 슬롯은 이벤트를 내지 않는다.** 슬롯이 재사용되면 `handle_of`가
+                // 새 물체의 핸들을 만들어, 닿은 적 없는 물체에 Stopped가 나간다.
+                // 제거는 호스트가 이미 아는 사실이므로 침묵이 옳다.
+                if !self.alive[ai] || !self.alive[bi] {
                     continue;
                 }
                 self.contact_events.push(ContactEvent {
