@@ -1334,6 +1334,39 @@ impl World {
             }
         }
 
+        // **중력 방향 정렬** — Gauss-Seidel은 제약 순서에 민감하다. 스택에서 지지력은
+        // 바닥에서 위로 전파되는데, 브로드페이즈가 내놓은 순서로 풀면 한 스윕에 한 층씩만
+        // 전파돼 수렴이 스택 깊이에 비례해 느려진다. 중력 방향 아래쪽 접촉부터 풀면
+        // 한 스윕으로 위까지 전파된다.
+        // 정렬 키 = 중력 단위벡터로의 투영(아래일수록 큼) → 내림차순. 무중력이면 전부 0이라
+        // 페어 키만 남는다. 동률은 페어 키(전순서·유일)로 끊어 **결정성**을 유지한다.
+        if constraints.len() > 1 {
+            let gdir = self.params.gravity.normalize_or_zero();
+            let depth = |c: &ContactConstraint| -> f32 {
+                let pa = self.bodies[c.a].pose.pos;
+                let pb = self.bodies[c.b].pose.pos;
+                pa.dot(gdir).max(pb.dot(gdir))
+            };
+            let mut order: Vec<u32> = (0..constraints.len() as u32).collect();
+            order.sort_unstable_by(|&i, &j| {
+                let (i, j) = (i as usize, j as usize);
+                depth(&constraints[j])
+                    .total_cmp(&depth(&constraints[i]))
+                    .then_with(|| constraint_keys[i].cmp(&constraint_keys[j]))
+            });
+            let mut c_tmp: Vec<Option<ContactConstraint>> =
+                constraints.drain(..).map(Some).collect();
+            let k_old = std::mem::take(&mut constraint_keys);
+            for &o in &order {
+                constraints.push(
+                    c_tmp[o as usize]
+                        .take()
+                        .expect("permutation is a bijection"),
+                );
+                constraint_keys.push(k_old[o as usize]);
+            }
+        }
+
         self.diag.phase_ns[2] = _t_np.elapsed().as_nanos() as u64;
         let _t_sv = std::time::Instant::now();
         // 3) TGS-soft 서브스텝 루프
