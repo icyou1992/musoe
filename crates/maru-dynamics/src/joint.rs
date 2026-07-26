@@ -33,10 +33,15 @@ pub enum JointKind {
 /// 조인트 모터 — 목표 속도를 최대 힘/토크까지 추종한다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Motor {
-    /// 목표 상대 각속도 (rad/s) 또는 선속도 (m/s).
+    /// 목표 상대 각속도 (rad/s).
     pub target_speed: f32,
-    /// 이 모터가 낼 수 있는 최대 임펄스 크기 (N·m·s 또는 N·s).
-    pub max_impulse: f32,
+    /// 이 모터가 낼 수 있는 **최대 토크** (N·m).
+    ///
+    /// 임펄스가 아니라 토크인 이유: 누적 임펄스는 서브스텝마다 warm start로 다시
+    /// 실리므로, 임펄스에 상한을 두면 **전달량이 서브스텝 수에 비례**한다
+    /// (검수: substeps 1 vs 8에서 결과가 갈렸다). 서브스텝 간격 `h`로 스케일한
+    /// `max_torque · h`를 누적 상한으로 쓰면 한 스텝 총량이 `max_torque · dt`로 고정된다.
+    pub max_torque: f32,
 }
 
 /// **엔드포인트는 세대 보유 핸들**이다(리뷰 BLOCKER). raw 인덱스면 같은 배치 안에서
@@ -124,7 +129,7 @@ impl Joint {
                     }
                 }
                 if let Some(m) = motor {
-                    if !(m.max_impulse >= 0.0 && in_state_range(m.max_impulse))
+                    if !(m.max_torque >= 0.0 && in_state_range(m.max_torque))
                         || !maru_collide::angular_in_range(m.target_speed)
                     {
                         return Err(ApiError::InvalidValue);
@@ -282,13 +287,13 @@ impl Joint {
     pub fn with_motor(
         mut self,
         target_speed: f32,
-        max_impulse: f32,
+        max_torque: f32,
     ) -> Result<Self, crate::world::ApiError> {
         match &mut self.kind {
             JointKind::Hinge { motor, .. } => {
                 *motor = Some(Motor {
                     target_speed,
-                    max_impulse,
+                    max_torque,
                 })
             }
             _ => return Err(crate::world::ApiError::InvalidValue),
@@ -446,6 +451,7 @@ fn clamp_len(v: Vec3, max: f32) -> Vec3 {
 pub fn solve(
     st: &mut crate::solver::SolverState,
     j: &mut Joint,
+    h: f32,
     soft: Option<(&Softness, f32, f32)>,
 ) {
     let (ia, ib) = (st.inv_i[j.ia()], st.inv_i[j.ib()]);
@@ -456,6 +462,7 @@ pub fn solve(
     // --- Distance: 1축 **부등식** 제약이라 위 3-DOF 경로를 타지 않는다 ---
     if let JointKind::Distance { min, max } = j.kind {
         solve_distance(st, j, ra, rb, min, max, &ia, &ib, inv_ma, inv_mb, soft);
+        let _ = h;
         return;
     }
 
@@ -527,39 +534,50 @@ pub fn solve(
         if k_ang > 0.0 {
             let wrel = axis.dot(st.ang[j.ia()] - st.ang[j.ib()]);
 
-            // 모터: 목표 상대 각속도를 최대 임펄스까지 추종한다(등식 제약 + 클램프).
+            // 모터: 목표 상대 각속도를 최대 토크까지 추종한다(등식 제약 + 클램프).
             if let Some(m) = motor {
                 let want = -(wrel - m.target_speed) / k_ang;
                 let old = j.motor_impulse;
-                // **누적을 클램프한다** — 증분만 자르면 스텝이 쌓이며 상한을 넘는다.
-                j.motor_impulse = (old + want).clamp(-m.max_impulse, m.max_impulse);
+                // **누적을 서브스텝 간격으로 스케일한 상한에 클램프한다.**
+                // 증분만 자르면 상한을 넘고, 상한을 임펄스로 두면 전달량이 서브스텝
+                // 수에 비례한다 — warm start가 누적분을 매 서브스텝 다시 싣기 때문이다
+                // (검수: substeps 1 vs 8에서 결과가 갈렸다).
+                let cap = m.max_torque * h;
+                j.motor_impulse = (old + want).clamp(-cap, cap);
                 let ang = axis * (j.motor_impulse - old);
                 st.apply_ang_pub(j.ia(), ang);
                 st.apply_ang_pub(j.ib(), -ang);
             }
 
             // 한계: 부등식이라 **한쪽 부호로만** 임펄스가 산다.
+            //
+            // 부호 유도(이 저장소가 두 번 틀린 지점이라 적어둔다):
+            // 임펄스 `imp`를 축 방향으로 A += / B -= 적용하면 `wrel(=ω_a−ω_b)`이
+            // `k_ang·imp` 만큼 는다. twist의 변화율은 `ω_b−ω_a = −wrel`이므로,
+            // 오차 `c`를 줄이려면 `d(twist)/dt = −β·c`, 즉 `wrel → +β·c`가 목표다.
+            // 따라서 `imp = (β·c − wrel)/k_ang = −(wrel + bias)/k_ang`,  **bias = −β·c**.
+            // 그리고 c > 0(위 한계 초과)이면 목표 wrel이 양수라 **임펄스도 양수**다 —
+            // 게이트는 `c`의 부호를 그대로 따른다.
             if let Some([lo, hi]) = limit {
                 let angle = hinge_angle(st, j, axis_a, axis_b);
-                let (c, sign) = if angle < lo {
-                    (angle - lo, 1.0f32) // 아래로 벗어남 → +방향으로 민다
+                let c = if angle < lo {
+                    angle - lo
                 } else if angle > hi {
-                    (angle - hi, -1.0f32)
+                    angle - hi
                 } else {
-                    (0.0, 0.0)
+                    0.0
                 };
-                if sign != 0.0 {
+                if c != 0.0 {
                     let wrel = axis.dot(st.ang[j.ia()] - st.ang[j.ib()]);
                     let bias = match soft {
                         Some((sf, _, max_ang_bias)) => {
-                            (c * sf.bias_rate).clamp(-max_ang_bias, max_ang_bias)
+                            (-(c * sf.bias_rate)).clamp(-max_ang_bias, max_ang_bias)
                         }
                         None => 0.0,
                     };
                     let want = -(wrel + bias) / k_ang;
                     let old = j.limit_impulse;
-                    // 부호 게이트: 벗어난 방향으로 미는 성분만 남긴다.
-                    let acc = if sign > 0.0 {
+                    let acc = if c > 0.0 {
                         (old + want).max(0.0)
                     } else {
                         (old + want).min(0.0)
@@ -568,7 +586,11 @@ pub fn solve(
                     let ang = axis * (acc - old);
                     st.apply_ang_pub(j.ia(), ang);
                     st.apply_ang_pub(j.ib(), -ang);
-                } else {
+                } else if j.limit_impulse != 0.0 {
+                    // 한계 안으로 돌아왔다 — warm start가 실은 임펄스를 되돌린다.
+                    let ang = axis * (-j.limit_impulse);
+                    st.apply_ang_pub(j.ia(), ang);
+                    st.apply_ang_pub(j.ib(), -ang);
                     j.limit_impulse = 0.0;
                 }
             }
@@ -581,7 +603,10 @@ pub fn solve(
         let qa = st.rot[j.ia()];
         let qb = st.rot[j.ib()];
         let want = qa * rel_rot; // B가 있어야 할 자세
-        let err_q = qb * want.conjugate();
+                                 // **부호 방향에 주의**: `qb → want`(B를 되돌리는 방향)여야 한다.
+                                 // 반대로 두면 아래 임펄스 규약(`imp = -(cdot+bias)/k`, A += / B -=)이
+                                 // `dC/dt = +β·C`를 만들어 **오차가 지수적으로 커진다**(검수 실측 0.0999 → 1.98).
+        let err_q = want * qb.conjugate();
         // 쿼터니언 부호 정규화 — q와 −q는 같은 자세지만 오차 벡터의 부호를 뒤집는다.
         let s = if err_q.w < 0.0 { -1.0 } else { 1.0 };
         let err = Vec3::new(err_q.x, err_q.y, err_q.z) * (2.0 * s);
@@ -614,13 +639,20 @@ pub fn solve(
     }
 }
 
-/// hinge 축 둘레 상대 각도 (라디안). 기준은 A의 수직 기저 u.
-fn hinge_angle(st: &crate::solver::SolverState, j: &Joint, axis_a: Vec3, axis_b: Vec3) -> f32 {
-    let a_axis = st.rot[j.ia()].rotate(axis_a);
-    let (u, v) = perp_basis(a_axis);
-    // B의 축에 수직인 기준 벡터를 A의 기저에 투영해 각을 잰다.
-    let (ub, _) = perp_basis(st.rot[j.ib()].rotate(axis_b));
-    ub.dot(v).atan2(ub.dot(u))
+/// hinge 축 둘레 상대 각도 (라디안) — **상대 자세의 twist 성분**.
+///
+/// 기준(0 rad)은 **두 바디의 상대 자세가 항등일 때**다. 문·팔을 정렬된 자세로 만들었으면
+/// 그 자세가 0이 된다.
+///
+/// 처음엔 `perp_basis(축)`으로 각 바디의 수직 기준을 만들어 각을 쟀는데 **항상 0이었다**:
+/// `perp_basis`는 축만의 순수 함수이고 경첩 제약이 두 축을 평행하게 유지하므로 두 기저가
+/// 늘 같아진다. 기준 벡터는 **바디에 붙어 있어야** 한다 — 그래서 축이 아니라 상대 자세에서
+/// 뽑는다(swing-twist 분해의 twist 성분).
+fn hinge_angle(st: &crate::solver::SolverState, j: &Joint, axis_a: Vec3, _axis_b: Vec3) -> f32 {
+    // `q_rel` = A 프레임에서 본 B의 자세. `axis_a`도 A 로컬이라 그대로 투영한다.
+    let q_rel = st.rot[j.ia()].conjugate() * st.rot[j.ib()];
+    let s = q_rel.x * axis_a.x + q_rel.y * axis_a.y + q_rel.z * axis_a.z;
+    2.0 * s.atan2(q_rel.w)
 }
 
 /// Distance: 두 앵커 거리를 `[min, max]`로 묶는다.
@@ -651,6 +683,15 @@ fn solve_distance(
     } else if len > max {
         (len - max, -1.0f32)
     } else {
+        // **구간 안으로 돌아왔다 — 그냥 0으로 두면 안 된다.** 이 서브스텝의 warm start가
+        // 이미 옛 누적 임펄스를 속도에 실었으므로, 되돌리는 델타(0 − old)를 적용해야
+        // 그 운동량이 남지 않는다 (검수: 부등식 게이트 × warm start).
+        let old = j.linear_impulse.x;
+        if old != 0.0 {
+            let imp = n * (-old);
+            st.apply_pub(j.ia(), imp, ra);
+            st.apply_pub(j.ib(), -imp, rb);
+        }
         j.limit_impulse = 0.0;
         j.linear_impulse = Vec3::ZERO;
         return;

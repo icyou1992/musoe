@@ -4220,4 +4220,416 @@ mod tests {
         }
         assert!(w.restore(&w.snapshot()).is_ok());
     }
+
+    // ==========================================================================
+    // 적대 리뷰(2026-07-27)에서 추가한 재현 테스트. 아래 5건은 **현 구현의 결함을
+    // 드러내기 위한 것**이며, 통과하도록 고치기 전까지 실패한다.
+    // ==========================================================================
+
+    /// 조인트 앵커가 B의 질량중심에서 **떨어져 있어야** 중력이 토크를 만든다.
+    /// 기존 조인트 테스트들은 앵커를 B의 COM에 두어 각 제약을 전혀 자극하지 않는다.
+    fn hinge_pendulum(w: &mut World) -> (BodyHandle, BodyHandle) {
+        let a = w.add_body(Body::new_static(
+            maru_collide::Shape::Sphere { radius: 0.1 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 10.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        let b = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Box {
+                half: maru_math::Vec3::new(1.0, 0.1, 0.1),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(1.0, 10.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        ));
+        (a, b)
+    }
+
+    /// **hinge 한계가 실제로 각을 재는가.** `hinge_angle`은 A·B 양쪽 축의
+    /// `perp_basis`를 비교하는데, 힌지가 두 축을 정렬시키므로 두 기저가 같아져
+    /// 각이 항상 0이 된다 → 한계가 절대 발동하지 않는다.
+    #[test]
+    fn review_hinge_limit_actually_limits_a_pendulum() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hinge_pendulum(&mut w);
+        let axis = maru_math::Vec3::new(0.0, 0.0, 1.0);
+        w.try_add_joint(
+            Joint::try_hinge(
+                a,
+                b,
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::new(-1.0, 0.0, 0.0),
+                axis,
+                axis,
+            )
+            .unwrap()
+            .with_limit(-0.3, 0.3)
+            .unwrap(),
+        )
+        .unwrap();
+        let mut worst: f32 = 0.0;
+        for _ in 0..300 {
+            w.try_step(1.0 / 60.0).unwrap();
+            let q = w.body(b).pose().rot;
+            let ang = 2.0 * q.z.abs().atan2(q.w.abs());
+            worst = worst.max(ang);
+        }
+        assert!(
+            worst < 0.45,
+            "한계 ±0.3 rad인데 최대 {worst} rad까지 돌았다 (한계가 발동하지 않음)"
+        );
+    }
+
+    /// **Fixed의 각 bias 부호.** err = 2·vec(qb·(qa·rel)⁻¹)는 d(err)/dt = ωb − ωa로
+    /// 자라는데 솔버는 cdot = (ωa − ωb)를 쓴다 — Baumgarte 항의 부호가 뒤집혀
+    /// 오차를 **되돌리는 대신 키운다**.
+    #[test]
+    fn review_fixed_joint_corrects_angular_error() {
+        let mut w = World::new(WorldParams {
+            gravity: maru_math::Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let a = w.add_body(Body::new_static(
+            maru_collide::Shape::Sphere { radius: 0.5 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(0.0, 10.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+        ));
+        // B의 초기 자세를 목표(항등)에서 0.1 rad 어긋나게 둔다.
+        let b = w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Box {
+                half: maru_math::Vec3::new(0.3, 0.3, 0.3),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(1.0, 10.0, 0.0),
+                rot: maru_math::Quat::from_axis_angle(maru_math::Vec3::new(1.0, 0.0, 0.0), 0.1),
+            },
+            1.0,
+        ));
+        w.try_add_joint(
+            Joint::try_fixed(
+                a,
+                b,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Vec3::ZERO,
+                maru_math::Quat::IDENTITY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let err0 = 2.0 * w.body(b).pose().rot.x.abs();
+        for _ in 0..60 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let err1 = 2.0 * w.body(b).pose().rot.x.abs();
+        assert!(
+            err1 < err0,
+            "고정 조인트가 각 오차를 줄여야 한다: {err0} → {err1}"
+        );
+    }
+
+    /// **부등식 게이트 × warm start.** 구간 안으로 들어온 서브스텝에서 누적 임펄스를
+    /// 0으로 되돌리지만, 같은 서브스텝의 warm start가 이미 옛 임펄스를 속도에 실었다 —
+    /// 되돌리는 델타(0 − old)를 적용하지 않아 그 운동량이 그대로 남는다.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn review_distance_joint_inactive_leaves_velocity_untouched() {
+        use crate::solver::{Softness, SolverState};
+        let mut st = SolverState::default();
+        // 2바디: 0=static, 1=dynamic. 거리 1.0(구간 [0,2] 안).
+        st.lin = vec![maru_math::Vec3::ZERO; 2];
+        st.ang = vec![maru_math::Vec3::ZERO; 2];
+        st.pos = vec![maru_math::Vec3::ZERO, maru_math::Vec3::new(1.0, 0.0, 0.0)];
+        st.rot = vec![maru_math::Quat::IDENTITY; 2];
+        st.inv_m = vec![0.0, 1.0];
+        st.inv_i = vec![
+            maru_math::Mat3::from_diagonal(maru_math::Vec3::ZERO),
+            maru_math::Mat3::from_diagonal(maru_math::Vec3::new(1.0, 1.0, 1.0)),
+        ];
+        st.dynamic = vec![false, true];
+        let ha = BodyHandle {
+            index: 0,
+            generation: 1,
+        };
+        let hb = BodyHandle {
+            index: 1,
+            generation: 1,
+        };
+        let mut j = Joint::try_distance(
+            ha,
+            hb,
+            maru_math::Vec3::ZERO,
+            maru_math::Vec3::ZERO,
+            0.0,
+            2.0,
+        )
+        .unwrap();
+        // 직전 서브스텝에 구간 밖이어서 쌓인 누적 임펄스 (로프가 당기고 있었다).
+        j.linear_impulse = maru_math::Vec3::new(-3.0, 0.0, 0.0);
+        let soft = Softness::new(60.0, 2.0, 1.0 / 240.0);
+        crate::joint::warm_start(&mut st, &j);
+        crate::joint::solve(&mut st, &mut j, 1.0 / 240.0, Some((&soft, 4.0, 30.0)));
+        assert!(
+            st.lin[1].length() < 1e-4,
+            "구간 안이면 조인트가 속도를 건드리면 안 된다: {:?}",
+            st.lin[1]
+        );
+    }
+
+    /// **모터 상한은 스텝당인가 서브스텝당인가.** `max_impulse`가 서브스텝 누적에
+    /// 걸리고 warm start가 매 서브스텝 전량을 다시 실으므로, 실제 전달 임펄스는
+    /// substeps에 비례한다 — 같은 월드에서 substeps만 바꾸면 모터 힘이 달라진다.
+    #[test]
+    fn review_motor_max_impulse_is_independent_of_substeps() {
+        fn spin(substeps: u32) -> f32 {
+            let mut w = World::new(WorldParams {
+                gravity: maru_math::Vec3::ZERO,
+                substeps,
+                ..WorldParams::default()
+            });
+            let a = w.add_body(Body::new_static(
+                maru_collide::Shape::Sphere { radius: 0.5 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::new(0.0, 10.0, 0.0),
+                    rot: maru_math::Quat::IDENTITY,
+                },
+            ));
+            let b = w.add_body(Body::new_dynamic(
+                maru_collide::Shape::Box {
+                    half: maru_math::Vec3::new(0.3, 0.3, 0.3),
+                    radius: 0.0,
+                },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::new(1.0, 10.0, 0.0),
+                    rot: maru_math::Quat::IDENTITY,
+                },
+                1.0,
+            ));
+            let axis = maru_math::Vec3::new(0.0, 0.0, 1.0);
+            w.try_add_joint(
+                Joint::try_hinge(
+                    a,
+                    b,
+                    maru_math::Vec3::new(1.0, 0.0, 0.0),
+                    maru_math::Vec3::ZERO,
+                    axis,
+                    axis,
+                )
+                .unwrap()
+                // 목표를 크게 잡아 모터를 항상 포화시킨다 → 전달량 = 상한 × (횟수)
+                .with_motor(50.0, 0.2)
+                .unwrap(),
+            )
+            .unwrap();
+            w.try_step(1.0 / 60.0).unwrap();
+            w.body(b).angvel().z
+        }
+        let s1 = spin(1);
+        let s8 = spin(8);
+        assert!(
+            (s1 - s8).abs() < 0.1 * s1.abs().max(1e-6),
+            "substeps만 바꿨는데 모터 전달 임펄스가 달라진다: {s1} vs {s8}"
+        );
+    }
+
+    /// **exclude는 세대를 무시한다** — 제거 후 재사용된 슬롯을 죽은 핸들이 계속 가린다.
+    #[test]
+    fn review_query_exclude_respects_generation() {
+        let mut w = World::new(WorldParams::default());
+        let sphere = |p: maru_math::Vec3| {
+            Body::new_static(
+                maru_collide::Shape::Sphere { radius: 1.0 },
+                maru_collide::Pose {
+                    pos: p,
+                    rot: maru_math::Quat::IDENTITY,
+                },
+            )
+        };
+        let dead = w.add_body(sphere(maru_math::Vec3::ZERO));
+        w.remove_body(dead).unwrap();
+        // 같은 슬롯이 재사용되며 세대만 올라간다.
+        let fresh = w.add_body(sphere(maru_math::Vec3::ZERO));
+        assert_eq!(fresh.index, dead.index, "슬롯 재사용 전제");
+        assert_ne!(fresh.generation, dead.generation);
+        let hit = w
+            .cast_ray_filtered(
+                maru_math::Vec3::new(-10.0, 0.0, 0.0),
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                100.0,
+                QueryFilter::ALL.exclude(dead),
+            )
+            .unwrap();
+        assert_eq!(
+            hit.map(|h| h.body),
+            Some(fresh),
+            "죽은 핸들이 재사용된 슬롯의 새 바디를 가리면 안 된다"
+        );
+    }
+
+    /// **무필터 질의의 계약 변경.** 물리적으로 아무와도 안 부딪히게 filter=0으로 둔
+    /// 바디가 `cast_ray`(무필터)에서도 사라진다 — 이전 커밋에서는 맞았다.
+    #[test]
+    fn review_unfiltered_ray_still_sees_noncolliding_bodies() {
+        let mut w = World::new(WorldParams::default());
+        let ghost = w.add_body(
+            Body::new_static(
+                maru_collide::Shape::Sphere { radius: 1.0 },
+                maru_collide::Pose {
+                    pos: maru_math::Vec3::ZERO,
+                    rot: maru_math::Quat::IDENTITY,
+                },
+            )
+            .with_groups(0b1, 0),
+        );
+        let hit = w
+            .cast_ray(
+                maru_math::Vec3::new(-10.0, 0.0, 0.0),
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                100.0,
+            )
+            .unwrap();
+        assert_eq!(hit.map(|h| h.body), Some(ghost));
+    }
+
+    /// **기존 조인트 테스트 2건은 각 제약을 자극하지 않는다**(`hung_pair`가 앵커를
+    /// B의 질량중심에 두어 중력 토크가 0이다). 같은 배치를 **Point 조인트**로 바꿔도
+    /// `fixed_joint_holds_relative_orientation` · `hinge_limit_stops_rotation`의
+    /// 단언이 그대로 통과한다 — 즉 두 테스트는 각 제약을 검증하지 않는다.
+    #[test]
+    fn review_existing_joint_tests_pass_without_any_angular_constraint() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        // Fixed도 Hinge도 아닌 **순수 point** — 각 제약이 전혀 없다.
+        w.try_add_joint(
+            Joint::try_point(
+                a,
+                b,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Vec3::ZERO,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..600 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let q = w.body(b).pose().rot;
+        // fixed_joint_holds_relative_orientation 의 단언
+        assert!(q.w.abs() > 0.995, "{q:?}");
+        let p = w.body(b).pose().pos;
+        assert!(
+            (p - maru_math::Vec3::new(1.0, 10.0, 0.0)).length() < 0.1,
+            "{p:?}"
+        );
+        // hinge_limit_stops_rotation 의 단언
+        let ang = 2.0 * q.z.abs().atan2(q.w.abs());
+        assert!(ang < 0.6, "{ang}");
+    }
+
+    /// preflight(`serialized_size`)가 새 조인트 종류까지 writer와 맞는가.
+    /// 기존 `snapshot_preflight_size_matches...` 테스트는 `Point`만 담고 있어
+    /// Hinge(limit·motor)·Fixed·Distance는 preflight 커버리지가 없었다.
+    #[test]
+    fn review_preflight_size_covers_new_joint_kinds() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        let axis = maru_math::Vec3::new(0.0, 0.0, 1.0);
+        let anchor_a = maru_math::Vec3::new(1.0, 0.0, 0.0);
+        w.try_add_joint(
+            Joint::try_fixed(
+                a,
+                b,
+                anchor_a,
+                maru_math::Vec3::ZERO,
+                maru_math::Quat::IDENTITY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        w.try_add_joint(
+            Joint::try_distance(a, b, maru_math::Vec3::ZERO, maru_math::Vec3::ZERO, 0.5, 2.0)
+                .unwrap(),
+        )
+        .unwrap();
+        w.try_add_joint(
+            Joint::try_hinge(a, b, anchor_a, maru_math::Vec3::ZERO, axis, axis)
+                .unwrap()
+                .with_limit(-1.0, 1.0)
+                .unwrap()
+                .with_motor(2.0, 50.0)
+                .unwrap(),
+        )
+        .unwrap();
+        // limit/motor 없는 hinge도 (Option 길이 고정 확인)
+        w.try_add_joint(
+            Joint::try_hinge(a, b, anchor_a, maru_math::Vec3::ZERO, axis, axis).unwrap(),
+        )
+        .unwrap();
+        let bytes = w.snapshot();
+        assert_eq!(
+            crate::snapshot::serialized_size(&w),
+            bytes.len(),
+            "preflight 크기가 writer와 어긋남 — 한쪽만 고친 것이다"
+        );
+    }
+
+    /// **`hinge_angle`은 축 둘레 각을 재지 못한다** (화이트박스).
+    ///
+    /// `hinge_angle`은 A·B **월드 축**의 `perp_basis`를 비교하는데, `perp_basis`는
+    /// 입력 축만의 순함수다. 힌지는 두 축을 같게 만들므로 두 기저가 같아지고
+    /// 각은 항상 0이 된다 — B가 축 둘레로 90° 돌아 있어도 한계가 발동하지 않는다.
+    /// 기준 벡터는 각 바디의 **로컬** 벡터를 월드로 돌린 것이어야 한다.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn review_hinge_limit_fires_when_b_is_rotated_about_the_axis() {
+        use crate::solver::{Softness, SolverState};
+        let axis = maru_math::Vec3::new(0.0, 0.0, 1.0);
+        let mut st = SolverState::default();
+        st.lin = vec![maru_math::Vec3::ZERO; 2];
+        st.ang = vec![maru_math::Vec3::ZERO; 2];
+        st.pos = vec![maru_math::Vec3::ZERO; 2];
+        // B는 힌지 축(z) 둘레로 90° 돌아 있다 — 한계 ±0.1 rad를 크게 벗어난다.
+        st.rot = vec![
+            maru_math::Quat::IDENTITY,
+            maru_math::Quat::from_axis_angle(axis, core::f32::consts::FRAC_PI_2),
+        ];
+        st.inv_m = vec![0.0, 1.0];
+        st.inv_i = vec![
+            maru_math::Mat3::from_diagonal(maru_math::Vec3::ZERO),
+            maru_math::Mat3::from_diagonal(maru_math::Vec3::new(1.0, 1.0, 1.0)),
+        ];
+        st.dynamic = vec![false, true];
+        let ha = BodyHandle {
+            index: 0,
+            generation: 1,
+        };
+        let hb = BodyHandle {
+            index: 1,
+            generation: 1,
+        };
+        let mut j = Joint::try_hinge(
+            ha,
+            hb,
+            maru_math::Vec3::ZERO,
+            maru_math::Vec3::ZERO,
+            axis,
+            axis,
+        )
+        .unwrap()
+        .with_limit(-0.1, 0.1)
+        .unwrap();
+        let soft = Softness::new(60.0, 2.0, 1.0 / 240.0);
+        crate::joint::solve(&mut st, &mut j, 1.0 / 240.0, Some((&soft, 4.0, 30.0)));
+        assert!(
+            j.limit_impulse != 0.0,
+            "축 둘레 90°는 한계 ±0.1을 벗어났는데 한계 임펄스가 0이다 (각이 측정되지 않음)"
+        );
+    }
 }

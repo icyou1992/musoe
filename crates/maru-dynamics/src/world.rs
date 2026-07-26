@@ -827,8 +827,15 @@ impl World {
                 out.push(hit);
             }
         }
-        // 슬롯 순서로 채웠으므로 toi만 안정 정렬하면 동률이 슬롯 순서로 남는다.
-        out.sort_by(|a, b| a.toi.total_cmp(&b.toi));
+        // **안정 정렬을 쓰지 않는다** — 안정 정렬은 임시 버퍼를 할당할 수 있고, 그
+        // 할당이 실패하면 `ResourceLimit`이 아니라 trap이 된다(검수 rev_710b92d2 MAJOR).
+        // 동률 순서도 "슬롯 순으로 채웠으니까"라는 암묵 의존 대신 **비교자에 명시**한다.
+        out.sort_unstable_by(|a, b| {
+            a.toi
+                .total_cmp(&b.toi)
+                .then_with(|| a.body.index.cmp(&b.body.index))
+                .then_with(|| a.body.generation.cmp(&b.body.generation))
+        });
         Ok(())
     }
 
@@ -925,13 +932,19 @@ impl World {
         if b.sensor && !f.include_sensors {
             return false;
         }
-        // 물리 충돌과 **같은 양방향 규칙**. 질의자를 membership=`groups`,
-        // filter=`groups`인 가상의 물체로 본다.
-        if (f.groups & b.filter) == 0 || (b.membership & f.groups) == 0 {
+        // **단방향이다** — 물체의 `membership`만 본다.
+        //
+        // 처음엔 물리와 같은 양방향 규칙으로 짰는데(검수 rev_710b92d2 반례로 뒤집었다),
+        // 그러면 `filter = 0`인 물체(아무것과도 안 부딪히는 유령)가 **필터 없는 광선에도
+        // 안 맞는다**. "아무것과도 안 부딪힌다"와 "안 보인다"는 다른 말이고, 그러면
+        // 호스트가 그 물체를 클릭할 수도 없다. 물체의 `filter`는 "내가 무엇과 부딪히려
+        // 하는가"라서 질의와는 무관하다.
+        if (b.membership & f.groups) == 0 {
             return false;
         }
         if let Some(ex) = f.exclude {
-            if ex.index as usize == i {
+            // **세대까지 본다** — 슬롯만 보면 제거 후 재사용된 물체를 죽은 핸들이 계속 가린다.
+            if ex.index as usize == i && ex.generation == self.generations[i] {
                 return false;
             }
         }
@@ -1857,15 +1870,21 @@ impl World {
                     BodyType::Dynamic => is_static_pair || self.asleep[b_id],
                     BodyType::Static => true,
                 };
-            if a_inactive && b_inactive {
-                live_keys.insert(key); // 잠든 페어의 PCM은 보존한다(아래 5))
-                continue;
-            }
-            let _ = (a_asleep, b_asleep);
-            // **충돌 그룹**: 양방향 조건이라 한쪽만 무시하는 비대칭이 생기지 않는다.
+            // **그룹 판정이 수면 분기보다 먼저다.** 반대면 그룹이 명시적으로 충돌을
+            // 거부한 페어도 잠든 동안 접촉으로 승격된다(검수 rev_7f7bb07c MAJOR).
             if !groups_collide(&self.bodies[a_id], &self.bodies[b_id]) {
                 continue;
             }
+            if a_inactive && b_inactive {
+                // 움직이지 않은 페어는 **새 접촉을 만들 수 없다.** 브로드페이즈 AABB
+                // 겹침은 매니폴드 존재의 충분조건이 아니므로, 직전 기준선에 실제
+                // 접촉으로 있던 키만 보존한다 — 아니면 잠들면서 거짓 Started가 난다.
+                if self.touching.contains(&key) {
+                    live_keys.insert(key);
+                }
+                continue;
+            }
+            let _ = (a_asleep, b_asleep);
             let (sa, pa) = (&self.bodies[a_id].shape, &self.bodies[a_id].pose);
             let (sb, pb) = (&self.bodies[b_id].shape, &self.bodies[b_id].pose);
             if let Some(m) = contact(sa, pa, sb, pb, self.params.speculative_margin) {
@@ -1945,6 +1964,11 @@ impl World {
             || self.inv_inertia_local.try_reserve(nb_pre).is_err()
             || self.integrate_gate.try_reserve(nb_pre).is_err()
             || self.gravity_gate.try_reserve(nb_pre).is_err()
+            // 스텝 스크래치는 **하나도 빠짐없이** 여기서 선점한다 — 하나만 빠져도
+            // 그 `extend`가 암묵 재할당을 하고, wasm에서 allocator 실패는 오류가 아니라
+            // trap이다(검수 rev_3ce4f6fd MAJOR: `ext_force`가 빠져 있었다).
+            || self.ext_force.try_reserve(nb_pre).is_err()
+            || self.damping.try_reserve(nb_pre).is_err()
             || self.island_parent.try_reserve(nb_pre).is_err()
         {
             self.bp_pairs = pairs;
@@ -2073,6 +2097,7 @@ impl World {
                 joint::solve(
                     &mut st,
                     &mut joints[ji],
+                    h,
                     Some((
                         &joint_soft,
                         self.params.solver.max_bias_speed,
@@ -2131,7 +2156,7 @@ impl World {
                 solver::refresh_anchors(&st, c);
             }
             for &ji in &active_joints {
-                joint::solve(&mut st, &mut joints[ji], None);
+                joint::solve(&mut st, &mut joints[ji], h, None);
             }
             for c in constraints.iter_mut() {
                 solver::solve(&mut st, c, inv_h, None);

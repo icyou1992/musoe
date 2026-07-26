@@ -284,13 +284,21 @@ fn ray_convex_ca(shape: &Shape, o: Vec3, d: Vec3, max_toi: f32) -> Option<Local>
         let (dist, n) = closest_core_dist(shape, p);
         let gap = dist - r;
         if gap <= eps {
+            // **0 법선을 내보내지 않는다.** 전진이 반올림으로 코어 안으로 한 발 넘어가면
+            // GJK가 `Intersecting`을 주고 `closest_core_dist`가 방향을 0으로 돌려준다.
+            // 그대로 반환하면 "법선은 바깥쪽 단위 벡터"라는 공개 계약이 깨지고
+            // 호스트의 반사·슬라이딩이 0/NaN이 된다 (검수 rev_710b92d2 MAJOR).
+            // 직전 반복의 법선이 여전히 유효한 바깥 방향이다.
+            let hit_normal = if n.length_sq() > 0.0 { n } else { normal };
             return Some(Local {
                 toi: t,
-                normal: n,
+                normal: hit_normal,
                 started_inside: false,
             });
         }
-        normal = n;
+        if n.length_sq() > 0.0 {
+            normal = n;
+        }
         // 광선이 표면 쪽으로 다가가는 속도. 멀어지면 절대 못 맞는다.
         let approach = -d.dot(n);
         if approach <= 1e-20 {
@@ -470,6 +478,59 @@ mod tests {
             "면 중앙은 half=1.0에서 맞아야 한다: {}",
             h.toi
         );
+    }
+
+    /// **성공 결과의 법선은 항상 단위 벡터**여야 한다 (공개 계약).
+    ///
+    /// 보수적 전진이 코어 안으로 한 발 넘어가면 GJK가 `Intersecting`을 주고 방향이
+    /// 0이 된다 — 그대로 내보내면 호스트의 반사 계산이 0/NaN이 된다.
+    #[test]
+    fn conservative_advancement_never_returns_a_zero_normal() {
+        let mut rng = 0x1234_5678u32;
+        let mut f = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let shapes = [
+            Shape::Box {
+                half: Vec3::new(1.0, 0.05, 1.0), // 얇은 판 — 스치는 각이 잘 나온다
+                radius: 0.02,
+            },
+            Shape::Hull {
+                points: vec![
+                    Vec3::new(0.6, 0.0, 0.0),
+                    Vec3::new(-0.6, 0.0, 0.0),
+                    Vec3::new(0.0, 0.03, 0.5),
+                    Vec3::new(0.0, -0.03, -0.5),
+                ],
+                radius: 0.05,
+            },
+        ];
+        let mut hits = 0;
+        for s in &shapes {
+            for _ in 0..4000 {
+                let o = Vec3::new((f() - 0.5) * 8.0, (f() - 0.5) * 8.0, (f() - 0.5) * 8.0);
+                // 셰이프 근처를 스치도록 목표점을 형상 경계 부근으로 잡는다
+                let target = Vec3::new((f() - 0.5) * 2.2, (f() - 0.5) * 0.3, (f() - 0.5) * 2.2);
+                let d = target - o;
+                if d.length_sq() < 1e-6 {
+                    continue;
+                }
+                let Some(h) = cast_ray(s, &ident(), o, d, 100.0) else {
+                    continue;
+                };
+                hits += 1;
+                let l2 = h.normal.length_sq();
+                assert!(
+                    (0.9..=1.1).contains(&l2),
+                    "법선이 단위가 아니다: {:?} (|n|²={l2}) shape={s:?} o={o:?} d={d:?}",
+                    h.normal
+                );
+            }
+        }
+        assert!(hits > 500, "표본이 너무 적다: {hits}");
     }
 
     #[test]

@@ -463,7 +463,7 @@ fn write_joint(w: &mut Writer, j: &Joint) {
             w.vec3(*axis_a);
             w.vec3(*axis_b);
             write_opt2(w, limit.as_ref().map(|l| [l[0], l[1]]));
-            write_opt2(w, motor.as_ref().map(|m| [m.target_speed, m.max_impulse]));
+            write_opt2(w, motor.as_ref().map(|m| [m.target_speed, m.max_torque]));
         }
         JointKind::Fixed { rel_rot } => {
             w.u8(2);
@@ -525,7 +525,7 @@ fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
             let limit = read_opt2(r)?;
             let motor = read_opt2(r)?.map(|m| crate::joint::Motor {
                 target_speed: m[0],
-                max_impulse: m[1],
+                max_torque: m[1],
             });
             JointKind::Hinge {
                 axis_a,
@@ -942,6 +942,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         &joints,
         &commands,
         &cache,
+        &touching,
     )?;
 
     // 여기까지 통과해야 월드를 교체한다 (원자적 복원)
@@ -981,6 +982,7 @@ fn validate_structure(
         (u32, u32),
         Vec<(maru_collide::FeatureId, crate::solver::CachedImpulse)>,
     >,
+    touching: &crate::world::IntSet<(u32, u32)>,
 ) -> Result<(), SnapshotError> {
     const STATIC_BIT: u32 = 1 << 31;
     let nb = bodies.len();
@@ -1107,8 +1109,11 @@ fn validate_structure(
         return Err(SnapshotError::InconsistentState);
     }
 
-    // PCM 캐시 키는 살아있는 바디 페어여야 하고, static 비트가 실제 타입과 맞아야 한다
-    for (a, b_raw) in cache.keys() {
+    // 접촉 기준선도 **캐시 키와 같은 규칙**으로 검증한다. 검증을 안 하면 조작된
+    // 스냅샷이 임의의 두 핸들로 가짜 Started/Stopped 이벤트를 만들 수 있고,
+    // 이벤트로 데미지·센서 상태를 구동하는 호스트가 그대로 속는다
+    // (검수 rev_7f7bb07c MAJOR).
+    for (a, b_raw) in touching.iter().chain(cache.keys()) {
         let b = (b_raw & !STATIC_BIT) as usize;
         let a = *a as usize;
         if a >= nb || b >= nb || !alive[a] || !alive[b] {
