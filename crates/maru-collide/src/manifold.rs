@@ -60,6 +60,31 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
     if let (Shape::Sphere { radius: ra }, Shape::Sphere { radius: rb }) = (sa, sb) {
         return sphere_sphere(*ra, pa.pos, *rb, pb.pos, margin);
     }
+    // **박스-박스는 SAT로 법선만 구한다.** 클리퍼는 법선만 요구하므로(깊이는 안 쓴다)
+    // GJK+EPA 전체를 돌릴 이유가 없다. 클리퍼 자체는 M1에서 검증된 코드 그대로 쓰고
+    // 법선의 출처만 바꾼다 — 실패하면(에지-에지 지배·퇴화) 아래 GJK 경로로 떨어진다.
+    if let (
+        Shape::Box {
+            half: ha,
+            radius: rab,
+        },
+        Shape::Box {
+            half: hb,
+            radius: rbb,
+        },
+    ) = (sa, sb)
+    {
+        match box_box_axis(*ha, *rab, pa, *hb, *rbb, pb, margin) {
+            SatResult::Apart => return None,
+            SatResult::Axis(n) => {
+                let eps_area = area_eps(characteristic_length(sa, sb));
+                if let Some(m) = clip_box_box(eps_area, *ha, *rab, pa, *hb, *rbb, pb, n, margin) {
+                    return Some(m);
+                }
+            }
+            SatResult::Degenerate => {}
+        }
+    }
     let (ra, rb) = (sa.radius(), sb.radius());
     let (normal, core_sep, on_a, on_b) = match gjk(sa, pa, sb, pb) {
         GjkResult::Separated {
@@ -112,6 +137,126 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
             feature: FeatureId(FEATURE_GENERIC),
         }],
     })
+}
+
+enum SatResult {
+    /// 여유(margin)를 넘어 분리 — 접촉 없음.
+    Apart,
+    /// A를 +normal로 밀면 분리되는 축.
+    Axis(Vec3),
+    /// 축이 퇴화(평행 에지 등) — 호출자가 GJK로 폴백.
+    Degenerate,
+}
+
+/// 면 축과 에지 축의 **근소 동률**을 깨는 허용치 (특성 길이 대비).
+///
+/// **이 편향이 없으면 정지 스택이 무너진다**: 면 접촉인데 수치 오차로 에지 축이 근소하게
+/// 이기면 스텝마다 참조면이 바뀌어 feature ID가 요동치고 warm start가 끊긴다.
+/// M2에서 SAT를 "실측 회귀"로 기각했던 실제 원인이 이것이었다 — 결론이
+/// "SAT를 쓰지 말자"가 아니라 "동률을 깨자"였어야 했다.
+///
+/// **비율 편향(예: 5%)은 안 된다**: 진짜 에지 지배 접촉까지 면으로 끌어당겨 법선이 틀리고
+/// 옆으로 미는 힘이 생긴다(40단 피라미드에서 z축 잔류속도 0.2 m/s로 실측됐다).
+/// 동률 구간만 덮는 **작은 절대 허용치**여야 한다 — Box2D·Jolt도 같은 형태다.
+const FACE_TIE_REL: f32 = 1.0e-3;
+
+/// 박스-박스 분리축 (코어 기준). 반환 법선은 **A를 +normal로 밀면 분리**되는 방향이다.
+#[allow(clippy::too_many_arguments)]
+fn box_box_axis(
+    ha: Vec3,
+    ra: f32,
+    pa: &Pose,
+    hb: Vec3,
+    rb: f32,
+    pb: &Pose,
+    margin: f32,
+) -> SatResult {
+    let core =
+        |h: Vec3, r: f32| Vec3::new((h.x - r).max(0.0), (h.y - r).max(0.0), (h.z - r).max(0.0));
+    let (ca, cb) = (core(ha, ra), core(hb, rb));
+    let axes_a = [
+        pa.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
+        pa.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
+        pa.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
+    ];
+    let axes_b = [
+        pb.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
+        pb.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
+        pb.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
+    ];
+    let d = pb.pos - pa.pos;
+    let extent = |axes: &[Vec3; 3], c: Vec3, n: Vec3| -> f32 {
+        (axes[0].dot(n) * c.x).abs() + (axes[1].dot(n) * c.y).abs() + (axes[2].dot(n) * c.z).abs()
+    };
+    // 코어 표면이 여유 안에 있어야 접촉이다: core_sep - ra - rb <= margin
+    let reach = margin + ra + rb;
+    // 평행 에지 판정은 **스케일 무관**하다 — 단위 축의 cross 길이는 sin(각)이다.
+    const PARALLEL_SIN2: f32 = 1.0e-8;
+
+    // 축 후보를 **세 부류로 따로** 추적한 뒤 마지막에 동률을 깬다: A면 / B면 / 에지.
+    // 부류 안에서는 최대값, 부류 사이에서는 허용치를 넘어야 승계된다.
+    let (mut a_sep, mut a_axis) = (f32::NEG_INFINITY, Vec3::ZERO);
+    let (mut b_sep, mut b_axis) = (f32::NEG_INFINITY, Vec3::ZERO);
+    let (mut edge_sep, mut edge_axis) = (f32::NEG_INFINITY, Vec3::ZERO);
+    let oriented = |n: Vec3| if d.dot(n) < 0.0 { n } else { -n };
+
+    for a in axes_a.iter() {
+        let sep = d.dot(*a).abs() - extent(&axes_a, ca, *a) - extent(&axes_b, cb, *a);
+        if sep > reach {
+            return SatResult::Apart;
+        }
+        if sep > a_sep {
+            a_sep = sep;
+            a_axis = oriented(*a);
+        }
+    }
+    for b in axes_b.iter() {
+        let sep = d.dot(*b).abs() - extent(&axes_a, ca, *b) - extent(&axes_b, cb, *b);
+        if sep > reach {
+            return SatResult::Apart;
+        }
+        if sep > b_sep {
+            b_sep = sep;
+            b_axis = oriented(*b);
+        }
+    }
+    for a in axes_a.iter() {
+        for b in axes_b.iter() {
+            let n = a.cross(*b);
+            let l2 = n.length_sq();
+            if l2 <= PARALLEL_SIN2 {
+                continue; // 평행 에지 — 축이 퇴화한다(면 축이 이미 덮는다)
+            }
+            let n = n * (1.0 / l2.sqrt());
+            let sep = d.dot(n).abs() - extent(&axes_a, ca, n) - extent(&axes_b, cb, n);
+            if sep > reach {
+                return SatResult::Apart;
+            }
+            if sep > edge_sep {
+                edge_sep = sep;
+                edge_axis = oriented(n);
+            }
+        }
+    }
+    if a_axis == Vec3::ZERO && b_axis == Vec3::ZERO {
+        return SatResult::Degenerate;
+    }
+    let scale = ca.length().min(cb.length()).max(1.0e-6);
+    let tol = FACE_TIE_REL * scale;
+    // **A면을 기본으로 두고, B면·에지는 허용치를 넘어야 이긴다.**
+    // 부류 안이 아니라 부류 **사이**의 동률이 실제 문제였다: 적층된 두 박스가 하중으로
+    // 미세하게 흔들리면 A의 Y축과 B의 Y축 분리값이 1e-7 수준으로 엎치락뒤치락하고,
+    // 그때마다 클리퍼의 참조면이 바뀌어 feature ID가 갈린다 → warm start 단절 → 지터.
+    // (40단 피라미드에서 z축 잔류속도로 실측됐다. 법선 자체는 GJK/EPA와 0.44° 안에서 일치한다.)
+    let (mut best_sep, mut best_axis) = (a_sep, a_axis);
+    if b_axis != Vec3::ZERO && b_sep > best_sep + tol {
+        best_sep = b_sep;
+        best_axis = b_axis;
+    }
+    if edge_axis != Vec3::ZERO && edge_sep > best_sep + tol {
+        best_axis = edge_axis;
+    }
+    SatResult::Axis(best_axis)
 }
 
 /// 구-구 해석 접촉. 중심이 겹친 퇴화는 결정적 축(+Y)으로 분리한다.
@@ -569,6 +714,63 @@ mod tests {
 
     /// 리뷰 요구: **metamorphic 스케일 테스트**. 같은 씬을 1e-3~1e2배로 변환해도
     /// 접촉 판정·법선·상대 침투가 유지되어야 한다(절대 임계가 남아 있으면 여기서 깨진다).
+    #[test]
+    fn sat_normal_agrees_with_gjk_epa() {
+        // 정지 스택에서 실제로 나타나는 배치(축정렬 + 미세 회전)를 결정적으로 흔들며
+        // SAT 법선과 GJK/EPA 법선의 각도차를 잰다. 두 경로가 다른 축을 고르면
+        // 참조면이 바뀌어 feature ID가 요동치고 warm start가 끊긴다.
+        let half = Vec3::new(0.5, 0.5, 0.5);
+        let mut rng: u32 = 0x1234_5678;
+        let mut next = || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5 // [-0.5, 0.5)
+        };
+        let (mut worst_deg, mut disagree, mut total) = (0.0f32, 0, 0);
+        for case in 0..600 {
+            // 수직 적층 / 수평 인접 / 대각 이웃을 번갈아
+            let base = match case % 3 {
+                0 => Vec3::new(0.0, 1.0, 0.0),
+                1 => Vec3::new(1.02, 0.0, 0.0),
+                _ => Vec3::new(0.51, 1.0, 0.0),
+            };
+            let jitter = Vec3::new(next(), next(), next()) * 0.02;
+            let mut tilt = |a: f32, b: f32, c: f32| {
+                Quat::from_axis_angle(Vec3::new(a, b, c).normalize_or_zero(), 0.01 * next())
+            };
+            let pa = Pose {
+                pos: Vec3::ZERO,
+                rot: tilt(1.0, 0.0, 0.0),
+            };
+            let pb = Pose {
+                pos: base + jitter,
+                rot: tilt(0.0, 0.0, 1.0),
+            };
+            let sat = match box_box_axis(half, 0.0, &pa, half, 0.0, &pb, 0.05) {
+                SatResult::Axis(n) => n,
+                _ => continue,
+            };
+            let sa = Shape::Box { half, radius: 0.0 };
+            let reference = match gjk(&sa, &pa, &sa, &pb) {
+                GjkResult::Separated { normal, .. } => normal,
+                GjkResult::Intersecting(seed) => epa(seed, &sa, &pa, &sa, &pb).normal,
+            };
+            total += 1;
+            let cos = sat.dot(reference).clamp(-1.0, 1.0);
+            let deg = cos.acos().to_degrees();
+            if deg > worst_deg {
+                worst_deg = deg;
+            }
+            if deg > 1.0 {
+                disagree += 1;
+            }
+        }
+        println!("SAT vs GJK/EPA: 표본 {total}, 1° 초과 불일치 {disagree}, 최대 {worst_deg:.2}°");
+        assert!(
+            disagree == 0,
+            "SAT 법선이 {disagree}/{total} 케이스에서 기존 경로와 다르다 (최대 {worst_deg:.2}°)"
+        );
+    }
+
     #[test]
     fn contact_is_scale_invariant() {
         for &k in &[1.0e-3f32, 1.0e-1, 1.0, 1.0e1, 1.0e2] {
