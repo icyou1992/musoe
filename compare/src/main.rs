@@ -114,9 +114,16 @@ mod maru_side {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(WorldParams::default().substeps);
+        let thr: f32 = std::env::var("MARU_SLEEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let d = WorldParams::default();
         let mut w = World::new(WorldParams {
             substeps: sub,
-            ..Default::default()
+            sleep_linear_threshold: if thr > 0.0 { thr } else { d.sleep_linear_threshold },
+            sleep_angular_threshold: if thr > 0.0 { thr * 1.25 } else { d.sleep_angular_threshold },
+            ..d
         });
         for (dx, dz, hx, hz) in [
             (0.0, 0.0, 30.0, 30.0),
@@ -151,12 +158,25 @@ mod maru_side {
         for _ in 0..warmup {
             let _ = w.try_step(DT);
         }
+        // **에너지 궤적**: 감소하면 아직 정착 중, 증가·유지면 주입이다(리뷰가 요구한 판별).
+        let energy = |w: &World, hs: &[maru_dynamics::BodyHandle]| -> (f64, f64) {
+            let (mut ke, mut pe) = (0.0f64, 0.0f64);
+            for h in hs {
+                let b = w.body(*h);
+                let m = 1.0 / b.inv_mass() as f64;
+                ke += 0.5 * m * (b.linvel().length_sq() as f64);
+                let ii = b.inv_inertia_local();
+                ke += 0.5 * (1.0 / ii.x as f64) * (b.angvel().length_sq() as f64);
+                pe += m * 9.81 * b.pose().pos.y as f64;
+            }
+            (ke, pe)
+        };
         let t0 = Instant::now();
         let mut acc = [0u64; 5];
         let mut reused = 0usize;
         let mut pairs_acc = 0usize;
         let mut pts_acc = 0usize;
-        for _ in 0..steps {
+        for si in 0..steps {
             let _ = w.try_step(DT);
             let d = w.diagnostics();
             for k in 0..5 {
@@ -165,6 +185,10 @@ mod maru_side {
             reused += d.bp_reused as usize;
             pairs_acc += d.pairs;
             pts_acc += d.warm_total;
+            if si % (steps / 8).max(1) == 0 {
+                let (ke, pe) = energy(&w, &handles);
+                eprintln!("      t={si:4}  KE={ke:11.1}  PE={pe:12.1}  E={:12.1}", ke + pe);
+            }
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
         let (mut lowest, mut finite, mut asleep) = (f32::MAX, true, 0usize);
