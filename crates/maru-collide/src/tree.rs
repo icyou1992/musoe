@@ -40,7 +40,13 @@ fn decode(c: u32) -> Child {
 }
 
 impl Tree {
-    /// 결정적 빌드: (id, aabb) 목록에서 top-down 4분할. 같은 입력 → 같은 트리.
+    /// (id, aabb) 목록에서 top-down 4분할 빌드.
+    ///
+    /// **트리 위상은 결과에 영향을 주지 않는다** — 페어 집합은 트리 후보에 정밀 AABB
+    /// 판정과 canonical 정렬을 적용한 결과로 정의된다(설계 §4.1,
+    /// `pair_set_is_tree_topology_independent`가 이를 잠근다). 그래서 분할 방식은
+    /// 자유롭게 고를 수 있고, 여기서는 **중앙값 선택**(O(n))을 쓴다 — 전에는 중앙값
+    /// 하나를 얻으려고 전체 정렬(O(n log n))을 돌렸다.
     pub fn build(items: &[(u32, Aabb)]) -> Self {
         let mut t = Tree {
             bounds: Vec::new(),
@@ -54,40 +60,60 @@ impl Tree {
             items.iter().all(|(id, _)| id & LEAF_BIT == 0),
             "tree leaf id 최상위 비트는 예약됨"
         );
+        // centroid를 **한 번만** 계산해 둔다. 전에는 비교 함수 안에서 계산해
+        // 비교마다 두 번씩 다시 구했다(정렬 비교 횟수 × 2회).
+        let centroids: Vec<Vec3> = items.iter().map(|(_, b)| (b.min + b.max) * 0.5).collect();
         let mut idx: Vec<usize> = (0..items.len()).collect();
-        t.root = t.build_rec(items, &mut idx);
+        t.root = t.build_rec(items, &centroids, &mut idx);
         t
     }
 
-    fn build_rec(&mut self, items: &[(u32, Aabb)], idx: &mut [usize]) -> u32 {
+    fn build_rec(&mut self, items: &[(u32, Aabb)], cen: &[Vec3], idx: &mut [usize]) -> u32 {
         if idx.len() == 1 {
             return items[idx[0]].0 | LEAF_BIT;
         }
-        // 4그룹: 최장축 2분할 → 각 절반을 그 절반의 최장축으로 재분할 (centroid 기준, id 동률 정렬)
-        let groups = split4(items, idx);
         let node = self.children.len();
         assert!(node < EMPTY as usize, "tree node index capacity exceeded");
         self.children.push([EMPTY; 4]);
         self.bounds.push(soa_bounds::AabbLanes::empty());
-        for (lane, g) in groups.into_iter().enumerate() {
+
+        // 4그룹: 최장축 중앙값 분할 → 각 절반을 그 절반의 최장축으로 재분할.
+        // **제자리 분할**이라 그룹당 Vec을 만들지 않는다 — 전에는 내부 노드마다 힙 할당이
+        // 4번이었고, 3000 바디면 스텝당 4천 번이었다.
+        let half = split2(cen, idx);
+        let (lo, hi) = idx.split_at_mut(half);
+        let lo_half = split2(cen, lo);
+        let hi_half = split2(cen, hi);
+        let (a, b) = lo.split_at_mut(lo_half);
+        let (c, d) = hi.split_at_mut(hi_half);
+        for (lane, g) in [a, b, c, d].into_iter().enumerate() {
             if g.is_empty() {
                 continue;
             }
-            let mut g = g;
-            let child = self.build_rec(items, &mut g);
-            let b = g
+            // 바운드는 **재귀 전에** 구한다 — 재귀가 g를 재배열해도 합집합은 불변이지만,
+            // 빌림을 겹치지 않게 하려면 여기서 끝내는 편이 단순하다.
+            let bnd = g
                 .iter()
                 .map(|&i| items[i].1)
-                .reduce(|a, x| a.merge(x))
+                .reduce(|x, y| x.merge(y))
                 .unwrap();
+            let child = self.build_rec(items, cen, g);
             self.children[node][lane] = child;
-            self.bounds[node].set_lane(lane, b);
+            self.bounds[node].set_lane(lane, bnd);
         }
         node as u32
     }
 
     /// 질의 AABB와 겹칠 **가능성이 있는** 리프 id들(superset). 정렬·정밀 판정은 호출자 몫.
+    /// 스택을 매번 할당하지 않도록 스크래치를 받는 버전은 [`Tree::query_candidates_in`].
     pub fn query_candidates(&self, q: Aabb, out: &mut Vec<u32>) {
+        let mut stack = Vec::new();
+        self.query_candidates_in(q, out, &mut stack);
+    }
+
+    /// 순회 스택을 호출자가 보관하는 버전. 브로드페이즈는 바디마다 질의하므로
+    /// `vec![root]` 한 줄이 스텝당 수천 번의 힙 할당이 된다.
+    pub fn query_candidates_in(&self, q: Aabb, out: &mut Vec<u32>, stack: &mut Vec<u32>) {
         let root = self.root;
         if root == EMPTY {
             return;
@@ -98,7 +124,8 @@ impl Tree {
         }
         let qmin = Vec3x4::splat(q.min);
         let qmax = Vec3x4::splat(q.max);
-        let mut stack: Vec<u32> = vec![root];
+        stack.clear();
+        stack.push(root);
         while let Some(n) = stack.pop() {
             let n = n as usize;
             let mask = self.bounds[n].overlaps_mask(qmin, qmax).to_array();
@@ -115,29 +142,18 @@ impl Tree {
     }
 }
 
-/// centroid 최장축 기준 4분할(결정적: 좌표 동률은 id 오름차순).
-fn split4(items: &[(u32, Aabb)], idx: &mut [usize]) -> [Vec<usize>; 4] {
-    let half = split2(items, idx);
-    let (lo, hi) = idx.split_at_mut(half);
-    let lo_half = split2(items, lo);
-    let hi_half = split2(items, hi);
-    let (a, b) = lo.split_at(lo_half);
-    let (c, d) = hi.split_at(hi_half);
-    [a.to_vec(), b.to_vec(), c.to_vec(), d.to_vec()]
-}
-
-fn split2(items: &[(u32, Aabb)], idx: &mut [usize]) -> usize {
+/// centroid 최장축 중앙값으로 제자리 분할하고 분할점을 돌려준다.
+///
+/// `select_nth_unstable_by`는 O(n)이고, 분할 양쪽의 내부 순서는 규정되지 않는다 —
+/// 트리 위상이 결과에 영향을 주지 않으므로(위 `build` 주석) 그래도 된다.
+fn split2(cen: &[Vec3], idx: &mut [usize]) -> usize {
     if idx.len() <= 1 {
         return idx.len();
     }
-    let centroid = |i: usize| {
-        let b = items[i].1;
-        (b.min + b.max) * 0.5
-    };
-    let mut lo = centroid(idx[0]);
+    let mut lo = cen[idx[0]];
     let mut hi = lo;
     for &i in idx.iter().skip(1) {
-        let c = centroid(i);
+        let c = cen[i];
         lo = Vec3::new(lo.x.min(c.x), lo.y.min(c.y), lo.z.min(c.z));
         hi = Vec3::new(hi.x.max(c.x), hi.y.max(c.y), hi.z.max(c.z));
     }
@@ -150,20 +166,17 @@ fn split2(items: &[(u32, Aabb)], idx: &mut [usize]) -> usize {
         2
     };
     let key = |i: usize| {
-        let c = centroid(i);
+        let c = cen[i];
         match axis {
             0 => c.x,
             1 => c.y,
             _ => c.z,
         }
     };
-    idx.sort_by(|&a, &b| {
-        // total_cmp: NaN에도 전순서 유지 (설계 §8 — 비교/분기에 NaN 유입 차단, 패닉 금지)
-        key(a)
-            .total_cmp(&key(b))
-            .then_with(|| items[a].0.cmp(&items[b].0))
-    });
-    idx.len() / 2
+    let mid = idx.len() / 2;
+    // total_cmp: NaN에도 전순서 유지 (설계 §8 — 비교/분기에 NaN 유입 차단, 패닉 금지)
+    idx.select_nth_unstable_by(mid, |&a, &b| key(a).total_cmp(&key(b)));
+    mid
 }
 
 /// SoA 노드 바운드 저장 (crate 내부용).

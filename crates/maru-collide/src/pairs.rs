@@ -61,6 +61,8 @@ impl Broadphase {
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         pairs.try_reserve_exact(budget).ok()?;
         let mut cand: Vec<u32> = Vec::new();
+        // 트리 순회 스택도 스텝 전체에서 재사용한다(질의마다 할당하지 않는다).
+        let mut stack: Vec<u32> = Vec::new();
 
         // **슬롯 색인 배열**로 상대 AABB를 찾는다. 전에는 `HashMap<u32, Aabb>` 두 개를
         // 매 스텝 새로 채우고 **후보마다** 조회했다 — 구 더미 3000에서 스텝당 10만 회를
@@ -97,7 +99,8 @@ impl Broadphase {
         for &(id, aabb) in &self.dynamic_items {
             // 동적-동적 (self-pair 제거, canonical (min,max)로 절반만 채택해 중복 원천 차단)
             cand.clear();
-            self.dyn_tree.query_candidates(aabb, &mut cand);
+            self.dyn_tree
+                .query_candidates_in(aabb, &mut cand, &mut stack);
             for &other in &cand {
                 if other <= id {
                     continue; // self + 역방향 중복 제거
@@ -111,7 +114,8 @@ impl Broadphase {
             }
             // 동적-정적
             cand.clear();
-            self.static_tree.query_candidates(aabb, &mut cand);
+            self.static_tree
+                .query_candidates_in(aabb, &mut cand, &mut stack);
             for &s in &cand {
                 if aabb.overlaps(static_by_slot[s as usize]) {
                     if pairs.len() >= budget {
