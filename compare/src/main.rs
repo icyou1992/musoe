@@ -334,7 +334,15 @@ mod rapier_side {
     }
 
     /// 빌더가 수면 임계를 노출하지 않으므로 삽입 뒤 직접 맞춘다.
-    fn match_sleep(s: &mut Sim, h: RigidBodyHandle) {
+    ///
+    /// **`can_sleep`이 참일 때만 만진다.** rapier의 `can_sleep(false)`는 임계를 −1로
+    /// 두는 방식이라, 무조건 덮어쓰면 처리량 모드(수면 OFF)에서 rapier를 도로 재운다 —
+    /// 공정성을 맞추려던 코드가 반대 방향으로 불공정을 만든다(2026-07-27 실측으로 발견:
+    /// 40단 rapier가 3.81 → 0.27 ms로 튀었다).
+    fn match_sleep(s: &mut Sim, h: RigidBodyHandle, can_sleep: bool) {
+        if !can_sleep {
+            return;
+        }
         let a = s.bodies[h].activation_mut();
         a.normalized_linear_threshold = SLEEP_LIN;
         a.angular_threshold = SLEEP_ANG;
@@ -361,7 +369,7 @@ mod rapier_side {
                         .translation(rapier3d::math::Vec3::new(x, y, 0.0))
                         .can_sleep(can_sleep),
                 );
-                match_sleep(&mut s, h);
+                match_sleep(&mut s, h, can_sleep);
                 s.colliders.insert_with_parent(
                     ColliderBuilder::cuboid(0.5, 0.5, 0.5).density(1.0),
                     h,
@@ -423,7 +431,7 @@ mod rapier_side {
                             .translation(rapier3d::math::Vec3::new(x, y, z))
                             .can_sleep(can_sleep),
                     );
-                    match_sleep(&mut s, h);
+                    match_sleep(&mut s, h, can_sleep);
                     s.colliders.insert_with_parent(
                         ColliderBuilder::ball(0.5).density(1.0),
                         h,
