@@ -96,15 +96,22 @@ impl Broadphase {
         let dyn_by_slot = slots(&self.dynamic_items)?;
         let static_by_slot = slots(&self.static_items)?;
 
+        // **입력이 id 오름차순이면 전역 정렬이 필요 없다.** 바깥 루프가 id 순으로 돌므로
+        // 페어는 이미 id 블록 단위로 오름차순이고, 블록 안만 정렬하면 전체가 정렬된다.
+        // 33k 페어 전역 정렬(≈50만 비교)이 블록당 ~11개 정렬(≈11만 비교)로 줄어든다.
+        // 정렬돼 있지 않으면(공개 API는 임의 순서를 허용한다) 기존대로 전역 정렬한다.
+        let blocked = self.dynamic_items.windows(2).all(|w| w[0].0 < w[1].0);
+
         for &(id, aabb) in &self.dynamic_items {
+            let block_start = pairs.len();
             // 동적-동적 (self-pair 제거, canonical (min,max)로 절반만 채택해 중복 원천 차단)
             cand.clear();
+            // `above=id`로 순회 단계에서 잘라낸다 — 아래 `other <= id` 판정과 같은 결과지만
+            // 버릴 후보를 애초에 만들지 않는다(페어 집합 불변, 순회·후보 벡터가 절반).
             self.dyn_tree
-                .query_candidates_in(aabb, &mut cand, &mut stack);
+                .query_above_in(aabb, Some(id), &mut cand, &mut stack);
             for &other in &cand {
-                if other <= id {
-                    continue; // self + 역방향 중복 제거
-                }
+                debug_assert!(other > id, "가지치기가 채택 가능한 후보만 남겨야 한다");
                 if aabb.overlaps(dyn_by_slot[other as usize]) {
                     if pairs.len() >= budget {
                         return None;
@@ -124,8 +131,17 @@ impl Broadphase {
                     pairs.push((id, s | STATIC_BIT));
                 }
             }
+            if blocked {
+                pairs[block_start..].sort_unstable();
+            }
         }
-        pairs.sort_unstable();
+        if !blocked {
+            pairs.sort_unstable();
+        }
+        debug_assert!(
+            pairs.windows(2).all(|w| w[0] <= w[1]),
+            "canonical 페어 집합은 전순서로 정렬돼 있어야 한다"
+        );
         pairs.dedup();
         Some(pairs)
     }

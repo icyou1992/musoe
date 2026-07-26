@@ -26,6 +26,13 @@ pub struct Tree {
     /// 노드별 자식 4개의 바운드(SoA). 빈 레인은 반전 AABB(항상 불일치).
     bounds: Vec<soa_bounds::AabbLanes>,
     children: Vec<[u32; 4]>,
+    /// 자식 서브트리의 **최대 리프 id**. 빈 자식은 0.
+    ///
+    /// 동적-동적 페어를 뽑을 때 `(i, j)`를 i의 질의와 j의 질의에서 두 번 만나 절반을
+    /// `other <= id`로 버린다 — 버릴 후보를 **순회 단계에서** 잘라내려고 둔다.
+    /// 서브트리 최대 id가 질의 id 이하면 그 아래에는 채택될 후보가 하나도 없다.
+    /// 페어 집합은 그대로다(버릴 것만 안 만든다).
+    child_max_id: Vec<[u32; 4]>,
     root: u32,
 }
 
@@ -51,6 +58,7 @@ impl Tree {
         let mut t = Tree {
             bounds: Vec::new(),
             children: Vec::new(),
+            child_max_id: Vec::new(),
             root: EMPTY,
         };
         if items.is_empty() {
@@ -75,6 +83,7 @@ impl Tree {
         let node = self.children.len();
         assert!(node < EMPTY as usize, "tree node index capacity exceeded");
         self.children.push([EMPTY; 4]);
+        self.child_max_id.push([0; 4]);
         self.bounds.push(soa_bounds::AabbLanes::empty());
 
         // 4그룹: 최장축 중앙값 분할 → 각 절반을 그 절반의 최장축으로 재분할.
@@ -97,8 +106,10 @@ impl Tree {
                 .map(|&i| items[i].1)
                 .reduce(|x, y| x.merge(y))
                 .unwrap();
+            let max_id = g.iter().map(|&i| items[i].0).max().unwrap();
             let child = self.build_rec(items, cen, g);
             self.children[node][lane] = child;
+            self.child_max_id[node][lane] = max_id;
             self.bounds[node].set_lane(lane, bnd);
         }
         node as u32
@@ -114,12 +125,31 @@ impl Tree {
     /// 순회 스택을 호출자가 보관하는 버전. 브로드페이즈는 바디마다 질의하므로
     /// `vec![root]` 한 줄이 스텝당 수천 번의 힙 할당이 된다.
     pub fn query_candidates_in(&self, q: Aabb, out: &mut Vec<u32>, stack: &mut Vec<u32>) {
+        self.query_above_in(q, None, out, stack)
+    }
+
+    /// `above`가 있으면 **id가 그 값 이하인 후보는 만들지 않는다**.
+    ///
+    /// 동적-동적 페어는 `(i, j)`를 i의 질의와 j의 질의에서 두 번 만나 절반을 버린다.
+    /// 서브트리의 최대 리프 id가 `above` 이하면 그 아래에는 채택될 후보가 없으므로
+    /// 순회 자체를 건너뛴다 — **페어 집합은 동일하고**(버릴 것만 안 만든다)
+    /// 순회와 후보 벡터가 대략 절반이 된다.
+    /// 동적-정적 질의는 id 공간이 달라 이 가지치기를 쓰면 안 된다(`None`을 넘긴다).
+    pub fn query_above_in(
+        &self,
+        q: Aabb,
+        above: Option<u32>,
+        out: &mut Vec<u32>,
+        stack: &mut Vec<u32>,
+    ) {
         let root = self.root;
         if root == EMPTY {
             return;
         }
         if let Child::Leaf(id) = decode(root) {
-            out.push(id);
+            if above.is_none_or(|a| id > a) {
+                out.push(id);
+            }
             return;
         }
         let qmin = Vec3x4::splat(q.min);
@@ -129,13 +159,19 @@ impl Tree {
         while let Some(n) = stack.pop() {
             let n = n as usize;
             let mask = self.bounds[n].overlaps_mask(qmin, qmax).to_array();
-            for (hit, &child) in mask.iter().zip(&self.children[n]) {
-                if *hit != 0.0 {
-                    match decode(child) {
-                        Child::Node(c) => stack.push(c),
-                        Child::Leaf(id) => out.push(id),
-                        Child::None => {}
+            for (lane, (hit, &child)) in mask.iter().zip(&self.children[n]).enumerate() {
+                if *hit == 0.0 {
+                    continue;
+                }
+                if let Some(a) = above {
+                    if self.child_max_id[n][lane] <= a {
+                        continue;
                     }
+                }
+                match decode(child) {
+                    Child::Node(c) => stack.push(c),
+                    Child::Leaf(id) => out.push(id),
+                    Child::None => {}
                 }
             }
         }
