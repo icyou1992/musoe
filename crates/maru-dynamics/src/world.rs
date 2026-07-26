@@ -106,6 +106,11 @@ pub struct World {
     diag: Diagnostics,
     /// 직전 스텝이 자원 예산으로 중단됐는가 (비캐노니컬 — 복원 시 초기화).
     resource_limit: bool,
+    /// 솔버 핫패스 스크래치 (비캐노니컬). 매 스텝 재할당하지 않으려고 월드가 보관한다.
+    solver_state: solver::SolverState,
+    inv_inertia_local: Vec<Vec3>,
+    integrate_gate: Vec<bool>,
+    gravity_gate: Vec<bool>,
 }
 
 /// 읽기 전용 진단 (엔진 캐노니컬 상태가 아니다 — 스냅샷·해시에 포함되지 않는다).
@@ -212,6 +217,12 @@ pub(crate) fn anchor_fits(b: &Body, anchor: Vec3) -> bool {
     anchor.length() <= limit
 }
 
+/// 게이트 슬라이스를 인덱스와 함께 순회한다 (clippy: 루프 변수로 인덱싱하지 말 것).
+#[inline]
+fn gravity_gate_iter(g: &[bool]) -> impl Iterator<Item = (usize, bool)> + '_ {
+    g.iter().copied().enumerate()
+}
+
 impl World {
     /// 파라미터 불변식을 생성 경계에서 강제한다 (리뷰 MAJOR: 무검증 public 필드가
     /// dt/substeps·Softness 분모를 NaN/Inf로 만들 수 있었다).
@@ -244,6 +255,10 @@ impl World {
             last_report: CommandReport::default(),
             diag: Diagnostics::default(),
             resource_limit: false,
+            solver_state: solver::SolverState::default(),
+            inv_inertia_local: Vec::new(),
+            integrate_gate: Vec::new(),
+            gravity_gate: Vec::new(),
         }
     }
 
@@ -1197,23 +1212,56 @@ impl World {
             })
             .map(|(i, _)| i)
             .collect();
+        // **솔버는 압축 상태 배열 위에서 돈다**(설계 §3 SoA 핫패스). `Body`를 제약 순서로
+        // 무작위 접근하면 셰이프·재질까지 딸린 뚱뚱한 구조체가 캐시를 밀어낸다 —
+        // 실측 점당 73ns에 산술은 40 flops 남짓이었다. 솔버가 실제로 쓰는 6개 배열만
+        // 뽑아 돌리고 루프가 끝난 뒤 한 번만 되쓴다.
+        let n_bodies = self.bodies.len();
+        let mut st = std::mem::take(&mut self.solver_state);
+        st.sync_from(&self.bodies, &self.alive);
+        let inv_i_local = &mut self.inv_inertia_local;
+        inv_i_local.clear();
+        inv_i_local.extend(self.bodies.iter().map(|b| b.inv_inertia_local));
+        // 적분 대상 게이트도 스크래치에 재사용한다(루프에서 매번 판정하지 않는다).
+        let integrate = &mut self.integrate_gate;
+        let gravity_on = &mut self.gravity_gate;
+        integrate.clear();
+        gravity_on.clear();
+        for i in 0..n_bodies {
+            let ok = self.alive[i]
+                && self.bodies[i].body_type != BodyType::Static
+                && !self.asleep[i]
+                && !self.oob[i];
+            integrate.push(ok);
+            gravity_on.push(ok && self.bodies[i].is_dynamic());
+        }
+        let inv_i_local = &self.inv_inertia_local;
+        let integrate = &self.integrate_gate;
+        let gravity_on = &self.gravity_gate;
+        let (max_lin, max_ang) = (
+            self.params.max_linear_velocity,
+            self.params.max_angular_velocity,
+        );
         for _ in 0..n_sub {
-            // 속도 적분 (sleeping 제외)
-            for (i, b) in self.bodies.iter_mut().enumerate() {
-                if self.alive[i] && b.is_dynamic() && !self.asleep[i] && !self.oob[i] {
-                    b.linvel += g * h;
+            for (i, on) in gravity_gate_iter(gravity_on) {
+                if on {
+                    st.lin[i] += g * h;
                 }
+            }
+            st.refresh_inv_i(inv_i_local);
+            for c in constraints.iter_mut() {
+                solver::refresh_anchors(&st, c);
             }
             // warm start + bias 솔브 (조인트 먼저 — Box2D 순서)
             for &ji in &active_joints {
-                joint::warm_start(&mut self.bodies, &joints[ji]);
+                joint::warm_start(&mut st, &joints[ji]);
             }
             for c in constraints.iter_mut() {
-                solver::warm_start(&mut self.bodies, c);
+                solver::warm_start(&mut st, c);
             }
             for &ji in &active_joints {
                 joint::solve(
-                    &mut self.bodies,
+                    &mut st,
                     &mut joints[ji],
                     Some((
                         &joint_soft,
@@ -1223,48 +1271,73 @@ impl World {
                 );
             }
             for c in constraints.iter_mut() {
-                let sf = if self.bodies[c.a].is_dynamic() && self.bodies[c.b].is_dynamic() {
+                let sf = if st.dynamic[c.a] && st.dynamic[c.b] {
                     &soft
                 } else {
                     &static_soft
                 };
                 solver::solve(
-                    &mut self.bodies,
+                    &mut st,
                     c,
                     inv_h,
                     Some((sf, self.params.solver.max_bias_speed)),
                 );
             }
             // 속도 상한 — 위치 적분 **전에** 걸어야 변위도 유계가 된다
-            self.clamp_velocities();
-            // 위치 적분 (dynamic + kinematic, sleeping 제외)
-            for (i, b) in self.bodies.iter_mut().enumerate() {
-                if self.alive[i]
-                    && b.body_type != BodyType::Static
-                    && !self.asleep[i]
-                    && !self.oob[i]
-                {
-                    b.pose.pos += b.linvel * h;
-                    b.pose.rot = b.pose.rot.integrate(b.angvel, h);
+            for (i, on) in gravity_gate_iter(integrate) {
+                if !on {
+                    continue;
+                }
+                let l2 = st.lin[i].length_sq();
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
+                if !(l2 <= max_lin * max_lin) {
+                    let n = st.lin[i].length();
+                    st.lin[i] = if n.is_finite() && n > 0.0 {
+                        st.lin[i] * (max_lin / n)
+                    } else {
+                        Vec3::ZERO
+                    };
+                    self.diag.velocity_clamped += 1;
+                }
+                let a2 = st.ang[i].length_sq();
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
+                if !(a2 <= max_ang * max_ang) {
+                    let n = st.ang[i].length();
+                    st.ang[i] = if n.is_finite() && n > 0.0 {
+                        st.ang[i] * (max_ang / n)
+                    } else {
+                        Vec3::ZERO
+                    };
+                    self.diag.velocity_clamped += 1;
                 }
             }
-            // relax — bias 에너지 제거
+            // 위치 적분 (dynamic + kinematic, sleeping 제외)
+            for (i, on) in gravity_gate_iter(integrate) {
+                if on {
+                    st.pos[i] += st.lin[i] * h;
+                    st.rot[i] = st.rot[i].integrate(st.ang[i], h);
+                }
+            }
+            // relax — bias 에너지 제거 (위치 적분으로 자세가 바뀌었으므로 갱신)
+            st.refresh_inv_i(inv_i_local);
+            for c in constraints.iter_mut() {
+                solver::refresh_anchors(&st, c);
+            }
             for &ji in &active_joints {
-                joint::solve(&mut self.bodies, &mut joints[ji], None);
+                joint::solve(&mut st, &mut joints[ji], None);
             }
             for c in constraints.iter_mut() {
-                solver::solve(&mut self.bodies, c, inv_h, None);
+                solver::solve(&mut st, c, inv_h, None);
             }
         }
 
         // 4) restitution 패스 (임팩트 게이트)
         for c in constraints.iter_mut() {
-            solver::apply_restitution(
-                &mut self.bodies,
-                c,
-                self.params.solver.restitution_threshold,
-            );
+            solver::apply_restitution(&mut st, c, self.params.solver.restitution_threshold);
         }
+
+        st.write_back(&mut self.bodies, &self.alive);
+        self.solver_state = st;
 
         // 5) PCM 캐시 갱신. **잠든 페어의 엔트리는 보존**한다 — 전체 clear는 첫 수면 스텝에
         //    지속 매니폴드를 날려, 나중에 깨어날 때 warm start 없이 거칠게 재정착한다(리뷰 지적).

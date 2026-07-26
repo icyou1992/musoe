@@ -3,7 +3,7 @@
 //! 서브스텝마다 TGS 방식으로 현재 자세에서 위치 오차 C를 재계산하고 soft bias로 해석.
 //! [근거: Box2D v3가 조인트까지 soft-step 단일 솔버로 처리 — 01 §2 정정 반영]
 
-use crate::body::{Body, BodyHandle};
+use crate::body::BodyHandle;
 use crate::solver::Softness;
 use maru_collide::{in_state_range, vec_anchor_in_range, vec_in_state_range};
 use maru_math::{Mat3, Vec3};
@@ -150,35 +150,18 @@ impl Joint {
     }
 }
 
-#[inline]
-fn apply(body: &mut Body, imp: Vec3, r: Vec3, inv_i: &Mat3) {
-    if body.is_dynamic() {
-        body.linvel += imp * body.inv_mass;
-        body.angvel += inv_i.mul_vec(r.cross(imp));
-    }
-}
-
-#[inline]
-fn apply_angular(body: &mut Body, imp: Vec3, inv_i: &Mat3) {
-    if body.is_dynamic() {
-        body.angvel += inv_i.mul_vec(imp);
-    }
-}
-
 /// warm start (서브스텝 시작마다 — 접촉과 동일 패턴).
-pub fn warm_start(bodies: &mut [Body], j: &Joint) {
-    let ia = bodies[j.ia()].inv_inertia_world();
-    let ib = bodies[j.ib()].inv_inertia_world();
-    let ra = bodies[j.ia()].pose.rot.rotate(j.anchor_a);
-    let rb = bodies[j.ib()].pose.rot.rotate(j.anchor_b);
-    apply(&mut bodies[j.ia()], j.linear_impulse, ra, &ia);
-    apply(&mut bodies[j.ib()], -j.linear_impulse, rb, &ib);
+pub fn warm_start(st: &mut crate::solver::SolverState, j: &Joint) {
+    let ra = st.rot[j.ia()].rotate(j.anchor_a);
+    let rb = st.rot[j.ib()].rotate(j.anchor_b);
+    st.apply_pub(j.ia(), j.linear_impulse, ra);
+    st.apply_pub(j.ib(), -j.linear_impulse, rb);
     if let JointKind::Hinge { axis_a, .. } = &j.kind {
-        let wa = bodies[j.ia()].pose.rot.rotate(*axis_a);
+        let wa = st.rot[j.ia()].rotate(*axis_a);
         let (u, v) = perp_basis(wa);
         let ang = u * j.angular_impulse[0] + v * j.angular_impulse[1];
-        apply_angular(&mut bodies[j.ia()], ang, &ia);
-        apply_angular(&mut bodies[j.ib()], -ang, &ib);
+        st.apply_ang_pub(j.ia(), ang);
+        st.apply_ang_pub(j.ib(), -ang);
     }
 }
 
@@ -212,12 +195,15 @@ fn clamp_len(v: Vec3, max: f32) -> Vec3 {
 /// **각 bias는 각속도 상한**(rad/s). `c × bias_rate`는 오차가 크고 h가 작을 때 1e12까지 가고,
 /// 유효(관성)질량을 곱하면 파생 상태 상한을 넘긴다. 접촉이 이미 선형 방어를 하고 있었는데
 /// 조인트는 선형·각 모두 빠져 있었다.
-pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32, f32)>) {
-    let ia = bodies[j.ia()].inv_inertia_world();
-    let ib = bodies[j.ib()].inv_inertia_world();
-    let (inv_ma, inv_mb) = (bodies[j.ia()].inv_mass, bodies[j.ib()].inv_mass);
-    let ra = bodies[j.ia()].pose.rot.rotate(j.anchor_a);
-    let rb = bodies[j.ib()].pose.rot.rotate(j.anchor_b);
+pub fn solve(
+    st: &mut crate::solver::SolverState,
+    j: &mut Joint,
+    soft: Option<(&Softness, f32, f32)>,
+) {
+    let (ia, ib) = (st.inv_i[j.ia()], st.inv_i[j.ib()]);
+    let (inv_ma, inv_mb) = (st.inv_m[j.ia()], st.inv_m[j.ib()]);
+    let ra = st.rot[j.ia()].rotate(j.anchor_a);
+    let rb = st.rot[j.ib()].rotate(j.anchor_b);
 
     // --- 선형 3-DOF: K = (1/ma+1/mb)I + skew(ra)ᵀIa⁻¹skew(ra) + skew(rb)ᵀIb⁻¹skew(rb) ---
     let k = {
@@ -238,8 +224,8 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32, f
         }
         m
     };
-    let c_pos = (bodies[j.ia()].pose.pos + ra) - (bodies[j.ib()].pose.pos + rb);
-    let cdot = bodies[j.ia()].velocity_at(ra) - bodies[j.ib()].velocity_at(rb);
+    let c_pos = (st.pos[j.ia()] + ra) - (st.pos[j.ib()] + rb);
+    let cdot = st.vel_at_pub(j.ia(), ra) - st.vel_at_pub(j.ib(), rb);
     let (bias, mass_scale, impulse_scale) = match soft {
         Some((sf, max_bias, _)) => (
             clamp_len(c_pos * sf.bias_rate, max_bias),
@@ -251,15 +237,15 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32, f
     let impulse =
         k.inverse().mul_vec(-(cdot + bias)) * mass_scale - j.linear_impulse * impulse_scale;
     j.linear_impulse += impulse;
-    apply(&mut bodies[j.ia()], impulse, ra, &ia);
-    apply(&mut bodies[j.ib()], -impulse, rb, &ib);
+    st.apply_pub(j.ia(), impulse, ra);
+    st.apply_pub(j.ib(), -impulse, rb);
 
     // --- hinge 각 2-DOF: 축 수직 성분 상대 각속도 = 0, 위치 bias = 축 어긋남 ---
     if let JointKind::Hinge { axis_a, axis_b } = j.kind {
-        let wa_axis = bodies[j.ia()].pose.rot.rotate(axis_a);
-        let wb_axis = bodies[j.ib()].pose.rot.rotate(axis_b);
+        let wa_axis = st.rot[j.ia()].rotate(axis_a);
+        let wb_axis = st.rot[j.ib()].rotate(axis_b);
         let (u, v) = perp_basis(wa_axis);
-        let wrel = bodies[j.ia()].angvel - bodies[j.ib()].angvel;
+        let wrel = st.ang[j.ia()] - st.ang[j.ib()];
         // 축 오차. 부호는 임펄스 적용 규약(A += imp, B -= imp)과 맞아야 한다 —
         // wa×wb를 쓰면 20° 어긋난 축이 정렬되는 대신 반대축(-1)으로 넘어간다(실증).
         let err = wb_axis.cross(wa_axis);
@@ -285,8 +271,8 @@ pub fn solve(bodies: &mut [Body], j: &mut Joint, soft: Option<(&Softness, f32, f
             let imp = -(cdot + bias) / k_ang * ms - j.angular_impulse[axis_i] * is_;
             j.angular_impulse[axis_i] += imp;
             let ang = dir * imp;
-            apply_angular(&mut bodies[j.ia()], ang, &ia);
-            apply_angular(&mut bodies[j.ib()], -ang, &ib);
+            st.apply_ang_pub(j.ia(), ang);
+            st.apply_ang_pub(j.ib(), -ang);
         }
     }
 }

@@ -85,13 +85,17 @@ mod maru_side {
             pairs_acc / steps
         );
 
-        let (mut top, mut vmax, mut finite) = (f32::MIN, 0.0f32, true);
+        let (mut top, mut vmax, mut finite, mut asleep) = (f32::MIN, 0.0f32, true, 0usize);
         for h in &handles {
             let b = w.body(*h);
             top = top.max(b.pose().pos.y);
             vmax = vmax.max(b.linvel().length());
             finite &= b.pose().pos.y.is_finite();
+            if w.is_asleep(*h) {
+                asleep += 1;
+            }
         }
+        eprintln!("    [maru sleep] {asleep}/{} 잠듦", handles.len());
         let expect = tiers as f32 - 0.5;
         let stable = finite && (top - expect).abs() < 0.02 * tiers as f32 && vmax < 0.5;
         Result_ {
@@ -244,13 +248,17 @@ mod rapier_side {
             s.step();
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
-        let (mut top, mut vmax, mut finite) = (f32::MIN, 0.0f32, true);
+        let (mut top, mut vmax, mut finite, mut asleep) = (f32::MIN, 0.0f32, true, 0usize);
         for h in &handles {
             let b = &s.bodies[*h];
             top = top.max(b.translation().y);
             vmax = vmax.max(b.linvel().length());
             finite &= b.translation().y.is_finite();
+            if b.is_sleeping() {
+                asleep += 1;
+            }
         }
+        eprintln!("    [rapier sleep] {asleep}/{} 잠듦", handles.len());
         let expect = tiers as f32 - 0.5;
         let stable = finite && (top - expect).abs() < 0.02 * tiers as f32 && vmax < 0.5;
         Result_ {
@@ -314,6 +322,19 @@ mod rapier_side {
     }
 }
 
+/// 같은 시나리오를 여러 번 돌려 **최소값**을 취한다. 벽시계는 위로만 오염되므로
+/// (스케줄러·터보·캐시 경합) 최소값이 처리량의 최소분산 추정이다. 평균은 노이즈를 삼킨다.
+fn best(reps: usize, mut f: impl FnMut() -> Result_) -> Result_ {
+    let mut best: Option<Result_> = None;
+    for _ in 0..reps {
+        let r = f();
+        if best.as_ref().is_none_or(|b| r.ms_per_step < b.ms_per_step) {
+            best = Some(r);
+        }
+    }
+    best.unwrap()
+}
+
 fn row(name: &str, r: &Result_) {
     println!(
         "  {:<8} {:>9.3} ms/step   {}   {}",
@@ -329,24 +350,25 @@ fn main() {
     let scenario = args.get(1).map(|s| s.as_str()).unwrap_or("all");
     let steps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(240);
     let warmup: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60);
+    let reps: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
 
     println!("Maru(M2) vs Rapier3D 0.34 — dt=1/60, release(lto=thin, cgu=1), 단일 스레드");
     println!("설정: Maru=기본(4 서브스텝·30Hz 접촉) / Rapier=IntegrationParameters::default()");
     println!("주의: Maru는 CCD 없음·셰이프 4종(M2). Rapier는 CCD·쿼리 파이프라인을 함께 돌린다.");
-    println!("측정: 워밍업 {warmup} 스텝 후 {steps} 스텝 평균. UNSTABLE이면 성능 수치는 무의미하다.\n");
+    println!("측정: 워밍업 {warmup} + {steps} 스텝, {reps}회 반복의 **최소값**. UNSTABLE이면 수치는 무의미하다.\n");
 
     if scenario == "all" || scenario == "pyramid" {
         for tiers in [10usize, 20, 30, 40] {
             println!("[피라미드 {tiers}단]");
-            row("maru", &maru_side::pyramid(tiers, steps, warmup));
-            row("rapier", &rapier_side::pyramid(tiers, steps, warmup));
+            row("maru", &best(reps, || maru_side::pyramid(tiers, steps, warmup)));
+            row("rapier", &best(reps, || rapier_side::pyramid(tiers, steps, warmup)));
         }
     }
     if scenario == "all" || scenario == "pile" {
         for n in [500usize, 1500, 3000] {
             println!("[구 더미 {n}개]");
-            row("maru", &maru_side::pile(n, steps, warmup));
-            row("rapier", &rapier_side::pile(n, steps, warmup));
+            row("maru", &best(reps, || maru_side::pile(n, steps, warmup)));
+            row("rapier", &best(reps, || rapier_side::pile(n, steps, warmup)));
         }
     }
 }

@@ -5,9 +5,9 @@
 //! 접근 속도(approach_vn)가 임계 이상일 때만, 실제 임펄스가 발생한 접점에만 발화.
 //! [근거: Solver2D 실증 + Box2D v3 releasing-3.0]
 
-use crate::body::{Body, BodyType};
+use crate::body::Body;
 use maru_collide::Manifold;
-use maru_math::{Mat3, Vec3};
+use maru_math::{Mat3, Quat, Vec3};
 
 pub struct SolverParams {
     pub contact_hertz: f32,
@@ -72,6 +72,11 @@ pub struct ContactPointConstraint {
     pub normal_impulse: f32,
     pub tangent_impulse: [f32; 2],
     pub max_normal_impulse: f32,
+    /// 이번 서브스텝의 월드 레버암 — `refresh_anchors`가 채운다.
+    /// warm start와 bias 솔브는 같은 자세를 보므로 회전을 한 번만 한다
+    /// (전에는 warm_start·solve·relax가 각각 다시 돌려 서브스텝당 3중 계산이었다).
+    pub ra: Vec3,
+    pub rb: Vec3,
     /// 접촉 생성 시점 법선 접근 속도 (restitution 게이트 입력).
     pub approach_vn: f32,
 }
@@ -115,6 +120,105 @@ fn effective_mass(
         1.0 / k
     } else {
         0.0
+    }
+}
+
+/// 솔버 핫패스의 **압축 상태**(설계 §3: SoA 핫패스).
+///
+/// 솔버가 `Body` 배열을 직접 훑으면 셰이프·재질까지 딸린 뚱뚱한 구조체를 제약 순서대로
+/// 무작위 접근하게 된다. 실제로 점당 73ns가 나왔는데 산술은 40 flops 남짓이었다 —
+/// 비용은 계산이 아니라 **메모리**였다. 솔버가 실제로 읽고 쓰는 6개 배열만 뽑아
+/// 연속 메모리에 두고, 서브스텝 루프가 끝난 뒤 한 번만 바디로 되쓴다.
+#[derive(Default)]
+pub struct SolverState {
+    pub lin: Vec<Vec3>,
+    pub ang: Vec<Vec3>,
+    pub pos: Vec<Vec3>,
+    pub rot: Vec<Quat>,
+    pub inv_m: Vec<f32>,
+    pub inv_i: Vec<Mat3>,
+    /// 동적 바디만 임펄스를 받는다 (static/kinematic은 inv_m=0이지만 명시 게이트가 더 싸다).
+    pub dynamic: Vec<bool>,
+}
+
+impl SolverState {
+    /// 바디에서 상태를 **제자리로** 채운다. 매 스텝 새 Vec을 만들면 할당 비용이
+    /// 솔버 이득을 먹는다(실측: SoA 전환이 되레 1.3ms 느려졌다) — 버퍼는 월드가 보관한다.
+    pub fn sync_from(&mut self, bodies: &[Body], alive: &[bool]) {
+        let n = bodies.len();
+        macro_rules! fit {
+            ($v:expr, $d:expr) => {
+                $v.clear();
+                $v.reserve(n);
+                $v.resize(n, $d);
+            };
+        }
+        fit!(self.lin, Vec3::ZERO);
+        fit!(self.ang, Vec3::ZERO);
+        fit!(self.pos, Vec3::ZERO);
+        fit!(self.rot, Quat::IDENTITY);
+        fit!(self.inv_m, 0.0);
+        fit!(self.inv_i, Mat3::from_diagonal(Vec3::ZERO));
+        fit!(self.dynamic, false);
+        for i in 0..n {
+            let b = &bodies[i];
+            self.lin[i] = b.linvel;
+            self.ang[i] = b.angvel;
+            self.pos[i] = b.pose.pos;
+            self.rot[i] = b.pose.rot;
+            self.inv_m[i] = b.inv_mass;
+            self.dynamic[i] = alive[i] && b.is_dynamic();
+        }
+    }
+
+    /// 솔버 결과를 바디로 되쓴다 (스텝당 1회 — 핫패스 밖).
+    pub fn write_back(&self, bodies: &mut [Body], alive: &[bool]) {
+        for i in 0..bodies.len() {
+            if alive[i] {
+                bodies[i].linvel = self.lin[i];
+                bodies[i].angvel = self.ang[i];
+                bodies[i].pose.pos = self.pos[i];
+                bodies[i].pose.rot = self.rot[i];
+            }
+        }
+    }
+
+    #[inline]
+    fn vel_at(&self, i: usize, r: Vec3) -> Vec3 {
+        self.lin[i] + self.ang[i].cross(r)
+    }
+    #[inline]
+    fn apply(&mut self, i: usize, imp: Vec3, r: Vec3) {
+        if self.dynamic[i] {
+            self.lin[i] += imp * self.inv_m[i];
+            self.ang[i] += self.inv_i[i].mul_vec(r.cross(imp));
+        }
+    }
+    #[inline]
+    fn apply_ang(&mut self, i: usize, ang: Vec3) {
+        if self.dynamic[i] {
+            self.ang[i] += self.inv_i[i].mul_vec(ang);
+        }
+    }
+    #[inline]
+    pub fn vel_at_pub(&self, i: usize, r: Vec3) -> Vec3 {
+        self.vel_at(i, r)
+    }
+    #[inline]
+    pub fn apply_pub(&mut self, i: usize, imp: Vec3, r: Vec3) {
+        self.apply(i, imp, r)
+    }
+    #[inline]
+    pub fn apply_ang_pub(&mut self, i: usize, ang: Vec3) {
+        self.apply_ang(i, ang)
+    }
+    /// 자세가 바뀐 뒤 월드 역관성을 갱신한다 (바디당 1회).
+    pub fn refresh_inv_i(&mut self, local: &[Vec3]) {
+        for (i, l) in local.iter().enumerate() {
+            if self.dynamic[i] {
+                self.inv_i[i] = Mat3::rotate_inertia(*l, self.rot[i]);
+            }
+        }
     }
 }
 
@@ -222,6 +326,8 @@ pub fn prepare(
                 normal_impulse: warm.normal,
                 tangent_impulse: warm_t,
                 max_normal_impulse: 0.0,
+                ra,
+                rb,
                 approach_vn: vn,
             }
         })
@@ -238,51 +344,44 @@ pub fn prepare(
     }
 }
 
-#[inline]
-fn apply_impulse(body: &mut Body, imp: Vec3, r: Vec3, inv_i: &Mat3) {
-    if body.body_type == BodyType::Dynamic {
-        body.linvel += imp * body.inv_mass;
-        body.angvel += inv_i.mul_vec(r.cross(imp));
+/// 현재 자세로 레버암을 갱신한다 (서브스텝당 1회, 위치 적분 뒤 1회).
+pub fn refresh_anchors(st: &SolverState, c: &mut ContactConstraint) {
+    let (qa, qb) = (st.rot[c.a], st.rot[c.b]);
+    for p in &mut c.points {
+        p.ra = qa.rotate(p.anchor_a);
+        p.rb = qb.rotate(p.anchor_b);
     }
 }
 
 /// warm start: 누적 임펄스를 서브스텝 시작 추정으로 재적용 (Box2D v3 동형).
-pub fn warm_start(bodies: &mut [Body], c: &ContactConstraint) {
-    let ia = bodies[c.a].inv_inertia_world();
-    let ib = bodies[c.b].inv_inertia_world();
+pub fn warm_start(st: &mut SolverState, c: &ContactConstraint) {
     for p in &c.points {
-        let ra = bodies[c.a].pose.rot.rotate(p.anchor_a);
-        let rb = bodies[c.b].pose.rot.rotate(p.anchor_b);
+        let (ra, rb) = (p.ra, p.rb);
         let imp = c.normal * p.normal_impulse
             + c.tangents[0] * p.tangent_impulse[0]
             + c.tangents[1] * p.tangent_impulse[1];
-        apply_impulse(&mut bodies[c.a], imp, ra, &ia);
-        apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
+        st.apply(c.a, imp, ra);
+        st.apply(c.b, -imp, rb);
     }
 }
 
 /// 속도 임펄스 해석. `soft`=bias 페이즈, `relax`(soft=None)=bias 제거 페이즈.
 pub fn solve(
-    bodies: &mut [Body],
+    st: &mut SolverState,
     c: &mut ContactConstraint,
     inv_h: f32,
     soft: Option<(&Softness, f32)>, // (계수, max_bias_speed)
 ) {
-    let ia = bodies[c.a].inv_inertia_world();
-    let ib = bodies[c.b].inv_inertia_world();
     for p in &mut c.points {
-        let ra = bodies[c.a].pose.rot.rotate(p.anchor_a);
-        let rb = bodies[c.b].pose.rot.rotate(p.anchor_b);
+        let (ra, rb) = (p.ra, p.rb);
         // TGS: 현재 자세로 separation 추적. A가 +n로 이동하면 s 증가해야 하므로
         // s = n·(pa − pb) + base (prepare 시점엔 앵커가 같은 월드점 → s = base).
-        let pa = bodies[c.a].pose.pos + ra;
-        let pb = bodies[c.b].pose.pos + rb;
+        let pa = st.pos[c.a] + ra;
+        let pb = st.pos[c.b] + rb;
         let s = c.normal.dot(pa - pb) + p.base_separation;
 
         // --- 법선 ---
-        let vn = c
-            .normal
-            .dot(bodies[c.a].velocity_at(ra) - bodies[c.b].velocity_at(rb));
+        let vn = c.normal.dot(st.vel_at(c.a, ra) - st.vel_at(c.b, rb));
         let (bias, mass_scale, impulse_scale) = match soft {
             Some((sf, max_bias)) => {
                 if s > 0.0 {
@@ -312,8 +411,8 @@ pub fn solve(
         p.normal_impulse = new_total;
         p.max_normal_impulse = p.max_normal_impulse.max(new_total);
         let imp = c.normal * applied;
-        apply_impulse(&mut bodies[c.a], imp, ra, &ia);
-        apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
+        st.apply(c.a, imp, ra);
+        st.apply(c.b, -imp, rb);
 
         // --- 마찰: 축별 **순차** 해석(GS) 후 누적 2D 임펄스를 Coulomb **원판**에 투영 ---
         // 사각형 클램프는 대각 슬라이드에서 √2·μN까지 허용해 41% 과도 감속하고 기저 의존적이다.
@@ -322,12 +421,12 @@ pub fn solve(
         let max_f = c.friction * p.normal_impulse;
         for axis in 0..2 {
             let t = c.tangents[axis];
-            let vt = t.dot(bodies[c.a].velocity_at(ra) - bodies[c.b].velocity_at(rb));
+            let vt = t.dot(st.vel_at(c.a, ra) - st.vel_at(c.b, rb));
             let delta = -p.tangent_mass[axis] * vt;
             p.tangent_impulse[axis] += delta;
             let imp = t * delta;
-            apply_impulse(&mut bodies[c.a], imp, ra, &ia);
-            apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
+            st.apply(c.a, imp, ra);
+            st.apply(c.b, -imp, rb);
         }
         let mag2 = p.tangent_impulse[0] * p.tangent_impulse[0]
             + p.tangent_impulse[1] * p.tangent_impulse[1];
@@ -338,38 +437,34 @@ pub fn solve(
             p.tangent_impulse[0] += corr0;
             p.tangent_impulse[1] += corr1;
             let imp = c.tangents[0] * corr0 + c.tangents[1] * corr1;
-            apply_impulse(&mut bodies[c.a], imp, ra, &ia);
-            apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
+            st.apply(c.a, imp, ra);
+            st.apply(c.b, -imp, rb);
         }
     }
     let _ = inv_h;
 }
 
 /// restitution 패스 — 전 서브스텝 종료 후 1회 (설계 §4.4 임팩트 게이트).
-pub fn apply_restitution(bodies: &mut [Body], c: &mut ContactConstraint, threshold: f32) {
+pub fn apply_restitution(st: &mut SolverState, c: &mut ContactConstraint, threshold: f32) {
     if c.restitution == 0.0 {
         return;
     }
-    let ia = bodies[c.a].inv_inertia_world();
-    let ib = bodies[c.b].inv_inertia_world();
     for p in &mut c.points {
         // 게이트(설계 §4.4): 실제 임펄스가 발생했고, 접근 속도(음수)가 임계보다 빨랐던 접점만
         if p.approach_vn > -threshold || p.max_normal_impulse == 0.0 {
             continue;
         }
-        let ra = bodies[c.a].pose.rot.rotate(p.anchor_a);
-        let rb = bodies[c.b].pose.rot.rotate(p.anchor_b);
-        let vn = c
-            .normal
-            .dot(bodies[c.a].velocity_at(ra) - bodies[c.b].velocity_at(rb));
+        let ra = st.rot[c.a].rotate(p.anchor_a);
+        let rb = st.rot[c.b].rotate(p.anchor_b);
+        let vn = c.normal.dot(st.vel_at(c.a, ra) - st.vel_at(c.b, rb));
         // 목표: vn_out = −e·approach_vn (approach_vn<0 → 양수 반발)
         let impulse = -p.normal_mass * (vn + c.restitution * p.approach_vn);
         let new_total = (p.normal_impulse + impulse).max(0.0);
         let applied = new_total - p.normal_impulse;
         p.normal_impulse = new_total;
         let imp = c.normal * applied;
-        apply_impulse(&mut bodies[c.a], imp, ra, &ia);
-        apply_impulse(&mut bodies[c.b], -imp, rb, &ib);
+        st.apply(c.a, imp, ra);
+        st.apply(c.b, -imp, rb);
     }
 }
 
