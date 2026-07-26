@@ -80,6 +80,12 @@ impl Joint {
         Ok(())
     }
 
+    /// 누적 임펄스 초기화 (OOB 전이 등 연속성이 끊기는 지점).
+    pub(crate) fn clear_impulses(&mut self) {
+        self.linear_impulse = Vec3::ZERO;
+        self.angular_impulse = [0.0, 0.0];
+    }
+
     /// 슬롯 인덱스 (월드가 생존·세대를 이미 검증한 뒤의 핫패스 전용).
     #[inline]
     pub(crate) fn ia(&self) -> usize {
@@ -160,8 +166,10 @@ pub(crate) fn linear_k(inv_ma: f32, inv_mb: f32, ia: &Mat3, ib: &Mat3, ra: Vec3,
     ];
     for (mat, r) in [(ia, ra), (ib, rb)] {
         for (ji, ej) in e.iter().enumerate() {
+            // K += -skew(r) I⁻¹ skew(r) — skew(r)ᵀ = -skew(r)이므로 **더한다**.
+            // (함수로 뽑으며 부호를 뒤집어, 검증이 솔버와 다른 행렬을 보고 있었다 — 리뷰 BLOCKER)
             let col = r.cross(mat.mul_vec(ej.cross(r)));
-            m.c[ji] = m.c[ji] - col;
+            m.c[ji] += col;
         }
     }
     m
@@ -238,24 +246,8 @@ pub fn solve(
     let rb = st.rot[j.ib()].rotate(j.anchor_b);
 
     // --- 선형 3-DOF: K = (1/ma+1/mb)I + skew(ra)ᵀIa⁻¹skew(ra) + skew(rb)ᵀIb⁻¹skew(rb) ---
-    let k = {
-        let mut m =
-            Mat3::from_diagonal(Vec3::new(inv_ma + inv_mb, inv_ma + inv_mb, inv_ma + inv_mb));
-        // skew(r)ᵀ I⁻¹ skew(r) 를 열 단위로 구성: col_j = r × (I⁻¹ (e_j × r))
-        for (mat, r) in [(&ia, ra), (&ib, rb)] {
-            let e = [
-                Vec3::new(1.0, 0.0, 0.0),
-                Vec3::new(0.0, 1.0, 0.0),
-                Vec3::new(0.0, 0.0, 1.0),
-            ];
-            for (ji, ej) in e.iter().enumerate() {
-                let col = r.cross(mat.mul_vec(ej.cross(r)));
-                // K += -skew(r) I⁻¹ skew(r) — 부호: skew(r)ᵀ = -skew(r)
-                m.c[ji] += col;
-            }
-        }
-        m
-    };
+    // **삽입 검증과 같은 함수**를 쓴다. 중복 구현이 있으면 둘이 갈라져 검증이 무의미해진다.
+    let k = linear_k(inv_ma, inv_mb, &ia, &ib, ra, rb);
     let c_pos = (st.pos[j.ia()] + ra) - (st.pos[j.ib()] + rb);
     let cdot = st.vel_at_pub(j.ia(), ra) - st.vel_at_pub(j.ib(), rb);
     let (bias, mass_scale, impulse_scale) = match soft {

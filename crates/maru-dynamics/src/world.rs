@@ -483,11 +483,32 @@ impl World {
         if !maru_collide::vec_in_range(pose.pos) || pose.rot.try_normalize().is_none() {
             return Err(ApiError::InvalidValue);
         }
-        let i = self.mutate(h)?;
-        self.bodies[i].pose = maru_collide::Pose {
+        let i = self.resolve(h)?;
+        if self.bodies[i].body_type == BodyType::Static {
+            return Err(ApiError::ImmutableStatic);
+        }
+        // **자세 변경은 연결 조인트의 K 조건수를 바꾼다**(리뷰 BLOCKER: 삽입 시점에만
+        // 검사하면, 두 이방성 바디가 서로 보완되는 자세에서 통과한 뒤 한쪽을 회전시켜
+        // 임계 아래로 내려갈 수 있다). 새 자세로 미리 검증하고, 깨지면 **거부**한다 —
+        // 조용히 풀리는 조인트보다 거부가 낫다.
+        let old = self.bodies[i].pose;
+        let new_pose = maru_collide::Pose {
             pos: pose.pos,
             rot: pose.rot.normalize(),
         };
+        self.bodies[i].pose = new_pose;
+        let ok = self
+            .joints
+            .iter()
+            .filter(|j| j.ia() == i || j.ib() == i)
+            .all(|j| crate::joint::k_is_solvable(&self.bodies, j));
+        if !ok {
+            self.bodies[i].pose = old;
+            return Err(ApiError::InvalidValue);
+        }
+        self.bodies[i].pose = old;
+        let i = self.mutate(h)?;
+        self.bodies[i].pose = new_pose;
         // 월드 안으로 되돌리는 것이 OOB 해제의 **유일한** 경로다(자동 복귀 없음).
         self.oob[i] = false;
         Ok(())
@@ -718,6 +739,14 @@ impl World {
             self.bodies[i].angvel = Vec3::ZERO;
             // `asleep`이 아니라 **별도 상태**다 — 자동 wake 경로에 걸리면 안 된다.
             self.bp_valid = false;
+            // **인접 조인트의 누적 임펄스를 지운다**(리뷰 MAJOR): OOB 동안 solve만 건너뛰면
+            // 이탈 전 자세에서 쌓인 임펄스가 남고, 호스트가 `set_pose`로 복귀시킨 다음 스텝의
+            // warm start가 그걸 새 자세에 그대로 적용해 큰 kick을 만든다.
+            for j in self.joints.iter_mut() {
+                if j.ia() == i || j.ib() == i {
+                    j.clear_impulses();
+                }
+            }
             self.oob[i] = true;
             self.asleep[i] = false;
             self.sleep_timer[i] = 0.0;
@@ -1094,8 +1123,15 @@ impl World {
         // 접촉 상대를 깨우고, 그 상대가 다시 조인트 상대를 깨우는 연쇄가 한 패스로는
         // 닫히지 않는다. 조인트 wake를 접촉 제약 생성 뒤에 두면 그 프레임은 지지 없이
         // 중력만 받는다(리뷰 MAJOR: 2.5단계 잔존).
-        let joint_pairs: Vec<(usize, usize)> =
-            self.joints.iter().map(|j| (j.ia(), j.ib())).collect();
+        let joint_pairs: Vec<(usize, usize)> = self
+            .joints
+            .iter()
+            // **OOB 끝점은 union하지 않는다**(리뷰 MAJOR): 두 정상 바디가 같은 OOB에
+            // 각각 매달리면 비활성 조인트를 통해 한 아일랜드로 묶여 함께 자고 깨며,
+            // 정상 바디의 대표가 OOB 인덱스가 될 수 있다.
+            .filter(|j| !self.oob[j.ia()] && !self.oob[j.ib()])
+            .map(|j| (j.ia(), j.ib()))
+            .collect();
         // kinematic은 **항상 활성**이다 — 처방 속도로 움직이므로 잠든 상대를 깨워야 한다.
         let is_active = |i: usize, this: &Self| {
             !this.oob[i]

@@ -161,7 +161,8 @@ RUSTFLAGS="" cargo run --release --target wasm32-wasip1 -p maru-bench  # SIMD of
   집계한다 — 조용히 삼키지 않는다.
 - 공개 커맨드 스키마(`Command`)에 **바디 추가가 없다**. 슬롯 예약과 커맨드 등록이 한 원자
   연산이어야 하므로 정본 경로는 `enqueue_add_body`(예약 핸들을 즉시 반환)뿐이다.
-- hull은 정점 `MAX_HULL_POINTS`(1024)까지. 더 복잡한 메시는 convex decomposition으로 나눈다.
+- hull은 정점 `MAX_HULL_POINTS`(**32**)까지 — 최소 폭을 삼중조합 전수로 **정확히** 검증할 수 있는 범위다.
+  더 복잡한 메시는 convex decomposition으로 여러 hull로 나눈다(검증할 수 없는 것을 지원한다고 말하지 않는다).
 
 - **CCD 없음 (v1).** 브로드페이즈는 `velocity × dt`로 sweep AABB를 확장하지만
   내로우페이즈는 **현재 자세에서만** 판정한다. 500 m/s 물체는 60Hz에 8.3 m를 지나므로

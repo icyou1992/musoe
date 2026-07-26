@@ -33,10 +33,12 @@ use maru_math::{Quat, Vec3};
 
 /// 포맷 매직·버전 — 다른 빌드/포맷의 바이트를 조용히 먹지 않기 위해.
 const MAGIC: u32 = 0x4d41_5255; // "MARU"
-/// v4: **WorldParams**(미래 동작을 바꾸는 mutable state) · OOB 플래그 · 앵커/최소 크기
-/// 정책 강화. v3와 같은 바이트라도 validator 정책이 달라졌으므로 버전을 올린다
-/// (리뷰 MAJOR: 정책 변경은 wire 의미 변경이다).
-const VERSION: u32 = 4;
+/// v5: hull 점 상한 1024→32, 조인트 K 조건수 검증 추가.
+///
+/// **정책 변경은 wire 의미 변경이다.** v4 시절 빌드가 만든 33~1024점 스냅샷은 지금 거부되고,
+/// K-특이 조인트를 담은 v4도 거부된다 — 같은 버전 번호가 다른 계약을 뜻하면 안 되므로 올린다.
+/// (v4: WorldParams·OOB 플래그·앵커/최소 크기 / v3: 예약 슬롯·AddBody 핸들·last_report)
+const VERSION: u32 = 5;
 
 /// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
 /// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
@@ -906,6 +908,11 @@ fn validate_structure(
         if !crate::world::anchor_fits(&bodies[j.body_a.index as usize], j.anchor_a)
             || !crate::world::anchor_fits(&bodies[j.body_b.index as usize], j.anchor_b)
         {
+            return Err(SnapshotError::InconsistentState);
+        }
+        // **K 조건수도 라이브와 같은 검사**를 거친다(리뷰 BLOCKER: restore가 우회해서,
+        // 라이브가 InvalidValue로 거부하는 K-특이 조인트를 정본 배열에 직접 넣을 수 있었다).
+        if !crate::joint::k_is_solvable(bodies, j) {
             return Err(SnapshotError::InconsistentState);
         }
     }

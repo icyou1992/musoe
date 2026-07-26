@@ -2720,4 +2720,203 @@ mod tests {
         )
         .is_err());
     }
+
+    // ─────────── 리뷰 rev_f724b2dd 회귀 ───────────
+
+    /// BLOCKER: 삽입 검증과 솔버가 **같은 K**를 만들어야 한다.
+    /// 함수로 뽑으며 회전 항의 부호를 뒤집어, 검증이 솔버와 다른 행렬을 보고 있었다.
+    /// 이제 솔버가 `linear_k`를 직접 호출하므로 구현이 하나다 — 그 사실을
+    /// **물리적 결과로** 잠근다: 검증을 통과한 조인트는 실제로 제약을 유지해야 한다.
+    #[test]
+    fn validated_joint_actually_holds_in_solver() {
+        let mut w = World::new(WorldParams::default());
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.1 },
+            pose(0.0, 5.0, 0.0),
+        ));
+        // 이방성 바디 — 검증과 솔버의 K가 갈리면 여기서 드러난다
+        let plate = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(2.0, 0.05, 2.0),
+                radius: 0.0,
+            },
+            pose(1.0, 5.0, 0.0),
+            100.0,
+        ));
+        w.try_add_joint(Joint::point(
+            anchor,
+            plate,
+            Vec3::ZERO,
+            Vec3::new(-1.0, 0.0, 0.0),
+        ))
+        .expect("검증을 통과해야 한다");
+        for _ in 0..600 {
+            w.step(DT);
+        }
+        // 조인트가 살아 있으면 앵커에서 대략 1m 반경을 유지한다
+        let d = (w.body(plate).pose().pos - Vec3::new(0.0, 5.0, 0.0)).length();
+        assert!(
+            (0.5..2.0).contains(&d),
+            "검증을 통과한 조인트가 실제로는 풀렸다 (거리 {d:.2})"
+        );
+    }
+
+    /// BLOCKER: 스냅샷 복원도 라이브와 **같은 K 검사**를 거쳐야 한다.
+    #[test]
+    fn restore_applies_the_same_joint_k_check() {
+        // 라이브가 거부하는 구성을 만들고, 그 거부가 복원 경로에도 존재하는지 확인한다.
+        let mut w = World::new(WorldParams::default());
+        let rod = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(1000.0, 0.001, 0.001),
+                radius: 0.0,
+            },
+            pose(0.0, 0.0, 0.0),
+            125.0,
+        ));
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.1 },
+            pose(0.0, 1000.0, 0.0),
+        ));
+        assert_eq!(
+            w.try_add_joint(Joint::point(
+                rod,
+                anchor,
+                Vec3::new(0.0, 1000.0, 0.0),
+                Vec3::ZERO
+            )),
+            Err(ApiError::InvalidValue)
+        );
+        // 정상 조인트만 있는 월드는 왕복이 성립한다
+        w.try_add_joint(Joint::point(
+            rod,
+            anchor,
+            Vec3::new(1000.0, 0.0, 0.0),
+            Vec3::ZERO,
+        ))
+        .unwrap();
+        w.step(DT);
+        assert!(w.restore(&w.snapshot()).is_ok());
+    }
+
+    /// BLOCKER: 자세 변경이 K를 깨뜨리면 **거부**돼야 한다 — 조용히 풀리는 것보다 낫다.
+    #[test]
+    fn set_pose_revalidates_connected_joint_k() {
+        let mut w = World::new(WorldParams::default());
+        let a = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.0, 0.0),
+            1.0,
+        ));
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(2.0, 0.0, 0.0),
+            1.0,
+        ));
+        w.try_add_joint(Joint::point(a, b, Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO))
+            .unwrap();
+        // 정상 자세 변경은 통과한다
+        assert!(w.set_pose(b, pose(2.0, 1.0, 0.0)).is_ok());
+        // 거부되더라도 자세는 **바뀌지 않은 채** 남아야 한다 (원자성)
+        let before = w.body(b).pose().pos;
+        let _ = w.set_pose(b, pose(f32::NAN, 0.0, 0.0));
+        assert_eq!(w.body(b).pose().pos, before);
+    }
+
+    /// MAJOR: OOB는 아일랜드 union에도 참여하면 안 된다 — 두 정상 바디가 같은 OOB에
+    /// 매달리면 비활성 조인트를 통해 한 아일랜드로 묶인다.
+    #[test]
+    fn oob_joint_does_not_union_islands() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..Default::default()
+        });
+        let edge = maru_collide::MAX_INPUT - 5.0;
+        let ghost = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(edge, 0.0, 0.0),
+            1.0,
+        ));
+        let l = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(edge - 3.0, 0.0, 0.0),
+            1.0,
+        ));
+        let r = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(edge - 6.0, 0.0, 0.0),
+            1.0,
+        ));
+        w.try_add_joint(Joint::point(ghost, l, Vec3::new(0.0, 0.5, 0.0), Vec3::ZERO))
+            .unwrap();
+        w.try_add_joint(Joint::point(
+            ghost,
+            r,
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::ZERO,
+        ))
+        .unwrap();
+        w.set_linear_velocity(ghost, Vec3::new(500.0, 0.0, 0.0))
+            .unwrap();
+        for _ in 0..10 {
+            let _ = w.try_step(crate::world::MAX_DT);
+        }
+        assert!(w.is_out_of_bounds(ghost));
+        for _ in 0..60 {
+            let _ = w.try_step(DT);
+            assert!(
+                w.restore(&w.snapshot()).is_ok(),
+                "OOB가 아일랜드에 묶여 복원 불변식을 깼다"
+            );
+        }
+    }
+
+    /// MAJOR: OOB 전이는 인접 조인트의 누적 임펄스를 **지워야** 한다 —
+    /// 복귀 후 warm start가 옛 자세의 임펄스를 새 자세에 적용하면 큰 kick이 된다.
+    #[test]
+    fn oob_transition_clears_adjacent_joint_impulses() {
+        let mut w = World::new(WorldParams::default());
+        let edge = maru_collide::MAX_INPUT - 5.0;
+        // **둘 다 동적**이어야 함께 경계 밖으로 나간다 — 정적 앵커에 매달리면 조인트가 잡는다.
+        let a = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(edge - 1.0, 0.0, 0.0),
+            1.0,
+        ));
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(edge, 0.0, 0.0),
+            1.0,
+        ));
+        w.try_add_joint(Joint::point(a, b, Vec3::new(0.5, 0.0, 0.0), Vec3::ZERO))
+            .unwrap();
+        // 중력·구속으로 누적 임펄스를 쌓는다
+        for _ in 0..120 {
+            w.step(DT);
+        }
+        // 함께 경계 밖으로
+        for h in [a, b] {
+            w.set_linear_velocity(h, Vec3::new(500.0, 0.0, 0.0))
+                .unwrap();
+        }
+        for _ in 0..10 {
+            let _ = w.try_step(crate::world::MAX_DT);
+        }
+        assert!(
+            w.is_out_of_bounds(a) && w.is_out_of_bounds(b),
+            "시나리오 전제 붕괴: OOB로 나가지 않았다"
+        );
+        // 호스트가 되돌린다 — 다음 스텝에 stale 임펄스 kick이 없어야 한다
+        w.set_pose(a, pose(0.0, 1.0, 0.0)).unwrap();
+        w.set_pose(b, pose(0.5, 1.0, 0.0)).unwrap();
+        w.step(DT);
+        let v = w.body(a).linvel().length().max(w.body(b).linvel().length());
+        assert!(v < 5.0, "복귀 직후 stale 임펄스 kick: {v}");
+    }
 }
