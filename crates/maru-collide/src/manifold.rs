@@ -112,6 +112,15 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
     if let (Shape::Sphere { radius: ra }, Shape::Sphere { radius: rb }) = (sa, sb) {
         return sphere_sphere(*ra, pa.pos, *rb, pb.pos, margin);
     }
+    // **구-박스도 해석 경로**: 박스 로컬로 옮겨 클램프하면 끝이다.
+    // 이게 없을 때 실측으로 페어당 6.0us였다 — 같은 씬의 구-구가 0.014us니까 428배다.
+    // 구 더미 씬에서 바닥판 접촉이 전부 이 경로를 타 내로우페이즈를 지배했다.
+    if let (Shape::Sphere { radius: rs }, Shape::Box { half, radius: rbox }) = (sa, sb) {
+        return sphere_box(*rs, pa.pos, *half, *rbox, pb, margin, true);
+    }
+    if let (Shape::Box { half, radius: rbox }, Shape::Sphere { radius: rs }) = (sa, sb) {
+        return sphere_box(*rs, pb.pos, *half, *rbox, pa, margin, false);
+    }
     // **박스-박스는 SAT로 법선만 구한다.** 클리퍼는 법선만 요구하므로(깊이는 안 쓴다)
     // GJK+EPA 전체를 돌릴 이유가 없다. 클리퍼 자체는 M1에서 검증된 코드 그대로 쓰고
     // 법선의 출처만 바꾼다 — 실패하면(에지-에지 지배·퇴화) 아래 GJK 경로로 떨어진다.
@@ -437,6 +446,89 @@ fn sphere_sphere(ra: f32, ca: Vec3, rb: f32, cb: Vec3, margin: f32) -> Option<Ma
         &[ContactPoint {
             position: (surface_a + surface_b) * 0.5,
             separation: dist - sum,
+            feature: FeatureId(FEATURE_ANALYTIC),
+        }],
+    ))
+}
+
+/// 구-박스 해석 경로.
+///
+/// GJK+EPA를 돌리면 페어당 6.0us지만(실측) 해석해는 30 flops 남짓이다: 구 중심을 박스
+/// 로컬로 옮기고 half-extent로 클램프하면 박스 코어 위의 최근접점이 나온다.
+/// 정확도도 낫다 — 반복 수렴 오차가 없고 접점이 스텝 간 안정적이다.
+///
+/// `sphere_is_a`: 호출부의 A가 구면 true. 법선 부호 계약이 "A를 +normal로 밀면 분리"라
+/// A가 어느 쪽인지 알아야 한다.
+fn sphere_box(
+    rs: f32,
+    cs: Vec3,
+    half: Vec3,
+    rbox: f32,
+    pbox: &Pose,
+    margin: f32,
+    sphere_is_a: bool,
+) -> Option<Manifold> {
+    let sum = rs + rbox;
+    let reach = sum + margin;
+    // 구 중심을 박스 로컬 프레임으로 (자세는 단위 쿼터니언 — 입력 검증이 보장한다)
+    let l = pbox.rot.conjugate().rotate(cs - pbox.pos);
+    let cl = Vec3::new(
+        l.x.clamp(-half.x, half.x),
+        l.y.clamp(-half.y, half.y),
+        l.z.clamp(-half.z, half.z),
+    );
+    let d = l - cl;
+    let d2 = d.length_sq();
+    // **조기 기각은 제곱 비교로** — 안 닿는 페어가 대다수인데 sqrt까지 갈 이유가 없다.
+    if d2 > reach * reach {
+        return None;
+    }
+    // 스케일 의존 epsilon (설계 §8 — 절대 상수는 스케일 버그다). d2는 길이²이므로 L².
+    let scale = half.x.max(half.y).max(half.z).max(rs);
+    let eps2 = crate::tolerance::length_sq_eps(scale);
+
+    // 중심이 박스 코어 **밖**: 최근접점에서 중심으로 가는 방향이 법선이다.
+    // `core_pt`는 법선 방향으로 잰 박스 **코어** 표면 위의 접점(겉면은 여기서 rbox 만큼 밖).
+    let (n_local, sep, core_pt) = if d2 > eps2 {
+        let dist = d2.sqrt();
+        (d * (1.0 / dist), dist - sum, cl)
+    } else {
+        // 중심이 코어 **안**(또는 면 위): 가장 얕은 면으로 밀어낸다.
+        // 동률은 낮은 축 인덱스, 축 위 0은 양의 방향 — 결정적 타이브레이크.
+        let depth = [half.x - l.x.abs(), half.y - l.y.abs(), half.z - l.z.abs()];
+        let mut axis = 0usize;
+        for (i, &v) in depth.iter().enumerate().skip(1) {
+            if v < depth[axis] {
+                axis = i;
+            }
+        }
+        let comp = [l.x, l.y, l.z][axis];
+        let sign = if comp >= 0.0 { 1.0 } else { -1.0 };
+        let mut n = Vec3::ZERO;
+        match axis {
+            0 => n.x = sign,
+            1 => n.y = sign,
+            _ => n.z = sign,
+        }
+        // 겉면 기준 침투: 면까지 depth + 구 반지름 + 박스 convex radius
+        (n, -(depth[axis] + sum), l + n * depth[axis])
+    };
+    if sep > margin {
+        return None;
+    }
+    // 겉면 위의 두 점 (로컬) → 월드
+    let surf_box_local = core_pt + n_local * rbox;
+    let surf_sphere_local = l - n_local * rs;
+    let mid_local = (surf_box_local + surf_sphere_local) * 0.5;
+    let position = pbox.pos + pbox.rot.rotate(mid_local);
+    // n_local은 박스 → 구 방향. A가 구면 그대로, A가 박스면 뒤집는다.
+    let n_world = pbox.rot.rotate(n_local);
+    let normal = if sphere_is_a { n_world } else { -n_world };
+    Some(Manifold::from_points(
+        normal,
+        &[ContactPoint {
+            position,
+            separation: sep,
             feature: FeatureId(FEATURE_ANALYTIC),
         }],
     ))
@@ -1027,5 +1119,244 @@ mod tests {
         assert!(contact(&s, &pose(0.0, 2.3, 0.0), &s, &pose(0.0, 0.0, 0.0), 0.05).is_none());
         let m = contact(&s, &pose(0.0, 2.3, 0.0), &s, &pose(0.0, 0.0, 0.0), 0.5).unwrap();
         assert!(m.points().iter().all(|p| (p.separation - 0.3).abs() < 1e-3));
+    }
+}
+
+#[cfg(test)]
+mod sphere_box_tests {
+    use super::*;
+
+    /// 고정 시드 xorshift — 재현 가능한 무작위 배치.
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32
+        }
+        fn sym(&mut self, s: f32) -> f32 {
+            (self.f() - 0.5) * 2.0 * s
+        }
+        fn quat(&mut self) -> Quat {
+            Quat::from_axis_angle(
+                Vec3::new(self.sym(1.0), self.sym(1.0), self.sym(1.0)),
+                self.sym(3.2),
+            )
+        }
+    }
+
+    /// 독립 계산과의 대조. GJK를 기준으로 쓰지 않는 이유는 실측 때문이다 — 중심이
+    /// 박스 밖 0.05에 있는 배치에서 `gjk`가 `Separated { distance: 0 }`을 돌려줬다.
+    /// 그래서 기준을 **회전축 내적으로 구한 점-OBB 거리**로 둔다. 해석 경로가 쓰는
+    /// 쿼터니언 켤레 변환과 다른 경로라, 켤레 방향을 뒤집는 류의 오류를 잡는다.
+    #[test]
+    fn sphere_box_matches_independent_point_obb_distance() {
+        let mut rng = Rng(0x5B07);
+        let mut checked = 0;
+        for _ in 0..12000 {
+            let half = Vec3::new(
+                0.2 + rng.f() * 2.0,
+                0.2 + rng.f() * 2.0,
+                0.2 + rng.f() * 2.0,
+            );
+            let rs = 0.1 + rng.f() * 1.5;
+            let pb = Pose {
+                pos: Vec3::new(rng.sym(2.0), rng.sym(2.0), rng.sym(2.0)),
+                rot: rng.quat(),
+            };
+            let cs = Vec3::new(rng.sym(6.0), rng.sym(6.0), rng.sym(6.0));
+
+            // 독립 기준: 박스의 월드 축 3개에 내적해 로컬 좌표를 얻고 클램프한다.
+            let ax = pb.rot.rotate(Vec3::new(1.0, 0.0, 0.0));
+            let ay = pb.rot.rotate(Vec3::new(0.0, 1.0, 0.0));
+            let az = pb.rot.rotate(Vec3::new(0.0, 0.0, 1.0));
+            let dv = cs - pb.pos;
+            let l = Vec3::new(dv.dot(ax), dv.dot(ay), dv.dot(az));
+            let cl = Vec3::new(
+                l.x.clamp(-half.x, half.x),
+                l.y.clamp(-half.y, half.y),
+                l.z.clamp(-half.z, half.z),
+            );
+            let outside = (l - cl).length();
+            let inside_depth = if outside > 0.0 {
+                0.0
+            } else {
+                (half.x - l.x.abs())
+                    .min(half.y - l.y.abs())
+                    .min(half.z - l.z.abs())
+            };
+            let want_sep = if outside > 0.0 {
+                outside - rs
+            } else {
+                -(inside_depth + rs)
+            };
+            if want_sep > 1.0 {
+                continue; // margin 밖 — 매니폴드가 없는 게 정답이다
+            }
+            let m = sphere_box(rs, cs, half, 0.0, &pb, 1.0, true)
+                .expect("margin 1.0 안이면 매니폴드가 나와야 한다");
+            let got = m.points()[0].separation;
+            let scale = 1.0 + half.x.max(half.y).max(half.z) + rs;
+            assert!(
+                (got - want_sep).abs() < 1e-4 * scale,
+                "separation 불일치: 해석 {got} vs 독립 {want_sep}  half={half:?} rs={rs}"
+            );
+            assert!(
+                (m.normal.length() - 1.0).abs() < 1e-4,
+                "법선이 단위벡터가 아니다"
+            );
+            // 법선은 박스 → 구 방향이어야 한다 (A=구를 +normal로 밀면 분리)
+            if outside > 1e-3 {
+                let e = l - cl;
+                let want_n = (ax * e.x + ay * e.y + az * e.z) * (1.0 / outside);
+                assert!(
+                    m.normal.dot(want_n) > 0.999,
+                    "법선 방향 불일치: dot={}",
+                    m.normal.dot(want_n)
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 1000, "표본이 너무 적다: {checked}");
+    }
+
+    /// **GJK가 틀린 실측 배치의 고정 회귀.**
+    ///
+    /// 위 무작위 대조를 처음엔 `gjk`를 기준으로 짰는데, 이 배치에서 `gjk`가
+    /// `Separated { distance: 0 }`을 돌려줬다 — 구 중심이 박스 코어 밖 0.0516에 있는데도.
+    /// 해석 경로와 독립 점-OBB 계산은 서로 일치하므로 어긋난 쪽은 gjk다.
+    /// gjk는 hull·capsule 쌍에서 여전히 쓰이므로 이 배치를 증거로 남겨둔다.
+    #[test]
+    fn gjk_underestimates_core_distance_on_this_config() {
+        let half = Vec3::new(0.4904285, 2.0158985, 1.071742);
+        let rs = 1.4453597f32;
+        let pb = Pose {
+            pos: Vec3::new(1.4413323, -1.2419696, 1.250838),
+            rot: Quat {
+                x: -0.047053058,
+                y: -0.12782943,
+                z: 0.15615694,
+                w: 0.9782948,
+            },
+        };
+        let cs = Vec3::new(1.368325, 0.080718756, 2.0537288);
+
+        // 독립 계산 (회전축 내적)
+        let ax = pb.rot.rotate(Vec3::new(1.0, 0.0, 0.0));
+        let ay = pb.rot.rotate(Vec3::new(0.0, 1.0, 0.0));
+        let az = pb.rot.rotate(Vec3::new(0.0, 0.0, 1.0));
+        let dv = cs - pb.pos;
+        let l = Vec3::new(dv.dot(ax), dv.dot(ay), dv.dot(az));
+        let cl = Vec3::new(
+            l.x.clamp(-half.x, half.x),
+            l.y.clamp(-half.y, half.y),
+            l.z.clamp(-half.z, half.z),
+        );
+        let core_dist = (l - cl).length();
+        assert!(
+            core_dist > 0.04,
+            "이 배치의 코어 거리는 0이 아니다: {core_dist}"
+        );
+
+        let m = sphere_box(rs, cs, half, 0.0, &pb, 1.0, true).unwrap();
+        assert!(
+            (m.points()[0].separation - (core_dist - rs)).abs() < 1e-4,
+            "해석 경로는 독립 계산과 일치해야 한다"
+        );
+
+        // gjk는 여기서 0을 준다 — 고쳐지면 이 단언이 깨져 알려준다.
+        let ss = Shape::Sphere { radius: rs };
+        let sbx = Shape::Box { half, radius: 0.0 };
+        let ps = Pose {
+            pos: cs,
+            rot: Quat::IDENTITY,
+        };
+        if let GjkResult::Separated { distance, .. } = gjk(&ss, &ps, &sbx, &pb) {
+            assert!(
+                distance < core_dist - 0.04,
+                "gjk가 고쳐졌다면 이 회귀를 갱신하라 (distance={distance}, 참값={core_dist})"
+            );
+        }
+    }
+
+    /// 부호·크기 자기일관성: 구를 법선 반대로 |sep|만큼 밀면 접촉이 정확히 풀려야 한다.
+    /// 관통(중심이 코어 안쪽인 경우 포함) 구간까지 덮는다.
+    #[test]
+    fn sphere_box_separation_resolves_overlap() {
+        let mut rng = Rng(0xB07E5);
+        let mut deep = 0;
+        for _ in 0..4000 {
+            let half = Vec3::new(
+                0.3 + rng.f() * 1.5,
+                0.3 + rng.f() * 1.5,
+                0.3 + rng.f() * 1.5,
+            );
+            let rs = 0.1 + rng.f() * 1.0;
+            let pb = Pose {
+                pos: Vec3::new(rng.sym(1.0), rng.sym(1.0), rng.sym(1.0)),
+                rot: rng.quat(),
+            };
+            // 박스 근처에 구를 촘촘히 뿌려 관통·내부 케이스를 포함시킨다
+            let cs = pb.pos + Vec3::new(rng.sym(2.0), rng.sym(2.0), rng.sym(2.0));
+            let Some(m) = sphere_box(rs, cs, half, 0.0, &pb, 0.0, true) else {
+                continue;
+            };
+            let sep = m.points()[0].separation;
+            if sep >= 0.0 {
+                continue;
+            }
+            deep += 1;
+            // A(구)를 +normal로 |sep|만큼 밀면 접촉이 풀린다 = separation ≈ 0
+            let moved = cs + m.normal * (-sep);
+            let after = sphere_box(rs, moved, half, 0.0, &pb, 1.0, true)
+                .expect("밀어낸 뒤에도 margin 1.0 안이다");
+            let s2 = after.points()[0].separation;
+            assert!(
+                s2.abs() < 3e-3 * (1.0 + half.x.max(half.y).max(half.z)),
+                "밀어낸 뒤 separation이 0이 아니다: {s2} (원래 {sep})"
+            );
+        }
+        assert!(deep > 200, "관통 표본이 너무 적다: {deep}");
+    }
+
+    /// 인자 순서 대칭: (구, 박스)와 (박스, 구)는 같은 접촉을 **법선만 뒤집어** 낸다.
+    #[test]
+    fn sphere_box_argument_order_is_symmetric() {
+        let mut rng = Rng(0x5133);
+        for _ in 0..2000 {
+            let half = Vec3::new(0.3 + rng.f(), 0.3 + rng.f(), 0.3 + rng.f());
+            let rs = 0.2 + rng.f();
+            let ss = Shape::Sphere { radius: rs };
+            let sbx = Shape::Box { half, radius: 0.0 };
+            let pb = Pose {
+                pos: Vec3::ZERO,
+                rot: rng.quat(),
+            };
+            let ps = Pose {
+                pos: Vec3::new(rng.sym(3.0), rng.sym(3.0), rng.sym(3.0)),
+                rot: Quat::IDENTITY,
+            };
+            let a = contact(&ss, &ps, &sbx, &pb, 0.05);
+            let b = contact(&sbx, &pb, &ss, &ps, 0.05);
+            match (a, b) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    assert!(
+                        (a.normal + b.normal).length() < 1e-5,
+                        "순서를 바꾸면 법선이 정확히 반대여야 한다"
+                    );
+                    assert!(
+                        (a.points()[0].separation - b.points()[0].separation).abs() < 1e-5,
+                        "separation은 순서에 무관해야 한다"
+                    );
+                    assert!(
+                        (a.points()[0].position - b.points()[0].position).length() < 1e-5,
+                        "접점 위치는 순서에 무관해야 한다"
+                    );
+                }
+                _ => panic!("한쪽만 접촉을 냈다"),
+            }
+        }
     }
 }
