@@ -860,7 +860,10 @@ fn validate_structure(
 ) -> Result<(), SnapshotError> {
     const STATIC_BIT: u32 = 1 << 31;
     let nb = bodies.len();
-    let live_dynamic = |i: usize| i < nb && alive[i] && bodies[i].is_dynamic();
+    // **OOB는 아일랜드 대표가 될 수 없다**(리뷰 PARTIAL): 라이브는 union에서 제외하는데
+    // 리더가 이를 허용하면 조작 스냅샷이 정상 바디의 대표를 OOB로 두어 wake 그룹을
+    // 임의로 연결할 수 있다.
+    let live_dynamic = |i: usize| i < nb && alive[i] && !oob[i] && bodies[i].is_dynamic();
 
     for i in 0..nb {
         // 슬롯은 살아있거나, 예약이거나, 비어있다 — 둘을 겸할 수 없다
@@ -903,6 +906,15 @@ fn validate_structure(
         }
         if !j.anchor_a.is_finite() || !j.anchor_b.is_finite() {
             return Err(SnapshotError::NonFinite);
+        }
+        // OOB 인접 조인트는 누적 임펄스가 **0이어야 한다** — 라이브 전이가 지우는 값이므로,
+        // 0이 아니면 라이브로 도달할 수 없는 상태다(복귀 시 stale kick의 씨앗).
+        if (oob[j.body_a.index as usize] || oob[j.body_b.index as usize])
+            && (j.linear_impulse != Vec3::ZERO
+                || j.angular_impulse[0] != 0.0
+                || j.angular_impulse[1] != 0.0)
+        {
+            return Err(SnapshotError::InconsistentState);
         }
         // 앵커가 **그 바디의 크기**에 비례하는지 — 라이브 `try_add_joint`와 같은 판정
         if !crate::world::anchor_fits(&bodies[j.body_a.index as usize], j.anchor_a)

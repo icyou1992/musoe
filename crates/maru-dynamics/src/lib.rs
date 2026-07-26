@@ -2919,4 +2919,116 @@ mod tests {
         let v = w.body(a).linvel().length().max(w.body(b).linvel().length());
         assert!(v < 5.0, "복귀 직후 stale 임펄스 kick: {v}");
     }
+
+    // ─────────── 리뷰 rev_63c4f4fc 회귀 ───────────
+
+    /// BLOCKER(L0): 파생 캐시(브로드페이즈 페어)의 무효화가 **한 경로라도** 빠지면
+    /// 같은 스냅샷의 미래가 캐시 유무로 갈린다. pending Add 실현 경로가 빠져 있었다.
+    ///
+    /// 재현: static만 있는 월드를 한 스텝 돌려 빈 페어 캐시를 valid로 만든 뒤,
+    /// 커맨드로 겹치는 dynamic을 추가한다. 원본은 캐시를 재사용해 접촉 없이 적분하고,
+    /// 복원본은 캐시가 없어 페어를 재빌드해 접촉을 푼다 → 궤적이 갈린다.
+    #[test]
+    fn derived_cache_invalidation_is_complete_for_pending_add() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        w.step(DT); // 빈 페어 캐시를 valid로 만든다
+                    // 지면과 **겹치도록** 커맨드로 추가한다
+        let h = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.2, 0.0),
+            1.0,
+        ));
+        w.flush_commands();
+        let snap = w.snapshot();
+
+        let mut restored = World::new(WorldParams::default());
+        restored.restore(&snap).unwrap();
+        // 같은 스냅샷에서 출발했으면 미래도 같아야 한다
+        for i in 0..30 {
+            w.step(DT);
+            restored.step(DT);
+            assert_eq!(
+                w.state_hash(),
+                restored.state_hash(),
+                "스텝 {i}에서 궤적이 갈렸다 — 파생 캐시가 L0를 깨고 있다"
+            );
+        }
+        assert!(w.is_alive(h));
+    }
+
+    /// MAJOR: 일반 `set_pose`(텔레포트)도 인접 조인트의 누적 임펄스를 지워야 한다 —
+    /// 이전 자세의 월드 임펄스를 새 레버암에 적용하면 인공 kick이 된다.
+    #[test]
+    fn teleport_clears_adjacent_joint_impulses() {
+        let mut w = World::new(WorldParams::default());
+        let anchor = w.add_body(Body::new_static(
+            Shape::Sphere { radius: 0.2 },
+            pose(0.0, 5.0, 0.0),
+        ));
+        let bob = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(1.0, 5.0, 0.0),
+            1.0,
+        ));
+        w.try_add_joint(Joint::point(
+            anchor,
+            bob,
+            Vec3::ZERO,
+            Vec3::new(-1.0, 0.0, 0.0),
+        ))
+        .unwrap();
+        for _ in 0..240 {
+            w.step(DT); // 하중으로 임펄스를 쌓는다
+        }
+        // 반대편으로 텔레포트 — 레버암 방향이 뒤집힌다
+        w.set_pose(bob, pose(-1.0, 5.0, 0.0)).unwrap();
+        w.step(DT);
+        let v = w.body(bob).linvel().length();
+        assert!(v < 5.0, "텔레포트 직후 stale 임펄스 kick: {v}");
+    }
+
+    /// SAT 보조 키는 **부호 불변**이어야 A/B 교환에 대칭이다(signed 사전식은 `n → -n`에서
+    /// 대소 순서가 보존되지 않아 다른 축을 고른다).
+    ///
+    /// **범위 주의**: 이 테스트는 `|d·n|`이 유의미한 **일반 구성**을 잠근다.
+    /// `d·n ≈ 0`(거의 동심 + 법선이 중심 방향에 수직)은 방향 규칙 자체가 교환에서 뒤집히지
+    /// 않는 **미해결 퇴화**다 — manifold.rs의 `oriented` 주석 참조. 그 층은 아직 못 고쳤다.
+    #[test]
+    fn sat_tie_break_symmetric_for_rotated_boxes() {
+        let half = Vec3::new(0.5, 0.5, 0.5);
+        let rot_a = Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), 0.3);
+        let rot_b = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.4);
+        let mk = |pa: Vec3, qa: Quat, pb: Vec3, qb: Quat| {
+            let mut w = World::new(WorldParams {
+                gravity: Vec3::ZERO,
+                ..Default::default()
+            });
+            let a = w.add_body(Body::new_dynamic(
+                Shape::Box { half, radius: 0.0 },
+                Pose { pos: pa, rot: qa },
+                1.0,
+            ));
+            let b = w.add_body(Body::new_dynamic(
+                Shape::Box { half, radius: 0.0 },
+                Pose { pos: pb, rot: qb },
+                1.0,
+            ));
+            for _ in 0..40 {
+                w.step(DT);
+            }
+            (w.body(a).pose().pos, w.body(b).pose().pos)
+        };
+        // 근소 동률이지만 `|d·n|`은 유의미한 구성 — 보조 키가 개입하면서 방향은 결정된다
+        let (pa, pb) = (Vec3::ZERO, Vec3::new(0.62, 0.31, 0.44));
+        let (a1, b1) = mk(pa, rot_a, pb, rot_b);
+        let (b2, a2) = mk(pb, rot_b, pa, rot_a);
+        assert!(
+            (a1 - a2).length() < 1e-3 && (b1 - b2).length() < 1e-3,
+            "회전 박스 삽입 순서에 따라 결과가 다르다: {a1:?}/{a2:?}, {b1:?}/{b2:?}"
+        );
+    }
 }

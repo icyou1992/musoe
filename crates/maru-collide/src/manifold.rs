@@ -159,8 +159,8 @@ enum SatResult {
 /// 옆으로 미는 힘이 생긴다(40단 피라미드에서 z축 잔류속도 0.2 m/s로 실측됐다).
 /// 동률 구간만 덮는 **작은 절대 허용치**여야 한다 — Box2D·Jolt도 같은 형태다.
 const FACE_TIE_REL: f32 = 1.0e-3;
-/// 정렬 키의 동률 폭. 이보다 가까우면 사전식 보조 키로 넘어간다.
-const ALIGN_TIE: f32 = 1.0e-9;
+/// 정렬 키의 동률 폭 (특성 길이 대비 — 절대값이면 장면 스케일에 따라 진입 여부가 달라진다).
+const ALIGN_TIE_REL: f32 = 1.0e-6;
 
 /// 박스-박스 분리축 (코어 기준). 반환 법선은 **A를 +normal로 밀면 분리**되는 방향이다.
 #[allow(clippy::too_many_arguments)]
@@ -200,6 +200,13 @@ fn box_box_axis(
     let (mut a_sep, mut a_axis) = (f32::NEG_INFINITY, Vec3::ZERO);
     let (mut b_sep, mut b_axis) = (f32::NEG_INFINITY, Vec3::ZERO);
     let (mut edge_sep, mut edge_axis) = (f32::NEG_INFINITY, Vec3::ZERO);
+    // 방향 규칙: A를 +normal로 밀면 분리된다.
+    //
+    // **알려진 한계(미해결)**: `d·n ≈ 0`(법선이 중심 방향에 수직)이면 이 규칙이 A/B 교환에서
+    // 뒤집히지 않는다 — 두 경우 모두 `-n`을 준다. 거의 동심이면서 법선이 수직인 구성은
+    // 물리적으로 방향이 결정되지 않는 퇴화이고, 소유자와 무관하면서 교환에 반전하는 키를
+    // 만들려면 `d` 말고 다른 비대칭 원천이 필요한데 그런 것이 없다(바디 인덱스는 월드마다
+    // 다르므로 소유자 의존이다). 일반 구성(`|d·n|`이 유의미)에서는 대칭이 성립한다.
     let oriented = |n: Vec3| if d.dot(n) < 0.0 { n } else { -n };
 
     for a in axes_a.iter() {
@@ -258,10 +265,13 @@ fn box_box_axis(
     // 성분 사전식 키는 대칭이지만 **불연속**이라 근소 동률에서 축이 튀어 봉투가 28→22단으로
     // 좁아졌다(실측) — 대칭성과 안정성을 동시에 만족하는 키가 필요하다.
     let align = |n: Vec3| n.dot(d).abs();
-    // `d ≈ 0`(중심 일치)이면 정렬 키가 전부 0이라 다시 "먼저 온 축"(=A)으로 퇴화한다
-    // (리뷰 MAJOR). 그때를 위해 **법선 자체의 사전식 키**를 보조로 둔다 — 소유자와 무관하고,
-    // 주 키가 동률일 때만 개입하므로 일반 구성의 연속성은 그대로다.
-    let lex = |n: Vec3| (n.x, n.y, n.z);
+    // `d ≈ 0`(중심 일치)이면 정렬 키가 전부 0이라 다시 "먼저 온 축"(=A)으로 퇴화한다.
+    // 보조 키는 **부호 불변**이어야 한다(리뷰 NOT_RESOLVED): A/B를 교환하면 후보 법선이
+    // `n → -n`으로 뒤집히는데 signed 사전식은 대소 순서가 보존되지 않아 다른 축을 고른다.
+    // 성분 절대값 사전식은 교환에 불변이므로 **같은 축(직선)** 을 고르고, 방향은 `d` 규칙이
+    // 정한다(d=0에서는 임의이지만 결정적이다).
+    let lex = |n: Vec3| (n.x.abs(), n.y.abs(), n.z.abs());
+    let align_tie = ALIGN_TIE_REL * scale;
     let better = |sep_new: f32, n_new: Vec3, sep_cur: f32, n_cur: Vec3| -> bool {
         if sep_new > sep_cur + tol {
             return true;
@@ -270,10 +280,10 @@ fn box_box_axis(
             return false;
         }
         let (an, ac) = (align(n_new), align(n_cur));
-        if an > ac + ALIGN_TIE {
+        if an > ac + align_tie {
             return true;
         }
-        if ac > an + ALIGN_TIE {
+        if ac > an + align_tie {
             return false;
         }
         lex(n_new) > lex(n_cur)

@@ -509,6 +509,14 @@ impl World {
         self.bodies[i].pose = old;
         let i = self.mutate(h)?;
         self.bodies[i].pose = new_pose;
+        // **텔레포트는 연속성을 끊는다** — 인접 조인트의 누적 임펄스를 지운다(리뷰 MAJOR).
+        // 이전 자세의 월드 임펄스를 새 레버암에 warm start로 적용하면 인공 kick이 된다.
+        // (PCM 캐시는 `mutate`가 이미 폐기했다.)
+        for j in self.joints.iter_mut() {
+            if j.ia() == i || j.ib() == i {
+                j.clear_impulses();
+            }
+        }
         // 월드 안으로 되돌리는 것이 OOB 해제의 **유일한** 경로다(자동 복귀 없음).
         self.oob[i] = false;
         Ok(())
@@ -633,6 +641,11 @@ impl World {
                         && self.generations[i] == h.generation
                         && b.validate().is_ok()
                     {
+                        // **파생 캐시 무효화는 여기서도 해야 한다**(리뷰 BLOCKER): 직접
+                        // `add_body`만 무효화하고 이 경로를 빠뜨려, 빈 페어 캐시를 가진 월드가
+                        // 커맨드로 바디를 얻어도 캐시를 재사용했다. 같은 스냅샷을 복원한
+                        // 월드는 캐시가 없어 페어를 재빌드하므로 **미래가 갈렸다** — L0 위반.
+                        self.bp_valid = false;
                         self.bodies[i] = *b;
                         self.reserved[i] = false;
                         self.alive[i] = true;
