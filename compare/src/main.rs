@@ -16,6 +16,18 @@ use std::time::Instant;
 
 const DT: f32 = 1.0 / 60.0;
 
+/// 측정 모드.
+///
+/// **하나의 수치로 둘을 재면 안 된다**(리뷰 BLOCKER): 한쪽이 잠들고 다른 쪽이 깨어 있으면
+/// wall-clock은 알고리즘 처리량이 아니라 **정착 성공 여부**를 잰다.
+/// - `Throughput`: 양쪽 **수면을 끄고** 순수 처리량만 잰다(같은 일을 하는 비교).
+/// - `Settle`: 수면을 켜고 정착 품질 + 총비용을 잰다(실사용 근사).
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Throughput,
+    Settle,
+}
+
 struct Result_ {
     ms_per_step: f64,
     stable: bool,
@@ -36,8 +48,22 @@ mod maru_side {
         }
     }
 
-    pub fn pyramid(tiers: usize, steps: usize, warmup: usize) -> Result_ {
-        let mut w = World::new(WorldParams::default());
+    pub fn pyramid(mode: Mode, tiers: usize, steps: usize, warmup: usize) -> Result_ {
+        let d = WorldParams::default();
+        let mut w = World::new(WorldParams {
+            // 수면을 끄려면 임계를 0으로 둔다(어떤 속도도 임계 아래가 되지 않는다).
+            sleep_linear_threshold: if mode == Mode::Throughput {
+                0.0
+            } else {
+                d.sleep_linear_threshold
+            },
+            sleep_angular_threshold: if mode == Mode::Throughput {
+                0.0
+            } else {
+                d.sleep_angular_threshold
+            },
+            ..d
+        });
         w.add_body(Body::new_static(
             Shape::Box {
                 half: Vec3::new(200.0, 1.0, 40.0),
@@ -109,11 +135,12 @@ mod maru_side {
         }
     }
 
-    pub fn pile(n: usize, steps: usize, warmup: usize) -> Result_ {
+    pub fn pile(mode: Mode, n: usize, steps: usize, warmup: usize) -> Result_ {
         let sub: u32 = std::env::var("MARU_SUB")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(WorldParams::default().substeps);
+        let _ = mode;
         let thr: f32 = std::env::var("MARU_SLEEP")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -121,8 +148,20 @@ mod maru_side {
         let d = WorldParams::default();
         let mut w = World::new(WorldParams {
             substeps: sub,
-            sleep_linear_threshold: if thr > 0.0 { thr } else { d.sleep_linear_threshold },
-            sleep_angular_threshold: if thr > 0.0 { thr * 1.25 } else { d.sleep_angular_threshold },
+            sleep_linear_threshold: if mode == Mode::Throughput {
+                0.0
+            } else if thr > 0.0 {
+                thr
+            } else {
+                d.sleep_linear_threshold
+            },
+            sleep_angular_threshold: if mode == Mode::Throughput {
+                0.0
+            } else if thr > 0.0 {
+                thr * 1.25
+            } else {
+                d.sleep_angular_threshold
+            },
             ..d
         });
         for (dx, dz, hx, hz) in [
@@ -283,8 +322,9 @@ mod rapier_side {
         }
     }
 
-    pub fn pyramid(tiers: usize, steps: usize, warmup: usize) -> Result_ {
+    pub fn pyramid(mode: Mode, tiers: usize, steps: usize, warmup: usize) -> Result_ {
         let mut s = Sim::new();
+        let can_sleep = mode == Mode::Settle;
         let ground = s.bodies.insert(RigidBodyBuilder::fixed().translation(rapier3d::math::Vec3::new(0.0, -1.0, 0.0)));
         s.colliders.insert_with_parent(
             ColliderBuilder::cuboid(200.0, 1.0, 40.0).density(1.0),
@@ -297,9 +337,11 @@ mod rapier_side {
             let y = 0.5 + t as f32;
             for i in 0..count {
                 let x = (i as f32 - (count as f32 - 1.0) * 0.5) * 1.02;
-                let h = s
-                    .bodies
-                    .insert(RigidBodyBuilder::dynamic().translation(rapier3d::math::Vec3::new(x, y, 0.0)));
+                let h = s.bodies.insert(
+                    RigidBodyBuilder::dynamic()
+                        .translation(rapier3d::math::Vec3::new(x, y, 0.0))
+                        .can_sleep(can_sleep),
+                );
                 s.colliders.insert_with_parent(
                     ColliderBuilder::cuboid(0.5, 0.5, 0.5).density(1.0),
                     h,
@@ -336,8 +378,9 @@ mod rapier_side {
         }
     }
 
-    pub fn pile(n: usize, steps: usize, warmup: usize) -> Result_ {
+    pub fn pile(mode: Mode, n: usize, steps: usize, warmup: usize) -> Result_ {
         let mut s = Sim::new();
+        let can_sleep = mode == Mode::Settle;
         let ground = s.bodies.insert(RigidBodyBuilder::fixed().translation(rapier3d::math::Vec3::new(0.0, -1.0, 0.0)));
         s.colliders.insert_with_parent(
             ColliderBuilder::cuboid(30.0, 1.0, 30.0).density(1.0),
@@ -355,9 +398,11 @@ mod rapier_side {
                     let x = ix as f32 * 1.1 - side as f32 * 0.55;
                     let z = iz as f32 * 1.1 - side as f32 * 0.55;
                     let y = 0.55 + iy as f32 * 1.1;
-                    let h = s
-                        .bodies
-                        .insert(RigidBodyBuilder::dynamic().translation(rapier3d::math::Vec3::new(x, y, z)));
+                    let h = s.bodies.insert(
+                        RigidBodyBuilder::dynamic()
+                            .translation(rapier3d::math::Vec3::new(x, y, z))
+                            .can_sleep(can_sleep),
+                    );
                     s.colliders.insert_with_parent(
                         ColliderBuilder::ball(0.5).density(1.0),
                         h,
@@ -435,18 +480,27 @@ fn main() {
     println!("      깨어 있으면 알고리즘 처리량 격차가 아니라 정착 성공 여부를 재는 것이다.");
     println!("측정: 워밍업 {warmup} + {steps} 스텝, {reps}회 반복의 **최소값**. UNSTABLE이면 수치는 무의미하다.\n");
 
-    if scenario == "all" || scenario == "pyramid" {
-        for tiers in [10usize, 20, 30, 40] {
-            println!("[피라미드 {tiers}단]");
-            row("maru", &best(reps, || maru_side::pyramid(tiers, steps, warmup)));
-            row("rapier", &best(reps, || rapier_side::pyramid(tiers, steps, warmup)));
+    for (mode, label) in [
+        (Mode::Throughput, "처리량 (양쪽 수면 OFF — 같은 일을 하는 비교)"),
+        (Mode::Settle, "정착 (수면 ON — 품질 + 총비용)"),
+    ] {
+        println!("\n══════ {label} ══════");
+        if scenario == "all" || scenario == "pyramid" {
+            for tiers in [10usize, 20, 30, 40] {
+                println!("[피라미드 {tiers}단]");
+                row("maru", &best(reps, || maru_side::pyramid(mode, tiers, steps, warmup)));
+                row(
+                    "rapier",
+                    &best(reps, || rapier_side::pyramid(mode, tiers, steps, warmup)),
+                );
+            }
         }
-    }
-    if scenario == "all" || scenario == "pile" {
-        for n in [500usize, 1500, 3000] {
-            println!("[구 더미 {n}개]");
-            row("maru", &best(reps, || maru_side::pile(n, steps, warmup)));
-            row("rapier", &best(reps, || rapier_side::pile(n, steps, warmup)));
+        if scenario == "all" || scenario == "pile" {
+            for n in [500usize, 1500, 3000] {
+                println!("[구 더미 {n}개]");
+                row("maru", &best(reps, || maru_side::pile(mode, n, steps, warmup)));
+                row("rapier", &best(reps, || rapier_side::pile(mode, n, steps, warmup)));
+            }
         }
     }
 }
