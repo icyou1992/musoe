@@ -297,7 +297,7 @@ pub fn prepare(
     let mut warm_matched = 0u32;
     let (ia, ib) = (ba.inv_inertia_world(), bb.inv_inertia_world());
     let points = m
-        .points
+        .points()
         .iter()
         .map(|p| {
             let ra = p.position - ba.pose.pos;
@@ -515,14 +515,14 @@ mod tests {
     }
 
     fn manifold_at(pos: Vec3) -> Manifold {
-        Manifold {
-            normal: Vec3::new(0.0, 1.0, 0.0),
-            points: vec![ContactPoint {
+        Manifold::from_points(
+            Vec3::new(0.0, 1.0, 0.0),
+            &[ContactPoint {
                 position: pos,
                 separation: -0.001,
                 feature: FeatureId(FEATURE_GENERIC),
             }],
-        }
+        )
     }
 
     /// 계약(리뷰 MAJOR): 계보 없는 witness 접점은 ID를 공유하므로 **위치 근접**까지 맞을 때만
@@ -603,7 +603,7 @@ mod tests {
             },
         )];
         let mut m = manifold_at(Vec3::new(2.0, 0.5, 0.0));
-        m.points[0].feature = fid;
+        m.points_mut()[0].feature = fid;
         let c = prepare(&bodies, 1, 0, &m, &cache, 1.0 / 60.0);
         assert_eq!(c.points[0].normal_impulse, 3.0);
     }

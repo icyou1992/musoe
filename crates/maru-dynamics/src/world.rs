@@ -1317,9 +1317,9 @@ impl World {
             let (sa, pa) = (&self.bodies[a_id].shape, &self.bodies[a_id].pose);
             let (sb, pb) = (&self.bodies[b_id].shape, &self.bodies[b_id].pose);
             if let Some(m) = contact(sa, pa, sb, pb, self.params.speculative_margin) {
-                if !m.points.is_empty() {
+                if !m.is_empty() {
                     let cached = self.contact_cache.get(&key).unwrap_or(&empty);
-                    for p in &m.points {
+                    for p in m.points() {
                         self.diag.max_penetration = self.diag.max_penetration.max(-p.separation);
                     }
                     let c = solver::prepare(&self.bodies, a_id, b_id, &m, cached, dt);

@@ -13,10 +13,10 @@ use crate::tolerance::{area_eps, characteristic_length};
 use crate::{Pose, Shape};
 use maru_math::{Quat, Vec3};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct FeatureId(pub u32);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ContactPoint {
     /// 월드 좌표 (B 표면 기준).
     pub position: Vec3,
@@ -25,11 +25,63 @@ pub struct ContactPoint {
     pub feature: FeatureId,
 }
 
-#[derive(Clone, Debug, Default)]
+/// 매니폴드 접점 상한. 클리핑이 `reduce_to_4`로 4점을 넘기지 않고, 해석 경로는 1점이다.
+pub const MAX_MANIFOLD_POINTS: usize = 4;
+
+/// 접촉 매니폴드.
+///
+/// 접점을 **인라인 배열**로 담는다(리뷰 MAJOR: 스텝 중 힙 할당). `Vec`이면 접촉마다
+/// 할당이 하나씩 생기는데, 3000구 더미의 5,538 접촉이면 스텝당 수천 회다 —
+/// 5,538 접촉 규모에서는 산술보다 allocator·포인터 추적이 지배할 수 있다.
+#[derive(Clone, Copy, Debug)]
 pub struct Manifold {
     /// A를 +normal로 밀면 분리 (GJK/EPA 관례 승계).
     pub normal: Vec3,
-    pub points: Vec<ContactPoint>,
+    points: [ContactPoint; MAX_MANIFOLD_POINTS],
+    count: u8,
+}
+
+impl Default for Manifold {
+    fn default() -> Self {
+        Self {
+            normal: Vec3::ZERO,
+            points: [ContactPoint::default(); MAX_MANIFOLD_POINTS],
+            count: 0,
+        }
+    }
+}
+
+impl Manifold {
+    #[inline]
+    pub fn points(&self) -> &[ContactPoint] {
+        &self.points[..self.count as usize]
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    #[inline]
+    pub fn push(&mut self, p: ContactPoint) {
+        if (self.count as usize) < MAX_MANIFOLD_POINTS {
+            self.points[self.count as usize] = p;
+            self.count += 1;
+        }
+    }
+    /// 테스트·조정용 가변 접근.
+    #[inline]
+    pub fn points_mut(&mut self) -> &mut [ContactPoint] {
+        &mut self.points[..self.count as usize]
+    }
+    pub fn from_points(normal: Vec3, pts: &[ContactPoint]) -> Self {
+        let mut m = Self {
+            normal,
+            ..Default::default()
+        };
+        for p in pts {
+            m.push(*p);
+        }
+        m
+    }
 }
 
 /// 면 지배 판정 임계: |면법선·접촉법선| 이 이 값 이상이면 face contact로 취급.
@@ -127,16 +179,16 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
     // 폴백: witness 단일점 (radius 재팽창 — 설계 shrink-then-reinflate의 reinflate 지점)
     let surface_a = on_a - normal * ra; // A 표면: 코어점에서 −normal(=B쪽)로 radius만큼
     let surface_b = on_b + normal * rb;
-    Some(Manifold {
+    Some(Manifold::from_points(
         normal,
-        points: vec![ContactPoint {
+        &[ContactPoint {
             position: (surface_a + surface_b) * 0.5,
             separation: core_sep,
             // witness 단일점: 계보가 없다(곡면·에지-에지). 상위 비트로 **generic 표식**을 달아
             // 솔버가 ID 대신 위치 근접으로 warm start를 매칭하게 한다(리뷰 MAJOR).
             feature: FeatureId(FEATURE_GENERIC),
         }],
-    })
+    ))
 }
 
 enum SatResult {
@@ -380,14 +432,14 @@ fn sphere_sphere(ra: f32, ca: Vec3, rb: f32, cb: Vec3, margin: f32) -> Option<Ma
     };
     let surface_a = ca - normal * ra;
     let surface_b = cb + normal * rb;
-    Some(Manifold {
+    Some(Manifold::from_points(
         normal,
-        points: vec![ContactPoint {
+        &[ContactPoint {
             position: (surface_a + surface_b) * 0.5,
             separation: dist - sum,
             feature: FeatureId(FEATURE_ANALYTIC),
         }],
-    })
+    ))
 }
 
 // ---------- box face 유틸 ----------
@@ -588,10 +640,7 @@ fn clip_box_box(
     }
     // manifold 법선은 push-A 관례로: reference가 A면 rn은 A→B → 뒤집기
     let m_normal = if ref_is_a { -rn } else { rn };
-    Some(Manifold {
-        normal: m_normal,
-        points: pts,
-    })
+    Some(Manifold::from_points(m_normal, &pts))
 }
 
 /// 최심점 고정 → 나머지 3점 전수 조합으로 접촉 사각형 면적 최대 선택 (설계 §4.2 원문,
@@ -684,8 +733,8 @@ mod tests {
             0.05,
         )
         .expect("contact expected");
-        assert_eq!(m.points.len(), 4, "{:?}", m.points);
-        for p in &m.points {
+        assert_eq!(m.points().len(), 4, "{:?}", m.points);
+        for p in m.points() {
             assert!(p.separation.abs() < 1e-4, "{:?}", p);
         }
         assert!(
@@ -694,7 +743,7 @@ mod tests {
             m.normal
         );
         // 4점의 feature는 서로 달라야 함
-        let mut feats: Vec<_> = m.points.iter().map(|p| p.feature).collect();
+        let mut feats: Vec<_> = m.points().iter().map(|p| p.feature).collect();
         feats.sort_unstable();
         feats.dedup();
         assert_eq!(feats.len(), 4);
@@ -750,11 +799,11 @@ mod tests {
         };
         let m = contact(&top, &pa, &ground, &pose(0.0, 0.0, 0.0), 0.05).unwrap();
         assert!(
-            !m.points.is_empty() && m.points.len() <= 4,
+            !m.points.is_empty() && m.points().len() <= 4,
             "{:?}",
-            m.points.len()
+            m.points().len()
         );
-        for p in &m.points {
+        for p in m.points() {
             assert!(p.separation < 0.05);
         }
     }
@@ -778,8 +827,8 @@ mod tests {
             0.05,
         )
         .unwrap();
-        assert_eq!(m.points.len(), 4);
-        for p in &m.points {
+        assert_eq!(m.points().len(), 4);
+        for p in m.points() {
             assert!((p.separation + 0.1).abs() < 1e-3, "sep={}", p.separation);
         }
     }
@@ -806,9 +855,9 @@ mod tests {
             rot,
         };
         let m = contact(&top, &pa, &ground, &pose(0.0, 0.0, 0.0), 0.05).unwrap();
-        assert!(!m.points.is_empty() && m.points.len() <= 4);
-        for (i, p) in m.points.iter().enumerate() {
-            for q in m.points.iter().skip(i + 1) {
+        assert!(!m.points.is_empty() && m.points().len() <= 4);
+        for (i, p) in m.points().iter().enumerate() {
+            for q in m.points().iter().skip(i + 1) {
                 let d = (p.position - q.position).length_sq();
                 assert!(d > 1.0e-8, "중복 접점: {p:?} vs {q:?}");
             }
@@ -895,17 +944,17 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("scale {k}: 접촉 소실"));
             assert_eq!(
-                m.points.len(),
+                m.points().len(),
                 4,
                 "scale {k}: 매니폴드 점수 {}",
-                m.points.len()
+                m.points().len()
             );
             assert!(
                 (m.normal.y - 1.0).abs() < 1.0e-3,
                 "scale {k}: 법선 {:?}",
                 m.normal
             );
-            for p in &m.points {
+            for p in m.points() {
                 let rel = p.separation / k;
                 assert!(
                     (rel + 0.01).abs() < 0.05,
@@ -935,8 +984,8 @@ mod tests {
             0.05,
         )
         .unwrap();
-        assert_eq!(m.points.len(), 4);
-        for p in &m.points {
+        assert_eq!(m.points().len(), 4);
+        for p in m.points() {
             assert!(p.position.x.abs() <= 0.7501, "point={p:?}");
             assert!(p.position.z.abs() <= 0.7501, "point={p:?}");
             assert!(p.separation.abs() < 1.0e-4, "point={p:?}");
@@ -959,11 +1008,11 @@ mod tests {
             0.1,
         )
         .unwrap();
-        assert_eq!(m.points.len(), 1);
+        assert_eq!(m.points().len(), 1);
         assert!(
-            (m.points[0].separation - 0.02).abs() < 1e-3,
+            (m.points()[0].separation - 0.02).abs() < 1e-3,
             "{:?}",
-            m.points[0]
+            m.points()[0]
         );
         assert!((m.normal.y - 1.0).abs() < 1e-3);
     }
@@ -977,6 +1026,6 @@ mod tests {
         };
         assert!(contact(&s, &pose(0.0, 2.3, 0.0), &s, &pose(0.0, 0.0, 0.0), 0.05).is_none());
         let m = contact(&s, &pose(0.0, 2.3, 0.0), &s, &pose(0.0, 0.0, 0.0), 0.5).unwrap();
-        assert!(m.points.iter().all(|p| (p.separation - 0.3).abs() < 1e-3));
+        assert!(m.points().iter().all(|p| (p.separation - 0.3).abs() < 1e-3));
     }
 }
