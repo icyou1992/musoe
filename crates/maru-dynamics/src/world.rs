@@ -461,8 +461,22 @@ impl World {
     }
 
     /// 바디 추가. 빈 슬롯이 있으면 **최소 인덱스**를 재사용한다(이력 무관 canonical 배치).
+    /// 바디 추가 (오류 반환형).
+    ///
+    /// 계약 "실패는 trap이 아니라 오류"에서 이 경로만 빠져 있었다 — 브라우저 바인딩은
+    /// unwind가 곧 trap이라 `expect`가 호스트에게 진단 불가능한 죽음이 된다.
+    pub fn try_add_body(&mut self, body: Body) -> Result<BodyHandle, ApiError> {
+        body.validate()?;
+        Ok(self.add_body_validated(body))
+    }
+
+    /// 패닉하는 편의 래퍼 (테스트·벤치용). 정본은 [`World::try_add_body`].
     pub fn add_body(&mut self, body: Body) -> BodyHandle {
         body.validate().expect("invalid body");
+        self.add_body_validated(body)
+    }
+
+    fn add_body_validated(&mut self, body: Body) -> BodyHandle {
         self.bp_valid = false;
         if let Some(index) = self.free_slot() {
             self.bodies[index] = body;

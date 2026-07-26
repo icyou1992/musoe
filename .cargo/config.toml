@@ -5,4 +5,8 @@ runner = ["node", "--no-warnings", "/home/icyou/workspace/maru/scripts/wasi-run.
 rustflags = ["-C", "target-feature=+simd128"]
 
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128"]
+# **브라우저 타깃은 panic=abort**다. wasm에서 unwind는 어차피 trap이라 되살릴 수 없고,
+# unwind 테이블만 산출물을 키운다. 바인딩은 fallible 경로(`try_*`)만 쓰므로 정상
+# 실패는 오류 코드로 나가고, 여기 걸리는 것은 진짜 버그뿐이다.
+# (wasip1 타깃은 그대로 둔다 — 게이트의 `should_panic` 테스트가 unwind를 필요로 한다.)
+rustflags = ["-C", "target-feature=+simd128", "-C", "panic=abort"]

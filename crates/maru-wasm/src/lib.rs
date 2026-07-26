@@ -193,7 +193,12 @@ pub unsafe extern "C" fn maru_add_body(
     let Ok(body) = body else {
         return u64::MAX;
     };
-    pack(w.world.add_body(body))
+    // **`add_body`가 아니라 `try_add_body`** — `add_body`는 검증 실패에 패닉하고,
+    // wasm에서 unwind는 호스트가 진단할 수 없는 trap이 된다.
+    match w.world.try_add_body(body) {
+        Ok(h) => pack(h),
+        Err(_) => u64::MAX,
+    }
 }
 
 /// # Safety

@@ -152,7 +152,7 @@ rapier 0.34 기본은 0.4 m/s(`time_until_sleep` 2초)로 **13배** 차이였다
 - **실패는 오류로, trap으로가 아니다.** M3 바인딩이 쓰는 정본 경로는 전부 fallible이다:
   `World::try_new` · `try_set_params` · `try_step` · `try_snapshot` · `try_state_hash` ·
   `Body::try_new_dynamic`/`try_new_static`/`try_new_kinematic` ·
-  `Joint::try_point`/`try_hinge` · `World::try_add_joint` · `enqueue`.
+  `Joint::try_point`/`try_hinge` · `World::try_add_joint` · `World::try_add_body` · `enqueue`.
   같은 이름의 비-try 함수는 패닉하는 편의 래퍼(테스트·진단용).
   `Joint::try_hinge`가 따로 필요한 이유: 0/NaN 축은 **Joint 생성 시점**에 걸리므로
   `try_add_joint`(이미 만들어진 Joint를 받는다)로는 잡을 수 없다.
