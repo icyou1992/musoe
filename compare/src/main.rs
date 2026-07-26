@@ -65,13 +65,13 @@ mod maru_side {
             let _ = w.try_step(DT);
         }
         let t0 = Instant::now();
-        let mut acc = [0u64; 4];
+        let mut acc = [0u64; 5];
         let mut pairs_acc = 0usize;
         let mut reused = 0usize;
         for _ in 0..steps {
             let _ = w.try_step(DT);
             let d = w.diagnostics();
-            for k in 0..4 {
+            for k in 0..5 {
                 acc[k] += d.phase_ns[k];
             }
             pairs_acc += d.pairs;
@@ -79,11 +79,12 @@ mod maru_side {
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
         eprintln!(
-            "    [maru 평균 us] broad={:.0} narrow={:.0} solve={:.0} book={:.0}  pairs={}",
+            "    [maru 평균 us] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0}  pairs={}",
             acc[0] as f64 / 1000.0 / steps as f64,
             acc[1] as f64 / 1000.0 / steps as f64,
             acc[2] as f64 / 1000.0 / steps as f64,
             acc[3] as f64 / 1000.0 / steps as f64,
+            acc[4] as f64 / 1000.0 / steps as f64,
             pairs_acc / steps
         );
         eprintln!("    [maru bp 재사용] {reused}/{steps}");
@@ -151,14 +152,14 @@ mod maru_side {
             let _ = w.try_step(DT);
         }
         let t0 = Instant::now();
-        let mut acc = [0u64; 4];
+        let mut acc = [0u64; 5];
         let mut reused = 0usize;
         let mut pairs_acc = 0usize;
         let mut pts_acc = 0usize;
         for _ in 0..steps {
             let _ = w.try_step(DT);
             let d = w.diagnostics();
-            for k in 0..4 {
+            for k in 0..5 {
                 acc[k] += d.phase_ns[k];
             }
             reused += d.bp_reused as usize;
@@ -180,11 +181,12 @@ mod maru_side {
             WorldParams::default().sleep_linear_threshold,
             WorldParams::default().sleep_angular_threshold);
         eprintln!(
-            "    [maru pile] broad={:.0} narrow={:.0} solve={:.0} book={:.0} us  수면 {asleep}/{}  bp재사용 {reused}/{steps}",
+            "    [maru pile] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us  수면 {asleep}/{}  bp재사용 {reused}/{steps}",
             acc[0] as f64 / 1000.0 / steps as f64,
             acc[1] as f64 / 1000.0 / steps as f64,
             acc[2] as f64 / 1000.0 / steps as f64,
             acc[3] as f64 / 1000.0 / steps as f64,
+            acc[4] as f64 / 1000.0 / steps as f64,
             handles.len()
         );
         eprintln!(
@@ -397,8 +399,16 @@ fn main() {
     let reps: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
 
     println!("Maru(M2) vs Rapier3D 0.34 — dt=1/60, release(lto=thin, cgu=1), 단일 스레드");
-    println!("설정: Maru=기본(4 서브스텝·30Hz 접촉) / Rapier=IntegrationParameters::default()");
-    println!("주의: Maru는 CCD 없음·셰이프 4종(M2). Rapier는 CCD·쿼리 파이프라인을 함께 돌린다.");
+    println!(
+        "설정: Maru=기본({} 서브스텝·{}Hz 접촉) / Rapier=IntegrationParameters::default()",
+        maru_dynamics::WorldParams::default().substeps,
+        maru_dynamics::WorldParams::default().solver.contact_hertz
+    );
+    // **정정**: 이 하네스의 Rapier 설정은 CCD를 켜지 않고 QueryPipeline도 만들지 않으며
+    // event handler도 `()`다. 이전 문구는 Rapier가 더 많은 일을 하는 것처럼 과장했다.
+    println!("주의: 양쪽 모두 CCD·쿼리 파이프라인 **없이** 돈다. Maru는 M2(셰이프 4종·단일 스레드).");
+    println!("주의: 이 벤치는 '정착 품질 + 처리량'을 **함께** 잰다 — 한쪽이 잠들고 다른 쪽이");
+    println!("      깨어 있으면 알고리즘 처리량 격차가 아니라 정착 성공 여부를 재는 것이다.");
     println!("측정: 워밍업 {warmup} + {steps} 스텝, {reps}회 반복의 **최소값**. UNSTABLE이면 수치는 무의미하다.\n");
 
     if scenario == "all" || scenario == "pyramid" {

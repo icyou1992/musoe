@@ -147,8 +147,15 @@ pub struct Diagnostics {
     pub pair_budget: usize,
     /// 이번 스텝이 브로드페이즈 캐시를 재사용했는가 (전원 수면 등 무변화 스텝).
     pub bp_reused: bool,
-    /// 단계별 소요 (ns) — 프로파일용. [broadphase, narrowphase, solve, bookkeeping]
-    pub phase_ns: [u64; 4],
+    /// 단계별 소요 (ns) — 프로파일용.
+    /// `[aabb, broad, narrow, solve, post]`
+    /// - `aabb`: 바디 순회 + 회전 월드 AABB 구성 (예전에는 broad에서 **빠져 있었다**)
+    /// - `broad`: 트리 구축 + 페어 질의 (캐시 재사용 스텝은 ~0)
+    /// - `narrow`: wake 폐쇄 + 접촉 생성 + 제약 준비
+    /// - `solve`: 서브스텝 루프 + restitution **만**
+    /// - `post`: write-back · PCM 갱신 · 아일랜드/슬립 · 상태 정책
+    ///   (예전에는 이 넷이 `solve`에 섞여 있어 최적화 우선순위를 잘못 귀속시켰다 — 리뷰 MAJOR)
+    pub phase_ns: [u64; 5],
     /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
     /// 0이 아니면 지원 범위 밖 입력이거나 엔진 버그이며, 그 스텝의 물리는 신뢰할 수 없다.
     /// 서로 다른 초과 상태가 같은 포화값으로 합쳐지므로 상태 해시만으로는 구분되지 않는다.
@@ -1070,6 +1077,7 @@ impl World {
         let static_soft = Softness::new(2.0 * hertz, self.params.solver.contact_damping, h);
 
         // 1) 브로드페이즈 — canonical 페어 (트리 비의존 계약은 maru-collide가 보장)
+        let _t_aabb = std::time::Instant::now();
         let mut dyn_items: Vec<(u32, Aabb)> = Vec::new();
         let mut static_items: Vec<(u32, Aabb)> = Vec::new();
         for (i, b) in self.bodies.iter().enumerate() {
@@ -1116,6 +1124,7 @@ impl World {
                 }
             }
         }
+        self.diag.phase_ns[0] = _t_aabb.elapsed().as_nanos() as u64;
         let _t_bp = std::time::Instant::now();
         // 예산은 **살아있는 바디 수** 기준(슬롯 수가 아니라) + 절대 개수 상한 + **바이트 상한**.
         // 개수만 묶으면 페어 뒤에 따라붙는 constraint·키·HashSet·SoA가 남는다 —
@@ -1255,7 +1264,7 @@ impl World {
             }
         }
 
-        self.diag.phase_ns[0] = _t_bp.elapsed().as_nanos() as u64;
+        self.diag.phase_ns[1] = _t_bp.elapsed().as_nanos() as u64;
         let _t_np = std::time::Instant::now();
         // 2) 내로우페이즈 → 제약 준비 (A=첫 인덱스, B=둘째 — canonical 순서가 곧 해석 순서)
         //    PCM 캐시에서 feature 일치 접점의 임펄스를 warm load (설계 §3)
@@ -1325,7 +1334,7 @@ impl World {
             }
         }
 
-        self.diag.phase_ns[1] = _t_np.elapsed().as_nanos() as u64;
+        self.diag.phase_ns[2] = _t_np.elapsed().as_nanos() as u64;
         let _t_sv = std::time::Instant::now();
         // 3) TGS-soft 서브스텝 루프
         let g = self.params.gravity;
@@ -1507,6 +1516,8 @@ impl World {
             solver::apply_restitution(&mut st, c, self.params.solver.restitution_threshold);
         }
 
+        self.diag.phase_ns[3] = _t_sv.elapsed().as_nanos() as u64;
+        let _t_post = std::time::Instant::now();
         st.write_back(&mut self.bodies, &self.alive);
         self.solver_state = st;
 
@@ -1642,11 +1653,9 @@ impl World {
         // **스텝 말 최종 클램프**: 서브스텝 루프 뒤의 relax·restitution 패스가 속도를 다시
         // 바꾸므로, 여기서 한 번 더 걸어야 저장되는 상태가 입력 범위 불변식을 만족한다
         // (리더가 `Body::validate`를 그대로 쓰는 근거).
-        self.diag.phase_ns[2] = _t_sv.elapsed().as_nanos() as u64;
-        let _t_bk = std::time::Instant::now();
         self.clamp_velocities();
         self.enforce_world_bounds();
         self.diag.state_saturations = self.close_state_policy();
-        self.diag.phase_ns[3] = _t_bk.elapsed().as_nanos() as u64;
+        self.diag.phase_ns[4] = _t_post.elapsed().as_nanos() as u64;
     }
 }
