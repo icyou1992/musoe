@@ -3095,4 +3095,43 @@ mod tests {
         // 상태는 손상되지 않고 스냅샷도 유효하다
         assert!(w.restore(&w.snapshot()).is_ok());
     }
+
+    /// BLOCKER 회귀: 자원 실패가 **캐노니컬 상태를 훼손하면 안 된다**.
+    /// `mem::take(&mut self.joints)` 뒤에 예약 실패로 조기 반환해 **모든 조인트가 삭제**되던
+    /// 경로가 있었다. 선점을 캐노니컬 변이 **전에** 모두 끝내 그 창을 없앴다.
+    #[test]
+    fn resource_failure_never_destroys_canonical_state() {
+        let mut w = World::new(WorldParams {
+            max_pairs_per_body: 1,
+            ..Default::default()
+        });
+        let a = dyn_box(&mut w, 0.0, 3.0);
+        let b = dyn_box(&mut w, 1.2, 3.0);
+        w.try_add_joint(Joint::point(a, b, Vec3::new(0.6, 0.0, 0.0), Vec3::ZERO))
+            .unwrap();
+        // 페어 예산을 넘겨 ResourceLimit을 강제한다
+        for _ in 0..200 {
+            w.add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.5 },
+                pose(0.0, 1.0, 0.0),
+                1.0,
+            ));
+        }
+        let before = w.state_hash();
+        let r = w.try_step(DT);
+        assert_eq!(r, Err(ApiError::ResourceLimit));
+        // **조인트가 살아 있고 물리도 전진하지 않았어야 한다**
+        assert_eq!(
+            w.state_hash(),
+            before,
+            "자원 실패가 상태를 바꿨다 (조인트 삭제 또는 물리 전진)"
+        );
+        assert!(w.restore(&w.snapshot()).is_ok());
+        // 원인을 없애면 다음 스텝은 정상이고 조인트도 그대로다
+        w.set_params(WorldParams {
+            max_pairs_per_body: 4096,
+            ..Default::default()
+        });
+        assert_eq!(w.try_step(DT), Ok(()));
+    }
 }

@@ -127,6 +127,7 @@ pub struct World {
     inv_inertia_local: Vec<Vec3>,
     integrate_gate: Vec<bool>,
     gravity_gate: Vec<bool>,
+    island_parent: Vec<usize>,
 }
 
 /// 읽기 전용 진단 (엔진 캐노니컬 상태가 아니다 — 스냅샷·해시에 포함되지 않는다).
@@ -292,6 +293,7 @@ impl World {
             inv_inertia_local: Vec::new(),
             integrate_gate: Vec::new(),
             gravity_gate: Vec::new(),
+            island_parent: Vec::new(),
         }
     }
 
@@ -1336,6 +1338,21 @@ impl World {
             2.0,
             h,
         );
+        // **fallible 선점은 캐노니컬 변이 전에 모두 끝낸다**(리뷰 BLOCKER).
+        // 예전에는 `mem::take(&mut self.joints)` 뒤에 예약 실패로 조기 반환해
+        // **모든 조인트가 삭제**됐고, 더 늦은 실패는 솔버 write-back·PCM 갱신이 끝난 뒤라
+        // 물리는 전진했는데 `ResourceLimit`을 돌려줬다.
+        let nb_pre = self.bodies.len();
+        if self.solver_state.reserve_for(nb_pre).is_err()
+            || self.inv_inertia_local.try_reserve(nb_pre).is_err()
+            || self.integrate_gate.try_reserve(nb_pre).is_err()
+            || self.gravity_gate.try_reserve(nb_pre).is_err()
+            || self.island_parent.try_reserve(nb_pre).is_err()
+        {
+            self.bp_pairs = pairs;
+            self.resource_limit = true;
+            return;
+        }
         let mut joints = std::mem::take(&mut self.joints);
         // 조인트도 접촉과 같은 비활성 게이트 (설계 §4.6 level-trigger): 양쪽 모두
         // 비활성(sleeping/static/kinematic)이면 스킵 — 잠든 바디에 warm-start 임펄스를
@@ -1367,29 +1384,16 @@ impl World {
         // 뽑아 돌리고 루프가 끝난 뒤 한 번만 되쓴다.
         let n_bodies = self.bodies.len();
         let mut st = std::mem::take(&mut self.solver_state);
-        if st.sync_from(&self.bodies, &self.alive, &self.oob).is_err() {
-            self.solver_state = st;
-            self.resource_limit = true;
-            return;
-        }
+        // 위에서 선점을 마쳤으므로 여기서는 실패하지 않는다(용량이 이미 확보돼 있다).
+        st.fill_from(&self.bodies, &self.alive, &self.oob);
         let inv_i_local = &mut self.inv_inertia_local;
         inv_i_local.clear();
-        if inv_i_local.try_reserve(n_bodies).is_err() {
-            self.solver_state = st;
-            self.resource_limit = true;
-            return;
-        }
         inv_i_local.extend(self.bodies.iter().map(|b| b.inv_inertia_local));
         // 적분 대상 게이트도 스크래치에 재사용한다(루프에서 매번 판정하지 않는다).
         let integrate = &mut self.integrate_gate;
         let gravity_on = &mut self.gravity_gate;
         integrate.clear();
         gravity_on.clear();
-        if integrate.try_reserve(n_bodies).is_err() || gravity_on.try_reserve(n_bodies).is_err() {
-            self.solver_state = st;
-            self.resource_limit = true;
-            return;
-        }
         for i in 0..n_bodies {
             let ok = self.alive[i]
                 && self.bodies[i].body_type != BodyType::Static
@@ -1537,11 +1541,9 @@ impl World {
         // 6) 아일랜드 union-find (동적-동적 edge만 — static은 anchor 전용, 설계 §4.3)
         //    + island 단위 일괄 sleep (설계 §4.6)
         let n = self.bodies.len();
-        let mut parent: Vec<usize> = Vec::new();
-        if parent.try_reserve(n).is_err() {
-            self.resource_limit = true;
-            return;
-        }
+        // 선점은 스텝 시작에 끝났다 — 여기서 실패할 수 없다.
+        let mut parent = std::mem::take(&mut self.island_parent);
+        parent.clear();
         parent.extend(0..n);
         fn find(parent: &mut [usize], mut x: usize) -> usize {
             while parent[x] != x {
@@ -1581,6 +1583,9 @@ impl World {
                 self.island[i] = find(&mut parent, i) as u32;
             }
         }
+        // 스크래치를 월드로 돌려놓는다(다음 스텝에서 재할당하지 않도록).
+        self.island_parent = std::mem::take(&mut parent);
+        let mut parent = std::mem::take(&mut self.island_parent);
         let lin2 = self.params.sleep_linear_threshold * self.params.sleep_linear_threshold;
         let ang2 = self.params.sleep_angular_threshold * self.params.sleep_angular_threshold;
         for i in 0..n {
@@ -1611,6 +1616,7 @@ impl World {
                 }
             }
         }
+        self.island_parent = parent;
 
         self.joints = joints;
 

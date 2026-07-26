@@ -144,20 +144,30 @@ pub struct SolverState {
 impl SolverState {
     /// 바디에서 상태를 **제자리로** 채운다. 매 스텝 새 Vec을 만들면 할당 비용이
     /// 솔버 이득을 먹는다(실측: SoA 전환이 되레 1.3ms 느려졌다) — 버퍼는 월드가 보관한다.
-    pub fn sync_from(
-        &mut self,
-        bodies: &[Body],
-        alive: &[bool],
-        oob: &[bool],
-    ) -> Result<(), crate::world::ApiError> {
+    /// 용량만 미리 확보한다 — **캐노니컬 변이 전에** 호출해 실패를 여기서 끝낸다.
+    pub fn reserve_for(&mut self, n: usize) -> Result<(), crate::world::ApiError> {
+        macro_rules! res {
+            ($v:expr) => {
+                $v.try_reserve(n.saturating_sub($v.capacity()))
+                    .map_err(|_| crate::world::ApiError::ResourceLimit)?;
+            };
+        }
+        res!(self.lin);
+        res!(self.ang);
+        res!(self.pos);
+        res!(self.rot);
+        res!(self.inv_m);
+        res!(self.inv_i);
+        res!(self.dynamic);
+        Ok(())
+    }
+
+    /// 용량이 확보된 상태에서 값을 채운다 (실패하지 않는다).
+    pub fn fill_from(&mut self, bodies: &[Body], alive: &[bool], oob: &[bool]) {
         let n = bodies.len();
-        // **암묵 재할당 금지**: 예산 안이라도 wasm 가용 메모리가 모자라면 `reserve`는
-        // abort가 된다. 실패는 오류로 전파한다.
         macro_rules! fit {
             ($v:expr, $d:expr) => {
                 $v.clear();
-                $v.try_reserve(n)
-                    .map_err(|_| crate::world::ApiError::ResourceLimit)?;
                 $v.resize(n, $d);
             };
         }
@@ -180,7 +190,6 @@ impl SolverState {
             self.inv_m[i] = if active { b.inv_mass } else { 0.0 };
             self.dynamic[i] = active && b.is_dynamic();
         }
-        Ok(())
     }
 
     /// 솔버 결과를 바디로 되쓴다 (스텝당 1회 — 핫패스 밖).

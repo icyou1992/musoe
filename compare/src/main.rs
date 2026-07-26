@@ -109,7 +109,14 @@ mod maru_side {
     }
 
     pub fn pile(n: usize, steps: usize, warmup: usize) -> Result_ {
-        let mut w = World::new(WorldParams::default());
+        let sub: u32 = std::env::var("MARU_SUB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(WorldParams::default().substeps);
+        let mut w = World::new(WorldParams {
+            substeps: sub,
+            ..Default::default()
+        });
         for (dx, dz, hx, hz) in [
             (0.0, 0.0, 30.0, 30.0),
         ] {
@@ -160,12 +167,18 @@ mod maru_side {
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
         let (mut lowest, mut finite, mut asleep) = (f32::MAX, true, 0usize);
+        let (mut vlin, mut vang) = (0.0f32, 0.0f32);
         for h in &handles {
             let b = w.body(*h);
             lowest = lowest.min(b.pose().pos.y);
             finite &= b.pose().pos.y.is_finite();
             asleep += w.is_asleep(*h) as usize;
+            vlin = vlin.max(b.linvel().length());
+            vang = vang.max(b.angvel().length());
         }
+        eprintln!("    [maru pile] 잔류 vlin={vlin:.4} vang={vang:.4} (임계 {:.2}/{:.2})",
+            WorldParams::default().sleep_linear_threshold,
+            WorldParams::default().sleep_angular_threshold);
         eprintln!(
             "    [maru pile] broad={:.0} narrow={:.0} solve={:.0} book={:.0} us  수면 {asleep}/{}  bp재사용 {reused}/{steps}",
             acc[0] as f64 / 1000.0 / steps as f64,
@@ -336,12 +349,14 @@ mod rapier_side {
             s.step();
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
-        let (mut lowest, mut finite) = (f32::MAX, true);
+        let (mut lowest, mut finite, mut asleep) = (f32::MAX, true, 0usize);
         for h in &handles {
             let b = &s.bodies[*h];
             lowest = lowest.min(b.translation().y);
             finite &= b.translation().y.is_finite();
+            asleep += b.is_sleeping() as usize;
         }
+        eprintln!("    [rapier pile] 수면 {asleep}/{}", handles.len());
         let stable = finite && lowest > -0.5;
         Result_ {
             ms_per_step: ms,
