@@ -16,6 +16,15 @@ use std::time::Instant;
 
 const DT: f32 = 1.0 / 60.0;
 
+/// **정착 모드의 수면 파라미터는 양쪽을 맞춘다.**
+/// 각 엔진 기본값으로 재면 엔진이 아니라 튜닝을 재게 된다 — 실제로 Maru 기본은
+/// 0.03 m/s인데 rapier 0.34 기본은 0.4 m/s로 **13배** 차이였고, 그 상태로 잰
+/// 정착 수치는 like-for-like가 아니었다(2026-07-27 발견).
+/// 여기서는 rapier 기본(0.4/0.5/2초)보다 엄격하고 Maru 기본보다 느슨한 공통값을 쓴다.
+const SLEEP_LIN: f32 = 0.1;
+const SLEEP_ANG: f32 = 0.15;
+const SLEEP_TIME: f32 = 0.5;
+
 /// 측정 모드.
 ///
 /// **하나의 수치로 둘을 재면 안 된다**(리뷰 BLOCKER): 한쪽이 잠들고 다른 쪽이 깨어 있으면
@@ -55,13 +64,14 @@ mod maru_side {
             sleep_linear_threshold: if mode == Mode::Throughput {
                 0.0
             } else {
-                d.sleep_linear_threshold
+                SLEEP_LIN
             },
             sleep_angular_threshold: if mode == Mode::Throughput {
                 0.0
             } else {
-                d.sleep_angular_threshold
+                SLEEP_ANG
             },
+            time_to_sleep: SLEEP_TIME,
             ..d
         });
         w.add_body(Body::new_static(
@@ -153,15 +163,16 @@ mod maru_side {
             } else if thr > 0.0 {
                 thr
             } else {
-                d.sleep_linear_threshold
+                SLEEP_LIN
             },
             sleep_angular_threshold: if mode == Mode::Throughput {
                 0.0
             } else if thr > 0.0 {
                 thr * 1.25
             } else {
-                d.sleep_angular_threshold
+                SLEEP_ANG
             },
+            time_to_sleep: SLEEP_TIME,
             ..d
         });
         for (dx, dz, hx, hz) in [
@@ -322,6 +333,14 @@ mod rapier_side {
         }
     }
 
+    /// 빌더가 수면 임계를 노출하지 않으므로 삽입 뒤 직접 맞춘다.
+    fn match_sleep(s: &mut Sim, h: RigidBodyHandle) {
+        let a = s.bodies[h].activation_mut();
+        a.normalized_linear_threshold = SLEEP_LIN;
+        a.angular_threshold = SLEEP_ANG;
+        a.time_until_sleep = SLEEP_TIME;
+    }
+
     pub fn pyramid(mode: Mode, tiers: usize, steps: usize, warmup: usize) -> Result_ {
         let mut s = Sim::new();
         let can_sleep = mode == Mode::Settle;
@@ -342,6 +361,7 @@ mod rapier_side {
                         .translation(rapier3d::math::Vec3::new(x, y, 0.0))
                         .can_sleep(can_sleep),
                 );
+                match_sleep(&mut s, h);
                 s.colliders.insert_with_parent(
                     ColliderBuilder::cuboid(0.5, 0.5, 0.5).density(1.0),
                     h,
@@ -403,6 +423,7 @@ mod rapier_side {
                             .translation(rapier3d::math::Vec3::new(x, y, z))
                             .can_sleep(can_sleep),
                     );
+                    match_sleep(&mut s, h);
                     s.colliders.insert_with_parent(
                         ColliderBuilder::ball(0.5).density(1.0),
                         h,
