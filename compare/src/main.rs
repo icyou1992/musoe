@@ -67,6 +67,7 @@ mod maru_side {
         let t0 = Instant::now();
         let mut acc = [0u64; 4];
         let mut pairs_acc = 0usize;
+        let mut reused = 0usize;
         for _ in 0..steps {
             let _ = w.try_step(DT);
             let d = w.diagnostics();
@@ -74,6 +75,7 @@ mod maru_side {
                 acc[k] += d.phase_ns[k];
             }
             pairs_acc += d.pairs;
+            reused += d.bp_reused as usize;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
         eprintln!(
@@ -84,6 +86,7 @@ mod maru_side {
             acc[3] as f64 / 1000.0 / steps as f64,
             pairs_acc / steps
         );
+        eprintln!("    [maru bp 재사용] {reused}/{steps}");
 
         let (mut top, mut vmax, mut finite, mut asleep) = (f32::MIN, 0.0f32, true, 0usize);
         for h in &handles {

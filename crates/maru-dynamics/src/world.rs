@@ -106,6 +106,15 @@ pub struct World {
     diag: Diagnostics,
     /// 직전 스텝이 자원 예산으로 중단됐는가 (비캐노니컬 — 복원 시 초기화).
     resource_limit: bool,
+    /// 브로드페이즈 페어 캐시 (비캐노니컬 — 순수 파생). 설계 §4.1이 "페어 집합은 **트리
+    /// 비의존**"을 계약으로 두었으므로, 입력(자세·sweep·생존 집합)이 그대로면 재계산 결과가
+    /// 비트 동일하다 → **재사용은 근사가 아니라 항등**이다. 전원이 잠든 스택에서 매 스텝
+    /// 트리 두 개를 새로 짓던 비용이 사라진다(10단 실측: 브로드페이즈가 스텝의 39%였다).
+    bp_pairs: Vec<(u32, u32)>,
+    /// 캐시가 유효한가. 구조 변경·변이·적분이 있으면 무효화된다.
+    bp_valid: bool,
+    /// 캐시를 만들 때의 dt (sweep AABB가 dt에 비례하므로 바뀌면 무효).
+    bp_dt: f32,
     /// 솔버 핫패스 스크래치 (비캐노니컬). 매 스텝 재할당하지 않으려고 월드가 보관한다.
     solver_state: solver::SolverState,
     inv_inertia_local: Vec<Vec3>,
@@ -128,6 +137,8 @@ pub struct Diagnostics {
     /// 호스트가 직접 확인할 수 있어야 한다.
     pub pairs: usize,
     pub pair_budget: usize,
+    /// 이번 스텝이 브로드페이즈 캐시를 재사용했는가 (전원 수면 등 무변화 스텝).
+    pub bp_reused: bool,
     /// 단계별 소요 (ns) — 프로파일용. [broadphase, narrowphase, solve, bookkeeping]
     pub phase_ns: [u64; 4],
     /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
@@ -259,6 +270,9 @@ impl World {
             last_report: CommandReport::default(),
             diag: Diagnostics::default(),
             resource_limit: false,
+            bp_pairs: Vec::new(),
+            bp_valid: false,
+            bp_dt: 0.0,
             solver_state: solver::SolverState::default(),
             inv_inertia_local: Vec::new(),
             integrate_gate: Vec::new(),
@@ -274,12 +288,14 @@ impl World {
     /// 파라미터 교체 — 생성자와 **같은 불변식**을 통과해야 한다.
     pub fn set_params(&mut self, params: WorldParams) {
         validate_params(&params);
+        self.bp_valid = false;
         self.params = params;
     }
 
     /// 파라미터 교체 (오류 반환형).
     pub fn try_set_params(&mut self, params: WorldParams) -> Result<(), ApiError> {
         check_params(&params)?;
+        self.bp_valid = false;
         self.params = params;
         Ok(())
     }
@@ -330,6 +346,7 @@ impl World {
     /// 바디 추가. 빈 슬롯이 있으면 **최소 인덱스**를 재사용한다(이력 무관 canonical 배치).
     pub fn add_body(&mut self, body: Body) -> BodyHandle {
         body.validate().expect("invalid body");
+        self.bp_valid = false;
         if let Some(index) = self.free_slot() {
             self.bodies[index] = body;
             self.alive[index] = true;
@@ -389,6 +406,7 @@ impl World {
             }
         }
         // ② 구조 변경
+        self.bp_valid = false;
         self.alive[i] = false;
         self.reserved[i] = false;
         self.oob[i] = false;
@@ -422,6 +440,7 @@ impl World {
     /// 모든 변이는 유한성 검사 + wake + stale PCM 폐기를 거친다. static은 불변(설계 §9).
     fn mutate(&mut self, h: BodyHandle) -> Result<usize, ApiError> {
         let i = self.resolve(h)?;
+        self.bp_valid = false;
         if self.bodies[i].body_type == BodyType::Static {
             return Err(ApiError::ImmutableStatic);
         }
@@ -691,6 +710,7 @@ impl World {
             self.bodies[i].linvel = Vec3::ZERO;
             self.bodies[i].angvel = Vec3::ZERO;
             // `asleep`이 아니라 **별도 상태**다 — 자동 wake 경로에 걸리면 안 된다.
+            self.bp_valid = false;
             self.oob[i] = true;
             self.asleep[i] = false;
             self.sleep_timer[i] = 0.0;
@@ -882,6 +902,7 @@ impl World {
         // (stale `state_saturations`가 다음 `try_step`을 StateOverflow로 만들던 경로).
         self.diag = Diagnostics::default();
         self.resource_limit = false;
+        self.bp_valid = false;
     }
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
@@ -1029,7 +1050,6 @@ impl World {
             }
         }
         let _t_bp = std::time::Instant::now();
-        let bp = Broadphase::build(dyn_items, static_items);
         // 예산은 **살아있는 바디 수** 기준이다(슬롯 수가 아니라) + 절대 상한.
         let live = self.alive.iter().filter(|a| **a).count();
         let budget = (self.params.max_pairs_per_body as usize)
@@ -1037,9 +1057,18 @@ impl World {
             .saturating_add(1024)
             .min(maru_collide::MAX_PAIRS);
         self.diag.pair_budget = budget;
-        let Some(pairs) = bp.canonical_pairs_bounded(budget) else {
-            self.resource_limit = true;
-            return;
+        // **아무것도 움직이지 않았으면 트리를 다시 짓지 않는다.** 페어 집합은 트리 비의존
+        // 계약(설계 §4.1)이라 입력이 같으면 결과가 비트 동일하다 — 재사용은 항등이다.
+        let pairs = if self.bp_valid && self.bp_dt == dt {
+            self.diag.bp_reused = true;
+            std::mem::take(&mut self.bp_pairs)
+        } else {
+            let bp = Broadphase::build(dyn_items, static_items);
+            let Some(p) = bp.canonical_pairs_bounded(budget) else {
+                self.resource_limit = true;
+                return;
+            };
+            p
         };
         self.diag.pairs = pairs.len();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
@@ -1356,6 +1385,13 @@ impl World {
 
         st.write_back(&mut self.bodies, &self.alive);
         self.solver_state = st;
+
+        // 이번 스텝에 **적분된 바디가 하나도 없으면** 자세가 그대로이므로 페어 집합도 그대로다.
+        // (kinematic도 적분 대상이라 구동 중이면 자연히 무효화된다.)
+        let moved = self.integrate_gate.iter().any(|x| *x);
+        self.bp_pairs = pairs;
+        self.bp_valid = !moved;
+        self.bp_dt = dt;
 
         // 5) PCM 캐시 갱신. **잠든 페어의 엔트리는 보존**한다 — 전체 clear는 첫 수면 스텝에
         //    지속 매니폴드를 날려, 나중에 깨어날 때 warm start 없이 거칠게 재정착한다(리뷰 지적).
