@@ -144,12 +144,20 @@ pub struct SolverState {
 impl SolverState {
     /// 바디에서 상태를 **제자리로** 채운다. 매 스텝 새 Vec을 만들면 할당 비용이
     /// 솔버 이득을 먹는다(실측: SoA 전환이 되레 1.3ms 느려졌다) — 버퍼는 월드가 보관한다.
-    pub fn sync_from(&mut self, bodies: &[Body], alive: &[bool], oob: &[bool]) {
+    pub fn sync_from(
+        &mut self,
+        bodies: &[Body],
+        alive: &[bool],
+        oob: &[bool],
+    ) -> Result<(), crate::world::ApiError> {
         let n = bodies.len();
+        // **암묵 재할당 금지**: 예산 안이라도 wasm 가용 메모리가 모자라면 `reserve`는
+        // abort가 된다. 실패는 오류로 전파한다.
         macro_rules! fit {
             ($v:expr, $d:expr) => {
                 $v.clear();
-                $v.reserve(n);
+                $v.try_reserve(n)
+                    .map_err(|_| crate::world::ApiError::ResourceLimit)?;
                 $v.resize(n, $d);
             };
         }
@@ -172,6 +180,7 @@ impl SolverState {
             self.inv_m[i] = if active { b.inv_mass } else { 0.0 };
             self.dynamic[i] = active && b.is_dynamic();
         }
+        Ok(())
     }
 
     /// 솔버 결과를 바디로 되쓴다 (스텝당 1회 — 핫패스 밖).

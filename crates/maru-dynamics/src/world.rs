@@ -156,6 +156,14 @@ pub struct Diagnostics {
 
 pub use maru_collide::{MAX_DT, MIN_DT};
 
+/// 한 스텝이 잡을 수 있는 **총 스크래치 바이트** 상한.
+///
+/// 페어 **개수** 예산만으로는 부족하다: 페어 뒤에 constraint·키·HashSet·SoA가 따라붙어
+/// 실제 메모리는 개수의 몇 배가 된다(리뷰 BLOCKER). 바이트로 상한을 정하고 그것으로
+/// 페어 상한을 되돌려 계산하면, 어떤 입력이 와도 한 스텝의 스크래치가 이 값을 넘지 않는다.
+/// 128MiB는 wasm 기본 힙에서 여유 있게 실패를 오류로 표현할 수 있는 크기다.
+pub const MAX_STEP_SCRATCH_BYTES: usize = 128 << 20;
+
 /// 파라미터 불변식 — **오류 반환형이 정본**이다(리뷰 PARTIAL BLOCKER: 호스트가 넘긴
 /// 파라미터로 wasm 모듈을 trap시키면 안 된다). 패닉 버전은 이것을 감싼 편의 함수다.
 ///
@@ -1110,12 +1118,20 @@ impl World {
             }
         }
         let _t_bp = std::time::Instant::now();
-        // 예산은 **살아있는 바디 수** 기준이다(슬롯 수가 아니라) + 절대 상한.
+        // 예산은 **살아있는 바디 수** 기준(슬롯 수가 아니라) + 절대 개수 상한 + **바이트 상한**.
+        // 개수만 묶으면 페어 뒤에 따라붙는 constraint·키·HashSet·SoA가 남는다 —
+        // 한 스텝이 잡을 수 있는 총 바이트를 정해 그것으로 페어 상한을 되돌려 계산한다.
         let live = self.alive.iter().filter(|a| **a).count();
+        let per_pair_bytes = core::mem::size_of::<(u32, u32)>()          // pairs
+            + core::mem::size_of::<ContactConstraint>()                  // constraints
+            + core::mem::size_of::<(u32, u32)>()                         // constraint_keys
+            + 48; // live_keys(HashSet) + PCM 엔트리 여유
+        let byte_cap = MAX_STEP_SCRATCH_BYTES / per_pair_bytes.max(1);
         let budget = (self.params.max_pairs_per_body as usize)
             .saturating_mul(live)
             .saturating_add(1024)
-            .min(maru_collide::MAX_PAIRS);
+            .min(maru_collide::MAX_PAIRS)
+            .min(byte_cap);
         self.diag.pair_budget = budget;
         // **아무것도 움직이지 않았으면 트리를 다시 짓지 않는다.** 페어 집합은 트리 비의존
         // 계약(설계 §4.1)이라 입력이 같으면 결과가 비트 동일하다 — 재사용은 항등이다.
@@ -1132,15 +1148,20 @@ impl World {
         };
         self.diag.pairs = pairs.len();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
-        let excluded: std::collections::HashSet<(u32, u32)> = self
-            .joints
-            .iter()
-            .filter(|j| !j.collide_connected)
-            .map(|j| {
-                let (a, b) = (j.ia() as u32, j.ib() as u32);
-                (a.min(b), a.max(b))
-            })
-            .collect();
+        let mut excluded: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        if excluded.try_reserve(self.joints.len()).is_err() {
+            self.resource_limit = true;
+            return;
+        }
+        excluded.extend(
+            self.joints
+                .iter()
+                .filter(|j| !j.collide_connected)
+                .map(|j| {
+                    let (a, b) = (j.ia() as u32, j.ib() as u32);
+                    (a.min(b), a.max(b))
+                }),
+        );
 
         // 1.5) **wake 폐쇄를 제약 생성보다 먼저 끝낸다** (리뷰 MAJOR).
         // 조인트 edge와 접촉 edge를 **번갈아 닫힐 때까지** 돌린다: 조인트로 깨어난 바디가
@@ -1239,10 +1260,24 @@ impl World {
         let _t_np = std::time::Instant::now();
         // 2) 내로우페이즈 → 제약 준비 (A=첫 인덱스, B=둘째 — canonical 순서가 곧 해석 순서)
         //    PCM 캐시에서 feature 일치 접점의 임펄스를 warm load (설계 §3)
+        // 제약 컨테이너도 페어 수 기준으로 **미리 fallible 예약**한다 — 접촉 페어마다
+        // 암묵 성장이 일어나면 그 재할당이 abort가 된다.
         let mut constraints: Vec<ContactConstraint> = Vec::new();
         let mut constraint_keys: Vec<(u32, u32)> = Vec::new();
+        if constraints.try_reserve(pairs.len()).is_err()
+            || constraint_keys.try_reserve(pairs.len()).is_err()
+        {
+            self.bp_pairs = pairs;
+            self.resource_limit = true;
+            return;
+        }
         let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
         let mut live_keys: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+        if live_keys.try_reserve(pairs.len()).is_err() {
+            self.bp_pairs = pairs;
+            self.resource_limit = true;
+            return;
+        }
         for &(a_id, b_raw) in &pairs {
             let key = (a_id, b_raw);
             let is_static_pair = b_raw & STATIC_BIT != 0;
@@ -1332,15 +1367,29 @@ impl World {
         // 뽑아 돌리고 루프가 끝난 뒤 한 번만 되쓴다.
         let n_bodies = self.bodies.len();
         let mut st = std::mem::take(&mut self.solver_state);
-        st.sync_from(&self.bodies, &self.alive, &self.oob);
+        if st.sync_from(&self.bodies, &self.alive, &self.oob).is_err() {
+            self.solver_state = st;
+            self.resource_limit = true;
+            return;
+        }
         let inv_i_local = &mut self.inv_inertia_local;
         inv_i_local.clear();
+        if inv_i_local.try_reserve(n_bodies).is_err() {
+            self.solver_state = st;
+            self.resource_limit = true;
+            return;
+        }
         inv_i_local.extend(self.bodies.iter().map(|b| b.inv_inertia_local));
         // 적분 대상 게이트도 스크래치에 재사용한다(루프에서 매번 판정하지 않는다).
         let integrate = &mut self.integrate_gate;
         let gravity_on = &mut self.gravity_gate;
         integrate.clear();
         gravity_on.clear();
+        if integrate.try_reserve(n_bodies).is_err() || gravity_on.try_reserve(n_bodies).is_err() {
+            self.solver_state = st;
+            self.resource_limit = true;
+            return;
+        }
         for i in 0..n_bodies {
             let ok = self.alive[i]
                 && self.bodies[i].body_type != BodyType::Static
@@ -1488,7 +1537,12 @@ impl World {
         // 6) 아일랜드 union-find (동적-동적 edge만 — static은 anchor 전용, 설계 §4.3)
         //    + island 단위 일괄 sleep (설계 §4.6)
         let n = self.bodies.len();
-        let mut parent: Vec<usize> = (0..n).collect();
+        let mut parent: Vec<usize> = Vec::new();
+        if parent.try_reserve(n).is_err() {
+            self.resource_limit = true;
+            return;
+        }
+        parent.extend(0..n);
         fn find(parent: &mut [usize], mut x: usize) -> usize {
             while parent[x] != x {
                 parent[x] = parent[parent[x]]; // 경로 압축

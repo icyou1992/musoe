@@ -2994,9 +2994,9 @@ mod tests {
     /// SAT 보조 키는 **부호 불변**이어야 A/B 교환에 대칭이다(signed 사전식은 `n → -n`에서
     /// 대소 순서가 보존되지 않아 다른 축을 고른다).
     ///
-    /// **범위 주의**: 이 테스트는 `|d·n|`이 유의미한 **일반 구성**을 잠근다.
-    /// `d·n ≈ 0`(거의 동심 + 법선이 중심 방향에 수직)은 방향 규칙 자체가 교환에서 뒤집히지
-    /// 않는 **미해결 퇴화**다 — manifold.rs의 `oriented` 주석 참조. 그 층은 아직 못 고쳤다.
+    /// 일반 구성(`|d·n|`이 유의미)과 **퇴화 구성**(거의 동심 + 수직 법선)을 함께 잠근다.
+    /// 퇴화에서는 `d`가 방향을 못 정하므로 **바디 자체 데이터**(치수·자세)로 만든
+    /// 교환 반대칭 키가 방향을 정한다 — manifold.rs의 `oriented` 주석 참조.
     #[test]
     fn sat_tie_break_symmetric_for_rotated_boxes() {
         let half = Vec3::new(0.5, 0.5, 0.5);
@@ -3022,13 +3022,54 @@ mod tests {
             }
             (w.body(a).pose().pos, w.body(b).pose().pos)
         };
-        // 근소 동률이지만 `|d·n|`은 유의미한 구성 — 보조 키가 개입하면서 방향은 결정된다
-        let (pa, pb) = (Vec3::ZERO, Vec3::new(0.62, 0.31, 0.44));
-        let (a1, b1) = mk(pa, rot_a, pb, rot_b);
-        let (b2, a2) = mk(pb, rot_b, pa, rot_a);
+        for (label, pa, pb) in [
+            // 일반 구성
+            ("일반", Vec3::ZERO, Vec3::new(0.62, 0.31, 0.44)),
+            // **퇴화**: 거의 동심 → 정렬 키가 전부 0이고 d가 방향을 못 정한다
+            ("퇴화(동심)", Vec3::ZERO, Vec3::new(0.02, 0.01, 0.0)),
+            // **퇴화**: 완전 동심
+            ("퇴화(완전동심)", Vec3::ZERO, Vec3::ZERO),
+        ] {
+            let (a1, b1) = mk(pa, rot_a, pb, rot_b);
+            let (b2, a2) = mk(pb, rot_b, pa, rot_a);
+            assert!(
+                (a1 - a2).length() < 1e-3 && (b1 - b2).length() < 1e-3,
+                "{label}: 삽입 순서에 따라 결과가 다르다: {a1:?}/{a2:?}, {b1:?}/{b2:?}"
+            );
+        }
+    }
+
+    /// 미해결이었던 **전 단계 fallible 바이트 예산**: 페어 개수만 묶으면 뒤따르는
+    /// constraint·키·HashSet·SoA가 남는다. 총 바이트로 상한을 정하고 그것으로 페어 상한을
+    /// 되돌려 계산하므로, 어떤 입력이 와도 한 스텝 스크래치가 상한을 넘지 않는다.
+    #[test]
+    fn step_scratch_is_byte_budgeted_and_fallible() {
+        // 계수형 예산을 최대로 열어도 **바이트 상한**이 페어를 묶는다
+        let mut w = World::new(WorldParams {
+            max_pairs_per_body: 4096,
+            ..Default::default()
+        });
+        for _ in 0..300 {
+            w.add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.5 },
+                pose(0.0, 1.0, 0.0), // 전부 같은 자리 → 최대 밀집
+                1.0,
+            ));
+        }
+        let r = w.try_step(DT);
+        // 성공하든 ResourceLimit이든 **trap이 아니라 값으로** 돌아와야 한다
         assert!(
-            (a1 - a2).length() < 1e-3 && (b1 - b2).length() < 1e-3,
-            "회전 박스 삽입 순서에 따라 결과가 다르다: {a1:?}/{a2:?}, {b1:?}/{b2:?}"
+            r.is_ok() || r == Err(ApiError::ResourceLimit),
+            "예상 밖 오류: {r:?}"
         );
+        let d = w.diagnostics();
+        let per_pair = core::mem::size_of::<(u32, u32)>() * 2 + 48;
+        assert!(
+            d.pair_budget.saturating_mul(per_pair) <= crate::world::MAX_STEP_SCRATCH_BYTES * 2,
+            "페어 예산이 바이트 상한과 무관하다: {} 페어",
+            d.pair_budget
+        );
+        // 상태는 손상되지 않고 스냅샷도 유효하다
+        assert!(w.restore(&w.snapshot()).is_ok());
     }
 }

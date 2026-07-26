@@ -54,16 +54,21 @@ impl Broadphase {
         // 예산 자체를 **절대 상한**으로 한 번 더 자른다: 계수형 예산은 메모리 예산이 아니다
         // (계수 4096 × 5000 바디 = 2천만 페어가 "예산 안"이지만 벡터만 160MB다).
         let budget = budget.min(MAX_PAIRS);
+        // **예산 전체를 미리 fallible로 잡는다**. 일부만 잡고 나머지를 `push`의 암묵
+        // 재할당에 맡기면 그 재할당이 abort/trap이 된다 — 오류 ABI가 거기서 깨진다.
+        // 예산은 이미 MAX_PAIRS(1M = 8MB)로 묶여 있으므로 선점 비용도 유계다.
         let mut pairs: Vec<(u32, u32)> = Vec::new();
-        // 재할당 중 abort를 피하려면 **미리 fallible로 잡는다**. 예산에서 멈추므로
-        // 이 용량을 넘길 일이 없다.
-        pairs.try_reserve_exact(budget.min(1 << 16)).ok()?;
+        pairs.try_reserve_exact(budget).ok()?;
         let mut cand: Vec<u32> = Vec::new();
 
-        let static_lookup: std::collections::HashMap<u32, Aabb> =
-            self.static_items.iter().copied().collect();
-        let dyn_lookup: std::collections::HashMap<u32, Aabb> =
-            self.dynamic_items.iter().copied().collect();
+        // lookup 맵도 fallible로 잡는다(암묵 성장 금지).
+        let mut static_lookup: std::collections::HashMap<u32, Aabb> =
+            std::collections::HashMap::new();
+        static_lookup.try_reserve(self.static_items.len()).ok()?;
+        static_lookup.extend(self.static_items.iter().copied());
+        let mut dyn_lookup: std::collections::HashMap<u32, Aabb> = std::collections::HashMap::new();
+        dyn_lookup.try_reserve(self.dynamic_items.len()).ok()?;
+        dyn_lookup.extend(self.dynamic_items.iter().copied());
 
         for &(id, aabb) in &self.dynamic_items {
             // 동적-동적 (self-pair 제거, canonical (min,max)로 절반만 채택해 중복 원천 차단)

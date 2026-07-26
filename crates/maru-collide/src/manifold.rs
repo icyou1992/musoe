@@ -202,12 +202,38 @@ fn box_box_axis(
     let (mut edge_sep, mut edge_axis) = (f32::NEG_INFINITY, Vec3::ZERO);
     // 방향 규칙: A를 +normal로 밀면 분리된다.
     //
-    // **알려진 한계(미해결)**: `d·n ≈ 0`(법선이 중심 방향에 수직)이면 이 규칙이 A/B 교환에서
-    // 뒤집히지 않는다 — 두 경우 모두 `-n`을 준다. 거의 동심이면서 법선이 수직인 구성은
-    // 물리적으로 방향이 결정되지 않는 퇴화이고, 소유자와 무관하면서 교환에 반전하는 키를
-    // 만들려면 `d` 말고 다른 비대칭 원천이 필요한데 그런 것이 없다(바디 인덱스는 월드마다
-    // 다르므로 소유자 의존이다). 일반 구성(`|d·n|`이 유의미)에서는 대칭이 성립한다.
-    let oriented = |n: Vec3| if d.dot(n) < 0.0 { n } else { -n };
+    // `d·n ≈ 0`(법선이 중심 방향에 수직)이면 `d`만으로는 방향이 정해지지 않고, 그대로 두면
+    // A/B 교환에서 부호가 뒤집히지 않아 물리가 삽입 순서에 의존한다.
+    // **비대칭 원천은 바디 자체의 데이터**다 — 교환하면 두 바디의 (치수, 자세) 역할이
+    // 뒤바뀌므로, 그것으로 만든 스칼라 키의 대소가 뒤집힌다. 인덱스(월드마다 다름)가 아니라
+    // 형상·자세에서 뽑으므로 소유자 무관이면서 교환 반대칭이다.
+    // 두 키가 정확히 같은 경우는 구성 자체가 교환 대칭이므로 어느 쪽을 골라도 동등하다.
+    let body_key =
+        |h: Vec3, p: &Pose| -> [f32; 7] { [h.x, h.y, h.z, p.rot.x, p.rot.y, p.rot.z, p.rot.w] };
+    let (ka, kb) = (body_key(ha, pa), body_key(hb, pb));
+    let tie_sign = {
+        let mut s = 1.0f32;
+        for i in 0..7 {
+            if ka[i] != kb[i] {
+                s = if ka[i] > kb[i] { 1.0 } else { -1.0 };
+                break;
+            }
+        }
+        s
+    };
+    let orient_tie = ALIGN_TIE_REL * ca.length().min(cb.length()).max(1.0e-6);
+    let oriented = |n: Vec3| {
+        let dn = d.dot(n);
+        if dn.abs() > orient_tie {
+            if dn < 0.0 {
+                n
+            } else {
+                -n
+            }
+        } else {
+            n * tie_sign
+        }
+    };
 
     for a in axes_a.iter() {
         let sep = d.dot(*a).abs() - extent(&axes_a, ca, *a) - extent(&axes_b, cb, *a);
