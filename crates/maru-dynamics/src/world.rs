@@ -573,6 +573,16 @@ impl World {
                 let p = *vertices.get(i as usize).ok_or(ApiError::InvalidValue)?;
                 pts.push(p);
             }
+            // **퇴화 검사 — 스케일 상대 면적**(교차검수 rev_e4075e85 MAJOR): 3점 hull의
+            // 회전 불변 폭은 0이라 radius만으로 validate를 통과한다 — 동일/일직선 정점이
+            // "둥근 점/선분 장애물"로 조용히 들어가 메시 오류가 유령 충돌이 된다.
+            // cross 길이는 L² 차원이므로 최장 에지²에 상대 비교한다(절대 상수 금지).
+            let e0 = pts[1] - pts[0];
+            let e1 = pts[2] - pts[0];
+            let scale = e0.length().max(e1.length()).max((pts[2] - pts[1]).length());
+            if e0.cross(e1).length() <= 1e-6 * scale * scale {
+                return Err(ApiError::InvalidValue);
+            }
             // 삼각형 중심을 바디 원점으로 — hull 점이 원점 근처라 앵커·톨러런스 스케일이 정직해진다.
             let c = (pts[0] + pts[1] + pts[2]) * (1.0 / 3.0);
             let local: Vec<Vec3> = pts.iter().map(|p| *p - c).collect();
@@ -2620,8 +2630,10 @@ impl World {
             .iter()
             .copied()
             .filter(|&i| {
-                let i = i as usize;
-                self.bodies[i].ccd && self.bodies[i].body_type == BodyType::Dynamic
+                let b = &self.bodies[i as usize];
+                // 센서는 절대 위치 절단 대상이 아니다(교차검수 rev_e4075e85 MAJOR) —
+                // "이벤트만 내고 밀지 않는다" 계약과 정반대가 된다. swept trigger는 미래 확장.
+                b.ccd && b.body_type == BodyType::Dynamic && !b.sensor
             })
             .collect();
         let mut ccd_index: Vec<u32> = Vec::new();

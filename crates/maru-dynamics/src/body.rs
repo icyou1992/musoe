@@ -136,6 +136,10 @@ impl Body {
     }
     /// 충돌 그룹을 바꾼 사본.
     /// CCD(linear cast) 켜기 — 고속 소형 dynamic 바디용. static 대상 관통만 막는다.
+    ///
+    /// **명시 한계 (설계 §4 CCD v0.5 = linear cast)**: 캐스트는 **선형 이동만** 본다.
+    /// 각속도만으로 끝점이 큰 호를 그리는 긴 바디(회전 막대 등)의 회전 관통은 범위 밖이다
+    /// — 회전 포함 보수적 전진은 예약 확장. 고속 회전 장형 바디에는 CCD를 기대하지 마라.
     pub fn with_ccd(mut self) -> Self {
         self.ccd = true;
         self

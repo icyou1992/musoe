@@ -5131,4 +5131,53 @@ mod tests {
         assert!(w.try_add_terrain(&verts, &[[0, 1, 3]], 0.0).is_err());
         let _ = n_before;
     }
+
+    /// 회귀(rev_e4075e85): 센서+CCD 바디는 벽에 물리적으로 멈추면 안 된다 — 센서 계약.
+    #[test]
+    fn sensor_with_ccd_is_not_clamped_by_walls() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.05, 5.0, 5.0),
+                radius: 0.0,
+            },
+            pose(10.0, 0.0, 0.0),
+        ));
+        let s = w.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(0.0, 0.0, 0.0), 1.0)
+                .as_sensor(true)
+                .with_ccd(),
+        );
+        w.set_linear_velocity(s, Vec3::new(400.0, 0.0, 0.0))
+            .unwrap();
+        for _ in 0..10 {
+            w.step(DT);
+        }
+        assert!(
+            w.body(s).pose().pos.x > 11.0,
+            "센서가 CCD에 막혔다: x={}",
+            w.body(s).pose().pos.x
+        );
+    }
+
+    /// 회귀(rev_e4075e85): 퇴화 삼각형(동일점·일직선)은 지형에서 전체 거부된다.
+    #[test]
+    fn terrain_rejects_degenerate_triangles() {
+        let mut w = World::new(WorldParams::default());
+        let v = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0), // 0-1-2 일직선
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        assert!(w.try_add_terrain(&v, &[[0, 0, 0]], 0.02).is_err(), "동일점");
+        assert!(w.try_add_terrain(&v, &[[0, 1, 2]], 0.02).is_err(), "일직선");
+        assert!(
+            w.try_add_terrain(&v, &[[0, 1, 3]], 0.02).is_ok(),
+            "정상 거부 오탐"
+        );
+    }
 }

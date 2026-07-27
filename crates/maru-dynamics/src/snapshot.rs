@@ -297,7 +297,7 @@ fn write_shape(w: &mut Writer, s: &Shape) {
     }
 }
 
-fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
+fn read_shape(r: &mut Reader, allow_compound: bool) -> Result<Shape, SnapshotError> {
     let shape = match r.u8()? {
         0 => Shape::Sphere { radius: r.f32()? },
         1 => Shape::Capsule {
@@ -321,6 +321,14 @@ fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
             }
         }
         4 => {
+            // **재귀 전에 깊이를 자른다**(교차검수 rev_e4075e85 BLOCKER): 자식을 읽고 나서
+            // compound인지 검사하면, 수천 단계 중첩 체인(~30바이트/단계)이 BadShape에
+            // 닿기 전에 호출 스택을 고갈시켜 trap이 된다 — 신뢰하지 않는 입력의 실패는
+            // 오류지 런타임 종료가 아니어야 한다. allow_compound=false 재귀는 태그 4를
+            // 즉시 거부하므로 깊이 1을 구조적으로 강제한다.
+            if !allow_compound {
+                return Err(SnapshotError::BadShape);
+            }
             // 자식 수는 u8 + validate 상한(8)로 이중 유계. 자식 셰이프는 재귀 읽기 —
             // 중첩 compound 바이트는 아래 validate가 거부한다(읽기 자체는 깊이 1에서
             // 태그 4를 다시 만나도 count 예산이 파일 크기로 묶여 폭주하지 않는다).
@@ -335,10 +343,7 @@ fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
             for _ in 0..n {
                 let pos = r.vec3()?;
                 let rot = r.quat()?;
-                let child = read_shape(r)?;
-                if matches!(child, Shape::Compound { .. }) {
-                    return Err(SnapshotError::BadShape);
-                }
+                let child = read_shape(r, false)?;
                 children.push((Pose { pos, rot }, child));
             }
             Shape::Compound { children }
@@ -462,7 +467,7 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
     };
     let linear_damping = r.f32()?;
     let angular_damping = r.f32()?;
-    let shape = read_shape(r)?;
+    let shape = read_shape(r, true)?;
     let b = Body {
         body_type,
         pose,
