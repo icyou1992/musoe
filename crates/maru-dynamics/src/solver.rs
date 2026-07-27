@@ -7,7 +7,8 @@
 
 use crate::body::Body;
 use maru_collide::Manifold;
-use maru_math::{Mat3, Quat, Vec3};
+use maru_math::{Mat3, Mat3x4, Quat, Vec3, Vec3x4};
+use wide::{f32x4, CmpGt};
 
 pub struct SolverParams {
     pub contact_hertz: f32,
@@ -136,7 +137,7 @@ fn effective_mass(
 /// 무작위 접근하게 된다. 실제로 점당 73ns가 나왔는데 산술은 40 flops 남짓이었다 —
 /// 비용은 계산이 아니라 **메모리**였다. 솔버가 실제로 읽고 쓰는 6개 배열만 뽑아
 /// 연속 메모리에 두고, 서브스텝 루프가 끝난 뒤 한 번만 바디로 되쓴다.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SolverState {
     pub lin: Vec<Vec3>,
     pub ang: Vec<Vec3>,
@@ -460,6 +461,201 @@ pub fn warm_start(st: &mut SolverState, c: &ContactConstraint) {
     bb.store(st, c.b);
 }
 
+// ===== SIMD 배치 (Unit 3 — 설계 §5) =====
+//
+// 같은 색의 4제약을 레인에 실어 warm_start/solve를 4-wide로 돈다. 같은 색은 공유 dynamic 바디가
+// 없으므로 레인이 서로 독립 — 스캐터 충돌이 없다(static/kinematic만 겹칠 수 있고 그건 write 대상
+// 아님). 게더/스캐터는 스칼라(WASM gather 명령 없음, 설계 §3 정직한 범위).
+//
+// **비트 동일 규율**: 레인당 연산 순서를 스칼라와 동일하게 유지하고(비FMA), 게이트(dynamic·
+// 점 존재)는 산술 마스킹이 아니라 **blend**로 한다 — `x + 0.0`이 `-0.0`을 `+0.0`으로 뒤집어
+// state hash를 가르기 때문. blend는 게이트 off 레인의 원본 값을 비트 그대로 보존한다.
+
+/// Vec3x4 → 레인별 Vec3 4개 (스캐터용).
+#[inline]
+#[allow(dead_code)] // 슬라이스 3b(서브스텝 루프 배선) 전까지 스테이징 — 격리 테스트로 검증됨
+fn vec3x4_lanes(v: Vec3x4) -> [Vec3; 4] {
+    let (x, y, z) = (v.x.to_array(), v.y.to_array(), v.z.to_array());
+    [
+        Vec3::new(x[0], y[0], z[0]),
+        Vec3::new(x[1], y[1], z[1]),
+        Vec3::new(x[2], y[2], z[2]),
+        Vec3::new(x[3], y[3], z[3]),
+    ]
+}
+
+#[inline]
+#[allow(dead_code)]
+fn negx4(v: Vec3x4) -> Vec3x4 {
+    Vec3x4 {
+        x: -v.x,
+        y: -v.y,
+        z: -v.z,
+    }
+}
+
+/// 레인별 blend: gate 마스크가 참인 레인은 `t`, 아니면 `f`(원본 보존).
+#[inline]
+#[allow(dead_code)]
+fn blend_vec(gate: f32x4, t: Vec3x4, f: Vec3x4) -> Vec3x4 {
+    Vec3x4 {
+        x: gate.blend(t.x, f.x),
+        y: gate.blend(t.y, f.y),
+        z: gate.blend(t.z, f.z),
+    }
+}
+
+/// 4제약 배치의 바디 상태 (SoA 레인) — 스칼라 `BodyReg`의 4-wide 대응.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct BodyRegx4 {
+    lin: Vec3x4,
+    ang: Vec3x4,
+    inv_m: f32x4,
+    inv_i: Mat3x4,
+    /// dynamic 게이트 마스크 (레인당 all-1s/0). 비-dynamic 레인은 write 안 됨.
+    dyn_mask: f32x4,
+}
+
+#[allow(dead_code)]
+impl BodyRegx4 {
+    #[inline]
+    fn load(st: &SolverState, idx: [usize; 4]) -> Self {
+        Self {
+            lin: Vec3x4::from_array([
+                st.lin[idx[0]],
+                st.lin[idx[1]],
+                st.lin[idx[2]],
+                st.lin[idx[3]],
+            ]),
+            ang: Vec3x4::from_array([
+                st.ang[idx[0]],
+                st.ang[idx[1]],
+                st.ang[idx[2]],
+                st.ang[idx[3]],
+            ]),
+            inv_m: f32x4::from([
+                st.inv_m[idx[0]],
+                st.inv_m[idx[1]],
+                st.inv_m[idx[2]],
+                st.inv_m[idx[3]],
+            ]),
+            inv_i: Mat3x4::from_array([
+                st.inv_i[idx[0]],
+                st.inv_i[idx[1]],
+                st.inv_i[idx[2]],
+                st.inv_i[idx[3]],
+            ]),
+            dyn_mask: f32x4::from([
+                st.dynamic[idx[0]] as u32 as f32,
+                st.dynamic[idx[1]] as u32 as f32,
+                st.dynamic[idx[2]] as u32 as f32,
+                st.dynamic[idx[3]] as u32 as f32,
+            ])
+            .cmp_gt(f32x4::splat(0.5)),
+        }
+    }
+
+    /// dynamic·active 레인에만 임펄스 적용 (스칼라 `BodyReg::apply`의 4-wide, blend 게이트).
+    /// `active` = 점 존재 마스크. 순서·연산은 스칼라와 동일 → 레인당 비트 동일.
+    #[inline]
+    fn apply(&mut self, imp: Vec3x4, r: Vec3x4, active: f32x4) {
+        let gate = self.dyn_mask & active;
+        let new_lin = self.lin + imp.scale(self.inv_m);
+        let new_ang = self.ang + self.inv_i.mul_vec(r.cross(imp));
+        self.lin = blend_vec(gate, new_lin, self.lin);
+        self.ang = blend_vec(gate, new_ang, self.ang);
+    }
+
+    /// dynamic 레인만 바디로 되쓴다 (스칼라 `store`와 동일 게이트 — 비-dynamic은 불변).
+    #[inline]
+    fn store(&self, st: &mut SolverState, idx: [usize; 4]) {
+        let (lin, ang) = (vec3x4_lanes(self.lin), vec3x4_lanes(self.ang));
+        for k in 0..4 {
+            if st.dynamic[idx[k]] {
+                st.lin[idx[k]] = lin[k];
+                st.ang[idx[k]] = ang[k];
+            }
+        }
+    }
+}
+
+/// warm start의 4제약 배치판. 레인당 결과는 스칼라 `warm_start`와 **비트 동일**하다
+/// (연산 순서 동일·비FMA·게이트 blend). 점 수가 다른 레인은 없는 점을 0/ZERO로 채우되,
+/// blend `active` 마스크로 걸러 그 레인 값을 건드리지 않는다.
+#[allow(dead_code)] // 슬라이스 3b에서 서브스텝 루프에 색 배치로 배선 예정
+pub fn warm_start_x4(st: &mut SolverState, cs: [&ContactConstraint; 4]) {
+    let a_idx = [cs[0].a, cs[1].a, cs[2].a, cs[3].a];
+    let b_idx = [cs[0].b, cs[1].b, cs[2].b, cs[3].b];
+    let mut ba = BodyRegx4::load(st, a_idx);
+    let mut bb = BodyRegx4::load(st, b_idx);
+    let normal = Vec3x4::from_array([cs[0].normal, cs[1].normal, cs[2].normal, cs[3].normal]);
+    let t0 = Vec3x4::from_array([
+        cs[0].tangents[0],
+        cs[1].tangents[0],
+        cs[2].tangents[0],
+        cs[3].tangents[0],
+    ]);
+    let t1 = Vec3x4::from_array([
+        cs[0].tangents[1],
+        cs[1].tangents[1],
+        cs[2].tangents[1],
+        cs[3].tangents[1],
+    ]);
+    let maxpts = cs.iter().map(|c| c.points.len()).max().unwrap_or(0);
+    for k in 0..maxpts {
+        let p = [
+            cs[0].points.get(k),
+            cs[1].points.get(k),
+            cs[2].points.get(k),
+            cs[3].points.get(k),
+        ];
+        let ni = f32x4::from([
+            p[0].map_or(0.0, |q| q.normal_impulse),
+            p[1].map_or(0.0, |q| q.normal_impulse),
+            p[2].map_or(0.0, |q| q.normal_impulse),
+            p[3].map_or(0.0, |q| q.normal_impulse),
+        ]);
+        let ti0 = f32x4::from([
+            p[0].map_or(0.0, |q| q.tangent_impulse[0]),
+            p[1].map_or(0.0, |q| q.tangent_impulse[0]),
+            p[2].map_or(0.0, |q| q.tangent_impulse[0]),
+            p[3].map_or(0.0, |q| q.tangent_impulse[0]),
+        ]);
+        let ti1 = f32x4::from([
+            p[0].map_or(0.0, |q| q.tangent_impulse[1]),
+            p[1].map_or(0.0, |q| q.tangent_impulse[1]),
+            p[2].map_or(0.0, |q| q.tangent_impulse[1]),
+            p[3].map_or(0.0, |q| q.tangent_impulse[1]),
+        ]);
+        let ra = Vec3x4::from_array([
+            p[0].map_or(Vec3::ZERO, |q| q.ra),
+            p[1].map_or(Vec3::ZERO, |q| q.ra),
+            p[2].map_or(Vec3::ZERO, |q| q.ra),
+            p[3].map_or(Vec3::ZERO, |q| q.ra),
+        ]);
+        let rb = Vec3x4::from_array([
+            p[0].map_or(Vec3::ZERO, |q| q.rb),
+            p[1].map_or(Vec3::ZERO, |q| q.rb),
+            p[2].map_or(Vec3::ZERO, |q| q.rb),
+            p[3].map_or(Vec3::ZERO, |q| q.rb),
+        ]);
+        let has = f32x4::from([
+            p[0].is_some() as u32 as f32,
+            p[1].is_some() as u32 as f32,
+            p[2].is_some() as u32 as f32,
+            p[3].is_some() as u32 as f32,
+        ])
+        .cmp_gt(f32x4::splat(0.5));
+        // imp = normal*ni + t0*ti0 + t1*ti1 (스칼라와 동일 좌→우 순서)
+        let imp = normal.scale(ni) + t0.scale(ti0) + t1.scale(ti1);
+        ba.apply(imp, ra, has);
+        bb.apply(negx4(imp), rb, has);
+    }
+    ba.store(st, a_idx);
+    bb.store(st, b_idx);
+}
+
 /// 속도 임펄스 해석. `soft`=bias 페이즈, `relax`(soft=None)=bias 제거 페이즈.
 pub fn solve(
     st: &mut SolverState,
@@ -781,6 +977,118 @@ mod tests {
         assert_eq!(out.iter().filter(|&&c| c == COLOR_OVERFLOW).count(), 2);
         // 오버플로를 스킵하므로 합법 충돌을 오판하지 않는다.
         assert_conflict_free(&endpoints, &conflict, &out);
+    }
+
+    // --- Unit 3: SIMD warm_start 비트 동일성 ---
+    #[allow(clippy::field_reassign_with_default)]
+    fn mk_state(n: usize) -> SolverState {
+        let mut st = SolverState::default();
+        st.lin = (0..n)
+            .map(|i| Vec3::new(i as f32 * 0.13, -(i as f32) * 0.07, 0.31))
+            .collect();
+        st.ang = (0..n)
+            .map(|i| Vec3::new(0.021 * i as f32, -0.04, -0.011 * i as f32))
+            .collect();
+        st.pos = vec![Vec3::ZERO; n];
+        st.rot = vec![Quat::IDENTITY; n];
+        st.inv_m = (0..n).map(|i| 0.5 + 0.1 * i as f32).collect();
+        st.inv_i = (0..n)
+            .map(|i| {
+                Mat3::from_diagonal(Vec3::new(1.0 + 0.1 * i as f32, 2.0, 0.5 + 0.05 * i as f32))
+            })
+            .collect();
+        st.dynamic = vec![true; n];
+        st
+    }
+
+    fn mk_point(seed: f32) -> ContactPointConstraint {
+        ContactPointConstraint {
+            feature: FeatureId(FEATURE_GENERIC),
+            position: Vec3::ZERO,
+            anchor_a: Vec3::ZERO,
+            anchor_b: Vec3::ZERO,
+            base_separation: 0.0,
+            normal_mass: 1.0,
+            tangent_mass: [1.0, 1.0],
+            normal_impulse: 0.5 + seed,
+            tangent_impulse: [0.1 * seed, -0.2 * seed],
+            max_normal_impulse: 0.0,
+            ra: Vec3::new(0.2 + seed, -0.1, 0.05 * seed),
+            rb: Vec3::new(-0.15, 0.3 * seed, 0.2),
+            approach_vn: 0.0,
+        }
+    }
+
+    fn mk_constraint(a: usize, b: usize, npts: usize) -> ContactConstraint {
+        ContactConstraint {
+            a,
+            b,
+            normal: Vec3::new(0.0, 1.0, 0.0),
+            tangents: [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)],
+            friction: 0.5,
+            restitution: 0.0,
+            points: (0..npts)
+                .map(|k| mk_point(a as f32 + 0.3 * k as f32))
+                .collect(),
+            warm_matched: 0,
+        }
+    }
+
+    fn assert_states_bit_identical(a: &SolverState, b: &SolverState, n: usize) {
+        for i in 0..n {
+            for (u, v, tag) in [(a.lin[i], b.lin[i], "lin"), (a.ang[i], b.ang[i], "ang")] {
+                assert_eq!(u.x.to_bits(), v.x.to_bits(), "{tag}[{i}].x");
+                assert_eq!(u.y.to_bits(), v.y.to_bits(), "{tag}[{i}].y");
+                assert_eq!(u.z.to_bits(), v.z.to_bits(), "{tag}[{i}].z");
+            }
+        }
+    }
+
+    /// 계약: `warm_start_x4`(4-wide)는 4번의 스칼라 `warm_start`와 레인당 **비트 동일**하다.
+    /// 점 수가 1·2·3·4로 다른 4제약 — 없는 점의 no-op가 blend로 걸러져 부호0 뒤집힘이 없다.
+    #[test]
+    fn warm_start_x4_matches_scalar_bit_for_bit() {
+        let n = 8;
+        let st = mk_state(n);
+        let cs = [
+            mk_constraint(0, 1, 1),
+            mk_constraint(2, 3, 2),
+            mk_constraint(4, 5, 3),
+            mk_constraint(6, 7, 4),
+        ];
+        let mut st_s = st.clone();
+        for c in &cs {
+            warm_start(&mut st_s, c);
+        }
+        let mut st_v = st.clone();
+        warm_start_x4(&mut st_v, [&cs[0], &cs[1], &cs[2], &cs[3]]);
+        assert_states_bit_identical(&st_s, &st_v, n);
+    }
+
+    /// 계약: 공유 static 바디(레인 간 겹침 허용)는 write되지 않고, dynamic 게이트가 스칼라와
+    /// 일치한다 — 4제약이 같은 static B를 공유해도 SIMD 결과가 스칼라와 비트 동일.
+    #[test]
+    fn warm_start_x4_respects_dynamic_gate_and_shared_static() {
+        let n = 9;
+        let mut st = mk_state(n);
+        st.inv_m[8] = 0.0;
+        st.dynamic[8] = false; // body 8 = static, 네 제약의 공유 B
+        let cs = [
+            mk_constraint(0, 8, 2),
+            mk_constraint(1, 8, 1),
+            mk_constraint(2, 8, 3),
+            mk_constraint(3, 8, 2),
+        ];
+        let mut st_s = st.clone();
+        for c in &cs {
+            warm_start(&mut st_s, c);
+        }
+        let mut st_v = st.clone();
+        warm_start_x4(&mut st_v, [&cs[0], &cs[1], &cs[2], &cs[3]]);
+        assert_states_bit_identical(&st_s, &st_v, n);
+        // static 바디(8)는 양쪽 다 불변 — 원본과 비트 동일
+        assert_eq!(st_v.lin[8].x.to_bits(), st.lin[8].x.to_bits());
+        assert_eq!(st_v.ang[8].z.to_bits(), st.ang[8].z.to_bits());
     }
 
     /// 같은 색 안에 공유 conflict 바디가 없음을 전수 검사한다 (오버플로 색 63 제외).

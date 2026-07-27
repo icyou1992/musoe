@@ -8,3 +8,4 @@ description = "Maru rigid body dynamics: TGS-soft solver, islands, sleeping, joi
 [dependencies]
 maru-math = { path = "../maru-math" }
 maru-collide = { path = "../maru-collide" }
+wide = { workspace = true }
