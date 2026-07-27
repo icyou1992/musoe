@@ -17,7 +17,7 @@ mod tolerance;
 mod tree;
 
 pub use aabb::Aabb;
-pub use cast::{shape_cast, ShapeCastHit};
+pub use cast::{shape_cast, shape_cast_dispatch, ShapeCastHit};
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
 pub use limits::{
@@ -28,13 +28,13 @@ pub use limits::{
     MAX_INPUT, MAX_SHAPE_EXTENT, MAX_SPEED, MAX_STATE, MIN_DT, MIN_INV_MASS, MIN_SHAPE_EXTENT,
 };
 pub use manifold::{
-    contact, ContactPoint, FeatureId, Manifold, FEATURE_ANALYTIC, FEATURE_GENERIC,
-    MAX_MANIFOLD_POINTS,
+    any_contact, contact, for_each_contact, ContactPoint, FeatureId, Manifold, FEATURE_ANALYTIC,
+    FEATURE_GENERIC, MAX_MANIFOLD_POINTS,
 };
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};
 pub use ray::{cast_ray, contains_point, RayCast};
-pub use shape::Shape;
+pub use shape::{transformed_aabb, Shape, MAX_COMPOUND_CHILDREN};
 pub use tolerance::{
     area_eps, bary_denom_eps, characteristic_length, length_eps, length_sq_eps, min_feature_size,
     volume_eps,

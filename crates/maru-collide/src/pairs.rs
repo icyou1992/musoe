@@ -254,9 +254,12 @@ impl Broadphase {
                 if other == r {
                     continue;
                 }
-                // R×R 중복 생성은 dedup이 지우지만, (R, 비R)를 비R 쪽에서 또 만들 일은
-                // 없다(비R은 질의하지 않는다). canonical (min,max)로 절반화.
-                if q.overlaps(dyn_by_slot[other as usize]) {
+                // R×R은 양쪽 질의에서 만나므로 **낮은 id 쪽만** 채택한다(교차검수
+                // rev_47788f13 MAJOR): 중복을 쌓고 dedup하면 고유 페어 수는 예산 안인데
+                // raw 길이가 먼저 예산에 닿아, 전체 재빌드면 성공할 정상 장면을 증분
+                // 경로만 ResourceLimit로 거절한다 — 관측 가능한 경로 분기다.
+                // R×비R은 R 쪽만 질의하므로 그대로. 결과적으로 fresh는 구성상 중복이 없다.
+                if q.overlaps(dyn_by_slot[other as usize]) && (!in_r(other) || r < other) {
                     if fresh.len() >= budget {
                         return None;
                     }
@@ -447,6 +450,49 @@ mod tests {
             let want = Broadphase::build(dynamic.clone(), statics.clone()).canonical_pairs();
             assert_eq!(pairs, want, "round {round}: 증분 페어가 재빌드와 불일치");
         }
+    }
+
+    /// 회귀(rev_47788f13 MAJOR): 예산은 canonical 페어 수에 걸려야 한다 — R×R 중복이
+    /// raw 길이를 부풀려 정상 장면을 증분 경로만 거절하면 재빌드와 관측이 갈린다.
+    #[test]
+    fn incremental_budget_counts_canonical_pairs_not_raw_duplicates() {
+        // 전원이 서로 겹치는 클러스터 10개 — canonical 페어 = 45.
+        let items: Vec<(u32, Aabb)> = (0..10)
+            .map(|i| {
+                (
+                    i,
+                    Aabb::from_center(
+                        Vec3::new(i as f32 * 0.01, 0.0, 0.0),
+                        Vec3::new(1.0, 1.0, 1.0),
+                    ),
+                )
+            })
+            .collect();
+        let mut bp = Broadphase::build(items.clone(), Vec::new());
+        let prev = bp.canonical_pairs();
+        assert_eq!(prev.len(), 45);
+        // 전원을 미세 이동(전원 R) — canonical 페어 수 불변.
+        let updates: Vec<(u32, Aabb)> = (0..10u32)
+            .map(|id| {
+                (
+                    id,
+                    Aabb::from_center(
+                        Vec3::new(id as f32 * 0.01 + 0.001, 0.0, 0.0),
+                        Vec3::new(1.0, 1.0, 1.0),
+                    ),
+                )
+            })
+            .collect();
+        bp.refresh_dynamic(&updates);
+        let moved: Vec<u32> = (0..10).collect();
+        let mask = vec![true; 10];
+        // 예산 = 정확히 canonical 페어 수. 중복을 세면 90에 닿아 실패한다.
+        let got = bp.incremental_pairs_bounded(&moved, &mask, &prev, 45);
+        assert!(
+            got.is_some(),
+            "canonical 45페어 == 예산 45인데 증분이 ResourceLimit — raw 중복이 과금됐다"
+        );
+        assert_eq!(got.unwrap().0.len(), 45);
     }
 
     /// 리핏 후 질의도 superset 계약을 유지해야 한다 (트리 위상은 낡고 바운드만 현재).

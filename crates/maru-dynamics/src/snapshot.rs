@@ -284,6 +284,16 @@ fn write_shape(w: &mut Writer, s: &Shape) {
             }
             w.f32(*radius);
         }
+        // v11: 복합 — 자식 수 u8 + 자식별 (pose + 재귀 셰이프). 중첩은 validate가 거부.
+        Shape::Compound { children } => {
+            w.u8(4);
+            w.u8(children.len() as u8);
+            for (cp, child) in children {
+                w.vec3(cp.pos);
+                w.quat(cp.rot);
+                write_shape(w, child);
+            }
+        }
     }
 }
 
@@ -309,6 +319,29 @@ fn read_shape(r: &mut Reader) -> Result<Shape, SnapshotError> {
                 points,
                 radius: r.f32()?,
             }
+        }
+        4 => {
+            // 자식 수는 u8 + validate 상한(8)로 이중 유계. 자식 셰이프는 재귀 읽기 —
+            // 중첩 compound 바이트는 아래 validate가 거부한다(읽기 자체는 깊이 1에서
+            // 태그 4를 다시 만나도 count 예산이 파일 크기로 묶여 폭주하지 않는다).
+            let n = r.u8()? as usize;
+            if n == 0 || n > maru_collide::MAX_COMPOUND_CHILDREN {
+                return Err(SnapshotError::BadShape);
+            }
+            let mut children = Vec::new();
+            children
+                .try_reserve_exact(n)
+                .map_err(|_| SnapshotError::CountTooLarge)?;
+            for _ in 0..n {
+                let pos = r.vec3()?;
+                let rot = r.quat()?;
+                let child = read_shape(r)?;
+                if matches!(child, Shape::Compound { .. }) {
+                    return Err(SnapshotError::BadShape);
+                }
+                children.push((Pose { pos, rot }, child));
+            }
+            Shape::Compound { children }
         }
         _ => return Err(SnapshotError::BadShape),
     };
@@ -624,6 +657,12 @@ fn shape_size(s: &Shape) -> usize {
         Shape::Capsule { .. } => 8,
         Shape::Box { .. } => 16,
         Shape::Hull { points, .. } => 4 + points.len() * 12 + 4,
+        Shape::Compound { children } => {
+            1 + children
+                .iter()
+                .map(|(_, c)| 12 + 16 + shape_size(c))
+                .sum::<usize>()
+        }
     }
 }
 

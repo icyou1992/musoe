@@ -104,7 +104,93 @@ struct ClipVertex {
 }
 
 /// 접촉 생성 진입점. `margin` = speculative margin (양의 separation 허용 한계).
+/// 복합 자식 feature 네임스페이스 슬롯 — bits 9..15 (7비트).
+/// 모든 feature 생산자가 이 비트를 쓰지 않는다: 클립 패킹은 31·28..30·25..27·0..8,
+/// 센티널(FEATURE_GENERIC/ANALYTIC)은 16..31만 쓴다. 그래서 `fid | (key<<9)`는
+/// key(=자식쌍 식별, 1..=64)별로 **단사**다 — 같은 바디 페어의 서로 다른 자식쌍이
+/// 같은 feature를 내도 warm start·PCM 매칭이 절대 섞이지 않는다(설계: 중복 판정 키에
+/// source collider 포함 — PCM 키 무변경 달성).
+pub const FEATURE_CHILD_SHIFT: u32 = 9;
+pub const FEATURE_CHILD_MASK: u32 = 0x7F << FEATURE_CHILD_SHIFT;
+
+impl Manifold {
+    /// 자식쌍 키를 전 접점 feature에 접는다. 비복합 경로는 호출하지 않는다(key 0 예약).
+    pub fn namespace_features(&mut self, key: u32) {
+        debug_assert!((1..=64).contains(&key), "자식쌍 키는 1..=64");
+        for i in 0..self.count as usize {
+            debug_assert!(
+                self.points[i].feature.0 & FEATURE_CHILD_MASK == 0,
+                "feature 생산자가 네임스페이스 비트(9..15)를 침범했다"
+            );
+            self.points[i].feature.0 |= key << FEATURE_CHILD_SHIFT;
+        }
+    }
+}
+
+/// 접촉 존재 판정 — wake 스윕용 (첫 히트에서 종료, 복합 디스패치 포함).
+pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> bool {
+    let mut found = false;
+    for_each_contact(sa, pa, sb, pb, margin, &mut |_, _, m| {
+        if !m.is_empty() {
+            found = true;
+        }
+    });
+    found
+}
+
+/// 접촉 디스패처 — compound를 자식으로 펼쳐 자식쌍마다 매니폴드를 콜백에 준다.
+/// 비복합 쌍은 (0,0) 키로 1회. 자식 순서는 목록 순 — 결정적. 콜백이 받은 매니폴드의
+/// feature 네임스페이싱(자식쌍 키 접기)은 **호출자 책임**이다(키 조립 규약이 호출자에 있다).
+pub fn for_each_contact(
+    sa: &Shape,
+    pa: &Pose,
+    sb: &Shape,
+    pb: &Pose,
+    margin: f32,
+    f: &mut dyn FnMut(u8, u8, Manifold),
+) {
+    let compose = |parent: &Pose, child: &Pose| Pose {
+        pos: parent.pos + parent.rot.rotate(child.pos),
+        rot: parent.rot * child.rot,
+    };
+    match (sa, sb) {
+        (Shape::Compound { children: ca }, Shape::Compound { children: cb }) => {
+            for (i, (cpa, csa)) in ca.iter().enumerate() {
+                let wpa = compose(pa, cpa);
+                for (j, (cpb, csb)) in cb.iter().enumerate() {
+                    if let Some(m) = contact(csa, &wpa, csb, &compose(pb, cpb), margin) {
+                        f(i as u8, j as u8, m);
+                    }
+                }
+            }
+        }
+        (Shape::Compound { children }, _) => {
+            for (i, (cp, cs)) in children.iter().enumerate() {
+                if let Some(m) = contact(cs, &compose(pa, cp), sb, pb, margin) {
+                    f(i as u8, 0, m);
+                }
+            }
+        }
+        (_, Shape::Compound { children }) => {
+            for (j, (cp, cs)) in children.iter().enumerate() {
+                if let Some(m) = contact(sa, pa, cs, &compose(pb, cp), margin) {
+                    f(0, j as u8, m);
+                }
+            }
+        }
+        _ => {
+            if let Some(m) = contact(sa, pa, sb, pb, margin) {
+                f(0, 0, m);
+            }
+        }
+    }
+}
+
 pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<Manifold> {
+    debug_assert!(
+        !matches!(sa, Shape::Compound { .. }) && !matches!(sb, Shape::Compound { .. }),
+        "compound는 for_each_contact로 디스패치해야 한다"
+    );
     // **전용 경로 우선**: 구-구는 해석적으로 정확하고 5 flops면 끝난다. 이걸 GJK+EPA로
     // 돌리면 페어당 마이크로초가 든다(대조 실측: 내로우페이즈가 스텝의 58%).
     // 정확도도 전용 경로가 낫다 — 반복 수렴 오차가 없고 접점 ID가 스텝 간 안정적이라

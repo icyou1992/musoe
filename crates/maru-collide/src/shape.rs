@@ -7,7 +7,11 @@
 
 use crate::limits::{extent_in_range, vec_extent_in_range, MAX_HULL_POINTS, MIN_SHAPE_EXTENT};
 use crate::Aabb;
+use crate::Pose;
 use maru_math::Vec3;
+
+/// 복합 바디 자식 수 상한 — feature ID 네임스페이스(자식 3비트×2)와 예산 유도의 근거.
+pub const MAX_COMPOUND_CHILDREN: usize = 8;
 
 #[derive(Clone, Debug)]
 pub enum Shape {
@@ -19,6 +23,11 @@ pub enum Shape {
     Box { half: Vec3, radius: f32 },
     /// 코어 포인트 집합(이미 수축됨) + radius.
     Hull { points: Vec<Vec3>, radius: f32 },
+    /// 복합 — 자식(로컬 pose + **primitive**) 목록. **볼록이 아니다**: GJK/EPA/support
+    /// 경로에 단독으로 들어가면 안 되고, 모든 진입점(내로우·캐스트·레이·질량)이 자식으로
+    /// 디스패치한다(`support_core`가 unreachable로 잠근다). 중첩 금지·자식 1..=8은
+    /// validate가 강제한다. 질량 생성 시 COM 재중심화+주축 베이킹은 body 계층 소관.
+    Compound { children: Vec<(Pose, Shape)> },
 }
 
 /// 점 집합의 **회전 불변** 최소 폭 **하한 추정**.
@@ -157,6 +166,25 @@ impl Shape {
                     return Err("box convex radius must not exceed the smallest half extent");
                 }
             }
+            Shape::Compound { children } => {
+                if children.is_empty() || children.len() > MAX_COMPOUND_CHILDREN {
+                    return Err("compound must have 1..=8 children");
+                }
+                for (pose, child) in children {
+                    if matches!(child, Shape::Compound { .. }) {
+                        return Err("compound nesting is not allowed");
+                    }
+                    child.validate()?;
+                    if !vec_extent_in_range(pose.pos) {
+                        return Err("compound child offset must be finite and within extent range");
+                    }
+                    let q = pose.rot;
+                    let l2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+                    if !l2.is_finite() || !(0.9..=1.1).contains(&l2) {
+                        return Err("compound child rotation must be a unit quaternion");
+                    }
+                }
+            }
             Shape::Hull { points, .. } => {
                 if points.is_empty() {
                     return Err("hull must contain at least one point");
@@ -190,6 +218,8 @@ impl Shape {
             | Shape::Capsule { radius, .. }
             | Shape::Box { radius, .. }
             | Shape::Hull { radius, .. } => radius,
+            // 복합은 볼록 질의 대상이 아니다 — radius는 convex 경로 전용 개념.
+            Shape::Compound { .. } => 0.0,
         }
     }
 
@@ -218,6 +248,9 @@ impl Shape {
                     if d.z >= 0.0 { c.z } else { -c.z },
                 )
             }
+            Shape::Compound { .. } => {
+                unreachable!("compound is not convex — dispatch to children before GJK/support")
+            }
             Shape::Hull { points, .. } => {
                 // 선형 스캔 (v1 — hill climbing은 벤치 증명 시 도입). 동률은 낮은 인덱스 우선(결정론).
                 let mut best = points[0];
@@ -243,6 +276,17 @@ impl Shape {
                 Aabb::from_center(Vec3::ZERO, Vec3::new(r, half_height + r, r))
             }
             Shape::Box { half, .. } => Aabb::from_center(Vec3::ZERO, *half),
+            Shape::Compound { children } => {
+                let mut acc: Option<Aabb> = None;
+                for (pose, child) in children {
+                    let t = transformed_aabb(child.local_aabb(), pose);
+                    acc = Some(match acc {
+                        None => t,
+                        Some(a) => a.merge(t),
+                    });
+                }
+                acc.expect("validate가 자식 ≥1을 강제한다")
+            }
             Shape::Hull { points, .. } => {
                 let mut min = points[0];
                 let mut max = points[0];
@@ -255,6 +299,23 @@ impl Shape {
             }
         }
     }
+}
+
+/// 로컬 AABB를 자식 pose로 변환한 보수적 AABB (회전-절댓값 확장 — world.rs body_aabb와 동형).
+pub fn transformed_aabb(local: Aabb, pose: &Pose) -> Aabb {
+    let c = (local.max + local.min) * 0.5;
+    let hl = (local.max - local.min) * 0.5;
+    let (ax, ay, az) = (
+        pose.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
+        pose.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
+        pose.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
+    );
+    let ext = Vec3::new(
+        ax.x.abs() * hl.x + ay.x.abs() * hl.y + az.x.abs() * hl.z,
+        ax.y.abs() * hl.x + ay.y.abs() * hl.y + az.y.abs() * hl.z,
+        ax.z.abs() * hl.x + ay.z.abs() * hl.y + az.z.abs() * hl.z,
+    );
+    Aabb::from_center(pose.pos + pose.rot.rotate(c), ext)
 }
 
 #[cfg(test)]

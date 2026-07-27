@@ -4895,4 +4895,183 @@ mod tests {
             "왕복 뒤에도 CCD가 벽을 막아야 한다"
         );
     }
+
+    /// 복합 질량 베이킹 해석해 대조: 나란한 두 박스 == 한 개의 넓은 박스.
+    /// COM 재중심화(pose.pos = 질량중심)와 주축 관성까지 단일 박스 해석해와 일치해야 한다.
+    #[test]
+    fn compound_mass_baking_matches_analytic_wide_box() {
+        let two = Body::new_dynamic(
+            Shape::Compound {
+                children: vec![
+                    (
+                        Pose {
+                            pos: Vec3::new(-0.5, 0.0, 0.0),
+                            rot: Quat::IDENTITY,
+                        },
+                        Shape::Box {
+                            half: Vec3::new(0.5, 0.5, 0.5),
+                            radius: 0.0,
+                        },
+                    ),
+                    (
+                        Pose {
+                            pos: Vec3::new(0.5, 0.0, 0.0),
+                            rot: Quat::IDENTITY,
+                        },
+                        Shape::Box {
+                            half: Vec3::new(0.5, 0.5, 0.5),
+                            radius: 0.0,
+                        },
+                    ),
+                ],
+            },
+            pose(3.0, 5.0, 0.0),
+            1.0,
+        );
+        let one = Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(1.0, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(3.0, 5.0, 0.0),
+            1.0,
+        );
+        assert!(
+            (two.inv_mass() - one.inv_mass()).abs() < 1e-5 * one.inv_mass(),
+            "질량 불일치: {} vs {}",
+            two.inv_mass(),
+            one.inv_mass()
+        );
+        // 주축 관성 비교 — 고유값 순서가 다를 수 있어 정렬 후 대조.
+        let sorted = |v: Vec3| {
+            let mut a = [v.x, v.y, v.z];
+            a.sort_by(f32::total_cmp);
+            a
+        };
+        let (ti, oi) = (
+            sorted(two.inv_inertia_local()),
+            sorted(one.inv_inertia_local()),
+        );
+        for k in 0..3 {
+            assert!(
+                (ti[k] - oi[k]).abs() < 1e-4 * oi[k].abs().max(1e-6),
+                "주축 관성 불일치: {ti:?} vs {oi:?}"
+            );
+        }
+        // COM 재중심화: 대칭 배치라 COM == 원 pose 위치.
+        assert!((two.pose().pos - Vec3::new(3.0, 5.0, 0.0)).length() < 1e-5);
+    }
+
+    /// L자 복합 바디가 낙하→정착→수면하고, 스냅샷 왕복 궤적이 비트 동일해야 한다.
+    /// (자식쌍 feature 네임스페이스·PCM append 병합·복합 디스패치의 통합 검증.)
+    #[test]
+    fn compound_l_shape_settles_and_roundtrips() {
+        let build = || {
+            let mut w = World::new(WorldParams::default());
+            ground(&mut w);
+            let l = w.add_body(Body::new_dynamic(
+                Shape::Compound {
+                    children: vec![
+                        (
+                            Pose {
+                                pos: Vec3::ZERO,
+                                rot: Quat::IDENTITY,
+                            },
+                            Shape::Box {
+                                half: Vec3::new(1.0, 0.25, 0.25),
+                                radius: 0.0,
+                            },
+                        ),
+                        (
+                            Pose {
+                                pos: Vec3::new(-0.75, 0.75, 0.0),
+                                rot: Quat::IDENTITY,
+                            },
+                            Shape::Box {
+                                half: Vec3::new(0.25, 0.5, 0.25),
+                                radius: 0.0,
+                            },
+                        ),
+                    ],
+                },
+                pose(0.0, 2.0, 0.0),
+                1.0,
+            ));
+            (w, l)
+        };
+        let (mut w, l) = build();
+        let mut asleep_at = None;
+        for step in 0..600 {
+            w.step(DT);
+            if w.is_asleep(l) {
+                asleep_at = Some(step);
+                break;
+            }
+        }
+        assert!(asleep_at.is_some(), "L자 복합이 600스텝에도 잠들지 않음");
+        let p = w.body(l).pose().pos;
+        assert!(p.y > 0.0 && p.y < 1.5, "정착 높이 이상: {p:?}");
+
+        // 왕복 궤적: 중간 시점 스냅샷 → 복원 → 잔여 궤적 비트 동일
+        let (mut a, _) = build();
+        for _ in 0..40 {
+            a.step(DT);
+        }
+        let snap = a.snapshot();
+        let mut b = World::new(WorldParams::default());
+        b.restore(&snap).unwrap();
+        for _ in 0..120 {
+            a.step(DT);
+            b.step(DT);
+        }
+        assert_eq!(a.snapshot(), b.snapshot(), "복합 왕복 궤적 분기");
+    }
+
+    /// 복합×복합 접촉: 두 L자가 서로 얹혀도 발산 없이 정착한다.
+    #[test]
+    fn compound_on_compound_stacks() {
+        let l_shape = || Shape::Compound {
+            children: vec![
+                (
+                    Pose {
+                        pos: Vec3::ZERO,
+                        rot: Quat::IDENTITY,
+                    },
+                    Shape::Box {
+                        half: Vec3::new(0.8, 0.25, 0.4),
+                        radius: 0.0,
+                    },
+                ),
+                (
+                    Pose {
+                        pos: Vec3::new(-0.55, 0.5, 0.0),
+                        rot: Quat::IDENTITY,
+                    },
+                    Shape::Box {
+                        half: Vec3::new(0.25, 0.25, 0.4),
+                        radius: 0.0,
+                    },
+                ),
+            ],
+        };
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let a = w.add_body(Body::new_dynamic(l_shape(), pose(0.0, 0.4, 0.0), 1.0));
+        let b = w.add_body(Body::new_dynamic(l_shape(), pose(0.15, 1.2, 0.0), 1.0));
+        for _ in 0..600 {
+            w.step(DT);
+        }
+        for h in [a, b] {
+            let p = w.body(h).pose().pos;
+            assert!(
+                p.y.is_finite() && p.y > -0.5 && p.y < 3.0,
+                "발산/관통: {p:?}"
+            );
+            assert!(
+                w.body(h).linvel().length() < 0.5,
+                "600스텝 후에도 큰 잔류 속도: {:?}",
+                w.body(h).linvel()
+            );
+        }
+    }
 }

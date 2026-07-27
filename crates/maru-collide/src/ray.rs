@@ -51,6 +51,30 @@ pub fn cast_ray(
             }
         }
         Shape::Hull { .. } => ray_convex_ca(shape, o, d, max_toi),
+        // 복합: 자식별 최소 TOI. 동률은 앞선 자식(낮은 인덱스) — 결정론.
+        Shape::Compound { ref children } => {
+            let mut best: Option<Local> = None;
+            for (cp, child) in children {
+                // 자식 로컬로 다시 변환해 재귀 대신 직접 호출 (중첩은 validate가 금지).
+                let world_child = Pose {
+                    pos: pose.pos + pose.rot.rotate(cp.pos),
+                    rot: pose.rot * cp.rot,
+                };
+                if let Some(hit) = cast_ray(child, &world_child, origin, dir, max_toi) {
+                    let better = best.as_ref().is_none_or(|b| hit.toi < b.toi);
+                    if better {
+                        // 자식 히트는 이미 월드 법선 — 아래 공통 회전을 건너뛰기 위해
+                        // 로컬 형식으로 역변환한다.
+                        best = Some(Local {
+                            toi: hit.toi,
+                            normal: pose.rot.conjugate().rotate(hit.normal),
+                            started_inside: hit.started_inside,
+                        });
+                    }
+                }
+            }
+            best
+        }
     }?;
     Some(RayCast {
         toi: local.toi,
@@ -80,6 +104,14 @@ pub fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
             // 코어까지의 거리가 radius 이하인가 — support 기반 최근접점으로 판정한다.
             closest_core_dist(shape, local).0 <= r
         }
+        // 복합: 어느 자식이든 포함하면 포함.
+        Shape::Compound { ref children } => children.iter().any(|(cp, child)| {
+            let world_child = Pose {
+                pos: pose.pos + pose.rot.rotate(cp.pos),
+                rot: pose.rot * cp.rot,
+            };
+            contains_point(child, &world_child, p)
+        }),
     }
 }
 

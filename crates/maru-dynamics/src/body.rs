@@ -282,8 +282,23 @@ impl Body {
             pos: pose.pos,
             rot: pose.rot.normalize(),
         };
-        let (shape, pose, shape_origin_offset) = recenter_hull(shape, pose);
-        let (mass, inertia) = mass_properties(&shape, density);
+        // **복합 베이킹**: 자식 합성 텐서는 평행축 항의 관성곱(비대각) 때문에 대각 로컬
+        // 관성 가정과 충돌한다 — COM 재중심화 + 주축(고유분해) 회전을 pose에 접고 자식
+        // pose를 역보정해 같은 물체를 유지한다(hull 재중심화와 같은 계열의 생성 경계 처리).
+        let (shape, pose, shape_origin_offset, baked) = match shape {
+            Shape::Compound { .. } => {
+                let (s2, p2, off, m, i) = bake_compound(shape, pose, density);
+                (s2, p2, off, Some((m, i)))
+            }
+            other => {
+                let (s2, p2, off) = recenter_hull(other, pose);
+                (s2, p2, off, None)
+            }
+        };
+        let (mass, inertia) = match baked {
+            Some(mi) => mi,
+            None => mass_properties(&shape, density),
+        };
         if !(mass.is_finite() && mass > 0.0) {
             return Err(ApiError::InvalidValue);
         }
@@ -376,8 +391,23 @@ impl Body {
         // inertia)**이 빠져 2축 이상 어긋나면 축이 틀린 텐서가 된다(리뷰 MAJOR).
         // 대각 텐서로 정확해지는 유일한 방법은 실제로 중심을 맞추는 것 — 점을 중심으로
         // 옮기고 pose를 같은 양만큼 월드에서 밀어 **같은 물체**를 유지한다.
-        let (shape, pose, shape_origin_offset) = recenter_hull(shape, pose);
-        let (mass, inertia) = mass_properties(&shape, density);
+        // **복합 베이킹**: 자식 합성 텐서는 평행축 항의 관성곱(비대각) 때문에 대각 로컬
+        // 관성 가정과 충돌한다 — COM 재중심화 + 주축(고유분해) 회전을 pose에 접고 자식
+        // pose를 역보정해 같은 물체를 유지한다(hull 재중심화와 같은 계열의 생성 경계 처리).
+        let (shape, pose, shape_origin_offset, baked) = match shape {
+            Shape::Compound { .. } => {
+                let (s2, p2, off, m, i) = bake_compound(shape, pose, density);
+                (s2, p2, off, Some((m, i)))
+            }
+            other => {
+                let (s2, p2, off) = recenter_hull(other, pose);
+                (s2, p2, off, None)
+            }
+        };
+        let (mass, inertia) = match baked {
+            Some(mi) => mi,
+            None => mass_properties(&shape, density),
+        };
         assert!(
             mass.is_finite()
                 && mass > 0.0
@@ -562,6 +592,104 @@ fn recenter_hull(shape: Shape, pose: Pose) -> (Shape, Pose, Vec3) {
     (Shape::Hull { points, radius }, pose, -c)
 }
 
+/// 복합 셰이프의 질량 베이킹: (재표현된 셰이프, 새 pose, 원점 오프셋, 질량, 주축 관성 대각).
+///
+/// 절차: 자식별 (질량, COM, COM 기준 대각 관성) → 합성 COM → COM 기준 합성 텐서
+/// (자식 회전 R·diag·Rᵀ + 평행축 m(|d|²E − ddᵀ)) → Jacobi 주축 분해 → 주축 회전 q_p를
+/// 바디 pose에 접고 자식 pose를 주축 프레임으로 재표현. 결과적으로 솔버의 두 가정
+/// (pose.pos = COM, 로컬 관성 = 대각)이 **정확하게** 참이 된다.
+fn bake_compound(shape: Shape, pose: Pose, density: f32) -> (Shape, Pose, Vec3, f32, Vec3) {
+    use maru_math::{Mat3, Quat};
+    let Shape::Compound { children } = shape else {
+        unreachable!("bake_compound은 Compound 전용")
+    };
+    // 자식별 질량·COM(바디 프레임)·COM 기준 대각 관성.
+    // primitive는 로컬 원점이 곧 COM이다(구·박스·캡슐 — 생성 규약; hull은 AABB 중심 근사).
+    let mut parts: Vec<(f32, Vec3, Vec3, Pose)> = Vec::with_capacity(children.len());
+    let mut total_m = 0.0f32;
+    let mut com = Vec3::ZERO;
+    for (cp, child) in &children {
+        let (m, i_diag, local_com) = match child {
+            Shape::Hull { points, .. } => {
+                let (mut min, mut max) = (points[0], points[0]);
+                for p in &points[1..] {
+                    min = Vec3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z));
+                    max = Vec3::new(max.x.max(p.x), max.y.max(p.y), max.z.max(p.z));
+                }
+                let half = (max - min) * 0.5;
+                let (m, i) = mass_properties(&Shape::Box { half, radius: 0.0 }, density);
+                (m, i, (max + min) * 0.5)
+            }
+            other => {
+                let (m, i) = mass_properties(other, density);
+                (m, i, Vec3::ZERO)
+            }
+        };
+        let c_world = cp.pos + cp.rot.rotate(local_com);
+        total_m += m;
+        com += c_world * m;
+        parts.push((m, i_diag, c_world, *cp));
+    }
+    com = com * (1.0 / total_m);
+    // COM 기준 합성 텐서 (대칭 3×3).
+    let mut i_total = Mat3 {
+        c: [Vec3::ZERO, Vec3::ZERO, Vec3::ZERO],
+    };
+    for (m, i_diag, c_world, cp) in &parts {
+        let r = Mat3::from_quat(cp.rot);
+        let rot_i = r
+            .mul_mat(&Mat3::from_diagonal(*i_diag))
+            .mul_mat(&r.transpose());
+        let d = *c_world - com;
+        let d2 = d.dot(d);
+        // 평행축: m(|d|²E − ddᵀ)
+        let pa = Mat3 {
+            c: [
+                Vec3::new(m * (d2 - d.x * d.x), m * (-d.x * d.y), m * (-d.x * d.z)),
+                Vec3::new(m * (-d.y * d.x), m * (d2 - d.y * d.y), m * (-d.y * d.z)),
+                Vec3::new(m * (-d.z * d.x), m * (-d.z * d.y), m * (d2 - d.z * d.z)),
+            ],
+        };
+        for k in 0..3 {
+            i_total.c[k] = i_total.c[k] + rot_i.c[k] + pa.c[k];
+        }
+    }
+    let (lambda, mut ev) = i_total.eigen_symmetric();
+    // 고유벡터 행렬이 반사(det<0)면 한 열을 뒤집어 회전으로 만든다.
+    let det = ev.c[0].dot(ev.c[1].cross(ev.c[2]));
+    if det < 0.0 {
+        ev.c[2] = -ev.c[2];
+    }
+    let q_p = Quat::from_mat3(&ev);
+    // 새 바디 프레임: 원점=COM, 축=주축. 자식을 재표현해 같은 물체를 유지한다.
+    let inv_q = q_p.conjugate();
+    let children: Vec<(Pose, Shape)> = children
+        .into_iter()
+        .map(|(cp, child)| {
+            (
+                Pose {
+                    pos: inv_q.rotate(cp.pos - com),
+                    rot: (inv_q * cp.rot).normalize(),
+                },
+                child,
+            )
+        })
+        .collect();
+    let new_pose = Pose {
+        pos: pose.pos + pose.rot.rotate(com),
+        rot: (pose.rot * q_p).normalize(),
+    };
+    // 원래 셰이프 원점의 새 로컬 좌표 (렌더 오프셋 — recenter_hull의 -c와 같은 의미).
+    let origin_offset = inv_q.rotate(-com);
+    (
+        Shape::Compound { children },
+        new_pose,
+        origin_offset,
+        total_m,
+        lambda,
+    )
+}
+
 /// (질량, 관성 대각). 캡슐은 원통+반구 근사 대신 v1은 동체 실린더 근사(문서화된 가정).
 fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
     match *shape {
@@ -592,6 +720,9 @@ fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
             let ixz = m * (3.0 * radius * radius + h * h) / 12.0;
             let iy = 0.5 * m * radius * radius;
             (m, Vec3::new(ixz, iy, ixz))
+        }
+        Shape::Compound { .. } => {
+            unreachable!("compound 질량은 bake_compound가 계산한다 — new_dynamic 디스패치 확인")
         }
         Shape::Hull { ref points, .. } => {
             // [가정] v1: AABB 근사 — hull 정밀 적분은 hull 빌더와 함께.

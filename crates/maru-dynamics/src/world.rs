@@ -9,7 +9,9 @@ use crate::body::{Body, BodyHandle, BodyType};
 use crate::command::{Command, CommandReport, PendingCommand};
 use crate::joint::{self, Joint};
 use crate::solver::{self, CachedImpulse, ContactConstraint, Softness, SolverParams};
-use maru_collide::{contact, shape_cast, Aabb, Broadphase, FeatureId, STATIC_BIT};
+use maru_collide::{
+    any_contact, for_each_contact, shape_cast_dispatch, Aabb, Broadphase, FeatureId, STATIC_BIT,
+};
 use maru_math::Vec3;
 use std::collections::HashMap;
 
@@ -2093,14 +2095,13 @@ impl World {
                 }
                 if (!excluded.is_empty()
                     && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))))
-                    || contact(
+                    || !any_contact(
                         &self.bodies[a].shape,
                         &self.bodies[a].pose,
                         &self.bodies[b].shape,
                         &self.bodies[b].pose,
                         self.params.speculative_margin,
                     )
-                    .is_none()
                 {
                     continue;
                 }
@@ -2152,15 +2153,13 @@ impl World {
                 continue;
             }
             // 실제 접촉이 있을 때만 깨운다 (AABB 근접만으로 깨우면 스택이 영영 못 잔다)
-            if contact(
+            if any_contact(
                 &self.bodies[a].shape,
                 &self.bodies[a].pose,
                 &self.bodies[b].shape,
                 &self.bodies[b].pose,
                 self.params.speculative_margin,
-            )
-            .is_some()
-            {
+            ) {
                 if wake_a {
                     self.wake(a);
                 }
@@ -2301,37 +2300,72 @@ impl World {
                 "dormant 페어는 조기 탈출이 이미 걸렀어야 한다 — 술어 동치 붕괴"
             );
             let _ = (a_asleep, b_asleep);
-            let (sa, pa) = (&self.bodies[a_id].shape, &self.bodies[a_id].pose);
-            let (sb, pb) = (&self.bodies[b_id].shape, &self.bodies[b_id].pose);
-            if let Some(m) = contact(sa, pa, sb, pb, self.params.speculative_margin) {
-                if !m.is_empty() {
-                    // **센서는 이벤트만 낸다** — 매니폴드는 만들되 제약을 만들지 않아
-                    // 임펄스를 주고받지 않는다. 아래 `live_keys`에는 넣으므로
-                    // 접촉 시작/종료 이벤트는 정상적으로 나간다.
-                    if self.bodies[a_id].sensor || self.bodies[b_id].sensor {
+            let sensor_pair = self.bodies[a_id].sensor || self.bodies[b_id].sensor;
+            // **복합 디스패치**: 자식쌍마다 독립 매니폴드 → 페어당 제약 여러 개(법선이 달라
+            // 병합 불가). 같은 pair 키를 constraint_keys에 반복 push하는 것이 규약이고,
+            // PCM 갱신(post 5절)이 같은 키의 엔트리를 append 병합한다. feature는 자식쌍 키
+            // (1..=64, 비복합=0 미변형)를 bits 9..15에 접어 자식 간 warm start 혼선을 막는다.
+            let is_compound = matches!(
+                self.bodies[a_id].shape,
+                maru_collide::Shape::Compound { .. }
+            ) || matches!(
+                self.bodies[b_id].shape,
+                maru_collide::Shape::Compound { .. }
+            );
+            let mut touched = false;
+            let mut bail = false;
+            {
+                let bodies = &self.bodies;
+                let diag = &mut self.diag;
+                let cache = &self.contact_cache;
+                let constraints = &mut constraints;
+                let constraint_keys = &mut constraint_keys;
+                let live_keys = &mut live_keys;
+                for_each_contact(
+                    &bodies[a_id].shape,
+                    &bodies[a_id].pose,
+                    &bodies[b_id].shape,
+                    &bodies[b_id].pose,
+                    self.params.speculative_margin,
+                    &mut |ca, cb, mut m| {
+                        if bail || m.is_empty() {
+                            return;
+                        }
+                        touched = true;
+                        if sensor_pair {
+                            return; // 센서: 이벤트만 — 아래 touched 처리에서 live_keys로
+                        }
+                        if is_compound {
+                            m.namespace_features(ca as u32 * 8 + cb as u32 + 1);
+                        }
+                        let cached = cache.get(&key).unwrap_or(&empty);
+                        for p in m.points() {
+                            diag.max_penetration = diag.max_penetration.max(-p.separation);
+                        }
+                        // narrowphase는 wake 이후이고 pairs를 대여 중이라 bp_pairs를 되돌릴 수
+                        // 없다. 접점 Vec 할당(≤4점) 실패는 극단 OOM — bail로 모아 아래서 처리.
+                        let Ok(c) = solver::prepare(bodies, a_id, b_id, &m, cached, dt) else {
+                            bail = true;
+                            return;
+                        };
+                        // 진단은 **실제 warm load**를 센다(feature ID 일치만 세면 generic 접점의
+                        // 위치·법선 게이트가 매칭을 끊어도 100%로 보인다 — 거짓 지표).
+                        diag.warm_total += c.points.len();
+                        diag.warm_hits += c.warm_matched as usize;
+                        constraints.push(c);
+                        constraint_keys.push(key);
                         live_keys.insert(key);
-                        continue;
-                    }
-                    let cached = self.contact_cache.get(&key).unwrap_or(&empty);
-                    for p in m.points() {
-                        self.diag.max_penetration = self.diag.max_penetration.max(-p.separation);
-                    }
-                    // narrowphase는 wake 이후이고 pairs를 대여 중이라 bp_pairs를 되돌릴 수 없다.
-                    // 접점 Vec 할당은 wake 이후 불가피한 유일한 잔여 예약이나(≤4점) — 예산 선점 후라
-                    // 실패는 극단 OOM뿐. 그 경우 bp_valid를 내려 다음 스텝이 재빌드하게 한다.
-                    let Ok(c) = solver::prepare(&self.bodies, a_id, b_id, &m, cached, dt) else {
-                        self.invalidate_bp();
-                        self.resource_limit = true;
-                        return;
-                    };
-                    // 진단은 **실제 warm load**를 센다(feature ID 일치만 세면 generic 접점의
-                    // 위치·법선 게이트가 매칭을 끊어도 100%로 보인다 — 거짓 지표).
-                    self.diag.warm_total += c.points.len();
-                    self.diag.warm_hits += c.warm_matched as usize;
-                    constraints.push(c);
-                    constraint_keys.push(key);
-                    live_keys.insert(key);
-                }
+                    },
+                );
+            }
+            if bail {
+                self.invalidate_bp();
+                self.resource_limit = true;
+                return;
+            }
+            // 센서 페어(또는 접촉만 있고 제약이 없는 경우의 이벤트 기준선).
+            if touched && sensor_pair {
+                live_keys.insert(key);
             }
         }
 
@@ -2686,9 +2720,14 @@ impl World {
                                         continue;
                                     }
                                 }
-                                if let Some(hit) =
-                                    shape_cast(&body.shape, &pose_now, d, &sb.shape, &sb.pose, skin)
-                                {
+                                if let Some(hit) = shape_cast_dispatch(
+                                    &body.shape,
+                                    &pose_now,
+                                    d,
+                                    &sb.shape,
+                                    &sb.pose,
+                                    skin,
+                                ) {
                                     // 결정적 최소: (toi, static id) 사전식 — 동시 hit 동률 절단.
                                     let better = match best {
                                         None => true,
@@ -2814,6 +2853,10 @@ impl World {
         // 저장되는 값·`state_saturations` 카운트 모두 동일하다(예전에도 fixpoint 도달 후엔
         // hit이 나지 않았다). retain은 값을 바꾸지 않으므로 삽입만 닫으면 충분하다.
         let mut cache_sat_hits = 0usize;
+        // **복합 페어는 같은 키의 제약이 여러 개다** — 첫 제약이 엔트리를 새로 만들고
+        // 나머지는 append 병합한다(insert로 덮으면 앞 자식의 warm start가 소실된다).
+        // feature가 자식쌍 네임스페이스로 유일하므로 병합 목록 안에서 충돌하지 않는다.
+        let mut cache_written: IntSet<(u32, u32)> = IntSet::default();
         for (c, key) in constraints.iter().zip(&constraint_keys) {
             let entry: Vec<(FeatureId, CachedImpulse)> = c
                 .points
@@ -2853,7 +2896,11 @@ impl World {
                     )
                 })
                 .collect();
-            self.contact_cache.insert(*key, entry);
+            if cache_written.insert(*key) {
+                self.contact_cache.insert(*key, entry);
+            } else if let Some(existing) = self.contact_cache.get_mut(key) {
+                existing.extend(entry);
+            }
         }
         self.diag.post_ns[2] = _t_pcm.elapsed().as_nanos() as u64;
 

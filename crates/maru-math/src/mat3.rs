@@ -226,6 +226,49 @@ impl Mat3 {
     }
 }
 
+impl Quat {
+    /// 회전 행렬(정규직교, det=+1) → 쿼터니언 (Shepperd). 주축 베이킹이 고유벡터 행렬을
+    /// pose에 접을 때 쓴다. det=−1(반사)은 호출자가 열 반전으로 먼저 고쳐야 한다.
+    pub fn from_mat3(m: &Mat3) -> Quat {
+        let (m00, m11, m22) = (m.c[0].x, m.c[1].y, m.c[2].z);
+        let tr = m00 + m11 + m22;
+        let q = if tr > 0.0 {
+            let s = (tr + 1.0).sqrt() * 2.0;
+            Quat {
+                w: 0.25 * s,
+                x: (m.c[1].z - m.c[2].y) / s,
+                y: (m.c[2].x - m.c[0].z) / s,
+                z: (m.c[0].y - m.c[1].x) / s,
+            }
+        } else if m00 >= m11 && m00 >= m22 {
+            let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+            Quat {
+                w: (m.c[1].z - m.c[2].y) / s,
+                x: 0.25 * s,
+                y: (m.c[1].x + m.c[0].y) / s,
+                z: (m.c[2].x + m.c[0].z) / s,
+            }
+        } else if m11 >= m22 {
+            let s = (1.0 - m00 + m11 - m22).sqrt() * 2.0;
+            Quat {
+                w: (m.c[2].x - m.c[0].z) / s,
+                x: (m.c[1].x + m.c[0].y) / s,
+                y: 0.25 * s,
+                z: (m.c[2].y + m.c[1].z) / s,
+            }
+        } else {
+            let s = (1.0 - m00 - m11 + m22).sqrt() * 2.0;
+            Quat {
+                w: (m.c[0].y - m.c[1].x) / s,
+                x: (m.c[2].x + m.c[0].z) / s,
+                y: (m.c[2].y + m.c[1].z) / s,
+                z: 0.25 * s,
+            }
+        };
+        q.normalize()
+    }
+}
+
 #[inline]
 fn get(m: &Mat3, r: usize, c: usize) -> f32 {
     let col = m.c[c];
@@ -282,6 +325,22 @@ mod eigen_tests {
             // R은 회전(정규직교): RᵀR ≈ I
             let i = r.transpose().mul_mat(&r);
             assert!((i.c[0].x - 1.0).abs() < 1e-5 && i.c[1].x.abs() < 1e-5);
+        }
+    }
+
+    /// from_mat3 ∘ from_quat == ±항등 (쿼터니언 부호 모호성 허용).
+    #[test]
+    fn quat_mat_roundtrip() {
+        for q in [
+            Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.7),
+            Quat::from_axis_angle(Vec3::new(1.0, 2.0, -0.5).normalize_or_zero(), 2.9),
+            Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::PI),
+            Quat::IDENTITY,
+        ] {
+            let m = Mat3::from_quat(q);
+            let r = Quat::from_mat3(&m);
+            let dot = (q.x * r.x + q.y * r.y + q.z * r.z + q.w * r.w).abs();
+            assert!(dot > 1.0 - 1e-5, "왕복 실패: {q:?} → {r:?} (|dot|={dot})");
         }
     }
 }

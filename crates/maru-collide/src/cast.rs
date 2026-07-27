@@ -101,6 +101,55 @@ pub fn shape_cast(
     })
 }
 
+/// 복합 디스패치 셰이프 캐스트 — 자식쌍의 earliest TOI (동률은 자식 순서 — 결정적).
+pub fn shape_cast_dispatch(
+    sa: &Shape,
+    pa: &Pose,
+    motion: Vec3,
+    sb: &Shape,
+    pb: &Pose,
+    skin: f32,
+) -> Option<ShapeCastHit> {
+    let compose = |parent: &Pose, child: &Pose| Pose {
+        pos: parent.pos + parent.rot.rotate(child.pos),
+        rot: parent.rot * child.rot,
+    };
+    let mut best: Option<ShapeCastHit> = None;
+    let mut consider = |h: ShapeCastHit| {
+        if best.as_ref().is_none_or(|b| h.toi < b.toi) {
+            best = Some(h);
+        }
+    };
+    match (sa, sb) {
+        (Shape::Compound { children: ca }, Shape::Compound { children: cb }) => {
+            for (cpa, csa) in ca {
+                let wpa = compose(pa, cpa);
+                for (cpb, csb) in cb {
+                    if let Some(h) = shape_cast(csa, &wpa, motion, csb, &compose(pb, cpb), skin) {
+                        consider(h);
+                    }
+                }
+            }
+        }
+        (Shape::Compound { children }, _) => {
+            for (cp, cs) in children {
+                if let Some(h) = shape_cast(cs, &compose(pa, cp), motion, sb, pb, skin) {
+                    consider(h);
+                }
+            }
+        }
+        (_, Shape::Compound { children }) => {
+            for (cp, cs) in children {
+                if let Some(h) = shape_cast(sa, pa, motion, cs, &compose(pb, cp), skin) {
+                    consider(h);
+                }
+            }
+        }
+        _ => return shape_cast(sa, pa, motion, sb, pb, skin),
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
