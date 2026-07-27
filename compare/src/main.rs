@@ -229,6 +229,7 @@ mod maru_side {
         let mut sub = [0u64; 5];
         let mut acc_late = [0u64; 5];
         let mut sub_late = [0u64; 5];
+        let mut post_late = [0u64; 4];
         let mut touch_late = 0usize;
         let mut late_steps = 0usize;
         let mut t_late = std::time::Duration::ZERO;
@@ -254,6 +255,9 @@ mod maru_side {
                 }
                 for k in 0..5 {
                     sub_late[k] += d.sub_ns[k];
+                }
+                for k in 0..4 {
+                    post_late[k] += d.post_ns[k];
                 }
                 touch_late += d.touching;
                 late_steps += 1;
@@ -307,6 +311,13 @@ mod maru_side {
             sub_late[3] as f64 / 1000.0 / ls,
             sub_late[4] as f64 / 1000.0 / ls,
             touch_late / late_steps.max(1),
+        );
+        eprintln!(
+            "    [maru pile] 정착 post 내역: writeback={:.0} 이벤트={:.0} pcm={:.0} 위생={:.0} us",
+            post_late[0] as f64 / 1000.0 / ls,
+            post_late[1] as f64 / 1000.0 / ls,
+            post_late[2] as f64 / 1000.0 / ls,
+            post_late[3] as f64 / 1000.0 / ls,
         );
         eprintln!(
             "    [maru pile] 전체평균 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",

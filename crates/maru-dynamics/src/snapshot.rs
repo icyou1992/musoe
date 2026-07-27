@@ -1000,6 +1000,17 @@ fn validate_structure(
         if asleep[i] && !live_dynamic(i) {
             return Err(SnapshotError::InconsistentState);
         }
+        // **잠든 바디의 속도는 0이어야 한다** — island sleep이 재우며 0으로 만들고, 모든
+        // 변이 API는 wake를 거치므로 잠든 채 속도가 있는 상태는 라이브로 도달할 수 없다
+        // (OOB 인접 조인트 임펄스 0 강제와 같은 계열). 이 보장이 스텝 말 위생 패스
+        // (denormal flush·속도 클램프·상태 포화)가 잠든 바디를 건너뛰는 것을 정확 등가로
+        // 만든다: 복원 직후에도 잠든 바디는 위생 패스가 손댈 게 없는 상태임이 증명된다.
+        if asleep[i]
+            && (bodies[i].linvel != maru_math::Vec3::ZERO
+                || bodies[i].angvel != maru_math::Vec3::ZERO)
+        {
+            return Err(SnapshotError::InconsistentState);
+        }
         // OOB는 살아있는 비-static만의 상태이고, sleep과 **겸할 수 없다**
         if oob[i] && (!alive[i] || bodies[i].body_type == BodyType::Static || asleep[i]) {
             return Err(SnapshotError::InconsistentState);

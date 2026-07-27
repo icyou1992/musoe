@@ -4647,4 +4647,50 @@ mod tests {
             "축 둘레 90°는 한계 ±0.1을 벗어났는데 한계 임펄스가 0이다 (각이 측정되지 않음)"
         );
     }
+
+    /// 정착(전원 수면) 월드의 스텝은 **캐노니컬 상태에 항등**이어야 한다 — fast path와
+    /// 풀 파이프라인 어느 쪽이 돌든. 스냅샷 바이트 동일성이 그 항등의 정의다.
+    /// (이 성질이 깨지면 잠든 월드가 스텝마다 미세하게 표류하고, 수면은 "얼림"이 아니게 된다.)
+    #[test]
+    fn settled_step_is_canonical_identity() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        for i in 0..3 {
+            dyn_box(&mut w, 0.0, 0.5 + i as f32);
+        }
+        for _ in 0..300 {
+            w.step(DT);
+        }
+        assert!(w.diagnostics().pairs > 0, "테스트 씬이 비어 있으면 무의미");
+        let before = w.snapshot();
+        w.step(DT);
+        assert!(
+            w.diagnostics().bp_reused,
+            "정착 스텝이 페어 캐시를 재사용하지 않음 — fast path가 죽었다"
+        );
+        let after = w.snapshot();
+        assert_eq!(before, after, "정착 스텝이 캐노니컬 상태를 바꿨다");
+    }
+
+    /// 회귀(캐시 계약): impulse는 속도를 **즉시** 바꾸고 sweep AABB는 속도의 함수이므로,
+    /// 정착 상태에서 impulse를 주면 다음 스텝은 페어 캐시를 버리고 재빌드해야 한다.
+    /// 재사용하면 임펄스 이전 속도의 페어로 한 스텝을 돌아 speculative 접촉이 빠진다.
+    #[test]
+    fn impulse_on_settled_world_rebuilds_pairs() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let h = dyn_box(&mut w, 0.0, 0.5);
+        for _ in 0..300 {
+            w.step(DT);
+        }
+        assert!(w.is_asleep(h), "먼저 잠들어야 의미 있는 테스트다");
+        w.step(DT);
+        assert!(w.diagnostics().bp_reused, "정착 상태 전제 확인");
+        w.apply_impulse(h, Vec3::new(50.0, 0.0, 0.0)).unwrap();
+        w.step(DT);
+        assert!(
+            !w.diagnostics().bp_reused,
+            "임펄스 후에도 페어 캐시를 재사용했다 — 임펄스 전 속도의 sweep AABB로 스텝이 돈다"
+        );
+    }
 }

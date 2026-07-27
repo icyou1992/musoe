@@ -300,6 +300,10 @@ pub struct Diagnostics {
     /// 상위 phase 안에서 **페어 수·바디 수에 비례하는 부분만** 따로 잰다: 전원 수면 씬은
     /// 산출물이 접점 몇 개인데도 이 넷이 페어/바디 전량을 훑어 스텝을 지배할 수 있다.
     pub sub_ns: [u64; 5],
+    /// post 단계 내역 (ns): `[write_back+외력클리어, 이벤트 차집합, PCM 갱신, 위생(denormal·클램프·경계·정책)]`.
+    /// 아일랜드는 `sub_ns[3]`에 이미 있다. 정착 씬에서 post가 스텝의 40%인데 아일랜드는
+    /// 그중 1/9뿐이라 — 나머지가 어디 사는지 귀속하려고 둔다.
+    pub post_ns: [u64; 4],
     /// 직전 스텝의 접촉 기준선 크기 — 정착 씬에서 페어 수와 함께 비용을 결정한다.
     pub touching: usize,
     /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
@@ -650,6 +654,13 @@ impl World {
         if self.bodies[i].body_type != BodyType::Dynamic {
             return Err(ApiError::ImmutableStatic);
         }
+        // **브로드페이즈 페어 캐시도 버린다.** sweep AABB는 속도의 함수인데 impulse 계열은
+        // 속도를 즉시 바꾼다 — 정착(캐시 유효) 상태에서 impulse를 주면 다음 스텝이 임펄스
+        // 이전 속도로 만든 페어를 재사용해, 이번 스텝에 도달할 상대와의 speculative 접촉이
+        // 한 스텝 빠진다(얇은 벽 터널링의 씨앗). 캐시 계약("재사용은 항등")의 위반이다.
+        // 힘/토크 경로는 속도가 적분 시점에 바뀌므로 원래도 등가지만, 힘이 실리는 장면은
+        // 어차피 moved=true로 캐시가 없어 일괄 무효화의 추가 비용이 없다.
+        self.bp_valid = false;
         self.wake(i);
         Ok(i)
     }
@@ -1257,7 +1268,9 @@ impl World {
             self.params.max_angular_velocity,
         );
         for (i, b) in self.bodies.iter_mut().enumerate() {
-            if !self.alive[i] || b.body_type == BodyType::Static {
+            // 잠든 바디의 속도는 정확히 0이다(변이 API는 전부 wake 경유, 복원은 asleep ⇒
+            // 속도 0을 강제) — 클램프가 손댈 게 없으므로 건너뜀은 항등이다.
+            if !self.alive[i] || b.body_type == BodyType::Static || self.asleep[i] {
                 continue;
             }
             let l2 = b.linvel.length_sq();
@@ -1350,8 +1363,16 @@ impl World {
                 hits += changed as usize;
             }};
         }
+        // **이번 스텝에 쓰이지 않은 상태는 닫지 않는다** — 포화는 멱등이라, 직전 닫힘 이후
+        // 변하지 않은 값은 여전히 닫혀 있다. 잠든(dormant) 바디가 그 경우다: 모든 변이 API는
+        // wake를 거치고(`mutate`/`accept_force`), 복원은 "asleep ⇒ 속도 0 + 상태 범위 리더"를
+        // 강제하므로, 잠든 바디의 pos·vel은 잠들던 스텝(그때는 integrate_gate=true라 여기서
+        // 닫혔다) 이후 불변이다. 전원 수면 pile-3k에서 이 패스가 post의 지배 비용이었다.
+        let dormant = |i: usize, asleep: &[bool], gate: &[bool]| {
+            asleep[i] && !gate.get(i).copied().unwrap_or(false)
+        };
         for (i, b) in self.bodies.iter_mut().enumerate() {
-            if !self.alive[i] {
+            if !self.alive[i] || dormant(i, &self.asleep, &self.integrate_gate) {
                 continue;
             }
             sat_vec!(b.pose.pos);
@@ -1359,26 +1380,21 @@ impl World {
             sat_vec!(b.angvel);
         }
         for j in self.joints.iter_mut() {
+            // 양 끝점이 dormant면 이 조인트는 이번 스텝에 풀리지 않았다 — 임펄스 불변.
+            // 잠들던 스텝엔 끝점 gate가 true라 여기 걸리지 않는다(그 스텝의 쓰기를 닫는다).
+            if dormant(j.ia(), &self.asleep, &self.integrate_gate)
+                && dormant(j.ib(), &self.asleep, &self.integrate_gate)
+            {
+                continue;
+            }
             sat_vec!(j.linear_impulse);
             sat!(j.angular_impulse[0]);
             sat!(j.angular_impulse[1]);
         }
-        for entry in self.contact_cache.values_mut() {
-            for (_, imp) in entry.iter_mut() {
-                sat!(imp.normal);
-                sat!(imp.tangent[0]);
-                sat!(imp.tangent[1]);
-                sat_vec!(imp.tangent_world);
-                sat_vec!(imp.position);
-                // **직렬화되는 필드는 하나도 빠뜨리지 않는다**(리뷰 MAJOR): contact_normal이
-                // NaN이 되면 스텝 뒤에도 남아 restore가 실패한다. 단위 벡터라 포화가 아니라
-                // 정규화 실패 시 0으로 되돌린다(매칭 게이트가 자연히 끊긴다).
-                if imp.contact_normal.try_normalize().is_none() {
-                    imp.contact_normal = Vec3::ZERO;
-                    hits += 1;
-                }
-            }
-        }
+        // PCM 캐시는 여기서 닫지 않는다 — **쓰는 시점(post 5절 insert)에 닫는다**. 캐시 엔트리의
+        // 쓰기 경로는 그 insert와 복원(상태 범위 리더가 거부) 둘뿐이라, 삽입 시 닫으면 관측
+        // 가능한 모든 시점에 닫혀 있다. 매 스텝 전체 캐시 순회(정착 씬에서 접촉 수천 엔트리 ×
+        // 필드 포화 + try_normalize의 sqrt)가 통째로 사라진다.
         for t in self.sleep_timer.iter_mut() {
             let (v, changed) = saturate_state(*t);
             *t = v.max(0.0);
@@ -1686,6 +1702,38 @@ impl World {
         // 버려진다 — 전원 수면 pile-3k에서 스텝의 12%가 그 낭비였다(93us/step).
         // 판정식은 아래 캐시 분기와 **같은 것**이어야 한다(다르면 빈 목록으로 트리를 짓는다).
         let bp_cache_hit = self.bp_valid && self.bp_dt == dt;
+        // **전원-휴면 fast path** — 정착한 월드의 스텝은 캐노니컬 상태에 항등이다.
+        //
+        // 근거 사슬(전부 위·아래 코드의 계약이다):
+        // `bp_valid`는 직전 스텝 말 `moved=false`에서만 참이고, moved는 integrate_gate
+        // (alive && !static && !asleep && !oob)의 any다 — 즉 캐시가 유효하면 직전 스텝 말에
+        // 활성 바디가 없었다. 스텝 사이 상태를 바꾸는 모든 경로는 wake(asleep=false)나
+        // `bp_valid=false`를 거친다(`mutate`·`accept_force`·add/remove·set_params·restore).
+        // 그래서 지금도 전원이 dormant면 이 스텝의 전 파이프라인이 항등이다:
+        // wake 폐쇄는 활성 끝점이 없어 아무도 깨우지 못하고, 제약·이벤트·PCM 갱신은 비며
+        // (live_keys == touching — 그룹·제외 입력도 마지막 계산 이후 불변), 아일랜드·수면
+        // 타이머는 잠든 값을 보존하고, 위생 패스는 dormant를 건너뛴다. 전원 수면 pile-3k에서
+        // 이 스텝들이 스텝의 전부(정착 후 100%)였다 — 항등을 계산으로 재확인하는 비용이
+        // 스텝당 ~0.7ms였다.
+        //
+        // 판정은 dormant의 정의를 바디 배열로 직접 편다(kinematic은 gate=항상 true라
+        // 캐시가 애초에 못 살아남으므로 여기 도달하지 않지만, 정의로 다시 거른다).
+        if bp_cache_hit
+            && (0..self.bodies.len()).all(|i| {
+                !self.alive[i]
+                    || self.oob[i]
+                    || self.asleep[i]
+                    || self.bodies[i].body_type == BodyType::Static
+            })
+        {
+            self.diag.bp_reused = true;
+            self.diag.pairs = self.bp_pairs.len();
+            // 예산은 이번 스텝에 계산하지 않았다 — 절대 상한을 보고한다("예산이 묶지 않았다"는
+            // 사실만 전달하면 된다. 0을 보고하면 호스트가 거부로 오독한다).
+            self.diag.pair_budget = maru_collide::MAX_PAIRS;
+            self.diag.touching = self.touching.len();
+            return;
+        }
         for (i, b) in self
             .bodies
             .iter()
@@ -2390,6 +2438,7 @@ impl World {
 
         self.diag.phase_ns[3] = _t_sv.elapsed().as_nanos() as u64;
         let _t_post = std::time::Instant::now();
+        let _t_wb = std::time::Instant::now();
         st.write_back(&mut self.bodies, &self.alive);
         self.solver_state = st;
 
@@ -2406,6 +2455,8 @@ impl World {
         self.bp_pairs = pairs;
         self.bp_valid = !moved;
         self.bp_dt = dt;
+        self.diag.post_ns[0] = _t_wb.elapsed().as_nanos() as u64;
+        let _t_ev = std::time::Instant::now();
 
         // 5-a) **접촉 이벤트** = 직전 기준선(`touching`)과 이번 `live_keys`의 차집합.
         //
@@ -2451,31 +2502,60 @@ impl World {
         // 기준선 갱신 — 다음 스텝의 이벤트가 이 집합과의 차집합이다.
         self.touching.clear();
         self.touching.extend(live_keys.iter().copied());
+        self.diag.post_ns[1] = _t_ev.elapsed().as_nanos() as u64;
+        let _t_pcm = std::time::Instant::now();
 
         // 5) PCM 캐시 갱신. **잠든 페어의 엔트리는 보존**한다 — 전체 clear는 첫 수면 스텝에
         //    지속 매니폴드를 날려, 나중에 깨어날 때 warm start 없이 거칠게 재정착한다(리뷰 지적).
         //    이번 스텝에 살아있지 않은(페어 소멸) 키만 폐기.
         self.contact_cache.retain(|k, _| live_keys.contains(k));
+        // **캐시는 삽입 시점에 상태 정책으로 닫는다** — `close_state_policy`가 더는 캐시를
+        // 순회하지 않는 근거다(그쪽 주석 참조). 포화는 멱등이라 예전처럼 "스텝 말에 닫는" 것과
+        // 저장되는 값·`state_saturations` 카운트 모두 동일하다(예전에도 fixpoint 도달 후엔
+        // hit이 나지 않았다). retain은 값을 바꾸지 않으므로 삽입만 닫으면 충분하다.
+        let mut cache_sat_hits = 0usize;
         for (c, key) in constraints.iter().zip(&constraint_keys) {
             let entry: Vec<(FeatureId, CachedImpulse)> = c
                 .points
                 .iter()
                 .map(|p| {
+                    use maru_collide::{saturate_state, saturate_state_vec};
+                    let mut sat = |v: f32| -> f32 {
+                        let (v, changed) = saturate_state(v);
+                        cache_sat_hits += changed as usize;
+                        v
+                    };
+                    let normal = sat(p.normal_impulse);
+                    let tangent = [sat(p.tangent_impulse[0]), sat(p.tangent_impulse[1])];
+                    let tw =
+                        c.tangents[0] * p.tangent_impulse[0] + c.tangents[1] * p.tangent_impulse[1];
+                    let (tangent_world, tw_hit) = saturate_state_vec(tw);
+                    let (position, pos_hit) = saturate_state_vec(p.position);
+                    cache_sat_hits += tw_hit as usize + pos_hit as usize;
+                    // 직렬화되는 필드는 하나도 빠뜨리지 않는다(리뷰 MAJOR): contact_normal이
+                    // NaN이면 restore가 실패한다. 단위 벡터라 포화가 아니라 정규화 실패 시
+                    // 0으로 되돌린다(매칭 게이트가 자연히 끊긴다).
+                    let contact_normal = if c.normal.try_normalize().is_none() {
+                        cache_sat_hits += 1;
+                        Vec3::ZERO
+                    } else {
+                        c.normal
+                    };
                     (
                         p.feature,
                         CachedImpulse {
-                            normal: p.normal_impulse,
-                            tangent: p.tangent_impulse,
-                            tangent_world: c.tangents[0] * p.tangent_impulse[0]
-                                + c.tangents[1] * p.tangent_impulse[1],
-                            position: p.position,
-                            contact_normal: c.normal,
+                            normal,
+                            tangent,
+                            tangent_world,
+                            position,
+                            contact_normal,
                         },
                     )
                 })
                 .collect();
             self.contact_cache.insert(*key, entry);
         }
+        self.diag.post_ns[2] = _t_pcm.elapsed().as_nanos() as u64;
 
         // 6) 아일랜드 union-find (동적-동적 edge만 — static은 anchor 전용, 설계 §4.3)
         //    + island 단위 일괄 sleep (설계 §4.6)
@@ -2560,10 +2640,14 @@ impl World {
         self.diag.sub_ns[3] = _t_isl.elapsed().as_nanos() as u64;
 
         self.joints = joints;
+        let _t_hyg = std::time::Instant::now();
 
         // 7) denormal 위생 (설계 §8 flush 지점)
+        // 잠든 바디는 건너뛴다 — 속도가 정확히 0이다(이번 스텝에 잠든 바디는 위 6절이 방금
+        // 0으로 만들었고, 이전에 잠든 바디는 모든 변이 API가 wake를 거치므로 0인 채 불변,
+        // 복원도 asleep ⇒ 속도 0을 강제한다). flush_tiny(0)=0이라 건너뜀은 항등이다.
         for (i, b) in self.bodies.iter_mut().enumerate() {
-            if self.alive[i] && b.is_dynamic() {
+            if self.alive[i] && b.is_dynamic() && !self.asleep[i] {
                 b.linvel = Vec3::new(
                     maru_math::flush_tiny(b.linvel.x),
                     maru_math::flush_tiny(b.linvel.y),
@@ -2581,7 +2665,9 @@ impl World {
         // (리더가 `Body::validate`를 그대로 쓰는 근거).
         self.clamp_velocities();
         self.enforce_world_bounds();
-        self.diag.state_saturations = self.close_state_policy();
+        // 캐시는 insert 시점에 닫았다(위 5절) — 그 hit도 이 스텝의 포화 카운트다.
+        self.diag.state_saturations = cache_sat_hits + self.close_state_policy();
+        self.diag.post_ns[3] = _t_hyg.elapsed().as_nanos() as u64;
         self.diag.phase_ns[4] = _t_post.elapsed().as_nanos() as u64;
     }
 }
