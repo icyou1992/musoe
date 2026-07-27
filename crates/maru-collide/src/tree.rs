@@ -115,6 +115,29 @@ impl Tree {
         node as u32
     }
 
+    /// **바운드만 다시 계산한다 — 위상은 그대로.** 아이템 AABB가 바뀐 뒤 호출하면
+    /// 모든 노드 바운드가 현재 아이템의 정확한(느슨하지 않은) 합집합이 된다.
+    ///
+    /// 위상을 안 바꾸는 것이 합법인 근거가 §4.1이다: 페어 집합은 트리 후보에 정밀 AABB
+    /// 판정을 적용한 결과로 정의되므로, 위상은 성능에만 영향을 준다. 낡은 위상은 후보를
+    /// 더 만들 수는 있어도 놓칠 수는 없다 — 바운드가 정확한 한.
+    ///
+    /// `build_rec`는 부모 노드를 자식보다 먼저 push하므로(자식 인덱스 > 부모) 역순 순회
+    /// 한 번이면 자식 바운드가 항상 부모보다 먼저 확정된다. O(노드) = O(n/3).
+    /// `aabb_of`는 리프 id → 현재 AABB (호출자가 슬롯 색인으로 O(1) 제공).
+    pub fn refit(&mut self, aabb_of: impl Fn(u32) -> Aabb) {
+        for node in (0..self.children.len()).rev() {
+            for lane in 0..4 {
+                let b = match decode(self.children[node][lane]) {
+                    Child::None => continue, // empty() 초기값(역전 AABB) 유지 — 항상 불일치
+                    Child::Leaf(id) => aabb_of(id),
+                    Child::Node(c) => self.bounds[c as usize].union_all(),
+                };
+                self.bounds[node].set_lane(lane, b);
+            }
+        }
+    }
+
     /// 질의 AABB와 겹칠 **가능성이 있는** 리프 id들(superset). 정렬·정밀 판정은 호출자 몫.
     /// 스택을 매번 할당하지 않도록 스크래치를 받는 버전은 [`Tree::query_candidates_in`].
     pub fn query_candidates(&self, q: Aabb, out: &mut Vec<u32>) {
@@ -237,6 +260,21 @@ pub(crate) mod soa_bounds {
         pub(crate) fn set_lane(&mut self, lane: usize, b: Aabb) {
             self.min[lane] = b.min;
             self.max[lane] = b.max;
+        }
+
+        /// 네 레인 바운드의 합집합 (빈 레인은 역전 AABB라 merge에 중립).
+        pub(crate) fn union_all(&self) -> Aabb {
+            let mut b = Aabb {
+                min: self.min[0],
+                max: self.max[0],
+            };
+            for lane in 1..4 {
+                b = b.merge(Aabb {
+                    min: self.min[lane],
+                    max: self.max[lane],
+                });
+            }
+            b
         }
 
         #[inline]

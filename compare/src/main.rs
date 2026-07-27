@@ -145,6 +145,116 @@ mod maru_side {
         }
     }
 
+
+    /// 혼합 씬: 정착한 더미 n개(전원 수면) + 공중 낙하 교란체 k개.
+    /// 낙하체는 측정 창 내내 미착지(y=150에서 4s 낙하 = 78m)라, 잠든 더미와의 상호작용
+    /// 없이 "활성 바디 k개가 존재하는 것 자체"의 스텝 비용을 격리해 잰다 —
+    /// bp_valid는 moved=false에서만 참이므로 혼합 씬은 페어 캐시를 절대 못 탄다.
+    pub fn mixed(n: usize, k: usize, steps: usize, warmup: usize) -> Result_ {
+        let d = WorldParams::default();
+        let mut w = World::new(WorldParams {
+            sleep_linear_threshold: SLEEP_LIN,
+            sleep_angular_threshold: SLEEP_ANG,
+            time_to_sleep: SLEEP_TIME,
+            ..d
+        });
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(30.0, 1.0, 30.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        ));
+        let side = (n as f32).cbrt().ceil() as usize;
+        let mut pile = Vec::new();
+        'outer: for iy in 0..side * 3 {
+            for ix in 0..side {
+                for iz in 0..side {
+                    if pile.len() >= n {
+                        break 'outer;
+                    }
+                    let x = ix as f32 * 1.1 - side as f32 * 0.55;
+                    let z = iz as f32 * 1.1 - side as f32 * 0.55;
+                    let y = 0.55 + iy as f32 * 1.1;
+                    pile.push(w.add_body(Body::new_dynamic(
+                        Shape::Sphere { radius: 0.5 },
+                        pose(x, y, z),
+                        1.0,
+                    )));
+                }
+            }
+        }
+        // 정착 — 전원 수면까지 (600스텝 상한, 실측 ~300)
+        let mut settle_steps = 0usize;
+        while settle_steps < 600 && !pile.iter().all(|h| w.is_asleep(*h)) {
+            w.step(DT);
+            settle_steps += 1;
+        }
+        let all_asleep = pile.iter().all(|h| w.is_asleep(*h));
+        // 교란체 k개 — 더미 위 상공, 서로 겹치지 않게 격자 배치
+        let mut drops = Vec::new();
+        for i in 0..k {
+            let x = (i % 5) as f32 * 2.0 - 4.0;
+            let z = ((i / 5) % 5) as f32 * 2.0 - 4.0;
+            let y = 150.0 + (i / 25) as f32 * 3.0;
+            drops.push(w.add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.5 },
+                pose(x, y, z),
+                1.0,
+            )));
+        }
+        for _ in 0..warmup {
+            let _ = w.try_step(DT);
+        }
+        let t0 = Instant::now();
+        let mut acc = [0u64; 5];
+        let mut sub = [0u64; 5];
+        let mut pairs_acc = 0usize;
+        let mut reused = 0usize;
+        let mut incr = 0usize;
+        for _ in 0..steps {
+            let _ = w.try_step(DT);
+            let dgn = w.diagnostics();
+            for j in 0..5 {
+                acc[j] += dgn.phase_ns[j];
+                sub[j] += dgn.sub_ns[j];
+            }
+            pairs_acc += dgn.pairs;
+            reused += dgn.bp_reused as usize;
+            incr += dgn.bp_incremental as usize;
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+        let sc = steps as f64;
+        eprintln!(
+            "    [maru mixed] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us  페어 {}  bp재사용 {reused} 증분 {incr} /{steps}",
+            acc[0] as f64 / 1000.0 / sc,
+            acc[1] as f64 / 1000.0 / sc,
+            acc[2] as f64 / 1000.0 / sc,
+            acc[3] as f64 / 1000.0 / sc,
+            acc[4] as f64 / 1000.0 / sc,
+            pairs_acc / steps,
+        );
+        eprintln!(
+            "    [maru mixed] 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} 기준선정렬={:.0} us",
+            sub[0] as f64 / 1000.0 / sc,
+            sub[1] as f64 / 1000.0 / sc,
+            sub[2] as f64 / 1000.0 / sc,
+            sub[3] as f64 / 1000.0 / sc,
+            sub[4] as f64 / 1000.0 / sc,
+        );
+        let asleep = pile.iter().filter(|h| w.is_asleep(**h)).count();
+        let finite = drops.iter().all(|h| w.body(*h).pose().pos.y.is_finite());
+        let airborne = drops.iter().all(|h| w.body(*h).pose().pos.y > 20.0);
+        Result_ {
+            ms_per_step: ms,
+            stable: all_asleep && finite && asleep == pile.len() && airborne,
+            detail: format!(
+                "정착 {settle_steps}스텝 · 더미수면 {asleep}/{} · 낙하체 공중 {airborne} · k={k}",
+                pile.len()
+            ),
+        }
+    }
+
     pub fn pile(mode: Mode, n: usize, steps: usize, warmup: usize) -> Result_ {
         let sub: u32 = std::env::var("MARU_SUB")
             .ok()
@@ -469,6 +579,89 @@ mod rapier_side {
         }
     }
 
+
+    /// 혼합 씬 — maru_side::mixed와 동일 구성 (정착 더미 n + 공중 낙하 k).
+    pub fn mixed(n: usize, k: usize, steps: usize, warmup: usize) -> Result_ {
+        let mut s = Sim::new();
+        let ground = s.bodies.insert(RigidBodyBuilder::fixed().translation(
+            rapier3d::math::Vec3::new(0.0, -1.0, 0.0),
+        ));
+        s.colliders.insert_with_parent(
+            ColliderBuilder::cuboid(30.0, 1.0, 30.0).density(1.0),
+            ground,
+            &mut s.bodies,
+        );
+        let side = (n as f32).cbrt().ceil() as usize;
+        let mut pile = Vec::new();
+        'outer: for iy in 0..side * 3 {
+            for ix in 0..side {
+                for iz in 0..side {
+                    if pile.len() >= n {
+                        break 'outer;
+                    }
+                    let x = ix as f32 * 1.1 - side as f32 * 0.55;
+                    let z = iz as f32 * 1.1 - side as f32 * 0.55;
+                    let y = 0.55 + iy as f32 * 1.1;
+                    let h = s.bodies.insert(
+                        RigidBodyBuilder::dynamic()
+                            .translation(rapier3d::math::Vec3::new(x, y, z))
+                            .can_sleep(true),
+                    );
+                    match_sleep(&mut s, h, true);
+                    s.colliders.insert_with_parent(
+                        ColliderBuilder::ball(0.5).density(1.0),
+                        h,
+                        &mut s.bodies,
+                    );
+                    pile.push(h);
+                }
+            }
+        }
+        let mut settle_steps = 0usize;
+        while settle_steps < 600 && !pile.iter().all(|h| s.bodies[*h].is_sleeping()) {
+            s.step();
+            settle_steps += 1;
+        }
+        let all_asleep = pile.iter().all(|h| s.bodies[*h].is_sleeping());
+        let mut drops = Vec::new();
+        for i in 0..k {
+            let x = (i % 5) as f32 * 2.0 - 4.0;
+            let z = ((i / 5) % 5) as f32 * 2.0 - 4.0;
+            let y = 150.0 + (i / 25) as f32 * 3.0;
+            let h = s.bodies.insert(
+                RigidBodyBuilder::dynamic()
+                    .translation(rapier3d::math::Vec3::new(x, y, z))
+                    .can_sleep(true),
+            );
+            match_sleep(&mut s, h, true);
+            s.colliders.insert_with_parent(
+                ColliderBuilder::ball(0.5).density(1.0),
+                h,
+                &mut s.bodies,
+            );
+            drops.push(h);
+        }
+        for _ in 0..warmup {
+            s.step();
+        }
+        let t0 = Instant::now();
+        for _ in 0..steps {
+            s.step();
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+        let asleep = pile.iter().filter(|h| s.bodies[**h].is_sleeping()).count();
+        let finite = drops.iter().all(|h| s.bodies[*h].translation().y.is_finite());
+        let airborne = drops.iter().all(|h| s.bodies[*h].translation().y > 20.0);
+        Result_ {
+            ms_per_step: ms,
+            stable: all_asleep && finite && asleep == pile.len() && airborne,
+            detail: format!(
+                "정착 {settle_steps}스텝 · 더미수면 {asleep}/{} · 낙하체 공중 {airborne} · k={k}",
+                pile.len()
+            ),
+        }
+    }
+
     pub fn pile(mode: Mode, n: usize, steps: usize, warmup: usize) -> Result_ {
         let mut s = Sim::new();
         let can_sleep = mode == Mode::Settle;
@@ -604,6 +797,13 @@ fn main() {
                 println!("[구 더미 {n}개]");
                 row("maru", &best(reps, || maru_side::pile(mode, n, steps, warmup)));
                 row("rapier", &best(reps, || rapier_side::pile(mode, n, steps, warmup)));
+            }
+        }
+        if (scenario == "all" || scenario == "mixed") && mode == Mode::Settle {
+            for k in [5usize, 25, 100] {
+                println!("[혼합: 정착 3000 + 낙하 {k}]");
+                row("maru", &best(reps, || maru_side::mixed(3000, k, steps, warmup)));
+                row("rapier", &best(reps, || rapier_side::mixed(3000, k, steps, warmup)));
             }
         }
     }

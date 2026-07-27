@@ -248,6 +248,15 @@ pub struct World {
     bp_valid: bool,
     /// 캐시를 만들 때의 dt (sweep AABB가 dt에 비례하므로 바뀌면 무효).
     bp_dt: f32,
+    /// 영속 브로드페이즈 구조(아이템·트리) — **파생 상태**(비캐노니컬, 스냅샷 제외).
+    /// `Some`이면 아이템·트리가 "마지막 브로드페이즈 시점 + 그 뒤 엔진 적분"과 일치한다는
+    /// 뜻이고, 호스트/구조 변이는 전부 `invalidate_bp`로 `None`을 만든다. 증분 갱신
+    /// (R = 직전 스텝 integrate_gate)의 근거이며, §4.1(페어 집합 트리 비의존)이 위상
+    /// 재사용을 합법으로 만든다.
+    bp: Option<Broadphase>,
+    /// 테스트 전용: 증분 브로드페이즈를 끄고 항상 재빌드 (등가성 A/B의 대조군).
+    /// 비캐노니컬·비직렬화 — 프로덕션 경로에서는 항상 false다.
+    bp_force_full: bool,
     /// 솔버 핫패스 스크래치 (비캐노니컬). 매 스텝 재할당하지 않으려고 월드가 보관한다.
     solver_state: solver::SolverState,
     inv_inertia_local: Vec<Vec3>,
@@ -286,6 +295,8 @@ pub struct Diagnostics {
     pub pair_budget: usize,
     /// 이번 스텝이 브로드페이즈 캐시를 재사용했는가 (전원 수면 등 무변화 스텝).
     pub bp_reused: bool,
+    /// 이번 스텝이 증분 브로드페이즈(움직인 바디만 갱신 + 페어 델타)를 탔는가.
+    pub bp_incremental: bool,
     /// 단계별 소요 (ns) — 프로파일용.
     /// `[aabb, broad, narrow, solve, post]`
     /// - `aabb`: 바디 순회 + 회전 월드 AABB 구성 (예전에는 broad에서 **빠져 있었다**)
@@ -440,6 +451,8 @@ impl World {
             bp_pairs: Vec::new(),
             bp_valid: false,
             bp_dt: 0.0,
+            bp: None,
+            bp_force_full: false,
             solver_state: solver::SolverState::default(),
             inv_inertia_local: Vec::new(),
             ext_force: Vec::new(),
@@ -460,14 +473,14 @@ impl World {
     /// 파라미터 교체 — 생성자와 **같은 불변식**을 통과해야 한다.
     pub fn set_params(&mut self, params: WorldParams) {
         validate_params(&params);
-        self.bp_valid = false;
+        self.invalidate_bp();
         self.params = params;
     }
 
     /// 파라미터 교체 (오류 반환형).
     pub fn try_set_params(&mut self, params: WorldParams) -> Result<(), ApiError> {
         check_params(&params)?;
-        self.bp_valid = false;
+        self.invalidate_bp();
         self.params = params;
         Ok(())
     }
@@ -532,7 +545,7 @@ impl World {
     }
 
     fn add_body_validated(&mut self, body: Body) -> BodyHandle {
-        self.bp_valid = false;
+        self.invalidate_bp();
         if let Some(index) = self.free_slot() {
             self.bodies[index] = body;
             self.alive[index] = true;
@@ -592,7 +605,7 @@ impl World {
             }
         }
         // ② 구조 변경
-        self.bp_valid = false;
+        self.invalidate_bp();
         self.alive[i] = false;
         self.reserved[i] = false;
         self.oob[i] = false;
@@ -631,7 +644,7 @@ impl World {
     /// 모든 변이는 유한성 검사 + wake + stale PCM 폐기를 거친다. static은 불변(설계 §9).
     fn mutate(&mut self, h: BodyHandle) -> Result<usize, ApiError> {
         let i = self.resolve(h)?;
-        self.bp_valid = false;
+        self.invalidate_bp();
         if self.bodies[i].body_type == BodyType::Static {
             return Err(ApiError::ImmutableStatic);
         }
@@ -660,7 +673,7 @@ impl World {
         // 한 스텝 빠진다(얇은 벽 터널링의 씨앗). 캐시 계약("재사용은 항등")의 위반이다.
         // 힘/토크 경로는 속도가 적분 시점에 바뀌므로 원래도 등가지만, 힘이 실리는 장면은
         // 어차피 moved=true로 캐시가 없어 일괄 무효화의 추가 비용이 없다.
-        self.bp_valid = false;
+        self.invalidate_bp();
         self.wake(i);
         Ok(i)
     }
@@ -1218,7 +1231,7 @@ impl World {
                         // `add_body`만 무효화하고 이 경로를 빠뜨려, 빈 페어 캐시를 가진 월드가
                         // 커맨드로 바디를 얻어도 캐시를 재사용했다. 같은 스냅샷을 복원한
                         // 월드는 캐시가 없어 페어를 재빌드하므로 **미래가 갈렸다** — L0 위반.
-                        self.bp_valid = false;
+                        self.invalidate_bp();
                         self.bodies[i] = *b;
                         self.reserved[i] = false;
                         self.alive[i] = true;
@@ -1329,7 +1342,7 @@ impl World {
             self.bodies[i].linvel = Vec3::ZERO;
             self.bodies[i].angvel = Vec3::ZERO;
             // `asleep`이 아니라 **별도 상태**다 — 자동 wake 경로에 걸리면 안 된다.
-            self.bp_valid = false;
+            self.invalidate_bp();
             // **인접 조인트의 누적 임펄스를 지운다**(리뷰 MAJOR): OOB 동안 solve만 건너뛰면
             // 이탈 전 자세에서 쌓인 임펄스가 남고, 호스트가 `set_pose`로 복귀시킨 다음 스텝의
             // warm start가 그걸 새 자세에 그대로 적용해 큰 kick을 만든다.
@@ -1557,7 +1570,7 @@ impl World {
         // (stale `state_saturations`가 다음 `try_step`을 StateOverflow로 만들던 경로).
         self.diag = Diagnostics::default();
         self.resource_limit = false;
-        self.bp_valid = false;
+        self.invalidate_bp();
     }
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
@@ -1587,6 +1600,22 @@ impl World {
 
     pub fn state_hash(&self) -> u64 {
         crate::snapshot::state_hash(&self.snapshot())
+    }
+
+    /// 브로드페이즈 파생 상태 전체 무효화 — 호스트/구조 변이의 공통 출구.
+    /// `bp_valid`(무이동 페어 캐시)와 `bp`(증분용 아이템·트리) 둘 다 버린다:
+    /// 아이템 집합·형상·자세·속도가 엔진 밖에서 바뀌면 "R = integrate_gate" 논증이 깨진다.
+    fn invalidate_bp(&mut self) {
+        self.bp_valid = false;
+        self.bp = None;
+    }
+
+    /// 테스트 전용 노브: 증분 브로드페이즈 비활성(항상 전체 재빌드).
+    /// 증분 궤적 == 재빌드 궤적(스냅샷 바이트) 등가 테스트의 대조군을 만든다.
+    #[doc(hidden)]
+    pub fn set_force_full_broadphase(&mut self, v: bool) {
+        self.bp_force_full = v;
+        self.invalidate_bp();
     }
 
     /// 아일랜드 단위 wake (설계 §4.6). 직전 스텝의 아일랜드 대표가 같은 동적 바디를 모두 깨운다.
@@ -1734,11 +1763,35 @@ impl World {
             self.diag.touching = self.touching.len();
             return;
         }
+        // **증분 브로드페이즈 판정.** 구조(아이템 집합·형상·자세의 호스트 변이)가 유효하고
+        // 직전 스텝의 integrate_gate가 현재 슬롯 수와 맞으면, "직전 스텝에 적분된 바디"가
+        // 곧 AABB가 변했을 수 있는 유일한 집합 R이다 — 엔진의 모든 자세·속도 쓰기는
+        // gate-true 바디에만 가고(비적분 바디의 write_back은 항등), 호스트 쓰기는 전부
+        // `invalidate_bp`를 거친다. R만 갱신하고 페어를 델타로 재생성하면 결과는 §4.1에 의해
+        // 전체 재빌드와 비트 동일하다(maru-collide 속성 테스트 + 아래 시뮬 등가 테스트가 잠금).
+        // R이 슬롯의 절반을 넘으면 재빌드가 더 싸다.
+        let can_incr = !bp_cache_hit
+            && !self.bp_force_full
+            && self.bp.is_some()
+            && self.integrate_gate.len() == self.bodies.len();
+        let moved_ids: Vec<u32> = if can_incr {
+            (0..self.bodies.len())
+                .filter(|&i| self.integrate_gate[i])
+                .map(|i| i as u32)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let incremental = can_incr && moved_ids.len() <= self.bodies.len() / 2;
         for (i, b) in self
             .bodies
             .iter()
             .enumerate()
-            .take(if bp_cache_hit { 0 } else { usize::MAX })
+            .take(if bp_cache_hit || incremental {
+                0
+            } else {
+                usize::MAX
+            })
         {
             if !self.alive[i] {
                 continue; // 제거된 슬롯
@@ -1762,6 +1815,25 @@ impl World {
                         world.expand_sweep(vel_dt, self.params.speculative_margin),
                     ));
                 }
+            }
+        }
+        // 증분 경로의 갱신 목록 — 위 전체 루프와 **같은 AABB 정의**(body_aabb + sweep).
+        let mut bp_updates: Vec<(u32, Aabb)> = Vec::new();
+        if incremental {
+            for &r in &moved_ids {
+                let i = r as usize;
+                // R 원소는 직전 스텝에 적분됐고(alive·비OOB·비static), 그 뒤의 구조 변경은
+                // 전부 invalidate_bp를 거쳐 여기 못 온다.
+                debug_assert!(
+                    self.alive[i] && !self.oob[i] && self.bodies[i].body_type != BodyType::Static,
+                    "R 원소가 브로드페이즈 대상이 아니다 — invalidate_bp 누락"
+                );
+                let world = self.body_aabb(i);
+                let vel_dt = self.bodies[i].linvel * dt;
+                bp_updates.push((
+                    r,
+                    world.expand_sweep(vel_dt, self.params.speculative_margin),
+                ));
             }
         }
         self.diag.phase_ns[0] = _t_aabb.elapsed().as_nanos() as u64;
@@ -1827,12 +1899,37 @@ impl World {
         let pairs = if bp_cache_hit {
             self.diag.bp_reused = true;
             std::mem::take(&mut self.bp_pairs)
+        } else if incremental {
+            // 증분: R의 AABB만 교체 + 트리 리핏(위상 유지) + 페어 델타 병합.
+            // 결과는 전체 재빌드와 비트 동일하다 — 등가 논증은 incremental_pairs_bounded 문서에.
+            self.diag.bp_incremental = true;
+            let bp = self.bp.as_mut().expect("incremental ⇒ bp 존재");
+            bp.refresh_dynamic(&bp_updates);
+            let mut mask = vec![false; self.bodies.len()];
+            for &r in &moved_ids {
+                mask[r as usize] = true;
+            }
+            let prev = std::mem::take(&mut self.bp_pairs);
+            match bp.incremental_pairs_bounded(&moved_ids, &mask, &prev, budget) {
+                Some(p) => p,
+                None => {
+                    // 아이템은 이미 갱신됐는데 페어는 옛것 — 구조를 통째로 버려 다음 스텝이
+                    // 재빌드하게 한다(스텝은 상태 불변으로 종료: 여기는 wake 폐쇄 이전이다).
+                    self.bp_pairs = prev;
+                    self.invalidate_bp();
+                    self.resource_limit = true;
+                    return;
+                }
+            }
         } else {
             let bp = Broadphase::build(dyn_items, static_items);
             let Some(p) = bp.canonical_pairs_bounded(budget) else {
+                self.invalidate_bp();
                 self.resource_limit = true;
                 return;
             };
+            // 다음 스텝의 증분 갱신을 위해 구조를 보존한다.
+            self.bp = Some(bp);
             p
         };
         self.diag.pairs = pairs.len();
@@ -2126,7 +2223,7 @@ impl World {
                     // 접점 Vec 할당은 wake 이후 불가피한 유일한 잔여 예약이나(≤4점) — 예산 선점 후라
                     // 실패는 극단 OOM뿐. 그 경우 bp_valid를 내려 다음 스텝이 재빌드하게 한다.
                     let Ok(c) = solver::prepare(&self.bodies, a_id, b_id, &m, cached, dt) else {
-                        self.bp_valid = false;
+                        self.invalidate_bp();
                         self.resource_limit = true;
                         return;
                     };

@@ -4693,4 +4693,75 @@ mod tests {
             "임펄스 후에도 페어 캐시를 재사용했다 — 임펄스 전 속도의 sweep AABB로 스텝이 돈다"
         );
     }
+
+    /// 증분 브로드페이즈 등가성 — **궤적 전체**로 잠근다: 증분 월드와 전체-재빌드 월드를
+    /// 같은 입력으로 락스텝 진행하며 매 스텝 스냅샷 바이트가 같아야 한다. 페어 집합이
+    /// 한 스텝이라도 갈리면 제약·이벤트·wake가 갈려 스냅샷이 갈린다.
+    /// 시나리오는 증분의 모든 전이를 지나간다: 활성 낙하(R>0) → 정착(전원 수면, fast path)
+    /// → 임펄스(구조 무효화 + wake) → 바디 추가(구조 무효화) → 재정착.
+    #[test]
+    fn incremental_broadphase_trajectory_matches_full_rebuild() {
+        let build = |force_full: bool| {
+            let mut w = World::new(WorldParams::default());
+            w.set_force_full_broadphase(force_full);
+            ground(&mut w);
+            let mut hs = Vec::new();
+            for i in 0..24 {
+                let x = (i % 4) as f32 * 1.05 - 2.0;
+                let z = ((i / 4) % 3) as f32 * 1.05 - 1.0;
+                let y = 0.5 + (i / 12) as f32 * 1.05;
+                hs.push(w.add_body(Body::new_dynamic(
+                    Shape::Box {
+                        half: Vec3::new(0.5, 0.5, 0.5),
+                        radius: 0.0,
+                    },
+                    pose(x, y, z),
+                    1.0,
+                )));
+            }
+            // 낙하 교란체 — 높이 띄워 "잠든 다수 + 활성 소수"(증분 창)를 길게 만든다.
+            // R이 슬롯 절반을 넘는 활성 구간은 설계상 재빌드 폴백이라 증분이 안 돈다.
+            for i in 0..4 {
+                hs.push(w.add_body(Body::new_dynamic(
+                    Shape::Sphere { radius: 0.4 },
+                    pose(i as f32 * 1.5 - 2.0, 50.0 + i as f32 * 8.0, 0.3),
+                    1.0,
+                )));
+            }
+            (w, hs)
+        };
+        let (mut a, ha) = build(false); // 증분
+        let (mut b, hb) = build(true); // 전체 재빌드 (대조군)
+        assert_eq!(ha.len(), hb.len());
+        let mut incr_steps = 0usize;
+        for step in 0..460 {
+            // 중간 이벤트: 임펄스(정착 후) · 바디 추가 — 양쪽 동일 적용
+            if step == 340 {
+                a.apply_impulse(ha[0], Vec3::new(6.0, 3.0, 0.0)).unwrap();
+                b.apply_impulse(hb[0], Vec3::new(6.0, 3.0, 0.0)).unwrap();
+            }
+            if step == 380 {
+                let body =
+                    || Body::new_dynamic(Shape::Sphere { radius: 0.4 }, pose(0.2, 8.0, -0.2), 1.0);
+                a.add_body(body());
+                b.add_body(body());
+            }
+            a.step(DT);
+            b.step(DT);
+            incr_steps += a.diagnostics().bp_incremental as usize;
+            assert!(
+                !b.diagnostics().bp_incremental,
+                "대조군이 증분을 탔다 — 노브 고장, 테스트 무의미"
+            );
+            assert_eq!(
+                a.snapshot(),
+                b.snapshot(),
+                "step {step}: 증분 궤적이 전체 재빌드 궤적에서 이탈"
+            );
+        }
+        assert!(
+            incr_steps > 60,
+            "증분 경로가 거의 안 돌았다({incr_steps}스텝) — 테스트가 아무것도 증명 안 함"
+        );
+    }
 }
