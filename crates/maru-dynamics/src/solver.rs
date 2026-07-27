@@ -58,6 +58,7 @@ impl Softness {
     }
 }
 
+#[derive(Clone)]
 pub struct ContactPointConstraint {
     /// PCM 캐시 매칭 키 (설계 §4.2 canonical feature ID — M1 클리핑 계보).
     pub feature: maru_collide::FeatureId,
@@ -82,6 +83,7 @@ pub struct ContactPointConstraint {
     pub approach_vn: f32,
 }
 
+#[derive(Clone)]
 pub struct ContactConstraint {
     pub a: usize,
     pub b: usize,
@@ -576,6 +578,12 @@ impl BodyRegx4 {
             }
         }
     }
+
+    /// 레인별 접점 속도 v + ω×r (스칼라 `BodyReg::vel_at`의 4-wide).
+    #[inline]
+    fn vel_at(&self, r: Vec3x4) -> Vec3x4 {
+        self.lin + self.ang.cross(r)
+    }
 }
 
 /// warm start의 4제약 배치판. 레인당 결과는 스칼라 `warm_start`와 **비트 동일**하다
@@ -686,6 +694,242 @@ pub fn warm_start_batched(
         }
         for c in &constraints[i..end] {
             warm_start(st, c);
+        }
+    }
+}
+
+/// 배치 solve 파라미터 (Unit 3c). bias 페이즈면 `relax=false`+per-lane softness 선택, relax면
+/// `relax=true`(bias 제거). soft=동적-동적, static_soft=동적-정적 — 레인마다 both-dynamic로 고른다.
+pub struct BatchSolveParams {
+    pub inv_h: f32,
+    pub relax: bool,
+    pub soft: Softness,
+    pub static_soft: Softness,
+    pub max_bias: f32,
+}
+
+/// solve의 4제약 배치판 (Unit 3c). 레인당 스칼라 `solve`와 **비트 동일**하다: 연산 순서 동일·
+/// 비FMA, 분기(s>0 speculative·Coulomb 원판)는 blend, 없는 점·비cond 레인은 마스크로 원본 보존
+/// (x+0.0 부호0 뒤집힘·0/0 NaN 오염 차단 — NaN은 select 밖으로 못 샌다). 점 변이(normal/tangent
+/// impulse·max)는 레인별로 각 제약 점에 스캐터. 같은 색이라 dynamic 바디 disjoint → 레인 독립.
+pub fn solve_x4(st: &mut SolverState, mut cs: [&mut ContactConstraint; 4], p: &BatchSolveParams) {
+    let a_idx = [cs[0].a, cs[1].a, cs[2].a, cs[3].a];
+    let b_idx = [cs[0].b, cs[1].b, cs[2].b, cs[3].b];
+    let mut ba = BodyRegx4::load(st, a_idx);
+    let mut bb = BodyRegx4::load(st, b_idx);
+    let pos_a = Vec3x4::from_array([
+        st.pos[a_idx[0]],
+        st.pos[a_idx[1]],
+        st.pos[a_idx[2]],
+        st.pos[a_idx[3]],
+    ]);
+    let pos_b = Vec3x4::from_array([
+        st.pos[b_idx[0]],
+        st.pos[b_idx[1]],
+        st.pos[b_idx[2]],
+        st.pos[b_idx[3]],
+    ]);
+    let normal = Vec3x4::from_array([cs[0].normal, cs[1].normal, cs[2].normal, cs[3].normal]);
+    let t0 = Vec3x4::from_array([
+        cs[0].tangents[0],
+        cs[1].tangents[0],
+        cs[2].tangents[0],
+        cs[3].tangents[0],
+    ]);
+    let t1 = Vec3x4::from_array([
+        cs[0].tangents[1],
+        cs[1].tangents[1],
+        cs[2].tangents[1],
+        cs[3].tangents[1],
+    ]);
+    let friction = f32x4::from([
+        cs[0].friction,
+        cs[1].friction,
+        cs[2].friction,
+        cs[3].friction,
+    ]);
+    let (zero, one) = (f32x4::splat(0.0), f32x4::splat(1.0));
+    // per-lane softness (bias 페이즈): both-dynamic면 soft, 아니면 static_soft.
+    let both_dyn = ba.dyn_mask & bb.dyn_mask;
+    let sf_bias = both_dyn.blend(
+        f32x4::splat(p.soft.bias_rate),
+        f32x4::splat(p.static_soft.bias_rate),
+    );
+    let sf_mass = both_dyn.blend(
+        f32x4::splat(p.soft.mass_scale),
+        f32x4::splat(p.static_soft.mass_scale),
+    );
+    let sf_imp = both_dyn.blend(
+        f32x4::splat(p.soft.impulse_scale),
+        f32x4::splat(p.static_soft.impulse_scale),
+    );
+    let inv_h = f32x4::splat(p.inv_h);
+    let neg_max_bias = f32x4::splat(-p.max_bias);
+    let maxpts = cs.iter().map(|c| c.points.len()).max().unwrap_or(0);
+    for k in 0..maxpts {
+        let q = [
+            cs[0].points.get(k),
+            cs[1].points.get(k),
+            cs[2].points.get(k),
+            cs[3].points.get(k),
+        ];
+        let has = f32x4::from([
+            q[0].is_some() as u32 as f32,
+            q[1].is_some() as u32 as f32,
+            q[2].is_some() as u32 as f32,
+            q[3].is_some() as u32 as f32,
+        ])
+        .cmp_gt(f32x4::splat(0.5));
+        let ra = Vec3x4::from_array([
+            q[0].map_or(Vec3::ZERO, |p| p.ra),
+            q[1].map_or(Vec3::ZERO, |p| p.ra),
+            q[2].map_or(Vec3::ZERO, |p| p.ra),
+            q[3].map_or(Vec3::ZERO, |p| p.ra),
+        ]);
+        let rb = Vec3x4::from_array([
+            q[0].map_or(Vec3::ZERO, |p| p.rb),
+            q[1].map_or(Vec3::ZERO, |p| p.rb),
+            q[2].map_or(Vec3::ZERO, |p| p.rb),
+            q[3].map_or(Vec3::ZERO, |p| p.rb),
+        ]);
+        let base_sep = f32x4::from([
+            q[0].map_or(0.0, |p| p.base_separation),
+            q[1].map_or(0.0, |p| p.base_separation),
+            q[2].map_or(0.0, |p| p.base_separation),
+            q[3].map_or(0.0, |p| p.base_separation),
+        ]);
+        let normal_mass = f32x4::from([
+            q[0].map_or(0.0, |p| p.normal_mass),
+            q[1].map_or(0.0, |p| p.normal_mass),
+            q[2].map_or(0.0, |p| p.normal_mass),
+            q[3].map_or(0.0, |p| p.normal_mass),
+        ]);
+        let tm0 = f32x4::from([
+            q[0].map_or(0.0, |p| p.tangent_mass[0]),
+            q[1].map_or(0.0, |p| p.tangent_mass[0]),
+            q[2].map_or(0.0, |p| p.tangent_mass[0]),
+            q[3].map_or(0.0, |p| p.tangent_mass[0]),
+        ]);
+        let tm1 = f32x4::from([
+            q[0].map_or(0.0, |p| p.tangent_mass[1]),
+            q[1].map_or(0.0, |p| p.tangent_mass[1]),
+            q[2].map_or(0.0, |p| p.tangent_mass[1]),
+            q[3].map_or(0.0, |p| p.tangent_mass[1]),
+        ]);
+        let mut ni = f32x4::from([
+            q[0].map_or(0.0, |p| p.normal_impulse),
+            q[1].map_or(0.0, |p| p.normal_impulse),
+            q[2].map_or(0.0, |p| p.normal_impulse),
+            q[3].map_or(0.0, |p| p.normal_impulse),
+        ]);
+        let mut ti0 = f32x4::from([
+            q[0].map_or(0.0, |p| p.tangent_impulse[0]),
+            q[1].map_or(0.0, |p| p.tangent_impulse[0]),
+            q[2].map_or(0.0, |p| p.tangent_impulse[0]),
+            q[3].map_or(0.0, |p| p.tangent_impulse[0]),
+        ]);
+        let mut ti1 = f32x4::from([
+            q[0].map_or(0.0, |p| p.tangent_impulse[1]),
+            q[1].map_or(0.0, |p| p.tangent_impulse[1]),
+            q[2].map_or(0.0, |p| p.tangent_impulse[1]),
+            q[3].map_or(0.0, |p| p.tangent_impulse[1]),
+        ]);
+        let mut mni = f32x4::from([
+            q[0].map_or(0.0, |p| p.max_normal_impulse),
+            q[1].map_or(0.0, |p| p.max_normal_impulse),
+            q[2].map_or(0.0, |p| p.max_normal_impulse),
+            q[3].map_or(0.0, |p| p.max_normal_impulse),
+        ]);
+
+        // s = normal·(pa − pb) + base
+        let s = normal.dot((pos_a + ra) - (pos_b + rb)) + base_sep;
+        // --- 법선 ---
+        let vn = normal.dot(ba.vel_at(ra) - bb.vel_at(rb));
+        let s_pos = s.cmp_gt(zero);
+        // else 분기: relax면 (0,1,0), bias면 ((bias_rate·s).max(-max_bias), mass_scale, impulse_scale)
+        let (bias_else, mass_else, imp_else) = if p.relax {
+            (zero, one, zero)
+        } else {
+            ((sf_bias * s).max(neg_max_bias), sf_mass, sf_imp)
+        };
+        let bias = s_pos.blend(s * inv_h, bias_else);
+        let mass_scale = s_pos.blend(one, mass_else);
+        let impulse_scale = s_pos.blend(zero, imp_else);
+        let impulse = -normal_mass * mass_scale * (vn + bias) - impulse_scale * ni;
+        let new_total = (ni + impulse).max(zero);
+        let applied = new_total - ni;
+        ni = new_total;
+        mni = mni.max(new_total);
+        let imp = normal.scale(applied);
+        ba.apply(imp, ra, has);
+        bb.apply(negx4(imp), rb, has);
+        // --- 마찰: 축별 순차 GS 후 Coulomb 원판 ---
+        let max_f = friction * ni;
+        for (t, ti, tm) in [(t0, &mut ti0, tm0), (t1, &mut ti1, tm1)] {
+            let vt = t.dot(ba.vel_at(ra) - bb.vel_at(rb));
+            let delta = -tm * vt;
+            *ti += delta;
+            let imp = t.scale(delta);
+            ba.apply(imp, ra, has);
+            bb.apply(negx4(imp), rb, has);
+        }
+        let mag2 = ti0 * ti0 + ti1 * ti1;
+        let cond = mag2.cmp_gt(max_f * max_f) & mag2.cmp_gt(zero);
+        let scale = max_f / mag2.sqrt();
+        let corr0 = ti0 * (scale - one);
+        let corr1 = ti1 * (scale - one);
+        ti0 = cond.blend(ti0 + corr0, ti0);
+        ti1 = cond.blend(ti1 + corr1, ti1);
+        let imp = t0.scale(corr0) + t1.scale(corr1);
+        ba.apply(imp, ra, has & cond);
+        bb.apply(negx4(imp), rb, has & cond);
+
+        // 점 변이 스캐터 (레인별, 존재하는 점만)
+        let (ni_l, ti0_l, ti1_l, mni_l) = (
+            ni.to_array(),
+            ti0.to_array(),
+            ti1.to_array(),
+            mni.to_array(),
+        );
+        for (lane, c) in cs.iter_mut().enumerate() {
+            if let Some(pt) = c.points.get_mut(k) {
+                pt.normal_impulse = ni_l[lane];
+                pt.tangent_impulse = [ti0_l[lane], ti1_l[lane]];
+                pt.max_normal_impulse = mni_l[lane];
+            }
+        }
+    }
+    ba.store(st, a_idx);
+    bb.store(st, b_idx);
+}
+
+/// solve를 색 범위 단위로 배치 디스패치 (Unit 3c). 색 내 4제약 SIMD, 나머지·오버플로 스칼라.
+pub fn solve_batched(
+    st: &mut SolverState,
+    constraints: &mut [ContactConstraint],
+    color_ranges: &[(u32, u32)],
+    p: &BatchSolveParams,
+) {
+    for (color, &(start, end)) in color_ranges.iter().enumerate() {
+        let (start, end) = (start as usize, end as usize);
+        let overflow = color as u32 == COLOR_OVERFLOW;
+        for chunk in constraints[start..end].chunks_mut(4) {
+            if chunk.len() == 4 && !overflow {
+                if let [c0, c1, c2, c3] = chunk {
+                    solve_x4(st, [c0, c1, c2, c3], p);
+                    continue;
+                }
+            }
+            for c in chunk.iter_mut() {
+                let soft = if p.relax {
+                    None
+                } else if st.dynamic[c.a] && st.dynamic[c.b] {
+                    Some((&p.soft, p.max_bias))
+                } else {
+                    Some((&p.static_soft, p.max_bias))
+                };
+                solve(st, c, p.inv_h, soft);
+            }
         }
     }
 }
@@ -1125,6 +1369,93 @@ mod tests {
         // static 바디(8)는 양쪽 다 불변 — 원본과 비트 동일
         assert_eq!(st_v.lin[8].x.to_bits(), st.lin[8].x.to_bits());
         assert_eq!(st_v.ang[8].z.to_bits(), st.ang[8].z.to_bits());
+    }
+
+    /// 계약: `solve_x4`(bias·relax)는 4번의 스칼라 `solve`와 레인당 **비트 동일**하다 —
+    /// s>0 speculative 분기, per-lane softness(dyn-dyn vs dyn-static), 마찰 2축, Coulomb 원판
+    /// 클램프, 점 변이 스캐터 전부. 혼합 dynamic/static + Coulomb 트리거 + 가변 점수를 모두 친다.
+    #[test]
+    fn solve_x4_matches_scalar_bit_for_bit() {
+        let soft = Softness::new(30.0, 10.0, 1.0 / 240.0);
+        let static_soft = Softness::new(60.0, 10.0, 1.0 / 240.0);
+        let inv_h = 240.0;
+        let max_bias = 3.0;
+        let build = || -> Vec<ContactConstraint> {
+            let mut v = vec![
+                mk_constraint(0, 1, 1),
+                mk_constraint(2, 3, 2),
+                mk_constraint(4, 5, 3),
+                mk_constraint(6, 7, 4),
+            ];
+            // Coulomb 클램프 트리거: 제약0 점0에 큰 접선 임펄스 + 낮은 마찰.
+            v[0].friction = 0.05;
+            v[0].points[0].tangent_impulse = [5.0, -4.0];
+            v[0].points[0].normal_impulse = 0.3;
+            v
+        };
+        for relax in [false, true] {
+            let n = 8;
+            let mut st = mk_state(n);
+            st.dynamic[7] = false; // static → dyn-static softness 경로
+            st.inv_m[7] = 0.0;
+            st.pos = (0..n)
+                .map(|i| Vec3::new(0.1 * i as f32, if i % 2 == 0 { 0.03 } else { -0.02 }, 0.0))
+                .collect();
+            let p = BatchSolveParams {
+                inv_h,
+                relax,
+                soft,
+                static_soft,
+                max_bias,
+            };
+            // 스칼라 (per-constraint sf 선택 — world.rs와 동일)
+            let mut st_s = st.clone();
+            let mut cs_s = build();
+            for c in &mut cs_s {
+                let opt = if relax {
+                    None
+                } else if st_s.dynamic[c.a] && st_s.dynamic[c.b] {
+                    Some((&soft, max_bias))
+                } else {
+                    Some((&static_soft, max_bias))
+                };
+                solve(&mut st_s, c, inv_h, opt);
+            }
+            // SIMD
+            let mut st_v = st.clone();
+            let mut cs_v = build();
+            {
+                let [c0, c1, c2, c3] = &mut cs_v[..] else {
+                    unreachable!()
+                };
+                solve_x4(&mut st_v, [c0, c1, c2, c3], &p);
+            }
+            assert_states_bit_identical(&st_s, &st_v, n);
+            for (a, b) in cs_s.iter().zip(&cs_v) {
+                for (pa, pb) in a.points.iter().zip(&b.points) {
+                    assert_eq!(
+                        pa.normal_impulse.to_bits(),
+                        pb.normal_impulse.to_bits(),
+                        "ni relax={relax}"
+                    );
+                    assert_eq!(
+                        pa.tangent_impulse[0].to_bits(),
+                        pb.tangent_impulse[0].to_bits(),
+                        "ti0 relax={relax}"
+                    );
+                    assert_eq!(
+                        pa.tangent_impulse[1].to_bits(),
+                        pb.tangent_impulse[1].to_bits(),
+                        "ti1 relax={relax}"
+                    );
+                    assert_eq!(
+                        pa.max_normal_impulse.to_bits(),
+                        pb.max_normal_impulse.to_bits(),
+                        "mni relax={relax}"
+                    );
+                }
+            }
+        }
     }
 
     /// 같은 색 안에 공유 conflict 바디가 없음을 전수 검사한다 (오버플로 색 63 제외).

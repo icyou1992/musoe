@@ -1653,6 +1653,22 @@ impl World {
         // 정적/키네마틱 상대 접촉은 2배 강성 (Box2D v3 staticSoftness) — 무한 질량 상대라
         // 더 단단히 잡아도 안정하고, 지면 침하가 스택 전체 침하의 시작점이 된다.
         let static_soft = Softness::new(2.0 * hertz, self.params.solver.contact_damping, h);
+        // SIMD solve 배치 파라미터 (Unit 3c) — bias/relax 두 벌. 색 배치 디스패치가 per-lane으로
+        // dyn-dyn/dyn-static softness를 고른다. 레인당 스칼라와 비트 동일이라 L0 해시 불변.
+        let bias_params = solver::BatchSolveParams {
+            inv_h,
+            relax: false,
+            soft,
+            static_soft,
+            max_bias: self.params.solver.max_bias_speed,
+        };
+        let relax_params = solver::BatchSolveParams {
+            inv_h,
+            relax: true,
+            soft,
+            static_soft,
+            max_bias: self.params.solver.max_bias_speed,
+        };
 
         // 1) 브로드페이즈 — canonical 페어 (트리 비의존 계약은 maru-collide가 보장)
         let _t_aabb = std::time::Instant::now();
@@ -2240,19 +2256,8 @@ impl World {
                     )),
                 );
             }
-            for c in constraints.iter_mut() {
-                let sf = if st.dynamic[c.a] && st.dynamic[c.b] {
-                    &soft
-                } else {
-                    &static_soft
-                };
-                solver::solve(
-                    &mut st,
-                    c,
-                    inv_h,
-                    Some((sf, self.params.solver.max_bias_speed)),
-                );
-            }
+            // bias 솔브 — 색 배치 SIMD 디스패치(Unit 3c). 콜러드-스칼라와 비트 동일.
+            solver::solve_batched(&mut st, &mut constraints, &color_ranges, &bias_params);
             // 속도 상한 — 위치 적분 **전에** 걸어야 변위도 유계가 된다
             for &i in &active {
                 let i = i as usize;
@@ -2293,9 +2298,8 @@ impl World {
             for &ji in &active_joints {
                 joint::solve(&mut st, &mut joints[ji], h, None);
             }
-            for c in constraints.iter_mut() {
-                solver::solve(&mut st, c, inv_h, None);
-            }
+            // relax 솔브 — 색 배치 SIMD 디스패치(Unit 3c).
+            solver::solve_batched(&mut st, &mut constraints, &color_ranges, &relax_params);
         }
 
         // 4) restitution 패스 (임팩트 게이트)
