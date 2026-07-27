@@ -1692,8 +1692,21 @@ impl World {
         let per_pair_bytes = core::mem::size_of::<(u32, u32)>()          // pairs
             + core::mem::size_of::<ContactConstraint>()                  // constraints
             + core::mem::size_of::<(u32, u32)>()                         // constraint_keys
+            // 컬러링·재그룹 스크래치도 페어당이다 (교차검수 rev_21070c63 MAJOR):
+            + core::mem::size_of::<u32>()                                // 컬러 order
+            + core::mem::size_of::<(u32, u32)>()                         // 컬러 endpoints
+            + core::mem::size_of::<u32>()                                // color_of
+            + core::mem::size_of::<u32>()                                // grouped
+            + core::mem::size_of::<Option<ContactConstraint>>()          // c_tmp (거의 한 벌 더)
+            + core::mem::size_of::<(u32, u32)>()                         // new_keys
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
-        let byte_cap = MAX_STEP_SCRATCH_BYTES / per_pair_bytes.max(1);
+                  // 슬롯당(페어 아님) 컬러링 버퍼: body_color(u64) + conflict(bool). 총상한에서 먼저 뺀다.
+        let color_body_bytes = self
+            .bodies
+            .len()
+            .saturating_mul(core::mem::size_of::<u64>() + core::mem::size_of::<bool>());
+        let byte_cap =
+            MAX_STEP_SCRATCH_BYTES.saturating_sub(color_body_bytes) / per_pair_bytes.max(1);
         let budget = (self.params.max_pairs_per_body as usize)
             .saturating_mul(live)
             .saturating_add(1024)
@@ -1714,6 +1727,34 @@ impl World {
             p
         };
         self.diag.pairs = pairs.len();
+        // **컬러링·재그룹 스크래치는 wake 폐쇄(아래 1.5)가 canonical sleep 상태를 바꾸기 전에
+        // 선점**한다 (교차검수 rev_21070c63 MAJOR). wake 이후 예약이 실패하면 깨워둔 채
+        // ResourceLimit을 돌려주게 된다. 실제 제약 수 ≤ pairs.len()이라 페어 수를 상한으로
+        // 잡고, 실패하면 어떤 바디도 깨우기 전에 여기서 끝낸다. 이 버퍼들은 위 per_pair_bytes에
+        // 포함돼 128MiB 총상한 안에 있다.
+        let color_ncap = pairs.len();
+        let color_nbody = self.bodies.len();
+        let mut order: Vec<u32> = Vec::new();
+        let mut conflict: Vec<bool> = Vec::new();
+        let mut endpoints: Vec<(u32, u32)> = Vec::new();
+        let mut body_color: Vec<u64> = Vec::new();
+        let mut color_of: Vec<u32> = Vec::new();
+        let mut grouped: Vec<u32> = Vec::new();
+        let mut c_tmp: Vec<Option<ContactConstraint>> = Vec::new();
+        let mut new_keys: Vec<(u32, u32)> = Vec::new();
+        if order.try_reserve(color_ncap).is_err()
+            || conflict.try_reserve(color_nbody).is_err()
+            || endpoints.try_reserve(color_ncap).is_err()
+            || body_color.try_reserve(color_nbody).is_err()
+            || color_of.try_reserve(color_ncap).is_err()
+            || grouped.try_reserve(color_ncap).is_err()
+            || c_tmp.try_reserve(color_ncap).is_err()
+            || new_keys.try_reserve(color_ncap).is_err()
+        {
+            self.bp_pairs = pairs;
+            self.resource_limit = true;
+            return;
+        }
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
         let mut excluded: IntSet<(u32, u32)> = IntSet::default();
         if excluded.try_reserve(self.joints.len()).is_err() {
@@ -1921,31 +1962,10 @@ impl World {
         if constraints.len() > 1 {
             let nb = self.bodies.len();
             let nc = constraints.len();
-            // **스텝 스크래치는 캐노니컬 변이 전에 fallible 선점**한다 — wasm에서 할당 실패는
-            // 오류가 아니라 trap이라 infallible `collect`/`vec!`는 `try_step`의 ResourceLimit
-            // 계약을 우회한다(교차검수 rev_0bb4745e MAJOR; [[feedback ext_force 누락]]과 동류).
-            // 하나라도 실패하면 배열을 건드리기 전에 여기서 끝낸다.
-            let mut order: Vec<u32> = Vec::new();
-            let mut conflict: Vec<bool> = Vec::new();
-            let mut endpoints: Vec<(u32, u32)> = Vec::new();
-            let mut body_color: Vec<u64> = Vec::new();
-            let mut color_of: Vec<u32> = Vec::new();
-            let mut grouped: Vec<u32> = Vec::new();
-            let mut c_tmp: Vec<Option<ContactConstraint>> = Vec::new();
-            let mut new_keys: Vec<(u32, u32)> = Vec::new();
-            if order.try_reserve(nc).is_err()
-                || conflict.try_reserve(nb).is_err()
-                || endpoints.try_reserve(nc).is_err()
-                || body_color.try_reserve(nb).is_err()
-                || color_of.try_reserve(nc).is_err()
-                || grouped.try_reserve(nc).is_err()
-                || c_tmp.try_reserve(nc).is_err()
-                || new_keys.try_reserve(nc).is_err()
-            {
-                self.bp_pairs = pairs;
-                self.resource_limit = true;
-                return;
-            }
+            // 컬러링·재그룹 스크래치(order·conflict·endpoints·body_color·color_of·grouped·
+            // c_tmp·new_keys)는 **wake 폐쇄 이전에 이미 fallible 선점**했다(위 1.5 앞) — 여기선
+            // 채워 쓰기만 하므로 어떤 push/extend/resize도 재할당하지 않는다(전부 pairs.len()·
+            // bodies.len() 상한 안). nc ≤ pairs.len(), nb == 선점 시 bodies.len().
             let gdir = self.params.gravity.normalize_or_zero();
             let depth = |c: &ContactConstraint| -> f32 {
                 let pa = self.bodies[c.a].pose.pos;

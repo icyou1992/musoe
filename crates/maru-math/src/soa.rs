@@ -213,9 +213,11 @@ mod tests {
         let (ox, oy, oz) = (out.x.to_array(), out.y.to_array(), out.z.to_array());
         for i in 0..4 {
             let s = mats[i].mul_vec(vs[i]);
-            assert_eq!(ox[i], s.x, "lane {i} x");
-            assert_eq!(oy[i], s.y, "lane {i} y");
-            assert_eq!(oz[i], s.z, "lane {i} z");
+            // **비트 비교** — `f32` `==`는 +0.0==-0.0이라 state hash가 구분하는 부호 0 차이를
+            // 놓친다(교차검수 rev_21070c63 MINOR). to_bits로 부호 0·NaN 페이로드까지 잠근다.
+            assert_eq!(ox[i].to_bits(), s.x.to_bits(), "lane {i} x");
+            assert_eq!(oy[i].to_bits(), s.y.to_bits(), "lane {i} y");
+            assert_eq!(oz[i].to_bits(), s.z.to_bits(), "lane {i} z");
         }
     }
 
