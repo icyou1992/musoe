@@ -227,14 +227,34 @@ mod maru_side {
         let mut pairs_acc = 0usize;
         let mut pts_acc = 0usize;
         let mut sub = [0u64; 4];
+        let mut acc_late = [0u64; 5];
+        let mut sub_late = [0u64; 4];
+        let mut late_steps = 0usize;
+        let mut t_late = std::time::Duration::ZERO;
         for si in 0..steps {
+            let t_step = std::time::Instant::now();
             let _ = w.try_step(DT);
+            if si >= steps / 2 {
+                t_late += t_step.elapsed();
+            }
             let d = w.diagnostics();
             for k in 0..5 {
                 acc[k] += d.phase_ns[k];
             }
             for k in 0..4 {
                 sub[k] += d.sub_ns[k];
+            }
+            // **정착 구간만 따로 잰다.** 전체 평균은 앞쪽 몇 스텝의 진짜 정착 과정(수천 접점,
+            // 트리 재빌드)이 지배해서 "전원 수면 상태의 스텝 비용"을 가린다 — 이 하네스로
+            // 정착 레짐을 최적화하려면 후반부만 봐야 한다.
+            if si >= steps / 2 {
+                for k in 0..5 {
+                    acc_late[k] += d.phase_ns[k];
+                }
+                for k in 0..4 {
+                    sub_late[k] += d.sub_ns[k];
+                }
+                late_steps += 1;
             }
             reused += d.bp_reused as usize;
             pairs_acc += d.pairs;
@@ -267,8 +287,25 @@ mod maru_side {
             acc[4] as f64 / 1000.0 / steps as f64,
             handles.len()
         );
+        let ls = late_steps.max(1) as f64;
         eprintln!(
-            "    [maru pile] 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",
+            "    [maru pile] 정착구간({late_steps}스텝): {:.3} ms/step  aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us",
+            t_late.as_secs_f64() * 1000.0 / ls,
+            acc_late[0] as f64 / 1000.0 / ls,
+            acc_late[1] as f64 / 1000.0 / ls,
+            acc_late[2] as f64 / 1000.0 / ls,
+            acc_late[3] as f64 / 1000.0 / ls,
+            acc_late[4] as f64 / 1000.0 / ls,
+        );
+        eprintln!(
+            "    [maru pile] 정착구간 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",
+            sub_late[0] as f64 / 1000.0 / ls,
+            sub_late[1] as f64 / 1000.0 / ls,
+            sub_late[2] as f64 / 1000.0 / ls,
+            sub_late[3] as f64 / 1000.0 / ls,
+        );
+        eprintln!(
+            "    [maru pile] 전체평균 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",
             sub[0] as f64 / 1000.0 / steps as f64,
             sub[1] as f64 / 1000.0 / steps as f64,
             sub[2] as f64 / 1000.0 / steps as f64,
@@ -456,10 +493,22 @@ mod rapier_side {
             s.step();
         }
         let t0 = Instant::now();
-        for _ in 0..steps {
+        // maru 쪽과 **같은 창**으로 정착 구간을 따로 잰다(전체 평균은 앞쪽 정착 과정이 지배한다).
+        let mut t_late = std::time::Duration::ZERO;
+        let mut late_steps = 0usize;
+        for si in 0..steps {
+            let t_step = Instant::now();
             s.step();
+            if si >= steps / 2 {
+                t_late += t_step.elapsed();
+                late_steps += 1;
+            }
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
+        eprintln!(
+            "    [rapier pile] 정착구간({late_steps}스텝): {:.3} ms/step",
+            t_late.as_secs_f64() * 1000.0 / late_steps.max(1) as f64
+        );
         let (mut lowest, mut finite, mut asleep) = (f32::MAX, true, 0usize);
         for h in &handles {
             let b = &s.bodies[*h];

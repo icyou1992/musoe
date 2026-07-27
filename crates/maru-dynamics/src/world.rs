@@ -1679,7 +1679,17 @@ impl World {
         let _t_aabb = std::time::Instant::now();
         let mut dyn_items: Vec<(u32, Aabb)> = Vec::new();
         let mut static_items: Vec<(u32, Aabb)> = Vec::new();
-        for (i, b) in self.bodies.iter().enumerate() {
+        // **캐시를 쓸 스텝이면 AABB를 아예 만들지 않는다.** 페어 캐시가 유효하면 아래에서
+        // `Broadphase::build(dyn_items, static_items)`를 부르지 않으므로 이 목록은 만들어서
+        // 버려진다 — 전원 수면 pile-3k에서 스텝의 12%가 그 낭비였다(93us/step).
+        // 판정식은 아래 캐시 분기와 **같은 것**이어야 한다(다르면 빈 목록으로 트리를 짓는다).
+        let bp_cache_hit = self.bp_valid && self.bp_dt == dt;
+        for (i, b) in self
+            .bodies
+            .iter()
+            .enumerate()
+            .take(if bp_cache_hit { 0 } else { usize::MAX })
+        {
             if !self.alive[i] {
                 continue; // 제거된 슬롯
             }
@@ -1764,7 +1774,7 @@ impl World {
         self.diag.pair_budget = budget;
         // **아무것도 움직이지 않았으면 트리를 다시 짓지 않는다.** 페어 집합은 트리 비의존
         // 계약(설계 §4.1)이라 입력이 같으면 결과가 비트 동일하다 — 재사용은 항등이다.
-        let pairs = if self.bp_valid && self.bp_dt == dt {
+        let pairs = if bp_cache_hit {
             self.diag.bp_reused = true;
             std::mem::take(&mut self.bp_pairs)
         } else {
@@ -1799,6 +1809,9 @@ impl World {
         let mut grouped: Vec<u32> = Vec::new();
         let mut c_tmp: Vec<Option<ContactConstraint>> = Vec::new();
         let mut new_keys: Vec<(u32, u32)> = Vec::new();
+        // 직전 접촉 기준선을 **정렬된 벡터**로 — dormant 페어 보존을 페어 순회와 병합하려고 둔다
+        // (아래 narrow 루프 주석). 크기는 직전 스텝 접촉 수이므로 wake 이전에 확정된다.
+        let mut touch_sorted: Vec<(u32, u32)> = Vec::new();
         // 색 범위 [start,end) — Unit 3b SIMD warm_start 배치 디스패치용. 색은 최대 64개.
         let mut color_ranges: Vec<(u32, u32)> = Vec::new();
         let _t_res = std::time::Instant::now();
@@ -1819,6 +1832,7 @@ impl World {
             || grouped.try_reserve(ncap).is_err()
             || c_tmp.try_reserve(ncap).is_err()
             || new_keys.try_reserve(ncap).is_err()
+            || touch_sorted.try_reserve(self.touching.len()).is_err()
             || self.solver_state.reserve_for(nbody).is_err()
             || self.inv_inertia_local.try_reserve(nbody).is_err()
             || self.integrate_gate.try_reserve(nbody).is_err()
@@ -1892,10 +1906,25 @@ impl World {
         // 얻지 못한다: 잠든 스택 (1,ground)/(1,2)/(2,3)이 먼저 스킵된 뒤 (3,4)가 아일랜드를
         // 깨우면 그 프레임은 지지망 없이 중력만 적분된다.
         // 아일랜드 단위 wake이므로 한 바퀴로 폐쇄된다(전파는 wake() 내부에서 완결).
+        //
+        // `active`의 **초집합** 술어 — 뚱뚱한 `Body`를 안 건드리고 Vec<bool> 두 개만 읽는다.
+        // static은 여기 쓰지 않는다(페어의 STATIC_BIT가 이미 구분한다). 근거는 호출부 주석.
+        let maybe_active = |i: usize, this: &Self| !this.asleep[i] && !this.oob[i];
         let _t_wake = std::time::Instant::now();
         for &(a_id, b_raw) in &pairs {
             let is_static_pair = b_raw & STATIC_BIT != 0;
             let b_plain = b_raw & !STATIC_BIT;
+            // **양쪽 다 깨어날 수 없으면 즉시 버린다** — 뚱뚱한 `Body`를 건드리기 전에.
+            // `maybe_active`는 `active`의 초집합이라 활성 끝점이 있는 페어를 버리지 않는다:
+            // `asleep[i]=true`는 dynamic에만 쓰이고(6절 island sleep) 복원도 `asleep ⇒ live
+            // dynamic`을 거부 검증하므로, kinematic은 항상 `!asleep`이고 static은 페어의
+            // STATIC_BIT로 이미 구분된다. 전원 수면 씬에서 이 한 줄이 24810 페어를
+            // Vec<bool> 두 번 읽고 끝낸다(원래는 페어마다 `Body` 4~6회 랜덤 접근).
+            if !maybe_active(a_id as usize, self)
+                && (is_static_pair || !maybe_active(b_plain as usize, self))
+            {
+                continue;
+            }
             // 조인트가 없으면 집합이 비어 있다 — 빈 집합에도 해시는 도는다.
             if !excluded.is_empty() && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
                 continue;
@@ -1951,10 +1980,46 @@ impl World {
         // constraints·constraint_keys·live_keys는 wake 이전에 선점됨 (위) — 여기선 채워 쓴다.
         let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
         let _t_nw = std::time::Instant::now();
+        // 직전 기준선을 페어와 **같은 전순서**로 정렬해 둔다(둘 다 (a, b_raw) 오름차순).
+        // 아래 루프가 단조 포인터 하나로 훑으므로 페어당 비용은 비교 1회다.
+        touch_sorted.extend(self.touching.iter().copied());
+        touch_sorted.sort_unstable();
+        let mut ti = 0usize;
         for &(a_id, b_raw) in &pairs {
             let key = (a_id, b_raw);
             let is_static_pair = b_raw & STATIC_BIT != 0;
             let b_plain = b_raw & !STATIC_BIT;
+            // 기준선 병합 포인터를 이 페어까지 전진시킨다(전 페어 공통, 총 전진 = |touching|).
+            while ti < touch_sorted.len() && touch_sorted[ti] < key {
+                ti += 1;
+            }
+            // **양쪽 다 비활성인 페어는 여기서 끝난다** (wake 폐쇄는 이미 위에서 닫혔다).
+            // 움직이지 않은 페어는 새 접촉을 만들 수 없고, 브로드페이즈 AABB 겹침은 매니폴드의
+            // 충분조건이 아니므로 **직전 기준선에 실제 접촉으로 있던 키만** 살린다 — 아니면
+            // 잠들면서 거짓 Started가 난다. 원래는 페어마다 `touching`을 해시했는데(전원 수면
+            // pile-3k에서 24810회/스텝), 두 정렬 배열의 병합이면 페어당 비교 1회로 같은 교집합이
+            // 나온다. 술어는 wake 루프와 동일한 초집합이다.
+            if !maybe_active(a_id as usize, self)
+                && (is_static_pair || !maybe_active(b_plain as usize, self))
+            {
+                if ti < touch_sorted.len() && touch_sorted[ti] == key {
+                    // 필터 순서는 활성 경로와 같다(제외 → 그룹 → 비활성). 특히 **그룹 판정이
+                    // 수면보다 먼저**여야 잠든 사이 그룹이 바뀐 페어가 접촉을 승계하지 않고
+                    // Stopped를 낸다(검수 rev_7f7bb07c MAJOR). 여기 도달하는 키는 ≤ 접촉 수라
+                    // 뚱뚱한 `Body` 접근도 그만큼만 일어난다.
+                    let excluded_pair = !excluded.is_empty()
+                        && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain)));
+                    if !excluded_pair
+                        && groups_collide(
+                            &self.bodies[a_id as usize],
+                            &self.bodies[b_plain as usize],
+                        )
+                    {
+                        live_keys.insert(key);
+                    }
+                }
+                continue;
+            }
             // 조인트가 없으면 집합이 비어 있다 — 빈 집합에도 해시는 도는다.
             if !excluded.is_empty() && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
                 continue;
@@ -1980,15 +2045,14 @@ impl World {
             if !groups_collide(&self.bodies[a_id], &self.bodies[b_id]) {
                 continue;
             }
-            if a_inactive && b_inactive {
-                // 움직이지 않은 페어는 **새 접촉을 만들 수 없다.** 브로드페이즈 AABB
-                // 겹침은 매니폴드 존재의 충분조건이 아니므로, 직전 기준선에 실제
-                // 접촉으로 있던 키만 보존한다 — 아니면 잠들면서 거짓 Started가 난다.
-                if self.touching.contains(&key) {
-                    live_keys.insert(key);
-                }
-                continue;
-            }
+            // 양쪽 비활성 페어는 위 조기 탈출에서 이미 걸러졌다. 두 술어는 **동치**다:
+            // a는 항상 동적 트리 원소(Dynamic|Kinematic)라 `a_inactive == !maybe_active(a)`이고,
+            // b는 static이면 `b_inactive == true == is_static_pair` 아니면 마찬가지다.
+            // 동치가 깨지면 접촉 기준선 보존이 두 경로로 갈라지므로 여기서 잠근다.
+            debug_assert!(
+                !(a_inactive && b_inactive),
+                "dormant 페어는 조기 탈출이 이미 걸렀어야 한다 — 술어 동치 붕괴"
+            );
             let _ = (a_asleep, b_asleep);
             let (sa, pa) = (&self.bodies[a_id].shape, &self.bodies[a_id].pose);
             let (sb, pb) = (&self.bodies[b_id].shape, &self.bodies[b_id].pose);
