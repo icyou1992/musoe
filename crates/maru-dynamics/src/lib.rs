@@ -5074,4 +5074,61 @@ mod tests {
             );
         }
     }
+
+    /// 지형 메시(삼각형당 static hull): 구가 4-삼각형 그리드에 얹혀 정착·수면하고,
+    /// 레이가 지형을 맞힌다. 퇴화 입력(범위 밖 인덱스·두께 0)은 전체 거부(부분 삽입 없음).
+    #[test]
+    fn terrain_mesh_supports_resting_sphere_and_rays() {
+        let mut w = World::new(WorldParams::default());
+        // 2×2 그리드 (4 정점 → 근데 그리드는 9정점… 간단히 3×3 정점, 8 삼각형)
+        let mut verts = Vec::new();
+        for z in 0..3 {
+            for x in 0..3 {
+                verts.push(Vec3::new(x as f32 * 2.0 - 2.0, 0.0, z as f32 * 2.0 - 2.0));
+            }
+        }
+        let mut tris: Vec<[u32; 3]> = Vec::new();
+        for z in 0..2u32 {
+            for x in 0..2u32 {
+                let i = z * 3 + x;
+                tris.push([i, i + 1, i + 3]);
+                tris.push([i + 1, i + 4, i + 3]);
+            }
+        }
+        let handles = w
+            .try_add_terrain(&verts, &tris, 0.02)
+            .expect("정상 지형이 거부됨");
+        assert_eq!(handles.len(), 8);
+
+        let ball = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.4 },
+            pose(0.3, 2.0, 0.2),
+            1.0,
+        ));
+        let mut slept = false;
+        for _ in 0..600 {
+            w.step(DT);
+            if w.is_asleep(ball) {
+                slept = true;
+                break;
+            }
+        }
+        assert!(slept, "지형 위 구가 잠들지 않음");
+        let y = w.body(ball).pose().pos.y;
+        // 표면(0) + radius(0.4) + hull radius(0.02) 근처
+        assert!((y - 0.42).abs() < 0.05, "정착 높이 이상: {y}");
+
+        // 레이: 위에서 아래로 — 지형에 맞아야 한다
+        let hit = w
+            .cast_ray(Vec3::new(-1.0, 5.0, -1.0), Vec3::new(0.0, -1.0, 0.0), 10.0)
+            .unwrap()
+            .expect("지형 레이 미스");
+        assert!(hit.toi > 4.0 && hit.toi < 5.1, "toi={}", hit.toi);
+
+        // 퇴화 입력 거부: 범위 밖 인덱스 · 두께 0 (radius 0)
+        let n_before = handles.len();
+        assert!(w.try_add_terrain(&verts, &[[0, 1, 99]], 0.02).is_err());
+        assert!(w.try_add_terrain(&verts, &[[0, 1, 3]], 0.0).is_err());
+        let _ = n_before;
+    }
 }

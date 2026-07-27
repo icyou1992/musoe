@@ -543,6 +543,62 @@ impl World {
     }
 
     /// 패닉하는 편의 래퍼 (테스트·벤치용). 정본은 [`World::try_add_body`].
+    /// 지형/레벨 삼각형 메시를 static으로 넣는다 — **삼각형당 static 바디 1개**(3점 hull +
+    /// convex radius). 이것이 이 엔진의 메시 정본 패턴이다(전용 메시 셰이프 없음): 3점은
+    /// 두께 0이라 최소 특징 크기를 radius로만 얻고, radius가 얇으면 hull validate가 거부한다.
+    /// static 트리는 구조 변경 시에만 빌드되므로 수천 삼각형도 스텝 비용에 영향이 없다.
+    ///
+    /// **v1 명시 한계 — internal edge welding 없음**: 인접 삼각형이 공유하는 에지에도
+    /// 독립 접촉이 생겨, 구가 평평한 메시를 굴러갈 때 에지 법선의 유령 충돌로 미세하게
+    /// 튈 수 있다(모든 per-triangle 메시의 고전 문제). welding(인접 법선 콘 필터)은 설계
+    /// §4.2 canonical feature ID의 예약 확장이다 — 요구 실증 시 구현.
+    ///
+    /// 반환: 삼각형별 핸들. 퇴화 삼각형(validate 실패)은 `Err`로 전체 거부(부분 삽입 없음).
+    pub fn try_add_terrain(
+        &mut self,
+        vertices: &[Vec3],
+        triangles: &[[u32; 3]],
+        radius: f32,
+    ) -> Result<Vec<BodyHandle>, ApiError> {
+        // 전체 검증 먼저 — 부분 삽입은 실패 시 호스트가 되돌릴 수 없다.
+        let mut bodies = Vec::new();
+        bodies
+            .try_reserve(triangles.len())
+            .map_err(|_| ApiError::ResourceLimit)?;
+        for t in triangles {
+            let mut pts = Vec::new();
+            pts.try_reserve_exact(3)
+                .map_err(|_| ApiError::ResourceLimit)?;
+            for &i in t {
+                let p = *vertices.get(i as usize).ok_or(ApiError::InvalidValue)?;
+                pts.push(p);
+            }
+            // 삼각형 중심을 바디 원점으로 — hull 점이 원점 근처라 앵커·톨러런스 스케일이 정직해진다.
+            let c = (pts[0] + pts[1] + pts[2]) * (1.0 / 3.0);
+            let local: Vec<Vec3> = pts.iter().map(|p| *p - c).collect();
+            let shape = maru_collide::Shape::Hull {
+                points: local,
+                radius,
+            };
+            shape.validate().map_err(|_| ApiError::InvalidValue)?;
+            bodies.push(Body::new_static(
+                shape,
+                maru_collide::Pose {
+                    pos: c,
+                    rot: maru_math::Quat::IDENTITY,
+                },
+            ));
+        }
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(bodies.len())
+            .map_err(|_| ApiError::ResourceLimit)?;
+        for b in bodies {
+            handles.push(self.add_body(b));
+        }
+        Ok(handles)
+    }
+
     pub fn add_body(&mut self, body: Body) -> BodyHandle {
         body.validate().expect("invalid body");
         self.add_body_validated(body)
