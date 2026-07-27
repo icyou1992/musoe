@@ -1689,10 +1689,14 @@ impl World {
         // 개수만 묶으면 페어 뒤에 따라붙는 constraint·키·HashSet·SoA가 남는다 —
         // 한 스텝이 잡을 수 있는 총 바이트를 정해 그것으로 페어 상한을 되돌려 계산한다.
         let live = self.alive.iter().filter(|a| **a).count();
+        // per-pair 스크래치. **매니폴드 접점 힙까지** 센다 — `ContactConstraint.points`는 페어당
+        // 최대 MAX_MANIFOLD_POINTS 원소를 따로 할당하므로 Vec 헤더만 세면 총상한이 깨진다
+        // (교차검수 rev_2ade4bf3 MAJOR).
         let per_pair_bytes = core::mem::size_of::<(u32, u32)>()          // pairs
-            + core::mem::size_of::<ContactConstraint>()                  // constraints
+            + core::mem::size_of::<ContactConstraint>()                  // constraints (Vec 헤더)
+            + maru_collide::MAX_MANIFOLD_POINTS
+                * core::mem::size_of::<solver::ContactPointConstraint>() // 접점 힙 원소
             + core::mem::size_of::<(u32, u32)>()                         // constraint_keys
-            // 컬러링·재그룹 스크래치도 페어당이다 (교차검수 rev_21070c63 MAJOR):
             + core::mem::size_of::<u32>()                                // 컬러 order
             + core::mem::size_of::<(u32, u32)>()                         // 컬러 endpoints
             + core::mem::size_of::<u32>()                                // color_of
@@ -1700,13 +1704,23 @@ impl World {
             + core::mem::size_of::<Option<ContactConstraint>>()          // c_tmp (거의 한 벌 더)
             + core::mem::size_of::<(u32, u32)>()                         // new_keys
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
-                  // 슬롯당(페어 아님) 컬러링 버퍼: body_color(u64) + conflict(bool). 총상한에서 먼저 뺀다.
-        let color_body_bytes = self
-            .bodies
-            .len()
-            .saturating_mul(core::mem::size_of::<u64>() + core::mem::size_of::<bool>());
+                  // per-body(슬롯당) 스크래치 전부: SolverState 7배열 + inv_inertia_local + ext_force +
+                  // damping + 게이트 2 + island_parent + 컬러 body_color/conflict. 총상한에서 먼저 뺀다.
+        let per_body_bytes = 3 * core::mem::size_of::<Vec3>()            // lin/ang/pos
+            + core::mem::size_of::<maru_math::Quat>()                    // rot
+            + core::mem::size_of::<f32>()                                // inv_m
+            + core::mem::size_of::<maru_math::Mat3>()                    // inv_i
+            + core::mem::size_of::<bool>()                               // dynamic
+            + core::mem::size_of::<Vec3>()                               // inv_inertia_local
+            + 2 * core::mem::size_of::<Vec3>()                           // ext_force(force,torque)
+            + 2 * core::mem::size_of::<f32>()                            // damping(lin,ang)
+            + 2 * core::mem::size_of::<bool>()                           // integrate/gravity gates
+            + core::mem::size_of::<usize>()                              // island_parent
+            + core::mem::size_of::<u64>()
+            + core::mem::size_of::<bool>(); // 컬러 body_color/conflict
+        let fixed_body_bytes = self.bodies.len().saturating_mul(per_body_bytes);
         let byte_cap =
-            MAX_STEP_SCRATCH_BYTES.saturating_sub(color_body_bytes) / per_pair_bytes.max(1);
+            MAX_STEP_SCRATCH_BYTES.saturating_sub(fixed_body_bytes) / per_pair_bytes.max(1);
         let budget = (self.params.max_pairs_per_body as usize)
             .saturating_mul(live)
             .saturating_add(1024)
@@ -1727,13 +1741,20 @@ impl World {
             p
         };
         self.diag.pairs = pairs.len();
-        // **컬러링·재그룹 스크래치는 wake 폐쇄(아래 1.5)가 canonical sleep 상태를 바꾸기 전에
-        // 선점**한다 (교차검수 rev_21070c63 MAJOR). wake 이후 예약이 실패하면 깨워둔 채
-        // ResourceLimit을 돌려주게 된다. 실제 제약 수 ≤ pairs.len()이라 페어 수를 상한으로
-        // 잡고, 실패하면 어떤 바디도 깨우기 전에 여기서 끝낸다. 이 버퍼들은 위 per_pair_bytes에
-        // 포함돼 128MiB 총상한 안에 있다.
-        let color_ncap = pairs.len();
-        let color_nbody = self.bodies.len();
+        // === 스텝 스크래치 전량 선점 (교차검수 rev_2ade4bf3 MAJOR) ===
+        // wake 폐쇄(아래 1.5)가 canonical sleep 상태(asleep·sleep_timer)를 바꾸기 전에,
+        // known-bound 스크래치를 **전부** fallible 예약한다. wake 이후 예약이 실패하면 깨워둔 채
+        // ResourceLimit을 돌려줘 "Err면 상태 불변" 계약이 깨진다(직전 검수가 컬러링 버퍼만 옮긴 걸
+        // 지적). 여기서 용량만 잡고(실패=wake 전 종료), 내용은 원래 자리에서 채운다(무재할당).
+        // 상한: 페어당=pairs.len(), 바디당=bodies.len(), 조인트당=joints.len(). 전부 위 byte 예산에 포함.
+        let ncap = pairs.len();
+        let nbody = self.bodies.len();
+        let njoint = self.joints.len();
+        let mut constraints: Vec<ContactConstraint> = Vec::new();
+        let mut constraint_keys: Vec<(u32, u32)> = Vec::new();
+        let mut live_keys: IntSet<(u32, u32)> = IntSet::default();
+        let mut joint_pairs: Vec<(usize, usize)> = Vec::new();
+        let mut active_joints: Vec<usize> = Vec::new();
         let mut order: Vec<u32> = Vec::new();
         let mut conflict: Vec<bool> = Vec::new();
         let mut endpoints: Vec<(u32, u32)> = Vec::new();
@@ -1742,14 +1763,26 @@ impl World {
         let mut grouped: Vec<u32> = Vec::new();
         let mut c_tmp: Vec<Option<ContactConstraint>> = Vec::new();
         let mut new_keys: Vec<(u32, u32)> = Vec::new();
-        if order.try_reserve(color_ncap).is_err()
-            || conflict.try_reserve(color_nbody).is_err()
-            || endpoints.try_reserve(color_ncap).is_err()
-            || body_color.try_reserve(color_nbody).is_err()
-            || color_of.try_reserve(color_ncap).is_err()
-            || grouped.try_reserve(color_ncap).is_err()
-            || c_tmp.try_reserve(color_ncap).is_err()
-            || new_keys.try_reserve(color_ncap).is_err()
+        if constraints.try_reserve(ncap).is_err()
+            || constraint_keys.try_reserve(ncap).is_err()
+            || live_keys.try_reserve(ncap).is_err()
+            || joint_pairs.try_reserve(njoint).is_err()
+            || active_joints.try_reserve(njoint).is_err()
+            || order.try_reserve(ncap).is_err()
+            || conflict.try_reserve(nbody).is_err()
+            || endpoints.try_reserve(ncap).is_err()
+            || body_color.try_reserve(nbody).is_err()
+            || color_of.try_reserve(ncap).is_err()
+            || grouped.try_reserve(ncap).is_err()
+            || c_tmp.try_reserve(ncap).is_err()
+            || new_keys.try_reserve(ncap).is_err()
+            || self.solver_state.reserve_for(nbody).is_err()
+            || self.inv_inertia_local.try_reserve(nbody).is_err()
+            || self.integrate_gate.try_reserve(nbody).is_err()
+            || self.gravity_gate.try_reserve(nbody).is_err()
+            || self.ext_force.try_reserve(nbody).is_err()
+            || self.damping.try_reserve(nbody).is_err()
+            || self.island_parent.try_reserve(nbody).is_err()
         {
             self.bp_pairs = pairs;
             self.resource_limit = true;
@@ -1776,15 +1809,16 @@ impl World {
         // 접촉 상대를 깨우고, 그 상대가 다시 조인트 상대를 깨우는 연쇄가 한 패스로는
         // 닫히지 않는다. 조인트 wake를 접촉 제약 생성 뒤에 두면 그 프레임은 지지 없이
         // 중력만 받는다(리뷰 MAJOR: 2.5단계 잔존).
-        let joint_pairs: Vec<(usize, usize)> = self
-            .joints
-            .iter()
-            // **OOB 끝점은 union하지 않는다**(리뷰 MAJOR): 두 정상 바디가 같은 OOB에
-            // 각각 매달리면 비활성 조인트를 통해 한 아일랜드로 묶여 함께 자고 깨며,
-            // 정상 바디의 대표가 OOB 인덱스가 될 수 있다.
-            .filter(|j| !self.oob[j.ia()] && !self.oob[j.ib()])
-            .map(|j| (j.ia(), j.ib()))
-            .collect();
+        // joint_pairs는 위에서 선점됨 — 여기선 채운다(무재할당). wake 루프 입력이라 wake 전에 채운다.
+        joint_pairs.extend(
+            self.joints
+                .iter()
+                // **OOB 끝점은 union하지 않는다**(리뷰 MAJOR): 두 정상 바디가 같은 OOB에
+                // 각각 매달리면 비활성 조인트를 통해 한 아일랜드로 묶여 함께 자고 깨며,
+                // 정상 바디의 대표가 OOB 인덱스가 될 수 있다.
+                .filter(|j| !self.oob[j.ia()] && !self.oob[j.ib()])
+                .map(|j| (j.ia(), j.ib())),
+        );
         // kinematic은 **항상 활성**이다 — 처방 속도로 움직이므로 잠든 상대를 깨워야 한다.
         let is_active = |i: usize, this: &Self| {
             !this.oob[i]
@@ -1871,22 +1905,8 @@ impl World {
         //    PCM 캐시에서 feature 일치 접점의 임펄스를 warm load (설계 §3)
         // 제약 컨테이너도 페어 수 기준으로 **미리 fallible 예약**한다 — 접촉 페어마다
         // 암묵 성장이 일어나면 그 재할당이 abort가 된다.
-        let mut constraints: Vec<ContactConstraint> = Vec::new();
-        let mut constraint_keys: Vec<(u32, u32)> = Vec::new();
-        if constraints.try_reserve(pairs.len()).is_err()
-            || constraint_keys.try_reserve(pairs.len()).is_err()
-        {
-            self.bp_pairs = pairs;
-            self.resource_limit = true;
-            return;
-        }
+        // constraints·constraint_keys·live_keys는 wake 이전에 선점됨 (위) — 여기선 채워 쓴다.
         let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
-        let mut live_keys: IntSet<(u32, u32)> = IntSet::default();
-        if live_keys.try_reserve(pairs.len()).is_err() {
-            self.bp_pairs = pairs;
-            self.resource_limit = true;
-            return;
-        }
         for &(a_id, b_raw) in &pairs {
             let key = (a_id, b_raw);
             let is_static_pair = b_raw & STATIC_BIT != 0;
@@ -1941,7 +1961,14 @@ impl World {
                     for p in m.points() {
                         self.diag.max_penetration = self.diag.max_penetration.max(-p.separation);
                     }
-                    let c = solver::prepare(&self.bodies, a_id, b_id, &m, cached, dt);
+                    // narrowphase는 wake 이후이고 pairs를 대여 중이라 bp_pairs를 되돌릴 수 없다.
+                    // 접점 Vec 할당은 wake 이후 불가피한 유일한 잔여 예약이나(≤4점) — 예산 선점 후라
+                    // 실패는 극단 OOM뿐. 그 경우 bp_valid를 내려 다음 스텝이 재빌드하게 한다.
+                    let Ok(c) = solver::prepare(&self.bodies, a_id, b_id, &m, cached, dt) else {
+                        self.bp_valid = false;
+                        self.resource_limit = true;
+                        return;
+                    };
                     // 진단은 **실제 warm load**를 센다(feature ID 일치만 세면 generic 접점의
                     // 위치·법선 게이트가 매칭을 끊어도 100%로 보인다 — 거짓 지표).
                     self.diag.warm_total += c.points.len();
@@ -2038,51 +2065,36 @@ impl World {
             2.0,
             h,
         );
-        // **fallible 선점은 캐노니컬 변이 전에 모두 끝낸다**(리뷰 BLOCKER).
-        // 예전에는 `mem::take(&mut self.joints)` 뒤에 예약 실패로 조기 반환해
-        // **모든 조인트가 삭제**됐고, 더 늦은 실패는 솔버 write-back·PCM 갱신이 끝난 뒤라
-        // 물리는 전진했는데 `ResourceLimit`을 돌려줬다.
-        let nb_pre = self.bodies.len();
-        if self.solver_state.reserve_for(nb_pre).is_err()
-            || self.inv_inertia_local.try_reserve(nb_pre).is_err()
-            || self.integrate_gate.try_reserve(nb_pre).is_err()
-            || self.gravity_gate.try_reserve(nb_pre).is_err()
-            // 스텝 스크래치는 **하나도 빠짐없이** 여기서 선점한다 — 하나만 빠져도
-            // 그 `extend`가 암묵 재할당을 하고, wasm에서 allocator 실패는 오류가 아니라
-            // trap이다(검수 rev_3ce4f6fd MAJOR: `ext_force`가 빠져 있었다).
-            || self.ext_force.try_reserve(nb_pre).is_err()
-            || self.damping.try_reserve(nb_pre).is_err()
-            || self.island_parent.try_reserve(nb_pre).is_err()
-        {
-            self.bp_pairs = pairs;
-            self.resource_limit = true;
-            return;
-        }
+        // 솔버 스크래치(solver_state·inv_inertia_local·게이트·ext_force·damping·island_parent)는
+        // **wake 이전에 전부 선점됨** (위 '스텝 스크래치 전량 선점'). 캐노니컬 변이(joints take)보다
+        // 앞서 예약이 끝났으므로 여기선 take·채우기만 하고 실패하지 않는다.
         let mut joints = std::mem::take(&mut self.joints);
         // 조인트도 접촉과 같은 비활성 게이트 (설계 §4.6 level-trigger): 양쪽 모두
         // 비활성(sleeping/static/kinematic)이면 스킵 — 잠든 바디에 warm-start 임펄스를
         // 주입하면 위치 적분이 없는 채 속도만 펌핑돼 정착한 체인이 되살아난다(실증:
         // t=6s vmax 0.006 정착 → 슬립 → t=8s 4.5 폭주).
-        let active_joints: Vec<usize> = joints
-            .iter()
-            .enumerate()
-            .filter(|(_, j)| {
-                // kinematic도 활성 — 구동 중인 kinematic에 매달린 조인트를 스킵하면
-                // 체인이 처방 운동을 따라가지 못한다(리뷰 MAJOR).
-                let awake = |i: usize| {
-                    !self.oob[i]
-                        && match self.bodies[i].body_type {
-                            BodyType::Kinematic => true,
-                            BodyType::Dynamic => !self.asleep[i],
-                            BodyType::Static => false,
-                        }
-                };
-                // 한쪽이라도 OOB면 조인트 자체를 비활성화한다 — OOB에 임펄스를 주면
-                // "시뮬레이션에서 빠진다"는 계약이 깨지고, 상대만 끌려간다.
-                !self.oob[j.ia()] && !self.oob[j.ib()] && (awake(j.ia()) || awake(j.ib()))
-            })
-            .map(|(i, _)| i)
-            .collect();
+        // active_joints는 위에서 선점됨 — 여기선 채운다(post-wake asleep를 읽으므로 wake 이후).
+        active_joints.extend(
+            joints
+                .iter()
+                .enumerate()
+                .filter(|(_, j)| {
+                    // kinematic도 활성 — 구동 중인 kinematic에 매달린 조인트를 스킵하면
+                    // 체인이 처방 운동을 따라가지 못한다(리뷰 MAJOR).
+                    let awake = |i: usize| {
+                        !self.oob[i]
+                            && match self.bodies[i].body_type {
+                                BodyType::Kinematic => true,
+                                BodyType::Dynamic => !self.asleep[i],
+                                BodyType::Static => false,
+                            }
+                    };
+                    // 한쪽이라도 OOB면 조인트 자체를 비활성화한다 — OOB에 임펄스를 주면
+                    // "시뮬레이션에서 빠진다"는 계약이 깨지고, 상대만 끌려간다.
+                    !self.oob[j.ia()] && !self.oob[j.ib()] && (awake(j.ia()) || awake(j.ib()))
+                })
+                .map(|(i, _)| i),
+        );
         // **솔버는 압축 상태 배열 위에서 돈다**(설계 §3 SoA 핫패스). `Body`를 제약 순서로
         // 무작위 접근하면 셰이프·재질까지 딸린 뚱뚱한 구조체가 캐시를 밀어낸다 —
         // 실측 점당 73ns에 산술은 40 flops 남짓이었다. 솔버가 실제로 쓰는 6개 배열만

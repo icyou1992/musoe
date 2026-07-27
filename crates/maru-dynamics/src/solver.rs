@@ -286,6 +286,9 @@ pub struct CachedImpulse {
 }
 
 /// 매니폴드 → 제약 준비. `cache`는 전 스텝 (feature → 임펄스) — feature ID 일치 접점만 warm load.
+/// 접점 Vec은 narrowphase(=wake 이후)에서 불가피하게 할당되므로 **fallible**하다 — wasm OOM을
+/// trap이 아니라 `ResourceLimit`으로 돌려준다(교차검수 rev_2ade4bf3 MAJOR). 접점 수 ≤4라 실할당은
+/// 미미하지만 trap 경로는 닫는다.
 pub fn prepare(
     bodies: &[Body],
     a: usize,
@@ -293,7 +296,7 @@ pub fn prepare(
     m: &Manifold,
     cache: &[(maru_collide::FeatureId, CachedImpulse)],
     dt: f32,
-) -> ContactConstraint {
+) -> Result<ContactConstraint, crate::world::ApiError> {
     // 기하 바닥은 형상 크기에 비례해야 한다(절대 상수 금지 — 톨러런스 정책과 동일 원칙).
     let geo_tol =
         WARM_MATCH_GEO * maru_collide::min_feature_size(&bodies[a].shape, &bodies[b].shape);
@@ -304,65 +307,65 @@ pub fn prepare(
     // 게이트가 얼마나 자주 매칭을 끊는지 보이지 않는다 — 지표가 거짓이면 회귀 테스트도 거짓이다.
     let mut warm_matched = 0u32;
     let (ia, ib) = (ba.inv_inertia_world(), bb.inv_inertia_world());
-    let points = m
-        .points()
-        .iter()
-        .map(|p| {
-            let ra = p.position - ba.pose.pos;
-            let rb = p.position - bb.pose.pos;
-            let vn = n.dot(ba.velocity_at(ra) - bb.velocity_at(rb));
-            // warm start 매칭 규칙 (리뷰 MAJOR):
-            // - 클리핑 접점: feature ID가 계보를 담아 안정적 → ID 일치
-            // - generic witness 접점: pair 안에서 ID를 공유하므로(구-박스 접점이 면→모서리로
-            //   이동해도 같은 ID) **위치 근접**까지 요구한다. 점프하면 임펄스를 물려주지 않는다.
-            let generic = p.feature.0 == maru_collide::FEATURE_GENERIC;
-            // 허용치 = 기하 바닥 + 접점의 정당한 이동 상한. 정지 접촉은 기하 바닥만 쓴다.
-            let drift = ba.linvel.length()
-                + ba.angvel.length() * ra.length()
-                + bb.linvel.length()
-                + bb.angvel.length() * rb.length();
-            let match_tol = geo_tol + WARM_MATCH_MOTION * drift * dt;
-            let match_tol2 = match_tol * match_tol;
-            let hit = cache
-                .iter()
-                .find(|(f, c)| {
-                    *f == p.feature
-                        && (!generic
-                            || ((c.position - p.position).length_sq() <= match_tol2
+    let mut points = Vec::new();
+    if points.try_reserve(m.points().len()).is_err() {
+        return Err(crate::world::ApiError::ResourceLimit);
+    }
+    points.extend(m.points().iter().map(|p| {
+        let ra = p.position - ba.pose.pos;
+        let rb = p.position - bb.pose.pos;
+        let vn = n.dot(ba.velocity_at(ra) - bb.velocity_at(rb));
+        // warm start 매칭 규칙 (리뷰 MAJOR):
+        // - 클리핑 접점: feature ID가 계보를 담아 안정적 → ID 일치
+        // - generic witness 접점: pair 안에서 ID를 공유하므로(구-박스 접점이 면→모서리로
+        //   이동해도 같은 ID) **위치 근접**까지 요구한다. 점프하면 임펄스를 물려주지 않는다.
+        let generic = p.feature.0 == maru_collide::FEATURE_GENERIC;
+        // 허용치 = 기하 바닥 + 접점의 정당한 이동 상한. 정지 접촉은 기하 바닥만 쓴다.
+        let drift = ba.linvel.length()
+            + ba.angvel.length() * ra.length()
+            + bb.linvel.length()
+            + bb.angvel.length() * rb.length();
+        let match_tol = geo_tol + WARM_MATCH_MOTION * drift * dt;
+        let match_tol2 = match_tol * match_tol;
+        let hit = cache
+            .iter()
+            .find(|(f, c)| {
+                *f == p.feature
+                    && (!generic
+                        || ((c.position - p.position).length_sq() <= match_tol2
                                 // 면이 바뀌었으면 다른 접촉 (곡면 feature 점프 차단)
                                 && c.contact_normal.dot(n) >= WARM_MATCH_COS))
-                })
-                .map(|(_, c)| *c);
-            if hit.is_some() {
-                warm_matched += 1;
-            }
-            let warm = hit.unwrap_or_default();
-            // 월드 마찰 임펄스를 현재 접평면에 재투영 (기저 회전 대응)
-            let warm_t = [
-                warm.tangent_world.dot(tangents[0]),
-                warm.tangent_world.dot(tangents[1]),
-            ];
-            ContactPointConstraint {
-                feature: p.feature,
-                position: p.position,
-                anchor_a: ba.pose.rot.conjugate().rotate(ra),
-                anchor_b: bb.pose.rot.conjugate().rotate(rb),
-                base_separation: p.separation,
-                normal_mass: effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, n),
-                tangent_mass: [
-                    effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[0]),
-                    effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[1]),
-                ],
-                normal_impulse: warm.normal,
-                tangent_impulse: warm_t,
-                max_normal_impulse: 0.0,
-                ra,
-                rb,
-                approach_vn: vn,
-            }
-        })
-        .collect();
-    ContactConstraint {
+            })
+            .map(|(_, c)| *c);
+        if hit.is_some() {
+            warm_matched += 1;
+        }
+        let warm = hit.unwrap_or_default();
+        // 월드 마찰 임펄스를 현재 접평면에 재투영 (기저 회전 대응)
+        let warm_t = [
+            warm.tangent_world.dot(tangents[0]),
+            warm.tangent_world.dot(tangents[1]),
+        ];
+        ContactPointConstraint {
+            feature: p.feature,
+            position: p.position,
+            anchor_a: ba.pose.rot.conjugate().rotate(ra),
+            anchor_b: bb.pose.rot.conjugate().rotate(rb),
+            base_separation: p.separation,
+            normal_mass: effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, n),
+            tangent_mass: [
+                effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[0]),
+                effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[1]),
+            ],
+            normal_impulse: warm.normal,
+            tangent_impulse: warm_t,
+            max_normal_impulse: 0.0,
+            ra,
+            rb,
+            approach_vn: vn,
+        }
+    }));
+    Ok(ContactConstraint {
         warm_matched,
         a,
         b,
@@ -371,7 +374,7 @@ pub fn prepare(
         friction: (ba.friction * bb.friction).sqrt(),
         restitution: ba.restitution.max(bb.restitution),
         points,
-    }
+    })
 }
 
 /// 현재 자세로 레버암을 갱신한다 (서브스텝당 1회, 위치 적분 뒤 1회).
@@ -871,7 +874,8 @@ mod tests {
             &manifold_at(cached_at + Vec3::new(0.01, 0.0, 0.0)),
             &cache,
             DT,
-        );
+        )
+        .unwrap();
         assert_eq!(
             near.points[0].normal_impulse, 7.0,
             "근접 접점은 warm start 계승"
@@ -884,7 +888,8 @@ mod tests {
             &manifold_at(cached_at + Vec3::new(1.0, 0.0, 0.0)),
             &cache,
             DT,
-        );
+        )
+        .unwrap();
         assert_eq!(
             far.points[0].normal_impulse, 0.0,
             "점프한 접점에 이전 임펄스가 적용됨"
@@ -900,7 +905,7 @@ mod tests {
                 contact_normal: Vec3::new(1.0, 0.0, 0.0),
             },
         )];
-        let turned = prepare(&bodies, 1, 0, &manifold_at(cached_at), &flipped, DT);
+        let turned = prepare(&bodies, 1, 0, &manifold_at(cached_at), &flipped, DT).unwrap();
         assert_eq!(
             turned.points[0].normal_impulse, 0.0,
             "법선이 바뀐 접촉에 이전 임펄스가 계승됨"
@@ -924,7 +929,7 @@ mod tests {
         )];
         let mut m = manifold_at(Vec3::new(2.0, 0.5, 0.0));
         m.points_mut()[0].feature = fid;
-        let c = prepare(&bodies, 1, 0, &m, &cache, 1.0 / 60.0);
+        let c = prepare(&bodies, 1, 0, &m, &cache, 1.0 / 60.0).unwrap();
         assert_eq!(c.points[0].normal_impulse, 3.0);
     }
 
