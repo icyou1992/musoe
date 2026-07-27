@@ -567,6 +567,53 @@ pub fn apply_restitution(st: &mut SolverState, c: &mut ContactConstraint, thresh
     }
 }
 
+/// 오버플로 색 — 64색을 다 쓴 제약이 몰리는 버킷. 이 색은 같은 색 안에 공유 dynamic 바디가
+/// 있을 수 있으므로 **SIMD 배칭에서 제외**하고 스칼라로 처리한다. 정착 씬의 접촉 그래프
+/// 최대 차수는 작아(박스가 이웃 ~4개) 실무에선 거의 발화하지 않는다.
+pub const COLOR_OVERFLOW: u32 = 63;
+
+/// 제약을 결정적으로 그래프 컬러링한다 (설계 §5 — SIMD 배칭 전제).
+///
+/// 입력 `endpoints`는 **canonical 순서**(중력깊이+pair-key 전순서)로 들어오고, 그 순서 기반
+/// 그리디로 색을 매긴다: 각 제약에 두 바디가 아직 안 쓴 **최소 색**. 같은 색 안에는 공유
+/// conflict 바디가 없으므로 그 색의 제약들은 서로 독립 — 레인 병렬(4-wide)로 풀어도 결과가 같다.
+/// 색 배정이 정렬 순서에만 의존하므로 결과는 결정적이다(설계 §5:439-441 방어선 ②).
+///
+/// **static/kinematic 바디는 conflict가 아니다**: 솔버 `apply`/`store`는 `dynamic`일 때만
+/// 바디에 쓰므로(위 `BodyReg`) 정적 바닥 하나에 붙은 접촉 수천 개가 한 색에 안전하게 들어간다.
+/// 이걸 놓치면 바닥 접촉마다 색이 폭발한다(Box2D v3도 static은 컬러링 conflict에서 제외).
+///
+/// `conflict[i]`=바디 i가 솔버 write 대상(dynamic&active)인가. `body_color`=스크래치
+/// (len=바디수, 0으로 채워 전달, 각 바디의 배정색 비트마스크). `out`에 제약별 색을 채운다.
+pub fn color_constraints(
+    endpoints: &[(u32, u32)],
+    conflict: &[bool],
+    body_color: &mut [u64],
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    for &(a, b) in endpoints {
+        let (a, b) = (a as usize, b as usize);
+        let mut forbidden = 0u64;
+        if conflict[a] {
+            forbidden |= body_color[a];
+        }
+        if conflict[b] {
+            forbidden |= body_color[b];
+        }
+        // 최소 free 색 = forbidden의 최하위 0비트. 64색 초과면 오버플로 버킷.
+        let color = (!forbidden).trailing_zeros().min(COLOR_OVERFLOW);
+        let bit = 1u64 << color;
+        if conflict[a] {
+            body_color[a] |= bit;
+        }
+        if conflict[b] {
+            body_color[b] |= bit;
+        }
+        out.push(color);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +730,78 @@ mod tests {
         m.points_mut()[0].feature = fid;
         let c = prepare(&bodies, 1, 0, &m, &cache, 1.0 / 60.0);
         assert_eq!(c.points[0].normal_impulse, 3.0);
+    }
+
+    /// 컬러링 계약: 수직 체인은 인접이 바디를 공유하므로 색이 교대하고, 결과는 결정적이다.
+    #[test]
+    fn coloring_alternates_on_a_dynamic_chain_and_is_deterministic() {
+        // (0,1)(1,2)(2,3) 전부 dynamic.
+        let endpoints = [(0u32, 1u32), (1, 2), (2, 3)];
+        let conflict = [true, true, true, true];
+        let mut bc = vec![0u64; 4];
+        let mut out = Vec::new();
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out);
+        // (0,1)=0 → (1,2)는 색0 금지 → 1 → (2,3)은 색1만 금지 → 0
+        assert_eq!(out, vec![0, 1, 0]);
+        // 결정성: 같은 입력 → 같은 색
+        let mut bc2 = vec![0u64; 4];
+        let mut out2 = Vec::new();
+        color_constraints(&endpoints, &conflict, &mut bc2, &mut out2);
+        assert_eq!(out, out2);
+        // 색 내 conflict-free 불변식: 같은 색 제약들은 conflict 바디를 공유하지 않는다.
+        assert_conflict_free(&endpoints, &conflict, &out);
+    }
+
+    /// static 바디(바닥)는 conflict가 아니므로 여러 접촉이 한 색에 들어간다 — 색 폭발 방지.
+    #[test]
+    fn static_bodies_do_not_force_new_colors() {
+        // body0 = static(바닥), box 1·2·3이 각각 바닥에 접촉.
+        let endpoints = [(0u32, 1u32), (0, 2), (0, 3)];
+        let conflict = [false, true, true, true];
+        let mut bc = vec![0u64; 4];
+        let mut out = Vec::new();
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out);
+        assert_eq!(out, vec![0, 0, 0]);
+        assert_conflict_free(&endpoints, &conflict, &out);
+    }
+
+    /// 오버플로 색(63)은 conflict-free가 **아닌** 스칼라 버킷임을 잠근다 (Unit 3 SIMD 배칭이
+    /// 색 63을 제외해야 하는 안전 전제 — 교차검수 rev_0bb4745e MINOR). 중심 0에 65개 동적
+    /// 바디가 연결되면 안전 색 0..62 소진 후 64·65번째가 모두 색 63으로 몰려 중심 바디가 중복된다.
+    #[test]
+    fn overflow_color_is_explicitly_scalar_and_may_conflict() {
+        let endpoints: Vec<(u32, u32)> = (1..=65).map(|i| (0, i)).collect();
+        let conflict = vec![true; 66];
+        let mut bc = vec![0u64; 66];
+        let mut out = Vec::new();
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out);
+        // 첫 64개는 색 0..63, 65번째는 오버플로 색 63으로 몰린다.
+        assert_eq!(&out[..64], (0u32..64).collect::<Vec<_>>().as_slice());
+        assert_eq!(out[64], COLOR_OVERFLOW);
+        assert_eq!(out.iter().filter(|&&c| c == COLOR_OVERFLOW).count(), 2);
+        // 오버플로를 스킵하므로 합법 충돌을 오판하지 않는다.
+        assert_conflict_free(&endpoints, &conflict, &out);
+    }
+
+    /// 같은 색 안에 공유 conflict 바디가 없음을 전수 검사한다 (오버플로 색 63 제외).
+    fn assert_conflict_free(endpoints: &[(u32, u32)], conflict: &[bool], color_of: &[u32]) {
+        use std::collections::HashSet;
+        let ncol = color_of.iter().copied().max().unwrap_or(0) as usize + 1;
+        let mut used: Vec<HashSet<u32>> = vec![HashSet::new(); ncol];
+        for (k, &(a, b)) in endpoints.iter().enumerate() {
+            let col = color_of[k] as usize;
+            // 오버플로 색(63)은 설계상 스칼라 버킷 — conflict-free가 아니다(SIMD 배칭 제외).
+            if color_of[k] == COLOR_OVERFLOW {
+                continue;
+            }
+            for body in [a, b] {
+                if conflict[body as usize] {
+                    assert!(
+                        used[col].insert(body),
+                        "색 {col}에 conflict 바디 {body} 중복 — 레인 병렬 시 write 유실"
+                    );
+                }
+            }
+        }
     }
 }

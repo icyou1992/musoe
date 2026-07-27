@@ -1919,30 +1919,93 @@ impl World {
         // 정렬 키 = 중력 단위벡터로의 투영(아래일수록 큼) → 내림차순. 무중력이면 전부 0이라
         // 페어 키만 남는다. 동률은 페어 키(전순서·유일)로 끊어 **결정성**을 유지한다.
         if constraints.len() > 1 {
+            let nb = self.bodies.len();
+            let nc = constraints.len();
+            // **스텝 스크래치는 캐노니컬 변이 전에 fallible 선점**한다 — wasm에서 할당 실패는
+            // 오류가 아니라 trap이라 infallible `collect`/`vec!`는 `try_step`의 ResourceLimit
+            // 계약을 우회한다(교차검수 rev_0bb4745e MAJOR; [[feedback ext_force 누락]]과 동류).
+            // 하나라도 실패하면 배열을 건드리기 전에 여기서 끝낸다.
+            let mut order: Vec<u32> = Vec::new();
+            let mut conflict: Vec<bool> = Vec::new();
+            let mut endpoints: Vec<(u32, u32)> = Vec::new();
+            let mut body_color: Vec<u64> = Vec::new();
+            let mut color_of: Vec<u32> = Vec::new();
+            let mut grouped: Vec<u32> = Vec::new();
+            let mut c_tmp: Vec<Option<ContactConstraint>> = Vec::new();
+            let mut new_keys: Vec<(u32, u32)> = Vec::new();
+            if order.try_reserve(nc).is_err()
+                || conflict.try_reserve(nb).is_err()
+                || endpoints.try_reserve(nc).is_err()
+                || body_color.try_reserve(nb).is_err()
+                || color_of.try_reserve(nc).is_err()
+                || grouped.try_reserve(nc).is_err()
+                || c_tmp.try_reserve(nc).is_err()
+                || new_keys.try_reserve(nc).is_err()
+            {
+                self.bp_pairs = pairs;
+                self.resource_limit = true;
+                return;
+            }
             let gdir = self.params.gravity.normalize_or_zero();
             let depth = |c: &ContactConstraint| -> f32 {
                 let pa = self.bodies[c.a].pose.pos;
                 let pb = self.bodies[c.b].pose.pos;
                 pa.dot(gdir).max(pb.dot(gdir))
             };
-            let mut order: Vec<u32> = (0..constraints.len() as u32).collect();
+            // ① canonical 전순서 (중력깊이 주 + pair-key 동률) — GS 수렴·결정성의 근거.
+            order.extend(0..nc as u32);
             order.sort_unstable_by(|&i, &j| {
                 let (i, j) = (i as usize, j as usize);
                 depth(&constraints[j])
                     .total_cmp(&depth(&constraints[i]))
                     .then_with(|| constraint_keys[i].cmp(&constraint_keys[j]))
             });
-            let mut c_tmp: Vec<Option<ContactConstraint>> =
-                constraints.drain(..).map(Some).collect();
-            let k_old = std::mem::take(&mut constraint_keys);
-            for &o in &order {
+            // ② 그래프 컬러링 (설계 §5): canonical 순서 기반 그리디. 같은 색 = 공유 dynamic
+            //    바디 없음 → 레인 병렬 가능. static/kinematic은 솔버가 안 쓰므로 conflict 아님.
+            //    이 순서로 **콜러드-스칼라** 솔브를 돌려(아래 서브스텝 루프는 그대로) 리오더링
+            //    비용·수렴·안정성을 먼저 재는 게 Unit 1 게이트다 — SIMD는 그 다음.
+            conflict.extend(
+                (0..nb).map(|i| self.alive[i] && !self.oob[i] && self.bodies[i].is_dynamic()),
+            );
+            endpoints.extend(order.iter().map(|&o| {
+                let c = &constraints[o as usize];
+                (c.a as u32, c.b as u32)
+            }));
+            body_color.resize(nb, 0u64);
+            solver::color_constraints(&endpoints, &conflict, &mut body_color, &mut color_of);
+            // ③ 색으로 **안정** 재그룹: 최종 순서 = 색 오름차순, 색 내 canonical 순서 보존.
+            //    제약'간' 순서만 red-black으로 바뀌고 색 안의 GS 순서는 canonical 그대로다.
+            //    색은 0..=COLOR_OVERFLOW(63) 유계라 offs는 **고정 배열**(할당 없음).
+            let ncol = color_of.iter().copied().max().unwrap_or(0) as usize + 1;
+            let mut offs = [0u32; solver::COLOR_OVERFLOW as usize + 1];
+            for &c in &color_of {
+                offs[c as usize] += 1;
+            }
+            let mut acc = 0u32;
+            for o in offs.iter_mut().take(ncol) {
+                let cnt = *o;
+                *o = acc;
+                acc += cnt;
+            }
+            grouped.resize(nc, 0u32);
+            for r in 0..order.len() {
+                let col = color_of[r] as usize;
+                grouped[offs[col] as usize] = order[r];
+                offs[col] += 1;
+            }
+            // ④ 최종 순열을 constraints/constraint_keys에 락스텝으로 적용 (PCM 갱신이
+            //    `constraints.iter().zip(&constraint_keys)`로 정렬 정합을 요구, 5)절).
+            //    constraints는 drain으로 용량을 보존하고, keys는 선점한 new_keys로 재구성한다.
+            c_tmp.extend(constraints.drain(..).map(Some));
+            for &o in &grouped {
                 constraints.push(
                     c_tmp[o as usize]
                         .take()
                         .expect("permutation is a bijection"),
                 );
-                constraint_keys.push(k_old[o as usize]);
+                new_keys.push(constraint_keys[o as usize]);
             }
+            constraint_keys = new_keys;
         }
 
         self.diag.phase_ns[2] = _t_np.elapsed().as_nanos() as u64;
