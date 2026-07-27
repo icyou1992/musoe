@@ -1725,10 +1725,16 @@ impl World {
             + core::mem::size_of::<usize>()                             // active_joints
             + 2 * core::mem::size_of::<(u32, u32)>(); // excluded(HashSet 오버헤드 여유)
         let fixed_joint_bytes = self.joints.len().saturating_mul(per_joint_bytes);
-        let byte_cap = MAX_STEP_SCRATCH_BYTES
-            .saturating_sub(fixed_body_bytes)
-            .saturating_sub(fixed_joint_bytes)
-            / per_pair_bytes.max(1);
+        // **고정 스크래치(body+joint)만으로 상한을 넘으면 페어 예약도 시작 전에 종료**한다
+        // (교차검수 rev_b86f5aea MAJOR). 페어를 0으로 막아도 아래 통합 블록이 body/joint 버퍼를
+        // nbody/njoint 크기로 그대로 예약하므로, 여기서 막지 않으면 소수 바디+대량 조인트가
+        // 128MiB를 넘겨 "총 스크래치 ≤ MAX" 계약을 깬다. 이 시점엔 pairs를 아직 안 건드렸다.
+        let fixed_bytes = fixed_body_bytes.saturating_add(fixed_joint_bytes);
+        if fixed_bytes >= MAX_STEP_SCRATCH_BYTES {
+            self.resource_limit = true;
+            return;
+        }
+        let byte_cap = (MAX_STEP_SCRATCH_BYTES - fixed_bytes) / per_pair_bytes.max(1);
         let budget = (self.params.max_pairs_per_body as usize)
             .saturating_mul(live)
             .saturating_add(1024)
