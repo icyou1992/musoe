@@ -226,9 +226,10 @@ mod maru_side {
         let mut reused = 0usize;
         let mut pairs_acc = 0usize;
         let mut pts_acc = 0usize;
-        let mut sub = [0u64; 4];
+        let mut sub = [0u64; 5];
         let mut acc_late = [0u64; 5];
-        let mut sub_late = [0u64; 4];
+        let mut sub_late = [0u64; 5];
+        let mut touch_late = 0usize;
         let mut late_steps = 0usize;
         let mut t_late = std::time::Duration::ZERO;
         for si in 0..steps {
@@ -241,7 +242,7 @@ mod maru_side {
             for k in 0..5 {
                 acc[k] += d.phase_ns[k];
             }
-            for k in 0..4 {
+            for k in 0..5 {
                 sub[k] += d.sub_ns[k];
             }
             // **정착 구간만 따로 잰다.** 전체 평균은 앞쪽 몇 스텝의 진짜 정착 과정(수천 접점,
@@ -251,9 +252,10 @@ mod maru_side {
                 for k in 0..5 {
                     acc_late[k] += d.phase_ns[k];
                 }
-                for k in 0..4 {
+                for k in 0..5 {
                     sub_late[k] += d.sub_ns[k];
                 }
+                touch_late += d.touching;
                 late_steps += 1;
             }
             reused += d.bp_reused as usize;
@@ -298,11 +300,13 @@ mod maru_side {
             acc_late[4] as f64 / 1000.0 / ls,
         );
         eprintln!(
-            "    [maru pile] 정착구간 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",
+            "    [maru pile] 정착구간 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us  (그중 기준선정렬={:.0} us, 기준선 {}개)",
             sub_late[0] as f64 / 1000.0 / ls,
             sub_late[1] as f64 / 1000.0 / ls,
             sub_late[2] as f64 / 1000.0 / ls,
             sub_late[3] as f64 / 1000.0 / ls,
+            sub_late[4] as f64 / 1000.0 / ls,
+            touch_late / late_steps.max(1),
         );
         eprintln!(
             "    [maru pile] 전체평균 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",

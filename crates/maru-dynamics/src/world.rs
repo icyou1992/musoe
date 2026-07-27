@@ -299,7 +299,9 @@ pub struct Diagnostics {
     /// `[scratch_reserve, wake_walk, narrow_walk, island_post]`
     /// 상위 phase 안에서 **페어 수·바디 수에 비례하는 부분만** 따로 잰다: 전원 수면 씬은
     /// 산출물이 접점 몇 개인데도 이 넷이 페어/바디 전량을 훑어 스텝을 지배할 수 있다.
-    pub sub_ns: [u64; 4],
+    pub sub_ns: [u64; 5],
+    /// 직전 스텝의 접촉 기준선 크기 — 정착 씬에서 페어 수와 함께 비용을 결정한다.
+    pub touching: usize,
     /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
     /// 0이 아니면 지원 범위 밖 입력이거나 엔진 버그이며, 그 스텝의 물리는 신뢰할 수 없다.
     /// 서로 다른 초과 상태가 같은 포화값으로 합쳐지므로 상태 해시만으로는 구분되지 않는다.
@@ -1982,8 +1984,11 @@ impl World {
         let _t_nw = std::time::Instant::now();
         // 직전 기준선을 페어와 **같은 전순서**로 정렬해 둔다(둘 다 (a, b_raw) 오름차순).
         // 아래 루프가 단조 포인터 하나로 훑으므로 페어당 비용은 비교 1회다.
+        let _t_sort = std::time::Instant::now();
         touch_sorted.extend(self.touching.iter().copied());
         touch_sorted.sort_unstable();
+        self.diag.sub_ns[4] = _t_sort.elapsed().as_nanos() as u64;
+        self.diag.touching = touch_sorted.len();
         let mut ti = 0usize;
         for &(a_id, b_raw) in &pairs {
             let key = (a_id, b_raw);
