@@ -3,7 +3,7 @@
 //! `Vec3x4` = 벡터 4개를 성분별 f32x4로: 모든 연산이 셔플 없는 순수 레인별 SIMD.
 //! WASM SIMD128(4×f32)과 정확히 동형 — 설계 §4.1 브로드페이즈 4-ary와 같은 이유.
 
-use crate::Vec3;
+use crate::{Mat3, Vec3};
 use core::ops::{Add, Sub};
 use wide::{f32x4, CmpGe, CmpLe};
 
@@ -118,6 +118,36 @@ impl Aabbx4 {
     }
 }
 
+/// Mat3 4개 (SoA) — 열 우선, 각 열이 `Vec3x4`. 솔버 배칭에서 4바디의 월드 역관성을
+/// 레인에 실어 `inv_i.mul_vec`를 4-wide로 돈다 (설계 §3·§5 SIMD 제약 배칭).
+#[derive(Clone, Copy, Debug)]
+pub struct Mat3x4 {
+    /// 열 벡터 3개 (각 4-wide).
+    pub c: [Vec3x4; 3],
+}
+
+impl Mat3x4 {
+    /// AoS 4개 → SoA 1개 (gather는 스칼라 — WASM에 gather 명령 없음, 설계 §3 정직한 범위).
+    #[inline]
+    pub fn from_array(m: [Mat3; 4]) -> Self {
+        Self {
+            c: [
+                Vec3x4::from_array([m[0].c[0], m[1].c[0], m[2].c[0], m[3].c[0]]),
+                Vec3x4::from_array([m[0].c[1], m[1].c[1], m[2].c[1], m[3].c[1]]),
+                Vec3x4::from_array([m[0].c[2], m[1].c[2], m[2].c[2], m[3].c[2]]),
+            ],
+        }
+    }
+
+    /// 레인별 M·v. 스칼라 `Mat3::mul_vec`(`c0·vx + c1·vy + c2·vz`)와 **연산 순서가 동일**하므로
+    /// 레인당 결과가 스칼라와 비트 동일하다(비FMA·IEEE 단정밀 — SIMD 솔브가 콜러드-스칼라와
+    /// 같은 L0 해시를 내게 하는 근거, 설계 §8).
+    #[inline]
+    pub fn mul_vec(self, v: Vec3x4) -> Vec3x4 {
+        self.c[0].scale(v.x) + self.c[1].scale(v.y) + self.c[2].scale(v.z)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +183,39 @@ mod tests {
         let d = Vec3x4::from_array(a).dot(Vec3x4::from_array(b)).to_array();
         for i in 0..4 {
             assert!((d[i] - a[i].dot(b[i])).abs() < 1e-6);
+        }
+    }
+
+    /// 계약: `Mat3x4::mul_vec`는 레인당 스칼라 `Mat3::mul_vec`과 **비트 동일**하다
+    /// (epsilon 아님 — 연산 순서 동일 + 비FMA). 이게 깨지면 SIMD 솔브의 L0 해시가 갈린다.
+    #[test]
+    fn mat3x4_mul_vec_is_bit_identical_to_scalar() {
+        use crate::Quat;
+        let mats = [
+            Mat3::rotate_inertia(
+                Vec3::new(0.5, 2.0, 1.3),
+                Quat::from_axis_angle(Vec3::new(1.0, 0.2, -0.4), 0.7),
+            ),
+            Mat3::from_diagonal(Vec3::new(1.0, 3.0, 0.25)),
+            Mat3::rotate_inertia(
+                Vec3::new(2.0, 0.1, 5.0),
+                Quat::from_axis_angle(Vec3::new(-0.3, 1.0, 0.5), 1.9),
+            ),
+            Mat3::IDENTITY,
+        ];
+        let vs = [
+            Vec3::new(1.0, -2.0, 3.5),
+            Vec3::new(0.0, 4.0, -1.0),
+            Vec3::new(-3.3, 0.7, 2.2),
+            Vec3::new(9.9, -9.9, 0.001),
+        ];
+        let out = Mat3x4::from_array(mats).mul_vec(Vec3x4::from_array(vs));
+        let (ox, oy, oz) = (out.x.to_array(), out.y.to_array(), out.z.to_array());
+        for i in 0..4 {
+            let s = mats[i].mul_vec(vs[i]);
+            assert_eq!(ox[i], s.x, "lane {i} x");
+            assert_eq!(oy[i], s.y, "lane {i} y");
+            assert_eq!(oz[i], s.z, "lane {i} z");
         }
     }
 
