@@ -151,6 +151,12 @@ impl Broadphase {
 }
 
 impl Broadphase {
+    /// static 트리 후보 질의 (superset — 정밀 판정은 호출자 몫). CCD linear cast가
+    /// 이동 sweep AABB로 static 후보를 뽑을 때 쓴다.
+    pub fn query_static(&self, q: Aabb, out: &mut Vec<u32>, stack: &mut Vec<u32>) {
+        self.static_tree.query_candidates_in(q, out, stack);
+    }
+
     /// **증분 갱신 1/2**: 움직인 동적 아이템의 AABB를 교체하고 dyn 트리 바운드를 리핏한다.
     /// 위상은 그대로 — §4.1(페어 집합은 트리 비의존)이 이것을 합법으로 만든다.
     /// `updates`의 id는 build 때 존재했어야 한다(추가/제거는 구조 변경 → 재빌드가 정답).

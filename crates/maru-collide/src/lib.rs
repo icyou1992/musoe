@@ -5,6 +5,7 @@
 //! - §4.1: 듀얼 4-ary 트리, **페어 집합은 트리 비의존**(정밀 AABB + canonical 정렬이 정본).
 
 mod aabb;
+mod cast;
 mod epa;
 pub(crate) mod gjk;
 mod limits;
@@ -16,6 +17,7 @@ mod tolerance;
 mod tree;
 
 pub use aabb::Aabb;
+pub use cast::{shape_cast, ShapeCastHit};
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
 pub use limits::{

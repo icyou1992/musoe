@@ -33,12 +33,13 @@ use maru_math::{Quat, Vec3};
 
 /// 포맷 매직·버전 — 다른 빌드/포맷의 바이트를 조용히 먹지 않기 위해.
 const MAGIC: u32 = 0x4d41_5255; // "MARU"
+/// v11: Body에 CCD linear cast opt-in 플래그(1바이트) 추가.
 /// v5: hull 점 상한 1024→32, 조인트 K 조건수 검증 추가.
 ///
 /// **정책 변경은 wire 의미 변경이다.** v4 시절 빌드가 만든 33~1024점 스냅샷은 지금 거부되고,
 /// K-특이 조인트를 담은 v4도 거부된다 — 같은 버전 번호가 다른 계약을 뜻하면 안 되므로 올린다.
 /// (v4: WorldParams·OOB 플래그·앵커/최소 크기 / v3: 예약 슬롯·AddBody 핸들·last_report)
-const VERSION: u32 = 10;
+const VERSION: u32 = 11;
 
 /// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
 /// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
@@ -54,9 +55,9 @@ mod min_bytes {
     /// 셰이프 최소: 태그(1) + Sphere 반지름(4)
     const SHAPE: usize = 5;
     /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4
-    /// + offset12 + force12 + torque12 + membership4 + filter4 + sensor1 + damp8
+    /// + offset12 + force12 + torque12 + membership4 + filter4 + sensor1 + ccd1(v11) + damp8
     const BODY_CORE: usize =
-        1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + 8 + SHAPE;
+        1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + 1 + 8 + SHAPE;
     /// 슬롯 레코드: alive1 + oob1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
     pub const SLOT: usize = 1 + 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
     /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang12 + limit4 + motor4
@@ -379,6 +380,7 @@ fn write_body(w: &mut Writer, b: &Body) {
     w.u32(b.membership);
     w.u32(b.filter);
     w.u8(b.sensor as u8);
+    w.u8(b.ccd as u8); // v11: CCD linear cast opt-in
     w.f32(b.linear_damping);
     w.f32(b.angular_damping);
     write_shape(w, &b.shape);
@@ -420,6 +422,11 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
         1 => true,
         _ => return Err(SnapshotError::InconsistentState),
     };
+    let ccd = match r.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(SnapshotError::InconsistentState),
+    };
     let linear_damping = r.f32()?;
     let angular_damping = r.f32()?;
     let shape = read_shape(r)?;
@@ -439,6 +446,7 @@ fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
         membership,
         filter,
         sensor,
+        ccd,
         linear_damping,
         angular_damping,
     };
@@ -622,8 +630,8 @@ fn shape_size(s: &Shape) -> usize {
 fn body_size(b: &Body) -> usize {
     // 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + offset12
     // + force12 + torque12 + 셰이프
-    // + membership4 + filter4 + sensor1 + linear_damping4 + angular_damping4
-    1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + 8 + shape_size(&b.shape)
+    // + membership4 + filter4 + sensor1 + ccd1(v11) + linear_damping4 + angular_damping4
+    1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + 1 + 8 + shape_size(&b.shape)
 }
 
 fn joint_size(j: &Joint) -> usize {

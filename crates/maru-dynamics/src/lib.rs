@@ -2104,9 +2104,9 @@ mod tests {
 
         // 슬롯(Box): alive1+oob1+reserved1+gen4
         //            + 본문(106 + force12 + torque12 + membership4 + filter4 + sensor1
-        //                   + damping8 = 147)
-        //            + sleep4+asleep1+island4 = 163
-        const SLOT: usize = 163;
+        //                   + ccd1(v11) + damping8 = 148)
+        //            + sleep4+asleep1+island4 = 164
+        const SLOT: usize = 164;
         let type_off = HDR + 4 + SLOT + 1 + 1 + 1 + 4;
         assert_eq!(
             good[type_off], 1,
@@ -4762,6 +4762,137 @@ mod tests {
         assert!(
             incr_steps > 60,
             "증분 경로가 거의 안 돌았다({incr_steps}스텝) — 테스트가 아무것도 증명 안 함"
+        );
+    }
+
+    /// CCD의 존재 이유: 고속 소형 바디가 얇은 static을 스텝 사이에 건너뛰는 것.
+    /// 같은 장면에서 CCD 없이는 관통하고(전제 확인 — 이게 안 뚫리면 테스트가 무의미),
+    /// CCD를 켜면 벽 앞에서 멈춰야 한다.
+    #[test]
+    fn ccd_stops_bullet_that_tunnels_without_it() {
+        let wall = |w: &mut World| {
+            w.add_body(Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(0.05, 5.0, 5.0),
+                    radius: 0.0,
+                },
+                pose(10.0, 0.0, 0.0),
+            ))
+        };
+        let bullet = |ccd: bool| {
+            let b = Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(0.0, 0.0, 0.0), 1.0);
+            if ccd {
+                b.with_ccd()
+            } else {
+                b
+            }
+        };
+        // 무중력 — 순수 관통 시나리오. 속도 400 m/s = 스텝당 6.7m (벽 두께 0.1의 67배).
+        let params = || WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        };
+
+        let mut w0 = World::new(params());
+        wall(&mut w0);
+        let h0 = w0.add_body(bullet(false));
+        w0.set_linear_velocity(h0, Vec3::new(400.0, 0.0, 0.0))
+            .unwrap();
+        for _ in 0..10 {
+            w0.step(DT);
+        }
+        assert!(
+            w0.body(h0).pose().pos.x > 11.0,
+            "CCD 없이 관통해야 전제가 성립하는데 x={} — 테스트가 아무것도 증명 못 한다",
+            w0.body(h0).pose().pos.x
+        );
+
+        let mut w1 = World::new(params());
+        wall(&mut w1);
+        let h1 = w1.add_body(bullet(true));
+        w1.set_linear_velocity(h1, Vec3::new(400.0, 0.0, 0.0))
+            .unwrap();
+        for _ in 0..10 {
+            w1.step(DT);
+        }
+        let x = w1.body(h1).pose().pos.x;
+        assert!(x < 9.95, "CCD가 켜졌는데 벽(근면 x=9.95)을 넘었다: x={x}");
+        assert!(x > 8.0, "벽 앞 어딘가에는 도달해야 한다: x={x}");
+    }
+
+    /// 클램프 평면은 단방향이다 — 바닥에 착지한 CCD 바디의 접선 이동(슬라이드)을 막지 않는다.
+    #[test]
+    fn ccd_clamp_allows_tangential_slide() {
+        let params = WorldParams {
+            gravity: Vec3::new(0.0, -9.8, 0.0),
+            ..WorldParams::default()
+        };
+        let mut w = World::new(params);
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(50.0, 1.0, 50.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        ));
+        let h = w.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.2 }, pose(0.0, 4.0, 0.0), 1.0)
+                .with_ccd()
+                .with_friction(0.0)
+                .unwrap(),
+        );
+        // 빠른 낙하 + 수평 속도 — 착지 후에도 수평으로 계속 가야 한다
+        w.set_linear_velocity(h, Vec3::new(30.0, -80.0, 0.0))
+            .unwrap();
+        let mut max_x = 0.0f32;
+        for _ in 0..30 {
+            w.step(DT);
+            let p = w.body(h).pose().pos;
+            assert!(p.y > 0.0, "바닥 관통: {p:?}");
+            max_x = max_x.max(p.x);
+        }
+        assert!(
+            max_x > 3.0,
+            "클램프가 슬라이드를 막았다 — 30스텝 동안 x 최대 {max_x}"
+        );
+    }
+
+    /// ccd 플래그는 캐노니컬 상태다 — 스냅샷 왕복에서 살아남고, 왕복한 월드의 미래가 같다.
+    #[test]
+    fn ccd_flag_survives_snapshot_roundtrip() {
+        let params = WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        };
+        let mut w = World::new(params);
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.05, 5.0, 5.0),
+                radius: 0.0,
+            },
+            pose(10.0, 0.0, 0.0),
+        ));
+        let h = w.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(0.0, 0.0, 0.0), 1.0).with_ccd(),
+        );
+        w.set_linear_velocity(h, Vec3::new(400.0, 0.0, 0.0))
+            .unwrap();
+        w.step(DT);
+        let snap = w.snapshot();
+        let mut w2 = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        w2.restore(&snap).unwrap();
+        assert!(w2.body(h).ccd(), "ccd 플래그가 왕복에서 사라졌다");
+        for _ in 0..9 {
+            w.step(DT);
+            w2.step(DT);
+        }
+        assert_eq!(w.snapshot(), w2.snapshot(), "왕복 후 궤적 분기");
+        assert!(
+            w.body(h).pose().pos.x < 9.95,
+            "왕복 뒤에도 CCD가 벽을 막아야 한다"
         );
     }
 }

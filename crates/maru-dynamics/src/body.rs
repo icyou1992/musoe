@@ -72,6 +72,11 @@ pub struct Body {
     pub(crate) filter: u32,
     /// 감지 전용(트리거). 접촉 이벤트는 내지만 임펄스는 주고받지 않는다.
     pub(crate) sensor: bool,
+    /// CCD linear cast opt-in (설계 §4 CCD 계약 v0.5, 대상 static 한정).
+    /// 고속 소형 바디(총알)가 얇은 static을 관통하지 않도록 서브스텝 적분마다
+    /// 이동 경로를 static 트리에 캐스트해 TOI에서 위치를 절단한다. dynamic 전용 의미 —
+    /// 다른 타입에서는 무시된다(kinematic은 처방 이동이라 절단이 계약 위반).
+    pub(crate) ccd: bool,
     /// 선형 감쇠 (1/s). 매 서브스텝 `v ← v / (1 + h·d)`로 **암시적**으로 적용한다.
     ///
     /// 명시적(`v *= 1 - h·d`)이면 `h·d > 1`에서 부호가 뒤집혀 발산한다 —
@@ -130,6 +135,16 @@ impl Body {
         self.sensor
     }
     /// 충돌 그룹을 바꾼 사본.
+    /// CCD(linear cast) 켜기 — 고속 소형 dynamic 바디용. static 대상 관통만 막는다.
+    pub fn with_ccd(mut self) -> Self {
+        self.ccd = true;
+        self
+    }
+
+    pub fn ccd(&self) -> bool {
+        self.ccd
+    }
+
     pub fn with_groups(mut self, membership: u32, filter: u32) -> Self {
         self.membership = membership;
         self.filter = filter;
@@ -290,6 +305,7 @@ impl Body {
             membership: ALL_GROUPS,
             filter: ALL_GROUPS,
             sensor: false,
+            ccd: false,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -340,6 +356,7 @@ impl Body {
             membership: ALL_GROUPS,
             filter: ALL_GROUPS,
             sensor: false,
+            ccd: false,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -400,6 +417,7 @@ impl Body {
             membership: ALL_GROUPS,
             filter: ALL_GROUPS,
             sensor: false,
+            ccd: false,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -430,6 +448,7 @@ impl Body {
             membership: ALL_GROUPS,
             filter: ALL_GROUPS,
             sensor: false,
+            ccd: false,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };

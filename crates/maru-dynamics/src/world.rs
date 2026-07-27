@@ -9,7 +9,7 @@ use crate::body::{Body, BodyHandle, BodyType};
 use crate::command::{Command, CommandReport, PendingCommand};
 use crate::joint::{self, Joint};
 use crate::solver::{self, CachedImpulse, ContactConstraint, Softness, SolverParams};
-use maru_collide::{contact, Aabb, Broadphase, FeatureId, STATIC_BIT};
+use maru_collide::{contact, shape_cast, Aabb, Broadphase, FeatureId, STATIC_BIT};
 use maru_math::Vec3;
 use std::collections::HashMap;
 
@@ -297,6 +297,8 @@ pub struct Diagnostics {
     pub bp_reused: bool,
     /// 이번 스텝이 증분 브로드페이즈(움직인 바디만 갱신 + 페어 델타)를 탔는가.
     pub bp_incremental: bool,
+    /// 이번 스텝 CCD linear cast가 이동을 절단한 횟수 (서브스텝×바디 누적).
+    pub ccd_clamps: usize,
     /// 단계별 소요 (ns) — 프로파일용.
     /// `[aabb, broad, narrow, solve, post]`
     /// - `aabb`: 바디 순회 + 회전 월드 AABB 구성 (예전에는 broad에서 **빠져 있었다**)
@@ -988,20 +990,7 @@ impl World {
     /// 두 곳에 따로 적으면 하나만 고쳐지는 비대칭이 생긴다(이 저장소의 반복 결함 계열).
     pub(crate) fn body_aabb(&self, i: usize) -> Aabb {
         let b = &self.bodies[i];
-        let local = b.shape.local_aabb();
-        let c = (local.max + local.min) * 0.5;
-        let hl = (local.max - local.min) * 0.5;
-        let (ax, ay, az) = (
-            b.pose.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
-            b.pose.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
-            b.pose.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
-        );
-        let ext = Vec3::new(
-            ax.x.abs() * hl.x + ay.x.abs() * hl.y + az.x.abs() * hl.z,
-            ax.y.abs() * hl.x + ay.y.abs() * hl.y + az.y.abs() * hl.z,
-            ax.z.abs() * hl.x + ay.z.abs() * hl.y + az.z.abs() * hl.z,
-        );
-        Aabb::from_center(b.pose.pos + b.pose.rot.rotate(c), ext)
+        shape_world_aabb(&b.shape, &b.pose)
     }
 
     fn handle_of(&self, i: usize) -> BodyHandle {
@@ -2530,6 +2519,36 @@ impl World {
             .copied()
             .filter(|&i| gravity_on[i as usize])
             .collect();
+        // === CCD linear cast 준비 (설계 §4 CCD 계약 v0.5 — 대상 static 한정, opt-in) ===
+        // 활성 CCD 바디마다: 서브스텝 적분에서 이동 경로를 static 트리에 캐스트해 TOI에서
+        // 절단하고, 이번 스텝의 잔여 서브스텝 동안 **단방향 평면 클램프**(침투 방향 이동
+        // 성분만 사영 제거 — 슬라이드 허용)를 유지한다. 평면은 바디당 최대 4개, 초과 hit는
+        // 이동 종료(구석 퇴화 — 결정적·안전). 속도는 절대 건드리지 않는다: 정지 위치가
+        // 표면(speculative skin 안)이라 다음 스텝의 일반 접촉 파이프라인이 실제 접근
+        // 속도로 반발·정지를 해석한다.
+        let ccd_list: Vec<u32> = active
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let i = i as usize;
+                self.bodies[i].ccd && self.bodies[i].body_type == BodyType::Dynamic
+            })
+            .collect();
+        let mut ccd_index: Vec<u32> = Vec::new();
+        let mut ccd_planes: Vec<[Vec3; 4]> = Vec::new();
+        let mut ccd_plane_count: Vec<u8> = Vec::new();
+        let mut ccd_frozen: Vec<bool> = Vec::new();
+        let mut ccd_cand: Vec<u32> = Vec::new();
+        let mut ccd_stack: Vec<u32> = Vec::new();
+        if !ccd_list.is_empty() {
+            ccd_index = vec![u32::MAX; n_bodies];
+            for (k, &i) in ccd_list.iter().enumerate() {
+                ccd_index[i as usize] = k as u32;
+            }
+            ccd_planes = vec![[Vec3::ZERO; 4]; ccd_list.len()];
+            ccd_plane_count = vec![0u8; ccd_list.len()];
+            ccd_frozen = vec![false; ccd_list.len()];
+        }
         for _ in 0..n_sub {
             // 역관성 갱신을 **외력보다 먼저** — 토크는 현재 자세의 월드 역관성을 쓴다
             // (뒤에 두면 첫 서브스텝에서 `inv_i`가 아직 0이라 토크가 통째로 사라진다).
@@ -2621,7 +2640,83 @@ impl World {
             // 위치 적분 (dynamic + kinematic, sleeping 제외)
             for &i in &active {
                 let i = i as usize;
-                st.pos[i] += st.lin[i] * h;
+                let ci = if ccd_list.is_empty() {
+                    u32::MAX
+                } else {
+                    ccd_index[i]
+                };
+                if ci == u32::MAX {
+                    st.pos[i] += st.lin[i] * h;
+                } else {
+                    // CCD 절단 적분: 평면 사영 → 잔여 이동 재캐스트 → TOI 절단.
+                    let ci = ci as usize;
+                    let mut d = st.lin[i] * h;
+                    for &n in ccd_planes[ci].iter().take(ccd_plane_count[ci] as usize) {
+                        let pen = d.dot(n);
+                        if pen < 0.0 {
+                            d = d - n * pen; // 침투 성분만 제거 — 슬라이드 허용
+                        }
+                    }
+                    if ccd_frozen[ci] {
+                        d = Vec3::ZERO;
+                    } else if d != Vec3::ZERO {
+                        let body = &self.bodies[i];
+                        let pose_now = maru_collide::Pose {
+                            pos: st.pos[i],
+                            rot: st.rot[i],
+                        };
+                        let skin = self.params.speculative_margin;
+                        let a0 = shape_world_aabb(&body.shape, &pose_now);
+                        let sweep = a0.merge(Aabb::new(a0.min + d, a0.max + d));
+                        // static 후보 — bp 구조는 브로드페이즈 단계가 항상 남긴다(무효화
+                        // 경로는 전부 그 전에 return). 방어적으로 없으면 캐스트 생략.
+                        let mut best: Option<(f32, Vec3, u32)> = None;
+                        if let Some(bp) = &self.bp {
+                            ccd_cand.clear();
+                            bp.query_static(sweep, &mut ccd_cand, &mut ccd_stack);
+                            for &sid in &ccd_cand {
+                                let sb = &self.bodies[sid as usize];
+                                // 접촉 규칙과 동일한 필터: 그룹·센서·조인트 제외 쌍.
+                                if sb.sensor || !groups_collide(body, sb) {
+                                    continue;
+                                }
+                                if !excluded.is_empty() {
+                                    let (x, y) = (i as u32, sid);
+                                    if excluded.contains(&(x.min(y), x.max(y))) {
+                                        continue;
+                                    }
+                                }
+                                if let Some(hit) =
+                                    shape_cast(&body.shape, &pose_now, d, &sb.shape, &sb.pose, skin)
+                                {
+                                    // 결정적 최소: (toi, static id) 사전식 — 동시 hit 동률 절단.
+                                    let better = match best {
+                                        None => true,
+                                        Some((bt, _, bid)) => {
+                                            hit.toi < bt || (hit.toi == bt && sid < bid)
+                                        }
+                                    };
+                                    if better {
+                                        best = Some((hit.toi, hit.normal, sid));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((toi, normal, _)) = best {
+                            d = d * toi;
+                            self.diag.ccd_clamps += 1;
+                            let cnt = ccd_plane_count[ci] as usize;
+                            if cnt < 4 {
+                                ccd_planes[ci][cnt] = normal;
+                                ccd_plane_count[ci] = (cnt + 1) as u8;
+                            } else {
+                                // 평면 5개째 = 구석에 낀 상태 — 이번 스텝 이동 종료 (설계).
+                                ccd_frozen[ci] = true;
+                            }
+                        }
+                    }
+                    st.pos[i] += d;
+                }
                 st.rot[i] = st.rot[i].integrate(st.ang[i], h);
             }
             // relax — bias 에너지 제거 (위치 적분으로 자세가 바뀌었으므로 갱신)
@@ -2875,6 +2970,25 @@ impl World {
         self.diag.post_ns[3] = _t_hyg.elapsed().as_nanos() as u64;
         self.diag.phase_ns[4] = _t_post.elapsed().as_nanos() as u64;
     }
+}
+
+/// 셰이프의 월드 AABB — 자세를 명시 인자로 받는 정본 (body_aabb와 CCD 중간-서브스텝
+/// 캐스트가 같은 정의를 공유한다: 후자는 솔버 스크래치의 현재 자세를 써야 한다).
+fn shape_world_aabb(shape: &maru_collide::Shape, pose: &maru_collide::Pose) -> Aabb {
+    let local = shape.local_aabb();
+    let c = (local.max + local.min) * 0.5;
+    let hl = (local.max - local.min) * 0.5;
+    let (ax, ay, az) = (
+        pose.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
+        pose.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
+        pose.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
+    );
+    let ext = Vec3::new(
+        ax.x.abs() * hl.x + ay.x.abs() * hl.y + az.x.abs() * hl.z,
+        ax.y.abs() * hl.x + ay.y.abs() * hl.y + az.y.abs() * hl.z,
+        ax.z.abs() * hl.x + ay.z.abs() * hl.y + az.z.abs() * hl.z,
+    );
+    Aabb::from_center(pose.pos + pose.rot.rotate(c), ext)
 }
 
 /// 두 물체가 충돌 그룹상 부딪히는가.

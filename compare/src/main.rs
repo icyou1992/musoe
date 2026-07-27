@@ -58,8 +58,13 @@ mod maru_side {
     }
 
     pub fn pyramid(mode: Mode, tiers: usize, steps: usize, warmup: usize) -> Result_ {
+        let sub: u32 = std::env::var("MARU_SUB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(WorldParams::default().substeps);
         let d = WorldParams::default();
         let mut w = World::new(WorldParams {
+            substeps: sub,
             // 수면을 끄려면 임계를 0으로 둔다(어떤 속도도 임계 아래가 되지 않는다).
             sleep_linear_threshold: if mode == Mode::Throughput {
                 0.0
