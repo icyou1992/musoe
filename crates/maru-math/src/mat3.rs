@@ -177,3 +177,111 @@ mod tests {
         assert!((out - axis * 2.0).length() < 1e-5, "{out:?}");
     }
 }
+
+impl Mat3 {
+    /// **대칭** 3×3의 고유분해 (Jacobi 회전) — `A = R · diag(λ) · Rᵀ`, R의 열이 고유벡터.
+    ///
+    /// 복합 바디의 합성 관성 텐서를 주축으로 돌리는 데 쓴다: 평행축 이동은 관성곱
+    /// (비대각 항)을 만들고, 엔진은 로컬 관성을 대각(Vec3)으로 저장하므로 생성 경계에서
+    /// 주축을 pose로 접어야 한다. 입력이 대칭이 아니면 결과는 의미가 없다(호출자 책임 —
+    /// 관성 텐서는 구성상 대칭이다).
+    ///
+    /// Jacobi는 대칭 행렬에서 무조건 수렴하고 분기 없는 회전만 쓰므로 결정론 계약(§8)에
+    /// 안전하다. 반복 상한 24 — 3×3에서는 6~10회면 기계 정밀도에 닿는다.
+    pub fn eigen_symmetric(&self) -> (Vec3, Mat3) {
+        let mut a = *self;
+        let mut v = Mat3::IDENTITY;
+        for _ in 0..24 {
+            // 최대 비대각 원소 (p,q) 선택
+            let od = [
+                (a.c[1].x.abs(), 0usize, 1usize), // a01
+                (a.c[2].x.abs(), 0, 2),           // a02
+                (a.c[2].y.abs(), 1, 2),           // a12
+            ];
+            let &(m, p, q) = od
+                .iter()
+                .max_by(|x, y| x.0.total_cmp(&y.0))
+                .expect("3원소 배열");
+            // 대각합 대비 무시 가능하면 종료 (스케일 상대 판정)
+            let diag_scale = a.c[0].x.abs() + a.c[1].y.abs() + a.c[2].z.abs();
+            if m <= f32::EPSILON * diag_scale.max(f32::MIN_POSITIVE) {
+                break;
+            }
+            let apq = get(&a, p, q);
+            let app = get(&a, p, p);
+            let aqq = get(&a, q, q);
+            // 고전 Jacobi 각: tan(2θ) = 2·apq / (app − aqq)
+            let theta = 0.5 * (2.0 * apq).atan2(app - aqq);
+            let (s, c) = theta.sin_cos();
+            // G = 평면 (p,q) 회전. A ← Gᵀ A G, V ← V G
+            let mut g = Mat3::IDENTITY;
+            set(&mut g, p, p, c);
+            set(&mut g, q, q, c);
+            set(&mut g, p, q, -s);
+            set(&mut g, q, p, s);
+            a = g.transpose().mul_mat(&a).mul_mat(&g);
+            v = v.mul_mat(&g);
+        }
+        (Vec3::new(a.c[0].x, a.c[1].y, a.c[2].z), v)
+    }
+}
+
+#[inline]
+fn get(m: &Mat3, r: usize, c: usize) -> f32 {
+    let col = m.c[c];
+    match r {
+        0 => col.x,
+        1 => col.y,
+        _ => col.z,
+    }
+}
+
+#[inline]
+fn set(m: &mut Mat3, r: usize, c: usize, v: f32) {
+    let col = &mut m.c[c];
+    match r {
+        0 => col.x = v,
+        1 => col.y = v,
+        _ => col.z = v,
+    }
+}
+
+#[cfg(test)]
+mod eigen_tests {
+    use super::*;
+
+    fn sym(a00: f32, a01: f32, a02: f32, a11: f32, a12: f32, a22: f32) -> Mat3 {
+        Mat3 {
+            c: [
+                Vec3::new(a00, a01, a02),
+                Vec3::new(a01, a11, a12),
+                Vec3::new(a02, a12, a22),
+            ],
+        }
+    }
+
+    /// 재구성 검증: R diag(λ) Rᵀ == A (허용 오차 = 스케일 상대).
+    #[test]
+    fn eigen_reconstructs_symmetric_matrix() {
+        for m in [
+            sym(2.0, 0.5, -0.3, 1.5, 0.7, 3.0),
+            sym(1.0, 0.0, 0.0, 1.0, 0.0, 1.0),       // 등방 (축퇴)
+            sym(5.0, 4.9, 0.0, 5.0, 0.0, 0.1),       // 거의 특이
+            sym(1e-3, 2e-4, 0.0, 4e-3, -1e-4, 9e-4), // 작은 스케일
+        ] {
+            let (l, r) = m.eigen_symmetric();
+            let rec = r.mul_mat(&Mat3::from_diagonal(l)).mul_mat(&r.transpose());
+            let scale: f32 = l.x.abs().max(l.y.abs()).max(l.z.abs()).max(1e-30);
+            for c in 0..3 {
+                let d = rec.c[c] - m.c[c];
+                assert!(
+                    d.length() <= 1e-5 * scale.max(1.0) + 1e-6,
+                    "재구성 오차: {m:?} → λ={l:?} d={d:?}"
+                );
+            }
+            // R은 회전(정규직교): RᵀR ≈ I
+            let i = r.transpose().mul_mat(&r);
+            assert!((i.c[0].x - 1.0).abs() < 1e-5 && i.c[1].x.abs() < 1e-5);
+        }
+    }
+}
