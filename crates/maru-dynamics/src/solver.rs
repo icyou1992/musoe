@@ -476,7 +476,6 @@ pub fn warm_start(st: &mut SolverState, c: &ContactConstraint) {
 
 /// Vec3x4 → 레인별 Vec3 4개 (스캐터용).
 #[inline]
-#[allow(dead_code)] // 슬라이스 3b(서브스텝 루프 배선) 전까지 스테이징 — 격리 테스트로 검증됨
 fn vec3x4_lanes(v: Vec3x4) -> [Vec3; 4] {
     let (x, y, z) = (v.x.to_array(), v.y.to_array(), v.z.to_array());
     [
@@ -488,7 +487,6 @@ fn vec3x4_lanes(v: Vec3x4) -> [Vec3; 4] {
 }
 
 #[inline]
-#[allow(dead_code)]
 fn negx4(v: Vec3x4) -> Vec3x4 {
     Vec3x4 {
         x: -v.x,
@@ -499,7 +497,6 @@ fn negx4(v: Vec3x4) -> Vec3x4 {
 
 /// 레인별 blend: gate 마스크가 참인 레인은 `t`, 아니면 `f`(원본 보존).
 #[inline]
-#[allow(dead_code)]
 fn blend_vec(gate: f32x4, t: Vec3x4, f: Vec3x4) -> Vec3x4 {
     Vec3x4 {
         x: gate.blend(t.x, f.x),
@@ -510,7 +507,6 @@ fn blend_vec(gate: f32x4, t: Vec3x4, f: Vec3x4) -> Vec3x4 {
 
 /// 4제약 배치의 바디 상태 (SoA 레인) — 스칼라 `BodyReg`의 4-wide 대응.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 struct BodyRegx4 {
     lin: Vec3x4,
     ang: Vec3x4,
@@ -520,7 +516,6 @@ struct BodyRegx4 {
     dyn_mask: f32x4,
 }
 
-#[allow(dead_code)]
 impl BodyRegx4 {
     #[inline]
     fn load(st: &SolverState, idx: [usize; 4]) -> Self {
@@ -586,7 +581,6 @@ impl BodyRegx4 {
 /// warm start의 4제약 배치판. 레인당 결과는 스칼라 `warm_start`와 **비트 동일**하다
 /// (연산 순서 동일·비FMA·게이트 blend). 점 수가 다른 레인은 없는 점을 0/ZERO로 채우되,
 /// blend `active` 마스크로 걸러 그 레인 값을 건드리지 않는다.
-#[allow(dead_code)] // 슬라이스 3b에서 서브스텝 루프에 색 배치로 배선 예정
 pub fn warm_start_x4(st: &mut SolverState, cs: [&ContactConstraint; 4]) {
     let a_idx = [cs[0].a, cs[1].a, cs[2].a, cs[3].a];
     let b_idx = [cs[0].b, cs[1].b, cs[2].b, cs[3].b];
@@ -657,6 +651,43 @@ pub fn warm_start_x4(st: &mut SolverState, cs: [&ContactConstraint; 4]) {
     }
     ba.store(st, a_idx);
     bb.store(st, b_idx);
+}
+
+/// warm_start를 **색 범위 단위로 배치 디스패치** (Unit 3b). 같은 색 4제약은 SIMD(공유 dynamic
+/// 바디 없음 → 레인 독립), 나머지(<4)와 오버플로 색(63, 공유 바디 가능)은 스칼라. 색 안의 제약은
+/// dynamic 바디가 서로 겹치지 않아 처리 순서와 무관하고, 색 그룹 순서는 콜러드-스칼라와 동일하므로
+/// 결과는 **비트 동일**하다(L0 해시 불변 — 기존 state_hash 테스트가 이를 잠근다).
+pub fn warm_start_batched(
+    st: &mut SolverState,
+    constraints: &[ContactConstraint],
+    color_ranges: &[(u32, u32)],
+) {
+    for (color, &(start, end)) in color_ranges.iter().enumerate() {
+        let (start, end) = (start as usize, end as usize);
+        // 색 63은 오버플로 버킷일 수 있어(공유 바디) 항상 스칼라 — 정상 색 63의 손실은 무시 가능.
+        if color as u32 == COLOR_OVERFLOW {
+            for c in &constraints[start..end] {
+                warm_start(st, c);
+            }
+            continue;
+        }
+        let mut i = start;
+        while i + 4 <= end {
+            warm_start_x4(
+                st,
+                [
+                    &constraints[i],
+                    &constraints[i + 1],
+                    &constraints[i + 2],
+                    &constraints[i + 3],
+                ],
+            );
+            i += 4;
+        }
+        for c in &constraints[i..end] {
+            warm_start(st, c);
+        }
+    }
 }
 
 /// 속도 임펄스 해석. `soft`=bias 페이즈, `relax`(soft=None)=bias 제거 페이즈.

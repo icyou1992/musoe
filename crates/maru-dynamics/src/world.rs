@@ -1772,7 +1772,12 @@ impl World {
         let mut grouped: Vec<u32> = Vec::new();
         let mut c_tmp: Vec<Option<ContactConstraint>> = Vec::new();
         let mut new_keys: Vec<(u32, u32)> = Vec::new();
+        // 색 범위 [start,end) — Unit 3b SIMD warm_start 배치 디스패치용. 색은 최대 64개.
+        let mut color_ranges: Vec<(u32, u32)> = Vec::new();
         if constraints.try_reserve(ncap).is_err()
+            || color_ranges
+                .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
+                .is_err()
             || constraint_keys.try_reserve(ncap).is_err()
             || live_keys.try_reserve(ncap).is_err()
             || joint_pairs.try_reserve(njoint).is_err()
@@ -2041,6 +2046,12 @@ impl World {
                 *o = acc;
                 acc += cnt;
             }
+            // 색 범위 [start,end) 캡처 — 이 시점 offs[c]=색 c 시작(placement 루프가 곧 변형).
+            for c in 0..ncol {
+                let start = offs[c];
+                let end = if c + 1 < ncol { offs[c + 1] } else { nc as u32 };
+                color_ranges.push((start, end));
+            }
             grouped.resize(nc, 0u32);
             for r in 0..order.len() {
                 let col = color_of[r] as usize;
@@ -2060,6 +2071,11 @@ impl World {
                 new_keys.push(constraint_keys[o as usize]);
             }
             constraint_keys = new_keys;
+        }
+        // 제약 ≤1이면 컬러링 블록을 건너뛴다 — 색 분리가 불필요하다. warm_start 배치 디스패치가
+        // 비지 않도록 전체를 한 범위(스칼라)로 둔다.
+        if color_ranges.is_empty() && !constraints.is_empty() {
+            color_ranges.push((0, constraints.len() as u32));
         }
 
         self.diag.phase_ns[2] = _t_np.elapsed().as_nanos() as u64;
@@ -2203,9 +2219,9 @@ impl World {
             for &ji in &active_joints {
                 joint::warm_start(&mut st, &joints[ji]);
             }
-            for c in constraints.iter_mut() {
-                solver::warm_start(&mut st, c);
-            }
+            // 접촉 warm_start — 색 배치 SIMD 디스패치(Unit 3b). 색 내 4제약은 4-wide, 나머지는
+            // 스칼라. 콜러드-스칼라와 비트 동일이라 L0 해시 불변(아래 state_hash 테스트가 잠금).
+            solver::warm_start_batched(&mut st, &constraints, &color_ranges);
             for &ji in &active_joints {
                 joint::solve(
                     &mut st,
