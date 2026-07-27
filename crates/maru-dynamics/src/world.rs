@@ -1719,8 +1719,16 @@ impl World {
             + core::mem::size_of::<u64>()
             + core::mem::size_of::<bool>(); // 컬러 body_color/conflict
         let fixed_body_bytes = self.bodies.len().saturating_mul(per_body_bytes);
-        let byte_cap =
-            MAX_STEP_SCRATCH_BYTES.saturating_sub(fixed_body_bytes) / per_pair_bytes.max(1);
+        // 조인트 비례 스크래치: joint_pairs·active_joints·excluded. **조인트 수는 pairs·bodies의
+        // 상한이 아니므로** 별도로 차감해야 총상한이 성립한다 (교차검수 rev_ba3ca887 MAJOR).
+        let per_joint_bytes = core::mem::size_of::<(usize, usize)>()     // joint_pairs
+            + core::mem::size_of::<usize>()                             // active_joints
+            + 2 * core::mem::size_of::<(u32, u32)>(); // excluded(HashSet 오버헤드 여유)
+        let fixed_joint_bytes = self.joints.len().saturating_mul(per_joint_bytes);
+        let byte_cap = MAX_STEP_SCRATCH_BYTES
+            .saturating_sub(fixed_body_bytes)
+            .saturating_sub(fixed_joint_bytes)
+            / per_pair_bytes.max(1);
         let budget = (self.params.max_pairs_per_body as usize)
             .saturating_mul(live)
             .saturating_add(1024)
@@ -1755,6 +1763,7 @@ impl World {
         let mut live_keys: IntSet<(u32, u32)> = IntSet::default();
         let mut joint_pairs: Vec<(usize, usize)> = Vec::new();
         let mut active_joints: Vec<usize> = Vec::new();
+        let mut excluded: IntSet<(u32, u32)> = IntSet::default();
         let mut order: Vec<u32> = Vec::new();
         let mut conflict: Vec<bool> = Vec::new();
         let mut endpoints: Vec<(u32, u32)> = Vec::new();
@@ -1768,6 +1777,7 @@ impl World {
             || live_keys.try_reserve(ncap).is_err()
             || joint_pairs.try_reserve(njoint).is_err()
             || active_joints.try_reserve(njoint).is_err()
+            || excluded.try_reserve(njoint).is_err()
             || order.try_reserve(ncap).is_err()
             || conflict.try_reserve(nbody).is_err()
             || endpoints.try_reserve(ncap).is_err()
@@ -1788,12 +1798,9 @@ impl World {
             self.resource_limit = true;
             return;
         }
-        // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본)
-        let mut excluded: IntSet<(u32, u32)> = IntSet::default();
-        if excluded.try_reserve(self.joints.len()).is_err() {
-            self.resource_limit = true;
-            return;
-        }
+        // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본).
+        // excluded는 위 통합 블록에서 선점됨(실패 bail이 bp_pairs를 복원 — 캐시 재사용 스텝에
+        // 빈 페어 집합이 유효 캐시로 남던 BLOCKER 차단, 교차검수 rev_ba3ca887). 여기선 채운다.
         excluded.extend(
             self.joints
                 .iter()
