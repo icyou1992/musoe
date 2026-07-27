@@ -12,6 +12,7 @@ maru-dynamics = { path = "../crates/maru-dynamics" }
 maru-collide = { path = "../crates/maru-collide" }
 maru-math = { path = "../crates/maru-math" }
 rapier3d = "0.34"
+joltc-sys = "0.3.1"
 
 # 엔진과 **같은 릴리스 프로파일**을 쓴다 — 재결합 최적화 없이 lto=thin, cgu=1.
 [profile.release]
