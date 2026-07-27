@@ -1896,6 +1896,9 @@ impl World {
         self.diag.pair_budget = budget;
         // **아무것도 움직이지 않았으면 트리를 다시 짓지 않는다.** 페어 집합은 트리 비의존
         // 계약(설계 §4.1)이라 입력이 같으면 결과가 비트 동일하다 — 재사용은 항등이다.
+        // 증분 스텝의 R 접촉 페어(fresh) — 아래 wake/narrow 순회 제한의 근거로 살려 둔다.
+        let mut fresh_pairs: Option<Vec<(u32, u32)>> = None;
+        let mut moved_mask: Vec<bool> = Vec::new();
         let pairs = if bp_cache_hit {
             self.diag.bp_reused = true;
             std::mem::take(&mut self.bp_pairs)
@@ -1905,13 +1908,16 @@ impl World {
             self.diag.bp_incremental = true;
             let bp = self.bp.as_mut().expect("incremental ⇒ bp 존재");
             bp.refresh_dynamic(&bp_updates);
-            let mut mask = vec![false; self.bodies.len()];
+            moved_mask = vec![false; self.bodies.len()];
             for &r in &moved_ids {
-                mask[r as usize] = true;
+                moved_mask[r as usize] = true;
             }
             let prev = std::mem::take(&mut self.bp_pairs);
-            match bp.incremental_pairs_bounded(&moved_ids, &mask, &prev, budget) {
-                Some(p) => p,
+            match bp.incremental_pairs_bounded(&moved_ids, &moved_mask, &prev, budget) {
+                Some((p, fresh)) => {
+                    fresh_pairs = Some(fresh);
+                    p
+                }
                 None => {
                     // 아이템은 이미 갱신됐는데 페어는 옛것 — 구조를 통째로 버려 다음 스텝이
                     // 재빌드하게 한다(스텝은 상태 불변으로 종료: 여기는 wake 폐쇄 이전이다).
@@ -2058,7 +2064,65 @@ impl World {
         // static은 여기 쓰지 않는다(페어의 STATIC_BIT가 이미 구분한다). 근거는 호출부 주석.
         let maybe_active = |i: usize, this: &Self| !this.asleep[i] && !this.oob[i];
         let _t_wake = std::time::Instant::now();
-        for &(a_id, b_raw) in &pairs {
+        // **순회 제한 판정** — 활성 집합이 R에 포함되는가. 전체 스윕의 "첫 wake"는 스윕 시작
+        // 상태에서 활성인 끝점을 가지므로, 활성 ⊆ R이면 그 페어는 반드시 fresh(R 접촉)에 있다.
+        // 따라서 fresh **드라이런**(무변이)이 후보를 못 찾으면 전체 스윕은 no-op이 증명되고,
+        // 하나라도 찾으면 원래 전체 스윕을 그대로 돌린다 — 스윕은 순서-민감(진행 중 wake가
+        // 뒤 페어의 판정을 바꾼다)이라 제한 목록으로 스윕 자체를 대체하면 갈릴 수 있다.
+        // R 밖 활성(W₀)은 add_joint처럼 wake만 하고 구조를 안 버리는 경로에서 생긴다 —
+        // 직전의 조인트 wake 폐쇄가 깨운 바디도 gate=false라 이 스캔에 걸린다.
+        let active_subset_of_r = fresh_pairs.is_some()
+            && (0..self.bodies.len()).all(|i| {
+                self.integrate_gate[i]
+                    || !self.alive[i]
+                    || self.oob[i]
+                    || self.asleep[i]
+                    || self.bodies[i].body_type == BodyType::Static
+            });
+        let mut need_full_sweep = !active_subset_of_r;
+        if active_subset_of_r {
+            for &(a_id, b_raw) in fresh_pairs.as_ref().expect("checked").iter() {
+                let is_static_pair = b_raw & STATIC_BIT != 0;
+                let b_plain = b_raw & !STATIC_BIT;
+                let (a, b) = (a_id as usize, b_plain as usize);
+                let sleeping_dyn = |i: usize, this: &Self| {
+                    this.bodies[i].is_dynamic() && this.asleep[i] && !this.oob[i]
+                };
+                let active = |i: usize, this: &Self| {
+                    !this.oob[i]
+                        && match this.bodies[i].body_type {
+                            BodyType::Kinematic => true,
+                            BodyType::Dynamic => !this.asleep[i],
+                            BodyType::Static => false,
+                        }
+                };
+                let a_sleep = sleeping_dyn(a, self);
+                let b_sleep = !is_static_pair && sleeping_dyn(b, self);
+                let b_active = !is_static_pair && active(b, self);
+                if !(a_sleep && b_active) && !(b_sleep && active(a, self)) {
+                    continue;
+                }
+                if (!excluded.is_empty()
+                    && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))))
+                    || contact(
+                        &self.bodies[a].shape,
+                        &self.bodies[a].pose,
+                        &self.bodies[b].shape,
+                        &self.bodies[b].pose,
+                        self.params.speculative_margin,
+                    )
+                    .is_none()
+                {
+                    continue;
+                }
+                need_full_sweep = true;
+                break;
+            }
+        }
+        for &(a_id, b_raw) in pairs
+            .iter()
+            .take(if need_full_sweep { usize::MAX } else { 0 })
+        {
             let is_static_pair = b_raw & STATIC_BIT != 0;
             let b_plain = b_raw & !STATIC_BIT;
             // **양쪽 다 깨어날 수 없으면 즉시 버린다** — 뚱뚱한 `Body`를 건드리기 전에.
@@ -2116,6 +2180,9 @@ impl World {
                 }
             }
         }
+        // 제한 narrow의 조건: 활성 ⊆ R **이고 이번 스텝에 아무도 깨지 않았다** —
+        // 그러면 활성 끝점을 가진 페어의 정확한 상집합이 여전히 fresh다.
+        let narrow_restricted = active_subset_of_r && !need_full_sweep;
 
         self.diag.sub_ns[1] = _t_wake.elapsed().as_nanos() as u64;
         self.diag.phase_ns[1] = _t_bp.elapsed().as_nanos() as u64;
@@ -2129,17 +2196,53 @@ impl World {
         let _t_nw = std::time::Instant::now();
         // 직전 기준선을 페어와 **같은 전순서**로 정렬해 둔다(둘 다 (a, b_raw) 오름차순).
         // 아래 루프가 단조 포인터 하나로 훑으므로 페어당 비용은 비교 1회다.
+        // 제한 모드에서는 병합을 안 쓰므로(작은 fresh만 돌고 기준선은 touching 쪽에서 처리)
+        // 정렬 자체를 건너뛴다.
         let _t_sort = std::time::Instant::now();
-        touch_sorted.extend(self.touching.iter().copied());
-        touch_sorted.sort_unstable();
+        if !narrow_restricted {
+            touch_sorted.extend(self.touching.iter().copied());
+            touch_sorted.sort_unstable();
+        }
         self.diag.sub_ns[4] = _t_sort.elapsed().as_nanos() as u64;
-        self.diag.touching = touch_sorted.len();
+        self.diag.touching = self.touching.len();
+        // **제한 모드의 dormant 기준선 보존** — 전체 경로는 24810 페어를 걸으며 dormant 분기에서
+        // 보존했지만, 제한 모드에서는 같은 교집합을 touching(수백~수천) 쪽에서 O(1) 마스크
+        // 판정으로 얻는다. 근거: t ∈ touching ⊆ 직전 pairs이고 ¬R접촉이면 t ∈ prev_minus ⊆
+        // 이번 pairs(증분 등가 논증) — 그리고 활성 ⊆ R ∧ 무wake이므로 ¬R접촉 페어는 전부
+        // dormant다. R접촉 키는 아래 fresh 순회의 dormant 분기가 담당한다(이중 삽입 없음).
+        // 필터 순서는 전체 경로의 dormant 분기와 동일(제외 → 그룹, rev_7f7bb07c).
+        if narrow_restricted {
+            for &key in self.touching.iter() {
+                let (a_id, b_raw) = key;
+                let b_plain = b_raw & !STATIC_BIT;
+                let r_touch = moved_mask[a_id as usize]
+                    || (b_raw & STATIC_BIT == 0 && moved_mask[b_plain as usize]);
+                if r_touch {
+                    continue;
+                }
+                if !excluded.is_empty()
+                    && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain)))
+                {
+                    continue;
+                }
+                if !groups_collide(&self.bodies[a_id as usize], &self.bodies[b_plain as usize]) {
+                    continue;
+                }
+                live_keys.insert(key);
+            }
+        }
+        let narrow_pairs: &[(u32, u32)] = if narrow_restricted {
+            fresh_pairs.as_ref().expect("narrow_restricted ⇒ 증분 스텝")
+        } else {
+            &pairs
+        };
         let mut ti = 0usize;
-        for &(a_id, b_raw) in &pairs {
+        for &(a_id, b_raw) in narrow_pairs {
             let key = (a_id, b_raw);
             let is_static_pair = b_raw & STATIC_BIT != 0;
             let b_plain = b_raw & !STATIC_BIT;
             // 기준선 병합 포인터를 이 페어까지 전진시킨다(전 페어 공통, 총 전진 = |touching|).
+            // 제한 모드는 fresh만 걸으므로 병합 대신 아래 dormant 분기에서 해시 1회를 쓴다.
             while ti < touch_sorted.len() && touch_sorted[ti] < key {
                 ti += 1;
             }
@@ -2152,7 +2255,12 @@ impl World {
             if !maybe_active(a_id as usize, self)
                 && (is_static_pair || !maybe_active(b_plain as usize, self))
             {
-                if ti < touch_sorted.len() && touch_sorted[ti] == key {
+                let in_baseline = if narrow_restricted {
+                    self.touching.contains(&key)
+                } else {
+                    ti < touch_sorted.len() && touch_sorted[ti] == key
+                };
+                if in_baseline {
                     // 필터 순서는 활성 경로와 같다(제외 → 그룹 → 비활성). 특히 **그룹 판정이
                     // 수면보다 먼저**여야 잠든 사이 그룹이 바뀐 페어가 접촉을 승계하지 않고
                     // Stopped를 낸다(검수 rev_7f7bb07c MAJOR). 여기 도달하는 키는 ≤ 접촉 수라

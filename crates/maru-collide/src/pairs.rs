@@ -23,6 +23,9 @@ pub const MAX_PAIRS: usize = 1 << 20;
 
 pub const STATIC_BIT: u32 = 1 << 31;
 
+/// 증분 갱신 결과: (병합된 canonical 페어 전체, fresh = R 접촉 페어만).
+pub type IncrementalPairs = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
 impl Broadphase {
     pub fn build(dynamic_items: Vec<(u32, Aabb)>, static_items: Vec<(u32, Aabb)>) -> Self {
         assert!(
@@ -196,13 +199,16 @@ impl Broadphase {
     ///   병합 결과가 전순서 canonical이다.
     ///
     /// `moved_mask[id]`는 R 소속 판정(호출자가 슬롯 크기로 준비), `moved`는 R의 id 목록.
+    /// 반환 = (병합된 canonical 페어, **fresh** = R 접촉 페어만). fresh는 "활성 끝점을 가질 수
+    /// 있는 페어"의 정확한 상집합이라(활성 ⊆ R일 때) 호출자가 wake/narrow 순회를 이 목록으로
+    /// 제한하는 근거가 된다.
     pub fn incremental_pairs_bounded(
         &self,
         moved: &[u32],
         moved_mask: &[bool],
         prev: &[(u32, u32)],
         budget: usize,
-    ) -> Option<Vec<(u32, u32)>> {
+    ) -> Option<IncrementalPairs> {
         let budget = budget.min(MAX_PAIRS);
         let in_r = |id: u32| moved_mask.get(id as usize).copied().unwrap_or(false);
 
@@ -299,7 +305,7 @@ impl Broadphase {
             out.windows(2).all(|w| w[0] < w[1]),
             "증분 병합 결과는 중복 없는 전순서여야 한다"
         );
-        Some(out)
+        Some((out, fresh))
     }
 }
 
@@ -418,9 +424,20 @@ mod tests {
                 })
                 .collect();
             bp.refresh_dynamic(&updates);
-            pairs = bp
+            let (merged, fresh) = bp
                 .incremental_pairs_bounded(&moved, &mask, &pairs, usize::MAX)
                 .expect("budget unbounded");
+            // fresh 계약: 병합 결과 중 R 접촉 페어와 정확히 일치해야 한다
+            let want_fresh: Vec<(u32, u32)> = merged
+                .iter()
+                .copied()
+                .filter(|&(a, b)| mask[a as usize] || (b & STATIC_BIT == 0 && mask[b as usize]))
+                .collect();
+            assert_eq!(
+                fresh, want_fresh,
+                "round {round}: fresh가 R 접촉 부분집합과 불일치"
+            );
+            pairs = merged;
             let want = Broadphase::build(dynamic.clone(), statics.clone()).canonical_pairs();
             assert_eq!(pairs, want, "round {round}: 증분 페어가 재빌드와 불일치");
         }
@@ -444,7 +461,7 @@ mod tests {
         bp.refresh_dynamic(&updates);
         let moved: Vec<u32> = (0..100).collect();
         let mask = vec![true; 100];
-        let got = bp
+        let (got, _) = bp
             .incremental_pairs_bounded(&moved, &mask, &[], usize::MAX)
             .unwrap();
         let want = brute_force(&items, &[]);
