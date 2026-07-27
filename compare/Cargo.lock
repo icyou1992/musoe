@@ -196,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "maru-collide",
  "maru-math",
+ "wide 0.7.33",
 ]
 
 [[package]]

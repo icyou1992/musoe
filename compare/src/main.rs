@@ -226,11 +226,15 @@ mod maru_side {
         let mut reused = 0usize;
         let mut pairs_acc = 0usize;
         let mut pts_acc = 0usize;
+        let mut sub = [0u64; 4];
         for si in 0..steps {
             let _ = w.try_step(DT);
             let d = w.diagnostics();
             for k in 0..5 {
                 acc[k] += d.phase_ns[k];
+            }
+            for k in 0..4 {
+                sub[k] += d.sub_ns[k];
             }
             reused += d.bp_reused as usize;
             pairs_acc += d.pairs;
@@ -262,6 +266,13 @@ mod maru_side {
             acc[3] as f64 / 1000.0 / steps as f64,
             acc[4] as f64 / 1000.0 / steps as f64,
             handles.len()
+        );
+        eprintln!(
+            "    [maru pile] 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",
+            sub[0] as f64 / 1000.0 / steps as f64,
+            sub[1] as f64 / 1000.0 / steps as f64,
+            sub[2] as f64 / 1000.0 / steps as f64,
+            sub[3] as f64 / 1000.0 / steps as f64,
         );
         eprintln!(
             "    [maru pile] 페어 {}  접점 {}  → 페어당 narrow {:.2} us",

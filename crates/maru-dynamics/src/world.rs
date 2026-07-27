@@ -295,6 +295,11 @@ pub struct Diagnostics {
     /// - `post`: write-back · PCM 갱신 · 아일랜드/슬립 · 상태 정책
     ///   (예전에는 이 넷이 `solve`에 섞여 있어 최적화 우선순위를 잘못 귀속시켰다 — 리뷰 MAJOR)
     pub phase_ns: [u64; 5],
+    /// 하위 단계 소요 (ns) — 정착 레짐 귀속용 계측기.
+    /// `[scratch_reserve, wake_walk, narrow_walk, island_post]`
+    /// 상위 phase 안에서 **페어 수·바디 수에 비례하는 부분만** 따로 잰다: 전원 수면 씬은
+    /// 산출물이 접점 몇 개인데도 이 넷이 페어/바디 전량을 훑어 스텝을 지배할 수 있다.
+    pub sub_ns: [u64; 4],
     /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
     /// 0이 아니면 지원 범위 밖 입력이거나 엔진 버그이며, 그 스텝의 물리는 신뢰할 수 없다.
     /// 서로 다른 초과 상태가 같은 포화값으로 합쳐지므로 상태 해시만으로는 구분되지 않는다.
@@ -1796,6 +1801,7 @@ impl World {
         let mut new_keys: Vec<(u32, u32)> = Vec::new();
         // 색 범위 [start,end) — Unit 3b SIMD warm_start 배치 디스패치용. 색은 최대 64개.
         let mut color_ranges: Vec<(u32, u32)> = Vec::new();
+        let _t_res = std::time::Instant::now();
         if constraints.try_reserve(ncap).is_err()
             || color_ranges
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
@@ -1825,6 +1831,7 @@ impl World {
             self.resource_limit = true;
             return;
         }
+        self.diag.sub_ns[0] = _t_res.elapsed().as_nanos() as u64;
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본).
         // excluded는 위 통합 블록에서 선점됨(실패 bail이 bp_pairs를 복원 — 캐시 재사용 스텝에
         // 빈 페어 집합이 유효 캐시로 남던 BLOCKER 차단, 교차검수 rev_ba3ca887). 여기선 채운다.
@@ -1885,6 +1892,7 @@ impl World {
         // 얻지 못한다: 잠든 스택 (1,ground)/(1,2)/(2,3)이 먼저 스킵된 뒤 (3,4)가 아일랜드를
         // 깨우면 그 프레임은 지지망 없이 중력만 적분된다.
         // 아일랜드 단위 wake이므로 한 바퀴로 폐쇄된다(전파는 wake() 내부에서 완결).
+        let _t_wake = std::time::Instant::now();
         for &(a_id, b_raw) in &pairs {
             let is_static_pair = b_raw & STATIC_BIT != 0;
             let b_plain = b_raw & !STATIC_BIT;
@@ -1933,6 +1941,7 @@ impl World {
             }
         }
 
+        self.diag.sub_ns[1] = _t_wake.elapsed().as_nanos() as u64;
         self.diag.phase_ns[1] = _t_bp.elapsed().as_nanos() as u64;
         let _t_np = std::time::Instant::now();
         // 2) 내로우페이즈 → 제약 준비 (A=첫 인덱스, B=둘째 — canonical 순서가 곧 해석 순서)
@@ -1941,6 +1950,7 @@ impl World {
         // 암묵 성장이 일어나면 그 재할당이 abort가 된다.
         // constraints·constraint_keys·live_keys는 wake 이전에 선점됨 (위) — 여기선 채워 쓴다.
         let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
+        let _t_nw = std::time::Instant::now();
         for &(a_id, b_raw) in &pairs {
             let key = (a_id, b_raw);
             let is_static_pair = b_raw & STATIC_BIT != 0;
@@ -2013,6 +2023,8 @@ impl World {
                 }
             }
         }
+
+        self.diag.sub_ns[2] = _t_nw.elapsed().as_nanos() as u64;
 
         // **중력 방향 정렬** — Gauss-Seidel은 제약 순서에 민감하다. 스택에서 지지력은
         // 바닥에서 위로 전파되는데, 브로드페이즈가 내놓은 순서로 풀면 한 스윕에 한 층씩만
@@ -2398,6 +2410,7 @@ impl World {
 
         // 6) 아일랜드 union-find (동적-동적 edge만 — static은 anchor 전용, 설계 §4.3)
         //    + island 단위 일괄 sleep (설계 §4.6)
+        let _t_isl = std::time::Instant::now();
         let n = self.bodies.len();
         // 선점은 스텝 시작에 끝났다 — 여기서 실패할 수 없다.
         let mut parent = std::mem::take(&mut self.island_parent);
@@ -2475,6 +2488,7 @@ impl World {
             }
         }
         self.island_parent = parent;
+        self.diag.sub_ns[3] = _t_isl.elapsed().as_nanos() as u64;
 
         self.joints = joints;
 
