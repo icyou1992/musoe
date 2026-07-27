@@ -321,7 +321,12 @@ pub fn prepare(
         // - 클리핑 접점: feature ID가 계보를 담아 안정적 → ID 일치
         // - generic witness 접점: pair 안에서 ID를 공유하므로(구-박스 접점이 면→모서리로
         //   이동해도 같은 ID) **위치 근접**까지 요구한다. 점프하면 임펄스를 물려주지 않는다.
-        let generic = p.feature.0 == maru_collide::FEATURE_GENERIC;
+        // **자식 네임스페이스 비트는 벗기고 판정한다** — 복합 자식의 generic 접점은
+        // 0xFFFF_0000 | (자식쌍<<9)라 정확 일치로는 generic으로 안 보이고, 그러면 위치
+        // 근접 게이트 없이 ID만으로 warm-match돼 점프한 접점이 낡은 임펄스를 승계한다
+        // (이 게이트가 애초에 막던 결함의 부활 — 자체 검수 발견).
+        let generic =
+            (p.feature.0 & !maru_collide::FEATURE_CHILD_MASK) == maru_collide::FEATURE_GENERIC;
         // 허용치 = 기하 바닥 + 접점의 정당한 이동 상한. 정지 접촉은 기하 바닥만 쓴다.
         let drift = ba.linvel.length()
             + ba.angvel.length() * ra.length()
@@ -1121,6 +1126,39 @@ mod tests {
                 feature: FeatureId(FEATURE_GENERIC),
             }],
         )
+    }
+
+    /// 회귀(자체 검수): **복합 자식의 generic 접점**(네임스페이스 비트 포함)도 위치 근접
+    /// 게이트를 통과해야 한다 — 정확 일치 판정이면 네임스페이스된 generic이 안정 feature로
+    /// 오분류돼 점프한 접점이 임펄스를 승계한다.
+    #[test]
+    fn namespaced_generic_contacts_still_require_proximity() {
+        let bodies = world_bodies();
+        let ns = maru_collide::FEATURE_GENERIC | (5u32 << maru_collide::FEATURE_CHILD_SHIFT);
+        let cache = vec![(
+            FeatureId(ns),
+            CachedImpulse {
+                normal: 7.0,
+                tangent: [0.0, 0.0],
+                tangent_world: Vec3::ZERO,
+                position: Vec3::new(0.0, 0.5, 0.0),
+                contact_normal: Vec3::new(0.0, 1.0, 0.0),
+            },
+        )];
+        // 접점이 0.4m 점프 — ID는 같아도 승계 금지
+        let far = Manifold::from_points(
+            Vec3::new(0.0, 1.0, 0.0),
+            &[ContactPoint {
+                position: Vec3::new(0.4, 0.5, 0.0),
+                separation: -0.001,
+                feature: FeatureId(ns),
+            }],
+        );
+        let c = prepare(&bodies, 1, 0, &far, &cache, 1.0 / 60.0).unwrap();
+        assert_eq!(
+            c.points[0].normal_impulse, 0.0,
+            "네임스페이스된 generic이 위치 게이트 없이 warm-match됐다"
+        );
     }
 
     /// 계약(리뷰 MAJOR): 계보 없는 witness 접점은 ID를 공유하므로 **위치 근접**까지 맞을 때만

@@ -29,7 +29,7 @@ pub use limits::{
 };
 pub use manifold::{
     any_contact, contact, for_each_contact, ContactPoint, FeatureId, Manifold, FEATURE_ANALYTIC,
-    FEATURE_GENERIC, MAX_MANIFOLD_POINTS,
+    FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT, FEATURE_GENERIC, MAX_MANIFOLD_POINTS,
 };
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};
