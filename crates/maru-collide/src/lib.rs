@@ -17,7 +17,7 @@ mod tolerance;
 mod tree;
 
 pub use aabb::Aabb;
-pub use cast::{shape_cast, shape_cast_dispatch, ShapeCastHit};
+pub use cast::{shape_cast, shape_cast_dispatch, shape_cast_dispatch_rotational, ShapeCastHit};
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
 pub use limits::{

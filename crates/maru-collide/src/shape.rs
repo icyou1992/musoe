@@ -223,6 +223,25 @@ impl Shape {
         }
     }
 
+    /// 셰이프 원점 기준 **외접 반지름**(겉면 포함) — 회전 캐스트의 각 기여 상한
+    /// `|angle| · bounding_radius`의 근거. 원점에서 가장 먼 표면점까지의 거리 상한이다.
+    pub fn bounding_radius(&self) -> f32 {
+        match self {
+            Shape::Sphere { radius } => *radius,
+            Shape::Capsule {
+                half_height,
+                radius,
+            } => half_height + radius,
+            Shape::Box { half, .. } => half.length(), // half는 겉면 기준(radius 포함)
+            Shape::Hull { points, radius } => {
+                points.iter().fold(0.0f32, |m, p| m.max(p.length())) + radius
+            }
+            Shape::Compound { children } => children.iter().fold(0.0f32, |m, (cp, cs)| {
+                m.max(cp.pos.length() + cs.bounding_radius())
+            }),
+        }
+    }
+
     /// 방향 d(비정규화 허용, 0이면 임의점)의 **코어** support point (로컬 공간).
     pub fn support_core(&self, d: Vec3) -> Vec3 {
         match self {

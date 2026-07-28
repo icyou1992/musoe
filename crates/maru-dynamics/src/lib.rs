@@ -5279,6 +5279,82 @@ mod tests {
         );
     }
 
+    /// 회전 스윕 CCD(§4 예약 확장): 선속도 0으로 **회전만으로** 벽을 쓸고 지나가는
+    /// 블레이드 — 선형 캐스트는 이동이 0이라 원리적으로 못 잡는다. 쌍둥이 대조로
+    /// 전제(비-CCD는 통과)와 효과(CCD는 차단)를 함께 증명한다.
+    #[test]
+    fn spinning_blade_does_not_sweep_through_wall() {
+        let params = || WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        };
+        let build = |ccd: bool| {
+            let mut w = World::new(params());
+            w.add_body(Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(0.05, 3.0, 3.0),
+                    radius: 0.0,
+                },
+                pose(1.2, 0.0, 0.0),
+            ));
+            // 장축을 z로 돌려둔 블레이드(반경 1.5) — y축 스핀이 팁을 +x 벽으로 보낸다.
+            let mut b = Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(1.5, 0.05, 0.05),
+                    radius: 0.0,
+                },
+                Pose {
+                    pos: Vec3::ZERO,
+                    rot: Quat::from_axis_angle(
+                        Vec3::new(0.0, 1.0, 0.0),
+                        core::f32::consts::FRAC_PI_2,
+                    ),
+                },
+                1.0,
+            );
+            if ccd {
+                b = b.with_ccd();
+            }
+            let h = w.add_body(b);
+            // 팁 속도 = 30 × 1.5 = 45 m/s → 서브스텝당 이동 0.19m (벽 두께 0.1의 ~2배).
+            w.set_angular_velocity(h, Vec3::new(0.0, 30.0, 0.0))
+                .unwrap();
+            (w, h)
+        };
+        // 팁의 x 최대 도달 — 관통 관측자. 벽 근면 x=1.15.
+        let tip_x = |w: &World, h: BodyHandle| {
+            let p = w.body(h).pose();
+            let a = p.pos + p.rot.rotate(Vec3::new(1.5, 0.0, 0.0));
+            let b = p.pos + p.rot.rotate(Vec3::new(-1.5, 0.0, 0.0));
+            a.x.max(b.x)
+        };
+
+        // 전제: CCD 없이는 팁이 벽 반대편(x > 1.25)까지 지나간다.
+        let (mut w0, h0) = build(false);
+        let mut crossed = false;
+        for _ in 0..120 {
+            w0.step(DT);
+            if tip_x(&w0, h0) > 1.25 {
+                crossed = true;
+                break;
+            }
+        }
+        assert!(crossed, "전제 실패: 비-CCD 블레이드가 벽을 통과하지 않았다");
+
+        // 효과: CCD는 매 스텝 팁이 벽 근면을 (skin 여유 안에서) 넘지 못한다.
+        let (mut w1, h1) = build(true);
+        let skin = w1.params().speculative_margin;
+        for step in 0..120 {
+            w1.step(DT);
+            let x = tip_x(&w1, h1);
+            assert!(
+                x <= 1.15 + skin + 0.02,
+                "step {step}: 회전 CCD가 팁 관통을 허용 (tip_x={x})"
+            );
+        }
+        assert!(w1.diagnostics().ccd_clamps > 0 || tip_x(&w1, h1) < 1.0);
+    }
+
     /// 회귀(rev_e4075e85): 센서+CCD 바디는 벽에 물리적으로 멈추면 안 된다 — 센서 계약.
     #[test]
     fn sensor_with_ccd_is_not_clamped_by_walls() {

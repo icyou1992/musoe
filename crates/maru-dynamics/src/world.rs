@@ -2883,16 +2883,35 @@ impl World {
                             d = d - n * pen; // 침투 성분만 제거 — 슬라이드 허용
                         }
                     }
+                    // **회전 스윕**(§4 예약 확장): 이번 서브스텝의 총각 × 외접 반지름이
+                    // skin의 1/4을 넘으면 회전 인지 캐스트를 쓴다 — 그 아래는 표면 이동이
+                    // skin 봉투 안이라 선형 캐스트(기존 경로, 비트 보존)로 충분하다.
+                    // 회전 히트 시 이 서브스텝의 회전도 같은 TOI에서 절단한다(속도는 불변 —
+                    // 반발은 다음 스텝 일반 파이프라인 소관, 선형 계약과 동일).
+                    let skin = self.params.speculative_margin;
+                    let omega = st.ang[i];
+                    let sub_angle = omega.length() * h;
+                    let arc = sub_angle * self.bodies[i].shape.bounding_radius();
+                    let rot_sweep = arc > 0.25 * skin;
+                    let mut rot_toi = 1.0f32;
                     if ccd_frozen[ci] {
                         d = Vec3::ZERO;
-                    } else if d != Vec3::ZERO {
+                    } else if d != Vec3::ZERO || rot_sweep {
                         let body = &self.bodies[i];
                         let pose_now = maru_collide::Pose {
                             pos: st.pos[i],
                             rot: st.rot[i],
                         };
-                        let skin = self.params.speculative_margin;
                         let a0 = shape_world_aabb(&body.shape, &pose_now);
+                        // 회전 스윕이면 외접 반지름 상자로 봉투를 넓힌다 — 스윕 AABB가
+                        // 후보를 놓치면 캐스트는 옳아도 관통이 조용히 지나간다.
+                        let a0 = if rot_sweep {
+                            let r = body.shape.bounding_radius();
+                            let e = Vec3::new(r, r, r);
+                            Aabb::new(pose_now.pos - e, pose_now.pos + e).merge(a0)
+                        } else {
+                            a0
+                        };
                         let sweep = a0.merge(Aabb::new(a0.min + d, a0.max + d));
                         // static 후보 — bp 구조는 브로드페이즈 단계가 항상 남긴다(무효화
                         // 경로는 전부 그 전에 return). 방어적으로 없으면 캐스트 생략.
@@ -2912,14 +2931,28 @@ impl World {
                                         continue;
                                     }
                                 }
-                                if let Some(hit) = shape_cast_dispatch(
-                                    &body.shape,
-                                    &pose_now,
-                                    d,
-                                    &sb.shape,
-                                    &sb.pose,
-                                    skin,
-                                ) {
+                                let cast = if rot_sweep {
+                                    maru_collide::shape_cast_dispatch_rotational(
+                                        &body.shape,
+                                        &pose_now,
+                                        d,
+                                        omega * (1.0 / omega.length()),
+                                        sub_angle,
+                                        &sb.shape,
+                                        &sb.pose,
+                                        skin,
+                                    )
+                                } else {
+                                    shape_cast_dispatch(
+                                        &body.shape,
+                                        &pose_now,
+                                        d,
+                                        &sb.shape,
+                                        &sb.pose,
+                                        skin,
+                                    )
+                                };
+                                if let Some(hit) = cast {
                                     // 결정적 최소: (toi, static id) 사전식 — 동시 hit 동률 절단.
                                     let better = match best {
                                         None => true,
@@ -2935,6 +2968,11 @@ impl World {
                         }
                         if let Some((toi, normal, _)) = best {
                             d = d * toi;
+                            if rot_sweep {
+                                // 회전 스윕 히트: 이 서브스텝의 회전도 TOI에서 절단 —
+                                // 아니면 캐스트가 멈춘 자리를 회전이 마저 뚫는다.
+                                rot_toi = toi;
+                            }
                             self.diag.ccd_clamps += 1;
                             let cnt = ccd_plane_count[ci] as usize;
                             if cnt < 4 {
@@ -2947,6 +2985,10 @@ impl World {
                         }
                     }
                     st.pos[i] += d;
+                    if rot_toi < 1.0 {
+                        st.rot[i] = st.rot[i].integrate(st.ang[i], h * rot_toi);
+                        continue; // 아래 전체-h 회전 적분을 건너뛴다
+                    }
                 }
                 st.rot[i] = st.rot[i].integrate(st.ang[i], h);
             }

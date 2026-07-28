@@ -101,6 +101,146 @@ pub fn shape_cast(
     })
 }
 
+/// **회전 인지 셰이프 캐스트** (§4 CCD 예약 확장 — 회전 보수적 전진).
+///
+/// A가 `motion`(평행이동)과 함께 `pivot`을 중심으로 축 `axis`(단위)·총각 `angle`만큼
+/// 회전하며 정지한 B와 처음 닿는 시각을 구한다. `pivot`은 회전 중심의 시작 위치
+/// (바디 COM — 복합 자식은 자기 원점이 아니라 바디 중심으로 돈다):
+/// `pos(t) = pivot + motion·t + R(angle·t)·(pa.pos − pivot)`, `rot(t) = R(angle·t)·pa.rot`.
+///
+/// 건전성: 표면 임의 점의 t-단위 이동은 `|motion·n|`(선형) + `|angle|·r_arc`(각) 이하다 —
+/// `r_arc = |pa.pos − pivot| + bounding_radius(A)` (Mirtich 보수적 전진의 각 상한).
+/// 따라서 `advance = gap / (선형 접근 + |angle|·r_arc)`는 관통을 건너뛸 수 없다.
+///
+/// 시작 표면 접촉의 접근 판정은 **witness 순간 속도**로 한다(각 상한은 여기선 과잉 —
+/// 구르는 접촉이 전부 toi=0이 되어 슬라이드를 막는다): witness 점 속도
+/// `motion + angle·(axis × (on_a − pivot))`의 법선 성분이 접근일 때만 toi=0.
+///
+/// 반환 규약은 [`shape_cast`]와 동일(시작 코어겹침=None·반복 상한=보수적 히트).
+#[allow(clippy::too_many_arguments)]
+pub fn shape_cast_rotational(
+    sa: &Shape,
+    pa: &Pose,
+    motion: Vec3,
+    axis: Vec3,
+    angle: f32,
+    pivot: Vec3,
+    sb: &Shape,
+    pb: &Pose,
+    skin: f32,
+) -> Option<ShapeCastHit> {
+    let (ra, rb) = (sa.radius(), sb.radius());
+    let r_arc = (pa.pos - pivot).length() + sa.bounding_radius();
+    let ang_bound = angle.abs() * r_arc;
+    let offset = pa.pos - pivot;
+    let mut t = 0.0f32;
+    let mut pose_a = *pa;
+    let mut last: Option<(Vec3, Vec3)> = None;
+    for _ in 0..64 {
+        match gjk(sa, &pose_a, sb, pb) {
+            GjkResult::Intersecting(_) => {
+                return if t > 0.0 {
+                    last.map(|(normal, point)| ShapeCastHit {
+                        toi: t,
+                        normal,
+                        point,
+                    })
+                } else {
+                    None
+                };
+            }
+            GjkResult::Separated {
+                distance,
+                on_a,
+                on_b,
+                normal,
+            } => {
+                let sep = distance - ra - rb;
+                let point = on_b + normal * rb;
+                if sep <= skin {
+                    if t == 0.0 {
+                        // witness 순간 접근 판정 — 각 상한이 아니라 실제 점 속도.
+                        let w_vel = motion + axis.cross(on_a - pivot) * angle;
+                        if w_vel.dot(normal) >= 0.0 {
+                            return None;
+                        }
+                    }
+                    return Some(ShapeCastHit {
+                        toi: t,
+                        normal,
+                        point,
+                    });
+                }
+                last = Some((normal, point));
+                let approach = -motion.dot(normal) + ang_bound;
+                if approach <= 0.0 {
+                    return None;
+                }
+                let advance = (sep - skin * 0.5) / approach;
+                t += advance.max(0.0);
+                if t > 1.0 {
+                    return None;
+                }
+                let rot_t = maru_math::Quat::from_axis_angle(axis, angle * t);
+                pose_a.pos = pivot + motion * t + rot_t.rotate(offset);
+                pose_a.rot = rot_t * pa.rot;
+            }
+        }
+    }
+    last.map(|(normal, point)| ShapeCastHit {
+        toi: t,
+        normal,
+        point,
+    })
+}
+
+/// 회전 인지 복합 디스패치 — 자식은 **바디 COM(pivot)** 중심으로 함께 돈다.
+/// 비복합은 자기 자신 1건으로 동작이 같다.
+#[allow(clippy::too_many_arguments)]
+pub fn shape_cast_dispatch_rotational(
+    sa: &Shape,
+    pa: &Pose,
+    motion: Vec3,
+    axis: Vec3,
+    angle: f32,
+    sb: &Shape,
+    pb: &Pose,
+    skin: f32,
+) -> Option<ShapeCastHit> {
+    let compose = |parent: &Pose, child: &Pose| Pose {
+        pos: parent.pos + parent.rot.rotate(child.pos),
+        rot: parent.rot * child.rot,
+    };
+    let cast_one = |csa: &Shape, cpa: &Pose| -> Option<ShapeCastHit> {
+        match sb {
+            Shape::Compound { children } => children
+                .iter()
+                .filter_map(|(cpb, csb)| {
+                    shape_cast_rotational(
+                        csa,
+                        cpa,
+                        motion,
+                        axis,
+                        angle,
+                        pa.pos,
+                        csb,
+                        &compose(pb, cpb),
+                        skin,
+                    )
+                })
+                .min_by(|x, y| x.toi.total_cmp(&y.toi)),
+            _ => shape_cast_rotational(csa, cpa, motion, axis, angle, pa.pos, sb, pb, skin),
+        }
+    };
+    match sa {
+        Shape::Compound { children } => children
+            .iter()
+            .filter_map(|(cp, cs)| cast_one(cs, &compose(pa, cp)))
+            .min_by(|x, y| x.toi.total_cmp(&y.toi)),
+        _ => cast_one(sa, pa),
+    }
+}
+
 /// 복합 디스패치 셰이프 캐스트 — 자식쌍의 earliest TOI (동률은 자식 순서 — 결정적).
 pub fn shape_cast_dispatch(
     sa: &Shape,
@@ -160,6 +300,123 @@ mod tests {
             pos: Vec3::new(x, y, z),
             rot: Quat::IDENTITY,
         }
+    }
+
+    /// 순수 회전 스윕: z축 정렬 블레이드가 y축으로 90° 돌며 +x 벽에 닿는다 —
+    /// 선형 캐스트(motion=0)는 원리적으로 잡을 수 없는 히트.
+    #[test]
+    fn pure_rotation_sweep_hits_wall() {
+        let blade = Shape::Box {
+            half: Vec3::new(1.5, 0.05, 0.05),
+            radius: 0.0,
+        };
+        let wall = Shape::Box {
+            half: Vec3::new(0.05, 5.0, 5.0),
+            radius: 0.0,
+        };
+        // 블레이드 장축을 z로 돌려두고, y축 -90°(z→x) 회전 스윕.
+        let pa = Pose {
+            pos: Vec3::ZERO,
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::FRAC_PI_2),
+        };
+        let pb = pose(1.2, 0.0, 0.0);
+        // 선형 캐스트는 이동이 0이라 아무것도 못 잡는다.
+        assert!(shape_cast(&blade, &pa, Vec3::ZERO, &wall, &pb, 0.02).is_none());
+        let hit = shape_cast_rotational(
+            &blade,
+            &pa,
+            Vec3::ZERO,
+            Vec3::new(0.0, 1.0, 0.0),
+            core::f32::consts::FRAC_PI_2,
+            pa.pos,
+            &wall,
+            &pb,
+            0.02,
+        )
+        .expect("회전 스윕이 벽을 놓쳤다");
+        // 팁 반경 1.5가 x=1.15 근면에 닿는 각도: cos보다 훨씬 전 — toi ∈ (0,1).
+        assert!(hit.toi > 0.0 && hit.toi < 1.0, "toi={}", hit.toi);
+        assert!(
+            hit.normal.x < -0.9,
+            "벽 법선이 −x여야 한다: {:?}",
+            hit.normal
+        );
+    }
+
+    /// 회전 0이면 선형 캐스트와 같은 답 (같은 원시 — 게이트 없는 경로 검증).
+    #[test]
+    fn zero_rotation_matches_linear_cast() {
+        let s = Shape::Sphere { radius: 0.5 };
+        let wall = Shape::Box {
+            half: Vec3::new(0.05, 5.0, 5.0),
+            radius: 0.0,
+        };
+        let motion = Vec3::new(20.0, 0.0, 0.0);
+        let lin = shape_cast(
+            &s,
+            &pose(0.0, 0.0, 0.0),
+            motion,
+            &wall,
+            &pose(10.0, 0.0, 0.0),
+            0.02,
+        )
+        .expect("선형 미스");
+        let rot = shape_cast_rotational(
+            &s,
+            &pose(0.0, 0.0, 0.0),
+            motion,
+            Vec3::new(0.0, 1.0, 0.0),
+            0.0,
+            Vec3::ZERO,
+            &wall,
+            &pose(10.0, 0.0, 0.0),
+            0.02,
+        )
+        .expect("회전0 미스");
+        assert!(
+            (lin.toi - rot.toi).abs() < 1e-4,
+            "{} vs {}",
+            lin.toi,
+            rot.toi
+        );
+    }
+
+    /// 구르는 접촉은 toi=0으로 막지 않는다 — witness 순간 속도가 접선이면 None.
+    #[test]
+    fn rolling_surface_contact_is_not_a_hit() {
+        let s = Shape::Sphere { radius: 0.5 };
+        let ground = Shape::Box {
+            half: Vec3::new(10.0, 0.5, 10.0),
+            radius: 0.0,
+        };
+        // 표면 접촉(간격 0.01 ≤ skin 0.02), 접선 이동 + 구름 회전.
+        let pa = pose(0.0, 1.01, 0.0);
+        let pb = pose(0.0, 0.0, 0.0);
+        let hit = shape_cast_rotational(
+            &s,
+            &pa,
+            Vec3::new(0.5, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            1.0,
+            pa.pos,
+            &ground,
+            &pb,
+            0.02,
+        );
+        assert!(hit.is_none(), "구르는 접촉이 toi=0으로 잡혔다: {hit:?}");
+        // 같은 자리에서 법선 방향으로 접근하면 toi=0 히트다.
+        let hit = shape_cast_rotational(
+            &s,
+            &pa,
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            1.0,
+            pa.pos,
+            &ground,
+            &pb,
+            0.02,
+        );
+        assert!(hit.is_some_and(|h| h.toi == 0.0), "누르는 접촉이 놓쳤다");
     }
 
     /// 해석해 대조: 반지름 0.5 구가 x=+10에 있는 두께 0.1 벽(박스)을 향해 20만큼 이동.
