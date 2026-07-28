@@ -69,7 +69,12 @@ function frame(now) {
   // (첫 RAF에서 스텝이 한 번도 안 돌아도 안전하다 — 포인터 취득이 콜드 변이를
   // 자동 동기화한다. 부호 없는 시프트: 포인터가 2GiB를 넘으면 >>는 음수가 된다.)
   const n = m.maru_slot_count(world);
-  const base = m.maru_transforms_ptr(world) >>> 2;
+  const ptr = m.maru_transforms_ptr(world);
+  if (!ptr) {                                 // 스테이징 OOM — null을 base 0으로 읽으면
+    requestAnimationFrame(frame);             // 선형 메모리 시작부가 좌표로 보인다.
+    return;
+  }
+  const base = ptr >>> 2;
   const t = mem();
 
   ctx.fillStyle = '#11131a';

@@ -75,6 +75,10 @@ pub struct WasmWorld {
     transforms_stale: bool,
     /// 접촉 이벤트 평탄화: [a_lo, a_hi, b_lo, b_hi, kind] × N
     events: Vec<u32>,
+    /// 이벤트 스테이징이 월드의 `contact_events`와 어긋남(스테이징 할당 실패 시).
+    /// 월드 쪽 원본은 다음 스텝까지 살아 있으므로, 그 전에 동기화하면 복구된다
+    /// (확인 검수 rev_b438e81e MAJOR: 복구 경로가 없으면 Started가 영구 유실).
+    events_stale: bool,
     /// 광선·질의 결과 스테이징. 용량은 생성 시 선점(7·2) — 핫패스에서 할당하지 않는다.
     query: Vec<f32>,
     hits: Vec<u32>,
@@ -146,6 +150,7 @@ pub extern "C" fn maru_world_create(gx: f32, gy: f32, gz: f32, substeps: u32) ->
         transforms: Vec::new(),
         transforms_stale: false,
         events: Vec::new(),
+        events_stale: false,
         query,
         hits,
     }))
@@ -322,7 +327,10 @@ pub unsafe extern "C" fn maru_apply_force(
 /// 월드의 이벤트가 곧 이번 스텝 것이고, 그대로 내보낸다.
 ///
 /// `ERR_STAGING_LIMIT`이면 스텝 자체는 성공·반영됐지만 버퍼가 stale하다 —
-/// `maru_sync_transforms`로 재시도할 수 있다.
+/// `maru_sync_transforms`·`maru_sync_events`로 재시도한다. 이벤트 원본은 다음 스텝까지
+/// 월드에 살아 있으므로 **다음 스텝 전에** 복구해야 한다. 스텝이 오류 코드를 돌려준
+/// 경우에도 버퍼를 읽기 전에 같은 동기화를 거치는 것이 안전하다(스텝 오류가 스테이징
+/// 오류를 가릴 수 있다).
 ///
 /// # Safety
 /// `p`는 살아있는 월드 포인터여야 한다.
@@ -333,7 +341,9 @@ pub unsafe extern "C" fn maru_step(p: *mut WasmWorld, dt: f32) -> i32 {
     // 스텝이 실패해도 변환 버퍼는 최신 상태로 맞춰둔다 — 호스트가 마지막 유효 자세를 그린다.
     let staged_t = w.refresh_transforms().is_ok();
     let staged_e = if matches!(step, Err(ApiError::InvalidValue)) {
+        // 실행되지 않은 스텝: 빈 버퍼가 곧 정답이다 — stale이 아니다.
         w.events.clear();
+        w.events_stale = false;
         true
     } else {
         w.refresh_events().is_ok()
@@ -379,10 +389,17 @@ impl WasmWorld {
         Ok(())
     }
 
+    /// 이벤트 스테이징을 월드와 일치시킨다. **clear보다 예약이 먼저다** — 실패하면
+    /// 기존 스테이징이 그대로 남고 stale 플래그만 선다. 월드의 `contact_events`는
+    /// 다음 스텝까지 불변이므로 재시도(`maru_sync_events`)로 복구할 수 있다
+    /// (확인 검수 rev_b438e81e MAJOR: clear를 먼저 하면 실패가 곧 영구 유실이었다).
     fn refresh_events(&mut self) -> Result<(), ()> {
-        self.events.clear();
+        self.events_stale = true;
         let len = self.world.contact_events().len().checked_mul(5).ok_or(())?;
-        self.events.try_reserve(len).map_err(|_| ())?;
+        // additional은 현재 len() 기준이라 목표 용량과의 차분만 청구한다.
+        let need = len.saturating_sub(self.events.len());
+        self.events.try_reserve(need).map_err(|_| ())?;
+        self.events.clear();
         for e in self.world.contact_events() {
             let (a, b) = (pack(e.a), pack(e.b));
             self.events.push(a as u32);
@@ -394,6 +411,7 @@ impl WasmWorld {
                 ContactEventKind::Stopped => 1,
             });
         }
+        self.events_stale = false;
         Ok(())
     }
 }
@@ -418,7 +436,9 @@ pub unsafe extern "C" fn maru_sync_transforms(p: *mut WasmWorld) -> i32 {
 /// 변환 버퍼 포인터 (`Float32Array`로 읽는다). 바디당 7 float: pos3 + quat4(xyzw).
 ///
 /// **`maru_step` 뒤에는 다시 물어봐야 한다** — 바디 수가 바뀌면 버퍼가 재할당돼
-/// 포인터가 무효화된다.
+/// 포인터가 무효화된다. 성공한 add/remove/set_pose도 **이전에 받아둔 포인터를
+/// 무효화한다**: 재할당이 없어도 그 포인터가 보여주는 값은 변이 이전의 스냅샷이다 —
+/// 자동 동기화는 이 함수를 다시 부를 때만 실행된다(확인 검수 rev_b438e81e MINOR).
 ///
 /// 콜드 변이(스텝 없는 add/remove/set_pose) 후에는 먼저 동기화한 뒤 내준다 —
 /// 동기화가 실패하면 stale 버퍼 대신 null을 돌려준다(검수 rev_05c33550 MAJOR:
@@ -455,24 +475,54 @@ pub unsafe extern "C" fn maru_is_alive(p: *mut WasmWorld, h: u64) -> u32 {
 
 // ---------- 접촉 이벤트 ----------
 
+/// 이벤트 스테이징을 명시적으로 동기화한다. 성공 0, 실패 `ERR_STAGING_LIMIT`.
+///
+/// `maru_step`이 `ERR_STAGING_LIMIT`을 돌려줬을 때의 복구 경로다. 월드의 이벤트
+/// 원본은 다음 스텝까지 불변이므로 **다음 스텝 전에** 부르면 유실이 없다.
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_sync_events(p: *mut WasmWorld) -> i32 {
+    let w = w_or!(p, ERR_NULL);
+    match w.refresh_events() {
+        Ok(()) => OK,
+        Err(()) => ERR_STAGING_LIMIT,
+    }
+}
+
 /// 이벤트 버퍼 포인터. `[a_lo, a_hi, b_lo, b_hi, kind]` × N (`Uint32Array`).
 /// `kind`: 0 = Started, 1 = Stopped.
+///
+/// 스테이징이 stale이면(직전 스텝의 스테이징 실패) 먼저 동기화한 뒤 내주고,
+/// 동기화가 실패하면 null이다 — stale 버퍼를 이번 스텝 것처럼 읽으면 이전 이벤트를
+/// 중복 소비한다(확인 검수 rev_b438e81e MAJOR).
 ///
 /// # Safety
 /// `p`는 살아있는 월드 포인터여야 한다.
 #[no_mangle]
 pub unsafe extern "C" fn maru_events_ptr(p: *mut WasmWorld) -> *const u32 {
     let w = w_or!(p, core::ptr::null());
+    if w.events_stale && w.refresh_events().is_err() {
+        return core::ptr::null();
+    }
     w.events.as_ptr()
 }
 
 /// 이벤트 개수 (u32 개수가 아니라 **이벤트 개수**).
+///
+/// `maru_events_ptr`와 같은 동기화 규칙을 따른다 — stale이면 동기화하고, 실패하면
+/// 0을 돌려준다(개수만 믿고 stale 버퍼를 읽는 조합을 막는다; 이벤트 자체는
+/// `maru_sync_events` 성공 후 다시 읽을 수 있다).
 ///
 /// # Safety
 /// `p`는 살아있는 월드 포인터여야 한다.
 #[no_mangle]
 pub unsafe extern "C" fn maru_events_len(p: *mut WasmWorld) -> u32 {
     let w = w_or!(p, 0);
+    if w.events_stale && w.refresh_events().is_err() {
+        return 0;
+    }
     (w.events.len() / 5) as u32
 }
 
@@ -721,6 +771,67 @@ mod tests {
                         0,
                         "실행되지 않은 스텝이 이벤트를 재발행했다"
                     );
+                    break;
+                }
+            }
+            assert!(saw, "공이 바닥에 닿아 Started가 나와야 한다");
+            maru_world_destroy(w);
+        }
+    }
+
+    /// `ERR_STAGING_LIMIT` 복구 계약의 근거: 이벤트 원본은 다음 스텝까지 월드에 살아
+    /// 있으므로, 스텝 후 재동기화는 같은 이벤트를 그대로 재구성한다(확인 검수
+    /// rev_b438e81e MAJOR — 이 성질이 없으면 `maru_sync_events`는 복구 경로가 아니다).
+    #[test]
+    fn sync_events_restages_the_same_events_until_the_next_step() {
+        unsafe {
+            let w = maru_world_create(0.0, -9.81, 0.0, 0);
+            maru_add_body(
+                w,
+                BODY_STATIC,
+                SHAPE_BOX,
+                10.0,
+                1.0,
+                10.0,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+            );
+            maru_add_body(
+                w,
+                BODY_DYNAMIC,
+                SHAPE_SPHERE,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                2.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+            );
+            let mut saw = false;
+            for _ in 0..180 {
+                assert_eq!(maru_step(w, 1.0 / 60.0), OK);
+                let n = maru_events_len(w) as usize;
+                if n > 0 {
+                    saw = true;
+                    let before: Vec<u32> =
+                        core::slice::from_raw_parts(maru_events_ptr(w), n * 5).to_vec();
+                    assert_eq!(maru_sync_events(w), OK);
+                    assert_eq!(maru_events_len(w) as usize, n);
+                    let after = core::slice::from_raw_parts(maru_events_ptr(w), n * 5);
+                    assert_eq!(before, after, "재동기화가 이벤트를 바꿨다");
                     break;
                 }
             }
