@@ -5456,6 +5456,53 @@ mod tests {
         );
     }
 
+    /// 회귀(확인 검수 rev_8672a3eb MAJOR): substeps=64에서 서브스텝당 팁 이동
+    /// (30/3840×1.5 ≈ 1.17cm)이 skin/4(1.25cm) 아래로 숨는다 — 게이트가 서브스텝
+    /// 단위면 캐스트가 아예 꺼져 스텝 전체 0.75m 회전 스윕이 무검사가 된다.
+    /// 게이트는 스텝 전체 봉투여야 한다.
+    #[test]
+    fn per_substep_gate_cannot_hide_a_full_step_rotation() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            substeps: 64,
+            ..WorldParams::default()
+        });
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.05, 3.0, 3.0),
+                radius: 0.0,
+            },
+            pose(1.2, 0.0, 0.0),
+        ));
+        let b = Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(1.5, 0.05, 0.05),
+                radius: 0.0,
+            },
+            Pose {
+                pos: Vec3::ZERO,
+                rot: Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::FRAC_PI_2),
+            },
+            1.0,
+        )
+        .with_ccd();
+        let h = w.add_body(b);
+        w.set_angular_velocity(h, Vec3::new(0.0, 30.0, 0.0))
+            .unwrap();
+        let skin = w.params().speculative_margin;
+        for step in 0..120 {
+            w.step(DT);
+            let p = w.body(h).pose();
+            let tip = (p.pos + p.rot.rotate(Vec3::new(1.5, 0.0, 0.0)))
+                .x
+                .max((p.pos + p.rot.rotate(Vec3::new(-1.5, 0.0, 0.0))).x);
+            assert!(
+                tip <= 1.15 + skin + 0.02,
+                "step {step}: 서브스텝 게이트 아래로 숨은 회전이 벽을 쓸었다 (tip_x={tip})"
+            );
+        }
+    }
+
     /// 회귀(rev_e4075e85): 센서+CCD 바디는 벽에 물리적으로 멈추면 안 된다 — 센서 계약.
     #[test]
     fn sensor_with_ccd_is_not_clamped_by_walls() {

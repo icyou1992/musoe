@@ -2918,7 +2918,12 @@ impl World {
                     let skin = self.params.speculative_margin;
                     let omega = st.ang[i];
                     let sub_angle = omega.length() * h;
-                    let arc = sub_angle * self.bodies[i].shape.bounding_radius();
+                    // **게이트는 스텝 전체 회전 봉투로** — 서브스텝 arc로 판정하면
+                    // substeps가 클수록 서브스텝당 이동이 skin/4 아래로 숨어, 스텝
+                    // 전체로는 수십 cm를 도는 블레이드가 캐스트 없이 회전한다(서브스텝
+                    // 사이에는 내로우페이즈가 없어 침투가 무검사로 누적된다 — 확인 검수
+                    // rev_8672a3eb MAJOR). 캐스트 자체는 서브스텝 각(sub_angle)으로 돈다.
+                    let arc = sub_angle * (n_sub as f32) * self.bodies[i].shape.bounding_radius();
                     let rot_sweep = arc > 0.25 * skin;
                     let mut rot_toi = 1.0f32;
                     if ccd_frozen[ci] {
