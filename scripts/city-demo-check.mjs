@@ -33,7 +33,7 @@ const browser = await chromium.launch({
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 page.on('pageerror', e => { console.error('[pageerror]', e.message); process.exitCode = 1; });
 page.on('console', msg => { if (msg.type() === 'error') console.error('[console]', msg.text()); });
-await page.goto(`http://127.0.0.1:${port}/city.html`);
+await page.goto(`http://127.0.0.1:${port}/${process.env.PAGE ?? 'city.html'}`);
 await page.waitForFunction(() => window.__READY__ === true, null, { timeout: 120_000 });
 
 // 정착 대기 — 전량 수면(또는 25초 상한)까지. 네이티브 재현 기준 ~6초.
