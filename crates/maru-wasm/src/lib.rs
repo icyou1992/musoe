@@ -496,6 +496,36 @@ pub unsafe extern "C" fn maru_is_alive(p: *mut WasmWorld, h: u64) -> u32 {
     w.world.is_alive(unpack(h)) as u32
 }
 
+/// 감쇠 설정 (1/s). 구르는 포탄 같은 바디가 스스로 멈춰 잠들게 한다 —
+/// 각 감쇠 없는 구는 마찰로 선속만 줄고 회전은 남아 영원히 구른다.
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_set_damping(
+    p: *mut WasmWorld,
+    h: u64,
+    linear: f32,
+    angular: f32,
+) -> i32 {
+    let w = w_or!(p, ERR_NULL);
+    match w.world.set_damping(unpack(h), linear, angular) {
+        Ok(()) => OK,
+        Err(e) => code(e),
+    }
+}
+
+/// 잠들어 있으면 1 (죽은 핸들·비수면 0). 호스트 시각화·LOD용 — 수면 도시가 어둡게,
+/// 충격 전파가 깨어나는 것으로 보인다.
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_is_asleep(p: *mut WasmWorld, h: u64) -> u32 {
+    let w = w_or!(p, 0);
+    w.world.is_asleep(unpack(h)) as u32
+}
+
 // ---------- 접촉 이벤트 ----------
 
 /// 이벤트 스테이징을 명시적으로 동기화한다. 성공 0, 실패 `ERR_STAGING_LIMIT`.
@@ -677,6 +707,9 @@ mod tests {
                 saw_contact |= maru_events_len(w) > 0;
             }
             assert!(saw_contact, "바닥에 닿으면 이벤트가 나와야 한다");
+            // 3초 정착이면 잠들어 있어야 하고, 수면 관측 ABI가 그걸 보여야 한다.
+            assert_eq!(maru_is_asleep(w, ball), 1, "정착한 공이 잠들지 않았다");
+            assert_eq!(maru_is_asleep(w, u64::MAX), 0, "죽은 핸들은 0");
 
             // 변환 버퍼를 JS가 읽듯이 읽는다
             let n = maru_slot_count(w) as usize;

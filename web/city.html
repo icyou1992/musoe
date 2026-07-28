@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>Maru — 수면 도시 포격</title>
+<style>
+  body { margin: 0; background: #0b0d14; overflow: hidden; }
+  #hud {
+    position: fixed; top: 12px; left: 14px; color: #cfd8ea; white-space: pre;
+    font: 13px/1.6 ui-monospace, monospace; pointer-events: none;
+    text-shadow: 0 1px 3px #000;
+  }
+  #hint { position: fixed; bottom: 12px; left: 14px; color: #6b7690; font: 12px ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<div id="hud">불러오는 중…</div>
+<div id="hint">클릭 = 포격 · 드래그 = 회전 · 휠 = 줌</div>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/" } }
+</script>
+<script type="module">
+// 수면 도시 포격 — maru의 실게임 프로파일(대부분 잠들고 국소만 활성)을 그대로 보여준다.
+// 물리 = maru wasm(C ABI + 선형 메모리 뷰), 렌더 = three.js InstancedMesh(드로우콜 2개).
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const SHAPE_SPHERE = 0, SHAPE_BOX = 1;
+const BODY_STATIC = 0, BODY_DYNAMIC = 1;
+const STRIDE = 7, IDENT = [0, 0, 0, 1];
+
+const { instance } = await WebAssembly.instantiateStreaming(fetch('./maru_wasm.wasm'), {});
+const m = instance.exports;
+const world = m.maru_world_create(0, -9.81, 0, 0);
+
+// ---- 도시: 바닥 + 타워 그리드 (1m 큐브, 완전 정렬 적층 → 빠르게 정착·수면) ----
+m.maru_add_body(world, BODY_STATIC, SHAPE_BOX, 80, 1, 80, 0, 0, -1, 0, ...IDENT, 1);
+const boxes = [];        // BigInt 핸들 (u64 ABI)
+const GRID = 12, SPACING = 6.0, BASE = 2, HEIGHT = 8;
+for (let gx = 0; gx < GRID; gx++) {
+  for (let gz = 0; gz < GRID; gz++) {
+    const cx = (gx - (GRID - 1) / 2) * SPACING;
+    const cz = (gz - (GRID - 1) / 2) * SPACING;
+    for (let h = 0; h < HEIGHT; h++) {
+      for (let bx = 0; bx < BASE; bx++) {
+        for (let bz = 0; bz < BASE; bz++) {
+          const hb = m.maru_add_body(
+            world, BODY_DYNAMIC, SHAPE_BOX, 0.5, 0.5, 0.5, 0,
+            cx + (bx - 0.5) * 1.001, 0.5 + h * 1.0, cz + (bz - 0.5) * 1.001,
+            ...IDENT, 1,
+          );
+          // 가벼운 감쇠(업계 표준 기본값 계열) — 무감쇠 잔해는 넘어진 뒤 오래 굴러
+          // 이웃을 계속 깨운다. 도시가 포격 후 다시 잠들려면 잔해가 멈춰야 한다.
+          m.maru_set_damping(world, hb, 0.05, 0.3);
+          boxes.push(hb);
+        }
+      }
+    }
+  }
+}
+const balls = [];
+const MAX_BALLS = 200;
+const BALL_R = 0.6, BALL_DENSITY = 3;
+const BALL_MASS = BALL_DENSITY * (4 / 3) * Math.PI * BALL_R ** 3;
+
+// ---- three.js ----
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0d14);
+scene.fog = new THREE.Fog(0x0b0d14, 80, 220);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 500);
+camera.position.set(42, 30, 42);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 6, 0);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0x8fa3c7, 0x1a1d29, 1.1));
+const sun = new THREE.DirectionalLight(0xffe9c4, 1.6);
+sun.position.set(30, 60, 20);
+scene.add(sun);
+const ground = new THREE.Mesh(
+  new THREE.BoxGeometry(160, 2, 160),
+  new THREE.MeshStandardMaterial({ color: 0x151a26, roughness: 0.95 }),
+);
+ground.position.y = -1;
+scene.add(ground);
+
+const boxMesh = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshStandardMaterial({ roughness: 0.8, metalness: 0.05 }),
+  boxes.length,
+);
+boxMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(boxMesh);
+const ballMesh = new THREE.InstancedMesh(
+  new THREE.SphereGeometry(BALL_R, 20, 14),
+  new THREE.MeshStandardMaterial({ color: 0xff8c42, roughness: 0.4, metalness: 0.3 }),
+  MAX_BALLS,
+);
+ballMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+ballMesh.count = 0;
+scene.add(ballMesh);
+
+// 수면 시각화: 잠든 박스는 어둡게, 깨어난 박스는 밝게 — 충격 전파가 눈에 보인다.
+const AWAKE = new THREE.Color(0xf2b04a), ASLEEP = new THREE.Color(0x3a4763);
+for (let i = 0; i < boxes.length; i++) boxMesh.setColorAt(i, ASLEEP);
+boxMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+
+// ---- 포격 ----
+addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || balls.length >= MAX_BALLS) return;
+  const ndc = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(ndc, camera);
+  const o = camera.position, d = ray.ray.direction;
+  const h = m.maru_add_body(
+    world, BODY_DYNAMIC, SHAPE_SPHERE, BALL_R, 0, 0, 0,
+    o.x + d.x * 2, o.y + d.y * 2, o.z + d.z * 2, ...IDENT, BALL_DENSITY,
+  );
+  if (h === -1n) return;
+  // 감쇠 — 각 감쇠 없는 구는 마찰로 선속만 줄고 회전이 남아 영원히 굴러 도시를
+  // 연쇄로 깨운다. 구른 뒤 멈춰 잠들어야 도시가 재정착한다.
+  m.maru_set_damping(world, h, 0.1, 0.6);
+  const V = 30; // m/s — substep당 0.125m < 반지름이라 CCD 불필요
+  m.maru_apply_impulse(world, h, d.x * V * BALL_MASS, d.y * V * BALL_MASS, d.z * V * BALL_MASS);
+  balls.push(h);
+  ballMesh.count = balls.length;
+});
+
+// ---- 루프 ----
+const hud = document.getElementById('hud');
+const M4 = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new THREE.Vector3(), S = new THREE.Vector3(1, 1, 1);
+let last = performance.now(), acc = 0, frames = 0;
+let stepMsAvg = 0, fpsAvg = 0, stepMsNow = 0;
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+function frame(now) {
+  const dtReal = (now - last) / 1000;
+  last = now;
+  fpsAvg = fpsAvg * 0.95 + (1 / Math.max(dtReal, 1e-4)) * 0.05;
+  acc = Math.min(acc + dtReal, 0.25);
+  const t0 = performance.now();
+  let stepped = 0;
+  while (acc >= 1 / 60) { m.maru_step(world, 1 / 60); acc -= 1 / 60; stepped++; }
+  if (stepped) {
+    stepMsNow = (performance.now() - t0) / stepped;
+    stepMsAvg = stepMsAvg * 0.9 + stepMsNow * 0.1;
+  }
+
+  // 핫패스: 포인터 1회 + Float32Array 뷰 1회. null = 스테이징 실패 프레임 스킵.
+  const ptr = m.maru_transforms_ptr(world);
+  if (ptr) {
+    const base = ptr >>> 2;
+    const t = new Float32Array(m.memory.buffer);
+    for (let i = 0; i < boxes.length; i++) {
+      const o = base + (i + 1) * STRIDE; // 0번 슬롯 = 바닥
+      P.set(t[o], t[o + 1], t[o + 2]);
+      Q.set(t[o + 3], t[o + 4], t[o + 5], t[o + 6]);
+      boxMesh.setMatrixAt(i, M4.compose(P, Q, S));
+    }
+    for (let i = 0; i < balls.length; i++) {
+      const o = base + (boxes.length + 1 + i) * STRIDE;
+      P.set(t[o], t[o + 1], t[o + 2]);
+      Q.set(t[o + 3], t[o + 4], t[o + 5], t[o + 6]);
+      ballMesh.setMatrixAt(i, M4.compose(P, Q, S));
+    }
+    boxMesh.instanceMatrix.needsUpdate = true;
+    if (balls.length) ballMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  // 수면 색 갱신 (4프레임마다 — 스칼라 ABI 콜 N회는 그때만)
+  let asleep = 0;
+  if ((frames & 3) === 0) {
+    for (let i = 0; i < boxes.length; i++) {
+      const s = m.maru_is_asleep(world, boxes[i]);
+      asleep += s;
+      boxMesh.setColorAt(i, s ? ASLEEP : AWAKE);
+    }
+    boxMesh.instanceColor.needsUpdate = true;
+    window.__ASLEEP__ = asleep;
+  }
+  if ((frames++ & 15) === 0) {
+    hud.textContent =
+      `Maru 물리엔진 — 수면 도시 포격\n` +
+      `바디 ${boxes.length + balls.length + 1}   물리 ${stepMsAvg.toFixed(2)} ms/step   ` +
+      `${fpsAvg.toFixed(0)} fps\n수면 ${window.__ASLEEP__ ?? 0}/${boxes.length}   포탄 ${balls.length}`;
+    window.__STATS__ = { stepMs: stepMsAvg, stepMsNow, fps: fpsAvg, bodies: boxes.length + balls.length };
+  }
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.__READY__ = true;
+</script>
+</body>
+</html>
