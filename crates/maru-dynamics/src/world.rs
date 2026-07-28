@@ -121,6 +121,38 @@ pub enum ContactEventKind {
     Stopped,
 }
 
+/// **CCD linear cast가 실제로 절단한 순간** — 스텝 안에서 언제·어디를 쳤는지.
+///
+/// 접촉 이벤트로는 이 정보를 낼 수 없다: linear cast는 바디를 표면(speculative skin 안)에
+/// 세워 두고, 반발·정지는 **다음 스텝**의 일반 접촉 파이프라인이 해석한다. 호스트가
+/// "총알이 언제 어디를 맞았나"를 알려면 절단 순간 자체가 필요하다(임팩트 이펙트·데미지 판정).
+///
+/// 서브스텝 안의 분율이므로 스텝 안의 시각은 `(substep + toi) / substeps`다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CcdHit {
+    /// 절단당한(움직이던) 바디.
+    pub body: BodyHandle,
+    /// 부딪힌 static 바디 — linear cast 대상은 static 한정이다(설계 §4.5).
+    pub other: BodyHandle,
+    /// 이 서브스텝 이동분의 분율 [0,1].
+    pub toi: f32,
+    /// 몇 번째 서브스텝인가 (0부터).
+    pub substep: u32,
+    /// 표면 법선 (움직이던 바디를 밀어내는 방향).
+    pub normal: Vec3,
+    /// 표면 위 접점 근사.
+    pub point: Vec3,
+}
+
+/// 한 스텝이 보고할 수 있는 CCD 히트 상한.
+///
+/// **상한이 있어야 할당이 없다**: 히트 수는 `CCD 바디 × 서브스텝`이라 입력에 비례해
+/// 자라는데, 이벤트 버퍼가 스텝마다 자라면 핫패스에 재할당이 들어온다. 상한을 두고
+/// 버퍼를 영속으로 잡으면 어떤 프레임도 할당하지 않는다. 넘치면 **뒤에 온 것부터
+/// 버리고**(순회 순서가 결정적이므로 버려지는 집합도 결정적이다)
+/// `Diagnostics::ccd_hits_dropped`로 보고한다 — 조용히 사라지지 않는다.
+pub const MAX_CCD_HITS: usize = 1024;
+
 /// 광선 질의 히트.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RayHit {
@@ -272,6 +304,9 @@ pub struct World {
     damping: Vec<(f32, f32)>,
     /// 이번 스텝의 접촉 이벤트. 스텝 시작에 비우고 스텝 안에서 채운다.
     contact_events: Vec<ContactEvent>,
+    /// 이번 스텝의 CCD 절단 히트 (비캐노니컬 — 스냅샷 밖, 스텝 시작에 비운다).
+    /// 상한 `MAX_CCD_HITS`, 버퍼는 영속이라 스텝 중 할당이 없다.
+    ccd_hits: Vec<CcdHit>,
     /// **직전 스텝에 닿아 있던 페어 집합** — 이벤트의 기준선.
     ///
     /// PCM 캐시 키에서 파생하려다 실패했다: `mutate`(텔레포트·속도 대입)가 그 바디의
@@ -342,6 +377,9 @@ pub struct Diagnostics {
     pub ccd_clamps: usize,
     /// 이번 스텝 frozen(평면 5개째 = 구석에 낌) 상태로 돈 서브스텝×바디 누적.
     pub ccd_frozen: usize,
+    /// 상한(`MAX_CCD_HITS`)을 넘겨 버려진 CCD 히트 수. 0이 아니면 호스트가 보는
+    /// 히트 목록이 이번 스텝의 전부가 아니다 — 조용한 유실과 구분되어야 한다.
+    pub ccd_hits_dropped: usize,
     /// 단계별 소요 (ns) — 프로파일용.
     /// `[aabb, broad, narrow, solve, post]`
     /// - `aabb`: 바디 순회 + 회전 월드 AABB 구성 (예전에는 broad에서 **빠져 있었다**)
@@ -512,6 +550,7 @@ impl World {
             ext_force: Vec::new(),
             damping: Vec::new(),
             contact_events: Vec::new(),
+            ccd_hits: Vec::new(),
             touching: IntSet::default(),
             integrate_gate: Vec::new(),
             gravity_gate: Vec::new(),
@@ -1897,9 +1936,17 @@ impl World {
         &self.contact_events
     }
 
+    /// 이번 스텝의 CCD 절단 히트. 스텝 시작에 비워지므로 **스텝 사이에만 유효**하다
+    /// (접촉 이벤트와 같은 수명). `Diagnostics::ccd_hits_dropped`가 0이 아니면
+    /// 상한을 넘겨 잘린 목록이다.
+    pub fn ccd_hits(&self) -> &[CcdHit] {
+        &self.ccd_hits
+    }
+
     fn step_inner(&mut self, dt: f32) {
         // 이벤트는 **스텝 단위 출력**이다 — 매 스텝 비운다.
         self.contact_events.clear();
+        self.ccd_hits.clear();
         // 자원 초과 플래그는 **매 스텝 초기화**한다(리뷰 BLOCKER): 생성·복원에서만 지우면
         // 한 번 초과한 뒤 바디를 지우거나 예산을 올려 실제로 성공해도 계속
         // `ResourceLimit`을 돌려주면서 상태만 앞으로 나간다.
@@ -2214,8 +2261,20 @@ impl World {
         // 블록은 제약 4개당 1개라 상한은 ncap/4 + 색 수(색마다 꼬리가 생길 수 있다).
         let mut block_starts: Vec<usize> = Vec::new();
         let mut work: Vec<solver_block::Work> = Vec::new();
+        // **CCD 히트 버퍼도 스텝 전에 선점한다** — 상한이 고정이라 첫 스텝에서만 실제로
+        // 잡히고 이후는 무연산이다. CCD 바디가 하나도 없으면 잡지 않는다(48KB 낭비 방지).
+        let ccd_any = self
+            .bodies
+            .iter()
+            .enumerate()
+            .any(|(i, b)| self.alive[i] && b.ccd);
         let _t_res = Stopwatch::start();
-        if constraints.try_reserve(ncap).is_err()
+        if (ccd_any
+            && self
+                .ccd_hits
+                .try_reserve(MAX_CCD_HITS.saturating_sub(self.ccd_hits.capacity()))
+                .is_err())
+            || constraints.try_reserve(ncap).is_err()
             // 여유 상수(`+1`·`+64`)를 붙이지 않는다: 페어가 0이면 이 버퍼들도 0이어야
             // 총 바이트 회계(위 `per_pair_bytes`)가 실제 선점과 일치한다.
             // 예산이 0페어로 잘린 월드에서 상수만큼 더 잡으면 128 MiB 계약을 넘긴다
@@ -2906,7 +2965,7 @@ impl World {
             ccd_plane_count = vec![0u8; ccd_list.len()];
             ccd_frozen = vec![false; ccd_list.len()];
         }
-        for _ in 0..n_sub {
+        for sub_i in 0..n_sub {
             // 역관성 갱신을 **외력보다 먼저** — 토크는 현재 자세의 월드 역관성을 쓴다
             // (뒤에 두면 첫 서브스텝에서 `inv_i`가 아직 0이라 토크가 통째로 사라진다).
             let _t_ii = Stopwatch::start();
@@ -3081,7 +3140,7 @@ impl World {
                         let sweep = a0.merge(Aabb::new(a0.min + d, a0.max + d));
                         // static 후보 — bp 구조는 브로드페이즈 단계가 항상 남긴다(무효화
                         // 경로는 전부 그 전에 return). 방어적으로 없으면 캐스트 생략.
-                        let mut best: Option<(f32, Vec3, u32)> = None;
+                        let mut best: Option<(f32, Vec3, Vec3, u32)> = None;
                         if let Some(bp) = &self.bp {
                             ccd_cand.clear();
                             bp.query_static(sweep, &mut ccd_cand, &mut ccd_stack);
@@ -3122,17 +3181,32 @@ impl World {
                                     // 결정적 최소: (toi, static id) 사전식 — 동시 hit 동률 절단.
                                     let better = match best {
                                         None => true,
-                                        Some((bt, _, bid)) => {
+                                        Some((bt, _, _, bid)) => {
                                             hit.toi < bt || (hit.toi == bt && sid < bid)
                                         }
                                     };
                                     if better {
-                                        best = Some((hit.toi, hit.normal, sid));
+                                        best = Some((hit.toi, hit.normal, hit.point, sid));
                                     }
                                 }
                             }
                         }
-                        if let Some((toi, normal, _)) = best {
+                        if let Some((toi, normal, point, sid)) = best {
+                            // **절단 순간을 호스트에게 보고한다** (설계 §4.5 TOI-hit 큐).
+                            // 상한을 넘으면 뒤에 온 것부터 버린다 — 바디 순회(활성 인덱스
+                            // 오름차순)와 서브스텝 순서가 결정적이라 버려지는 집합도 결정적이다.
+                            if self.ccd_hits.len() < MAX_CCD_HITS {
+                                self.ccd_hits.push(CcdHit {
+                                    body: self.handle_of(i),
+                                    other: self.handle_of(sid as usize),
+                                    toi,
+                                    substep: sub_i,
+                                    normal,
+                                    point,
+                                });
+                            } else {
+                                self.diag.ccd_hits_dropped += 1;
+                            }
                             d = d * toi;
                             if rot_sweep {
                                 // 회전 스윕 히트: 이 서브스텝의 회전도 TOI에서 절단 —

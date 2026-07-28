@@ -5295,6 +5295,144 @@ mod tests {
         assert!(x > 8.0, "벽 앞 어딘가에는 도달해야 한다: x={x}");
     }
 
+    /// **TOI-hit 큐** (설계 §4.5 / M4): 절단 순간이 호스트에게 보고돼야 한다.
+    ///
+    /// 접촉 이벤트로는 이 정보를 낼 수 없다 — linear cast는 바디를 표면에 세워 두고
+    /// 반발·정지는 다음 스텝의 접촉이 해석하므로, 절단 자체는 어디에도 안 남았다.
+    #[test]
+    fn ccd_reports_the_toi_hit_it_clamped_on() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let wall = w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.05, 5.0, 5.0),
+                radius: 0.0,
+            },
+            pose(10.0, 0.0, 0.0),
+        ));
+        let bullet = w.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(0.0, 0.0, 0.0), 1.0).with_ccd(),
+        );
+        w.set_linear_velocity(bullet, Vec3::new(400.0, 0.0, 0.0))
+            .unwrap();
+        // 벽까지 6.7m/step → 2스텝째에 맞는다. 맞은 스텝의 히트를 잡는다.
+        let mut hits = Vec::new();
+        for _ in 0..4 {
+            w.step(DT);
+            hits.extend_from_slice(w.ccd_hits());
+            if !hits.is_empty() {
+                break;
+            }
+        }
+        assert!(!hits.is_empty(), "CCD가 절단했는데 히트가 보고되지 않았다");
+        let h = hits[0];
+        assert_eq!(h.body, bullet);
+        assert_eq!(h.other, wall, "부딪힌 static 바디가 잘못 보고됐다");
+        assert!(
+            (0.0..=1.0).contains(&h.toi),
+            "toi는 서브스텝 분율이어야 한다: {}",
+            h.toi
+        );
+        assert!(
+            h.substep < WorldParams::default().substeps,
+            "서브스텝 인덱스가 범위를 넘었다: {}",
+            h.substep
+        );
+        // 법선은 벽이 총알을 밀어내는 방향(−x)이어야 한다.
+        assert!(
+            h.normal.x < -0.9,
+            "법선이 밀어내는 방향이 아니다: {:?}",
+            h.normal
+        );
+        // 접점은 벽 근면(x≈9.95) 부근이어야 한다.
+        assert!(
+            (h.point.x - 9.95).abs() < 0.3,
+            "접점이 벽 표면에서 멀다: {:?}",
+            h.point
+        );
+        // **스텝 단위 출력**이다 — 매 스텝 비워지므로 누적되지 않는다.
+        // (벽에 붙은 뒤에도 잔여 이동이 있으면 매 스텝 새 히트가 날 수 있다 —
+        //  그러니 "빈다"가 아니라 "안 쌓인다"가 검증해야 할 성질이다.)
+        let cap_per_step = WorldParams::default().substeps as usize;
+        for _ in 0..20 {
+            w.step(DT);
+            assert!(
+                w.ccd_hits().len() <= cap_per_step,
+                "히트가 스텝을 넘어 누적됐다: {} > 서브스텝 {}",
+                w.ccd_hits().len(),
+                cap_per_step
+            );
+        }
+    }
+
+    /// 히트 큐가 **상한에서 포화**해도 결정적이고, 버려진 수를 보고해야 한다.
+    /// (M4 완료 기준: "TOI 큐 상한 포화 프레임 — 할당 0·오버플로 결정성")
+    #[test]
+    fn ccd_hit_queue_saturates_deterministically() {
+        let build = || {
+            let mut w = World::new(WorldParams {
+                gravity: Vec3::ZERO,
+                ..WorldParams::default()
+            });
+            w.add_body(Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(0.05, 200.0, 200.0),
+                    radius: 0.0,
+                },
+                pose(10.0, 0.0, 0.0),
+            ));
+            let n = crate::world::MAX_CCD_HITS + 64;
+            for k in 0..n {
+                // 격자로 흩어 놓아 서로 겹치지 않게 한다.
+                let y = (k % 64) as f32 * 0.5 - 16.0;
+                let z = (k / 64) as f32 * 0.5 - 8.0;
+                let h = w.add_body(
+                    Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(0.0, y, z), 1.0)
+                        .with_ccd(),
+                );
+                w.set_linear_velocity(h, Vec3::new(400.0, 0.0, 0.0))
+                    .unwrap();
+            }
+            w
+        };
+        let run = || {
+            let mut w = build();
+            let mut seen = Vec::new();
+            let mut dropped = 0usize;
+            for _ in 0..4 {
+                w.step(DT);
+                if !w.ccd_hits().is_empty() {
+                    seen = w.ccd_hits().to_vec();
+                    dropped = w.diagnostics().ccd_hits_dropped;
+                    break;
+                }
+            }
+            (seen, dropped)
+        };
+        let (a, da) = run();
+        let (b, db) = run();
+        assert!(!a.is_empty(), "포화 시나리오에서 히트가 하나도 없다");
+        assert!(
+            a.len() <= crate::world::MAX_CCD_HITS,
+            "상한을 넘겨 보고했다: {}",
+            a.len()
+        );
+        assert!(
+            da > 0,
+            "상한을 넘겼는데 버려진 수가 0으로 보고됐다 — 조용한 유실이다"
+        );
+        // **결정성**: 같은 입력이면 남는 집합도 버려지는 수도 같아야 한다.
+        assert_eq!(da, db, "버려진 수가 실행마다 다르다");
+        assert_eq!(a.len(), b.len(), "보고된 히트 수가 실행마다 다르다");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.body, y.body, "히트 순서가 실행마다 다르다");
+            assert_eq!(x.other, y.other);
+            assert_eq!(x.toi.to_bits(), y.toi.to_bits(), "toi가 실행마다 다르다");
+        }
+    }
+
     /// 클램프 평면은 단방향이다 — 바닥에 착지한 CCD 바디의 접선 이동(슬라이드)을 막지 않는다.
     #[test]
     fn ccd_clamp_allows_tangential_slide() {
