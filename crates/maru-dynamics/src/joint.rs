@@ -28,20 +28,39 @@ pub enum JointKind {
     ///
     /// `min == max`면 막대(양방향), 아니면 **부등식 제약**이라 구간 안에서는 자유롭다.
     Distance { min: f32, max: f32 },
+    /// 슬라이더 — `axis_a`(A 로컬) 방향 병진 1-DOF만 남기고 나머지 5-DOF를 묶는다.
+    ///
+    /// 각 3-DOF는 `Fixed`와 같은 식으로 `rel_rot`(A 기준 B의 목표 상대 자세)에 고정하고,
+    /// 선형은 축에 **수직인 2-DOF**만 묶는다. `limit`이 있으면 축 방향 이동을
+    /// `[min, max]`(m)로, `motor`가 있으면 축 방향 상대 속도(m/s)를 최대 힘(N)까지 추종한다.
+    ///
+    /// 축 방향 좌표 `s`의 기준(0)은 **두 앵커가 겹칠 때**다:
+    /// `s = n · ((pos_b + rb) − (pos_a + ra))`, `n` = 월드 축.
+    Prismatic {
+        axis_a: Vec3,
+        rel_rot: Quat,
+        limit: Option<[f32; 2]>,
+        motor: Option<Motor>,
+    },
 }
 
-/// 조인트 모터 — 목표 속도를 최대 힘/토크까지 추종한다.
+/// 조인트 모터 — 목표 속도를 최대 일반화 힘까지 추종한다.
+///
+/// **단위는 조인트의 자유도가 정한다**: hinge(각 1-DOF)면 각속도(rad/s)와 토크(N·m),
+/// prismatic(선형 1-DOF)이면 속도(m/s)와 힘(N)이다. 두 경우 모두 "구동하는 자유도의
+/// 속도"와 "그 자유도에 실을 수 있는 최대 일반화 힘"이라 같은 구조체를 쓴다 —
+/// 필드 이름을 `max_torque`로 두면 선형 조인트에서 단위가 거짓말이 된다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Motor {
-    /// 목표 상대 각속도 (rad/s) — **A 기준 B**의 각속도(`ω_b − ω_a`).
+    /// 목표 상대 속도 — **A 기준 B**다(각: `ω_b − ω_a` rad/s, 선형: 축 방향 `v_b − v_a` m/s).
     pub target_speed: f32,
-    /// 이 모터가 낼 수 있는 **최대 토크** (N·m).
+    /// 이 모터가 낼 수 있는 **최대 일반화 힘** (각: N·m, 선형: N).
     ///
-    /// 임펄스가 아니라 토크인 이유: 누적 임펄스는 서브스텝마다 warm start로 다시
+    /// 임펄스가 아니라 힘인 이유: 누적 임펄스는 서브스텝마다 warm start로 다시
     /// 실리므로, 임펄스에 상한을 두면 **전달량이 서브스텝 수에 비례**한다
     /// (검수: substeps 1 vs 8에서 결과가 갈렸다). 서브스텝 간격 `h`로 스케일한
-    /// `max_torque · h`를 누적 상한으로 쓰면 한 스텝 총량이 `max_torque · dt`로 고정된다.
-    pub max_torque: f32,
+    /// `max_effort · h`를 누적 상한으로 쓰면 한 스텝 총량이 `max_effort · dt`로 고정된다.
+    pub max_effort: f32,
 }
 
 /// **엔드포인트는 세대 보유 핸들**이다(리뷰 BLOCKER). raw 인덱스면 같은 배치 안에서
@@ -130,7 +149,7 @@ impl Joint {
                     }
                 }
                 if let Some(m) = motor {
-                    if !(m.max_torque >= 0.0 && in_state_range(m.max_torque))
+                    if !(m.max_effort >= 0.0 && in_state_range(m.max_effort))
                         || !maru_collide::angular_in_range(m.target_speed)
                     {
                         return Err(ApiError::InvalidValue);
@@ -150,6 +169,44 @@ impl Joint {
                 // 거리는 **앵커와 같은 차원**이라 같은 범위를 쓴다.
                 if !(min >= 0.0 && min <= max && maru_collide::anchor_in_range(max)) {
                     return Err(ApiError::InvalidValue);
+                }
+            }
+            JointKind::Prismatic {
+                axis_a,
+                rel_rot,
+                limit,
+                motor,
+            } => {
+                let l2 = axis_a.length_sq();
+                if !(0.9..=1.1).contains(&l2) {
+                    return Err(ApiError::InvalidValue);
+                }
+                let q2 = rel_rot.x * rel_rot.x
+                    + rel_rot.y * rel_rot.y
+                    + rel_rot.z * rel_rot.z
+                    + rel_rot.w * rel_rot.w;
+                if !(0.9..=1.1).contains(&q2) {
+                    return Err(ApiError::InvalidValue);
+                }
+                if let Some([lo, hi]) = limit {
+                    // 양성 조건 — NaN은 어느 비교도 통과하지 못한다.
+                    // 한계는 **길이**이므로 거리 조인트와 같은 범위(앵커 = 셰이프 범위)를 쓴다:
+                    // 그보다 멀리 미끄러지면 레버암 논증이 깨지는 것이 아니라 월드 범위
+                    // 정책(`MAX_INPUT`)이 먼저 걸리므로, 조인트 쪽 상한을 좁게 잡는 편이 안전하다.
+                    if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+                        return Err(ApiError::InvalidValue);
+                    }
+                    if !maru_collide::anchor_in_range(lo) || !maru_collide::anchor_in_range(hi) {
+                        return Err(ApiError::InvalidValue);
+                    }
+                }
+                if let Some(m) = motor {
+                    // 선형 모터라 목표는 **선속도**다 — 각속도 범위로 검사하면 안 된다.
+                    if !(m.max_effort >= 0.0 && in_state_range(m.max_effort))
+                        || !maru_collide::speed_in_range(m.target_speed)
+                    {
+                        return Err(ApiError::InvalidValue);
+                    }
                 }
             }
             JointKind::Point => {}
@@ -274,27 +331,55 @@ impl Joint {
         Ok(j)
     }
 
-    /// hinge에 각도 한계를 단다 (라디안, 축 둘레).
+    /// 슬라이더(prismatic) — `axis_a`(A 로컬, 단위벡터) 방향 병진만 남긴다.
+    ///
+    /// `rel_rot` = A 기준 B의 목표 상대 자세. 두 바디를 원하는 상대 자세로 놓은 뒤
+    /// `q_a.conjugate() * q_b`를 넘기면 그 자세가 유지된다.
+    pub fn try_prismatic(
+        body_a: BodyHandle,
+        body_b: BodyHandle,
+        anchor_a: Vec3,
+        anchor_b: Vec3,
+        axis_a: Vec3,
+        rel_rot: Quat,
+    ) -> Result<Self, crate::world::ApiError> {
+        let mut j = Self::try_point(body_a, body_b, anchor_a, anchor_b)?;
+        // 축은 **생성 시점에** 정규화·검증한다 — `try_hinge`와 같은 이유로,
+        // 0/NaN 축은 조인트가 만들어진 뒤에는 잡을 수 없다.
+        let axis_a = axis_a.normalize_or_zero();
+        j.kind = JointKind::Prismatic {
+            axis_a,
+            rel_rot,
+            limit: None,
+            motor: None,
+        };
+        j.validate()?;
+        Ok(j)
+    }
+
+    /// 한계를 단다 — hinge면 축 둘레 각도(라디안), prismatic이면 축 방향 이동(m).
     pub fn with_limit(mut self, min: f32, max: f32) -> Result<Self, crate::world::ApiError> {
         match &mut self.kind {
-            JointKind::Hinge { limit, .. } => *limit = Some([min, max]),
+            JointKind::Hinge { limit, .. } | JointKind::Prismatic { limit, .. } => {
+                *limit = Some([min, max])
+            }
             _ => return Err(crate::world::ApiError::InvalidValue),
         }
         self.validate()?;
         Ok(self)
     }
 
-    /// hinge에 모터를 단다.
+    /// 모터를 단다 — hinge면 (rad/s, N·m), prismatic이면 (m/s, N).
     pub fn with_motor(
         mut self,
         target_speed: f32,
-        max_torque: f32,
+        max_effort: f32,
     ) -> Result<Self, crate::world::ApiError> {
         match &mut self.kind {
-            JointKind::Hinge { motor, .. } => {
+            JointKind::Hinge { motor, .. } | JointKind::Prismatic { motor, .. } => {
                 *motor = Some(Motor {
                     target_speed,
-                    max_torque,
+                    max_effort,
                 })
             }
             _ => return Err(crate::world::ApiError::InvalidValue),
@@ -402,6 +487,22 @@ pub fn warm_start(st: &mut crate::solver::SolverState, j: &Joint) {
             st.apply_ang_pub(j.ia(), ang);
             st.apply_ang_pub(j.ib(), -ang);
         }
+        JointKind::Prismatic { axis_a, .. } => {
+            // 각 3-DOF는 Fixed와 같다.
+            let ang = Vec3::new(
+                j.angular_impulse[0],
+                j.angular_impulse[1],
+                j.angular_impulse[2],
+            );
+            st.apply_ang_pub(j.ia(), ang);
+            st.apply_ang_pub(j.ib(), -ang);
+            // **한계·모터는 축 방향 선형 임펄스다** — hinge와 달리 각이 아니다.
+            // 여기서 각으로 실으면 슬라이더가 회전 토크를 받는다.
+            let n = st.rot[j.ia()].rotate(axis_a);
+            let imp = n * (j.limit_impulse + j.motor_impulse);
+            st.apply_pub(j.ia(), imp, ra);
+            st.apply_pub(j.ib(), -imp, rb);
+        }
         _ => {}
     }
 }
@@ -487,6 +588,35 @@ pub fn solve(
         return;
     }
 
+    // --- Prismatic: 선형은 **축 수직 2-DOF만** 묶는다(축 방향은 자유) ---
+    if let JointKind::Prismatic {
+        axis_a,
+        rel_rot,
+        limit,
+        motor,
+    } = j.kind
+    {
+        solve_prismatic(
+            st,
+            j,
+            PrismaticArgs {
+                ra,
+                rb,
+                axis_a,
+                rel_rot,
+                limit,
+                motor,
+                inv_ma,
+                inv_mb,
+                h,
+            },
+            &ia,
+            &ib,
+            soft,
+        );
+        return;
+    }
+
     // --- 선형 3-DOF: K = (1/ma+1/mb)I + skew(ra)ᵀIa⁻¹skew(ra) + skew(rb)ᵀIb⁻¹skew(rb) ---
     // **삽입 검증과 같은 함수**를 쓴다. 중복 구현이 있으면 둘이 갈라져 검증이 무의미해진다.
     let k = linear_k(inv_ma, inv_mb, &ia, &ib, ra, rb);
@@ -567,7 +697,7 @@ pub fn solve(
                 // 증분만 자르면 상한을 넘고, 상한을 임펄스로 두면 전달량이 서브스텝
                 // 수에 비례한다 — warm start가 누적분을 매 서브스텝 다시 싣기 때문이다
                 // (검수: substeps 1 vs 8에서 결과가 갈렸다).
-                let cap = m.max_torque * h;
+                let cap = m.max_effort * h;
                 j.motor_impulse = (old + want).clamp(-cap, cap);
                 let ang = axis * (j.motor_impulse - old);
                 st.apply_ang_pub(j.ia(), ang);
@@ -624,43 +754,57 @@ pub fn solve(
 
     // --- Fixed: 3-DOF 각 제약 (상대 자세를 목표로 되돌린다) ---
     if let JointKind::Fixed { rel_rot } = j.kind {
-        // 오차 = 현재 상대 자세와 목표의 차. 소각 근사로 축각 벡터를 만든다.
-        let qa = st.rot[j.ia()];
-        let qb = st.rot[j.ib()];
-        let want = qa * rel_rot; // B가 있어야 할 자세
-                                 // **부호 방향에 주의**: `qb → want`(B를 되돌리는 방향)여야 한다.
-                                 // 반대로 두면 아래 임펄스 규약(`imp = -(cdot+bias)/k`, A += / B -=)이
-                                 // `dC/dt = +β·C`를 만들어 **오차가 지수적으로 커진다**(검수 실측 0.0999 → 1.98).
-        let err_q = want * qb.conjugate();
-        // 쿼터니언 부호 정규화 — q와 −q는 같은 자세지만 오차 벡터의 부호를 뒤집는다.
-        let s = if err_q.w < 0.0 { -1.0 } else { 1.0 };
-        let err = Vec3::new(err_q.x, err_q.y, err_q.z) * (2.0 * s);
-        let wrel = st.ang[j.ia()] - st.ang[j.ib()];
-        for (axis_i, dir) in [
-            (0usize, Vec3::new(1.0, 0.0, 0.0)),
-            (1, Vec3::new(0.0, 1.0, 0.0)),
-            (2, Vec3::new(0.0, 0.0, 1.0)),
-        ] {
-            let k_ang = dir.dot(ia.mul_vec(dir)) + dir.dot(ib.mul_vec(dir));
-            if k_ang <= 0.0 {
-                continue;
-            }
-            let cdot = dir.dot(wrel);
-            let c = dir.dot(err);
-            let (bias, ms, is_) = match soft {
-                Some((sf, _, max_ang_bias)) => (
-                    (c * sf.bias_rate).clamp(-max_ang_bias, max_ang_bias),
-                    sf.mass_scale,
-                    sf.impulse_scale,
-                ),
-                None => (0.0, 1.0, 0.0),
-            };
-            let imp = -(cdot + bias) / k_ang * ms - j.angular_impulse[axis_i] * is_;
-            j.angular_impulse[axis_i] += imp;
-            let ang = dir * imp;
-            st.apply_ang_pub(j.ia(), ang);
-            st.apply_ang_pub(j.ib(), -ang);
+        solve_angular_lock(st, j, rel_rot, &ia, &ib, soft);
+    }
+}
+
+/// 상대 자세를 `rel_rot`으로 묶는 3-DOF 각 제약 — `Fixed`와 `Prismatic`이 공유한다.
+///
+/// 두 곳에 같은 식을 적으면 한쪽만 고쳐져 갈라진다(이 저장소가 `linear_k`에서 이미 겪었다).
+fn solve_angular_lock(
+    st: &mut crate::solver::SolverState,
+    j: &mut Joint,
+    rel_rot: Quat,
+    ia: &Mat3,
+    ib: &Mat3,
+    soft: Option<(&Softness, f32, f32)>,
+) {
+    // 오차 = 현재 상대 자세와 목표의 차. 소각 근사로 축각 벡터를 만든다.
+    let qa = st.rot[j.ia()];
+    let qb = st.rot[j.ib()];
+    let want = qa * rel_rot; // B가 있어야 할 자세
+                             // **부호 방향에 주의**: `qb → want`(B를 되돌리는 방향)여야 한다.
+                             // 반대로 두면 아래 임펄스 규약(`imp = -(cdot+bias)/k`, A += / B -=)이
+                             // `dC/dt = +β·C`를 만들어 **오차가 지수적으로 커진다**(검수 실측 0.0999 → 1.98).
+    let err_q = want * qb.conjugate();
+    // 쿼터니언 부호 정규화 — q와 −q는 같은 자세지만 오차 벡터의 부호를 뒤집는다.
+    let s = if err_q.w < 0.0 { -1.0 } else { 1.0 };
+    let err = Vec3::new(err_q.x, err_q.y, err_q.z) * (2.0 * s);
+    let wrel = st.ang[j.ia()] - st.ang[j.ib()];
+    for (axis_i, dir) in [
+        (0usize, Vec3::new(1.0, 0.0, 0.0)),
+        (1, Vec3::new(0.0, 1.0, 0.0)),
+        (2, Vec3::new(0.0, 0.0, 1.0)),
+    ] {
+        let k_ang = dir.dot(ia.mul_vec(dir)) + dir.dot(ib.mul_vec(dir));
+        if k_ang <= 0.0 {
+            continue;
         }
+        let cdot = dir.dot(wrel);
+        let c = dir.dot(err);
+        let (bias, ms, is_) = match soft {
+            Some((sf, _, max_ang_bias)) => (
+                (c * sf.bias_rate).clamp(-max_ang_bias, max_ang_bias),
+                sf.mass_scale,
+                sf.impulse_scale,
+            ),
+            None => (0.0, 1.0, 0.0),
+        };
+        let imp = -(cdot + bias) / k_ang * ms - j.angular_impulse[axis_i] * is_;
+        j.angular_impulse[axis_i] += imp;
+        let ang = dir * imp;
+        st.apply_ang_pub(j.ia(), ang);
+        st.apply_ang_pub(j.ib(), -ang);
     }
 }
 
@@ -755,4 +899,163 @@ fn solve_distance(
     let imp = n * (acc - old);
     st.apply_pub(j.ia(), imp, ra);
     st.apply_pub(j.ib(), -imp, rb);
+}
+
+/// `solve_prismatic` 인자 묶음 — 스칼라 9개를 나열하면 호출부에서 순서를 틀리기 쉽다.
+struct PrismaticArgs {
+    ra: Vec3,
+    rb: Vec3,
+    axis_a: Vec3,
+    rel_rot: Quat,
+    limit: Option<[f32; 2]>,
+    motor: Option<Motor>,
+    inv_ma: f32,
+    inv_mb: f32,
+    h: f32,
+}
+
+/// Prismatic: 축 수직 2-DOF(선형) + 3-DOF(각) + 축 방향 한계·모터.
+///
+/// **축 방향 부호 규약**을 먼저 고정한다 — 이 저장소가 hinge에서 두 번 틀린 지점이다.
+/// 월드 축 `n`, 슬라이드 좌표 `s = n·((pos_b+rb) − (pos_a+ra))`, 그 변화율 `vs = ds/dt`.
+/// 임펄스 `imp`를 `n` 방향으로 A += / B −= 적용하면 `cdot(= v_a − v_b)`가 `k·imp` 만큼 늘고,
+/// `vs = −n·cdot`이므로 **`vs`는 `k·imp` 만큼 준다**. 따라서
+/// - 모터(목표 `vs → target`): `imp = (vs − target)/k`
+/// - 한계(목표 `vs → −β·c`):   `imp = (vs + β·c)/k`, 게이트는 `c`의 부호를 따른다
+///   (`c > 0` = 상한 초과 → `imp ≥ 0`).
+fn solve_prismatic(
+    st: &mut crate::solver::SolverState,
+    j: &mut Joint,
+    a: PrismaticArgs,
+    ia: &Mat3,
+    ib: &Mat3,
+    soft: Option<(&Softness, f32, f32)>,
+) {
+    let (ra, rb) = (a.ra, a.rb);
+    let n = st.rot[j.ia()].rotate(a.axis_a);
+    let k = linear_k(a.inv_ma, a.inv_mb, ia, ib, ra, rb);
+
+    // --- 축 수직 2-DOF: 2×2 블록으로 푼다 ---
+    // 행별 Gauss-Seidel로 풀면 두 방향의 커플링(K의 비대각)이 서브스텝 안에서 남아
+    // 하중이 실린 슬라이더가 축에서 벗어난 채 진동한다. 2×2는 닫힌 형태라 공짜다.
+    let (u, v) = perp_basis(n);
+    let c_pos = (st.pos[j.ia()] + ra) - (st.pos[j.ib()] + rb);
+    let cdot = st.vel_at_pub(j.ia(), ra) - st.vel_at_pub(j.ib(), rb);
+    let (ku, kv) = (k.mul_vec(u), k.mul_vec(v));
+    let (mut a11, a12, mut a22) = (u.dot(ku), u.dot(kv), v.dot(kv)); // K 대칭 → a21 = a12
+    let scale = (a11.abs() + a22.abs()) * 0.5;
+    let mut det = a11 * a22 - a12 * a12;
+    // 특이하면 **정규화**해서 반드시 풀리게 만든다 (`solve_k`와 같은 정책):
+    // 0 임펄스로 넘기면 제약이 조용히 풀린 것처럼 보이고, 그게 가장 나쁜 실패다.
+    // 부정 비교는 **의도적**이다 — `det`가 NaN이면 정규화 분기로 가야 한다
+    // (`det > x`로 쓰면 NaN이 false라 그대로 통과해 NaN 임펄스를 만든다).
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !(det > scale * scale * 1.0e-8) && scale > 0.0 {
+        let eps = scale * 1.0e-4;
+        a11 += eps;
+        a22 += eps;
+        det = a11 * a22 - a12 * a12;
+    }
+    if det > 0.0 {
+        // bias는 **축 수직 성분**에서만 만든다 — 축 방향 오차는 자유도지 오차가 아니다.
+        let perp_err = c_pos - n * n.dot(c_pos);
+        let (bias_vec, ms, is_) = match soft {
+            Some((sf, max_bias, _)) => (
+                clamp_len(perp_err * sf.bias_rate, max_bias),
+                sf.mass_scale,
+                sf.impulse_scale,
+            ),
+            None => (Vec3::ZERO, 1.0, 0.0),
+        };
+        let r0 = -(u.dot(cdot) + u.dot(bias_vec));
+        let r1 = -(v.dot(cdot) + v.dot(bias_vec));
+        let inv_det = 1.0 / det;
+        let x0 = (a22 * r0 - a12 * r1) * inv_det;
+        let x1 = (a11 * r1 - a12 * r0) * inv_det;
+        // 누적은 월드 벡터로 들고 있다(기저 u·v는 축과 함께 돈다) — 접촉의 마찰 임펄스가
+        // 접평면 기저 회전에 대응하는 방식과 같다.
+        let old0 = u.dot(j.linear_impulse);
+        let old1 = v.dot(j.linear_impulse);
+        let i0 = x0 * ms - old0 * is_;
+        let i1 = x1 * ms - old1 * is_;
+        let imp = u * i0 + v * i1;
+        j.linear_impulse += imp;
+        st.apply_pub(j.ia(), imp, ra);
+        st.apply_pub(j.ib(), -imp, rb);
+    }
+
+    // --- 각 3-DOF: Fixed와 같은 잠금 ---
+    solve_angular_lock(st, j, a.rel_rot, ia, ib, soft);
+
+    // --- 축 방향 한계·모터 ---
+    let k_axis = n.dot(k.mul_vec(n));
+    if k_axis <= 0.0 {
+        return;
+    }
+    // 모터: 목표 상대 속도를 최대 힘까지 추종한다.
+    if let Some(m) = a.motor {
+        let vs = -n.dot(st.vel_at_pub(j.ia(), ra) - st.vel_at_pub(j.ib(), rb));
+        let want = (vs - m.target_speed) / k_axis;
+        let old = j.motor_impulse;
+        // 누적을 서브스텝 간격으로 스케일한 상한에 클램프 — 증분만 자르면 전달량이
+        // 서브스텝 수에 비례한다(hinge 모터와 같은 이유·같은 식).
+        let cap = m.max_effort * a.h;
+        j.motor_impulse = (old + want).clamp(-cap, cap);
+        let imp = n * (j.motor_impulse - old);
+        st.apply_pub(j.ia(), imp, ra);
+        st.apply_pub(j.ib(), -imp, rb);
+    }
+    // 한계: 부등식이라 한쪽 부호로만 임펄스가 산다.
+    if let Some([lo, hi]) = a.limit {
+        let c_pos = (st.pos[j.ia()] + ra) - (st.pos[j.ib()] + rb);
+        let s = -n.dot(c_pos);
+        let c = if s < lo {
+            s - lo
+        } else if s > hi {
+            s - hi
+        } else {
+            0.0
+        };
+        if c != 0.0 {
+            let vs = -n.dot(st.vel_at_pub(j.ia(), ra) - st.vel_at_pub(j.ib(), rb));
+            let bias = match soft {
+                Some((sf, max_bias, _)) => (c * sf.bias_rate).clamp(-max_bias, max_bias),
+                None => 0.0,
+            };
+            let want = (vs + bias) / k_axis;
+            let old = j.limit_impulse;
+            let acc = if c > 0.0 {
+                (old + want).max(0.0)
+            } else {
+                (old + want).min(0.0)
+            };
+            j.limit_impulse = acc;
+            let imp = n * (acc - old);
+            st.apply_pub(j.ia(), imp, ra);
+            st.apply_pub(j.ib(), -imp, rb);
+        } else if j.limit_impulse != 0.0 {
+            // 한계 안으로 돌아왔다 — warm start가 실은 임펄스를 되돌린다
+            // (안 되돌리면 그 운동량이 남아 슬라이더가 계속 밀린다).
+            let imp = n * (-j.limit_impulse);
+            st.apply_pub(j.ia(), imp, ra);
+            st.apply_pub(j.ib(), -imp, rb);
+            j.limit_impulse = 0.0;
+        }
+    }
+}
+
+/// 슬라이더의 축 방향 좌표 `s` (m). 기준(0)은 두 앵커가 겹칠 때이고,
+/// `axis_a`가 가리키는 쪽이 양수다 — 한계·모터가 쓰는 좌표와 **같은 식**이다.
+///
+/// 바디 자세에서 직접 계산한다(솔버 상태가 아니라) — 호스트가 스텝 밖에서 슬라이더
+/// 위치를 읽으려면 그래야 하고, 두 곳이 다른 식을 쓰면 표시값과 한계가 어긋난다.
+pub(crate) fn prismatic_translation(bodies: &[Body], j: &Joint) -> Option<f32> {
+    let JointKind::Prismatic { axis_a, .. } = j.kind else {
+        return None;
+    };
+    let (a, b) = (j.ia(), j.ib());
+    let ra = bodies[a].pose.rot.rotate(j.anchor_a);
+    let rb = bodies[b].pose.rot.rotate(j.anchor_b);
+    let n = bodies[a].pose.rot.rotate(axis_a);
+    Some(n.dot((bodies[b].pose.pos + rb) - (bodies[a].pose.pos + ra)))
 }

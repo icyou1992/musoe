@@ -1641,6 +1641,22 @@ impl World {
             .expect("joint endpoints must be distinct live bodies")
     }
 
+    /// 슬라이더(prismatic) 조인트의 축 방향 위치 `s` (m). 다른 종류이거나 없는
+    /// 인덱스면 `None`. 인덱스는 `try_add_joint`가 돌려준 값이다.
+    ///
+    /// 호스트가 슬라이더의 현재 위치(문이 얼마나 열렸는지 등)를 읽는 경로다 —
+    /// 한계·모터가 쓰는 좌표와 같은 식으로 계산해 표시값과 물리가 어긋나지 않게 한다.
+    pub fn prismatic_translation(&self, joint: usize) -> Option<f32> {
+        let j = self.joints.get(joint)?;
+        // 엔드포인트가 살아 있어야 자세를 읽을 수 있다.
+        if !self.alive.get(j.ia()).copied().unwrap_or(false)
+            || !self.alive.get(j.ib()).copied().unwrap_or(false)
+        {
+            return None;
+        }
+        crate::joint::prismatic_translation(&self.bodies, j)
+    }
+
     /// 조인트 추가 (오류 반환형). 엔드포인트는 **세대까지** 검증한다 — 인덱스만 보면
     /// 제거·재사용된 슬롯의 새 바디에 붙는다(리뷰 BLOCKER: ABA).
     pub fn try_add_joint(&mut self, mut joint: Joint) -> Result<usize, ApiError> {

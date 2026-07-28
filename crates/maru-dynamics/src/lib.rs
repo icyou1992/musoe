@@ -1054,6 +1054,277 @@ mod tests {
         assert!(p.with_motor(1.0, 1.0).is_err());
     }
 
+    // ─────────────── Prismatic (슬라이더) — M4 조인트 세트 ───────────────
+
+    /// 슬라이더 위 바디는 **축 방향으로만** 움직인다.
+    ///
+    /// 중력을 축과 수직으로 두면(축 = x, 중력 = −y) 자유 슬라이더는 y로 떨어지지 않아야
+    /// 한다. 떨어지면 수직 2-DOF 구속이 안 걸린 것이다.
+    #[test]
+    fn prismatic_confines_motion_to_its_axis() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        let axis = maru_math::Vec3::new(1.0, 0.0, 0.0);
+        w.try_add_joint(
+            Joint::try_prismatic(
+                a,
+                b,
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::ZERO,
+                axis,
+                maru_math::Quat::IDENTITY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let y0 = w.body(b).pose().pos.y;
+        for _ in 0..300 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let p = w.body(b).pose().pos;
+        assert!(
+            (p.y - y0).abs() < 0.02,
+            "축에 수직인 중력에 끌려 내려갔다: y {y0} → {}",
+            p.y
+        );
+        assert!(p.z.abs() < 0.02, "축 밖 z로 벗어났다: {}", p.z);
+    }
+
+    /// 슬라이더는 상대 자세를 잠근다 — 축 방향 병진만 남긴다.
+    #[test]
+    fn prismatic_locks_relative_orientation() {
+        let mut w = World::new(WorldParams {
+            gravity: maru_math::Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        w.try_add_joint(
+            Joint::try_prismatic(
+                a,
+                b,
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Quat::IDENTITY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // 축 둘레로 세게 돌려도 각 3-DOF 잠금이 되돌려야 한다.
+        w.set_angular_velocity(b, maru_math::Vec3::new(5.0, 3.0, -2.0))
+            .unwrap();
+        for _ in 0..300 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let q = w.body(b).pose().rot;
+        let angle = 2.0 * (q.x * q.x + q.y * q.y + q.z * q.z).sqrt().min(1.0).asin();
+        assert!(angle < 0.1, "상대 자세가 풀렸다: {angle} rad");
+    }
+
+    /// 축 방향 한계는 슬라이더를 구간 안에 묶는다.
+    #[test]
+    fn prismatic_limit_bounds_travel() {
+        let mut w = World::new(WorldParams {
+            // 중력을 **축 방향**으로 둔다 — 한계를 실제로 밀어붙이는 하중이 필요하다.
+            gravity: maru_math::Vec3::new(-9.81, 0.0, 0.0),
+            ..WorldParams::default()
+        });
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(0.0, 0.0, 0.0));
+        let jh = w
+            .try_add_joint(
+                Joint::try_prismatic(
+                    a,
+                    b,
+                    maru_math::Vec3::ZERO,
+                    maru_math::Vec3::ZERO,
+                    maru_math::Vec3::new(1.0, 0.0, 0.0),
+                    maru_math::Quat::IDENTITY,
+                )
+                .unwrap()
+                .with_limit(-0.5, 0.5)
+                .unwrap(),
+            )
+            .unwrap();
+        for _ in 0..600 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let x = w.body(b).pose().pos.x - w.body(a).pose().pos.x;
+        assert!(
+            x > -0.6,
+            "한계가 없으면 계속 미끄러진다 — 하한을 크게 넘었다: {x}"
+        );
+        assert!(x < 0.6, "상한을 넘었다: {x}");
+        // **호스트가 읽는 좌표와 물리가 같은 식이어야 한다** — 표시값이 따로 놀면
+        // "문이 얼마나 열렸나"가 한계와 어긋난다.
+        let s = w.prismatic_translation(jh).expect("prismatic 좌표");
+        assert!(
+            (s - x).abs() < 1.0e-4,
+            "World가 보고하는 슬라이더 좌표({s})가 실제 변위({x})와 다르다"
+        );
+        // 다른 종류 조인트는 None이어야 한다.
+        let jp = w
+            .try_add_joint(
+                Joint::try_point(a, b, maru_math::Vec3::ZERO, maru_math::Vec3::ZERO).unwrap(),
+            )
+            .unwrap();
+        assert!(w.prismatic_translation(jp).is_none());
+        assert!(w.prismatic_translation(9999).is_none());
+    }
+
+    /// 선형 모터는 목표 속도를 **부호까지** 추종한다.
+    #[test]
+    fn prismatic_motor_drives_toward_target_speed() {
+        let mut w = World::new(WorldParams {
+            gravity: maru_math::Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::ZERO);
+        w.try_add_joint(
+            Joint::try_prismatic(
+                a,
+                b,
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::new(1.0, 0.0, 0.0),
+                maru_math::Quat::IDENTITY,
+            )
+            .unwrap()
+            .with_motor(2.0, 100.0)
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..240 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let vx = w.body(b).linvel().x;
+        // 목표는 **A 기준 B**의 축 방향 속도다. A가 static이므로 그대로 vx여야 한다.
+        assert!(
+            (vx - 2.0).abs() < 0.3,
+            "목표 속도 +2 m/s를 부호까지 추종해야 한다: {vx}"
+        );
+    }
+
+    /// 선형 모터의 최대 힘도 **서브스텝 수에 무관**해야 한다 (hinge 모터와 같은 계약).
+    #[test]
+    fn prismatic_motor_effort_is_independent_of_substeps() {
+        fn push(substeps: u32) -> f32 {
+            let mut w = World::new(WorldParams {
+                gravity: maru_math::Vec3::ZERO,
+                substeps,
+                ..WorldParams::default()
+            });
+            let (a, b) = hung_pair(&mut w, maru_math::Vec3::ZERO);
+            w.try_add_joint(
+                Joint::try_prismatic(
+                    a,
+                    b,
+                    maru_math::Vec3::ZERO,
+                    maru_math::Vec3::ZERO,
+                    maru_math::Vec3::new(1.0, 0.0, 0.0),
+                    maru_math::Quat::IDENTITY,
+                )
+                .unwrap()
+                // 목표를 크게 잡아 모터를 항상 포화시킨다 → 전달량 = 상한 × dt
+                .with_motor(50.0, 0.2)
+                .unwrap(),
+            )
+            .unwrap();
+            w.try_step(1.0 / 60.0).unwrap();
+            w.body(b).linvel().x
+        }
+        let s1 = push(1);
+        let s8 = push(8);
+        assert!(
+            (s1 - s8).abs() < 0.1 * s1.abs().max(1e-6),
+            "substeps만 바꿨는데 모터 전달 임펄스가 달라진다: {s1} vs {s8}"
+        );
+    }
+
+    /// prismatic도 스냅샷을 왕복하고 복원 후 미래가 갈리지 않아야 한다.
+    #[test]
+    fn prismatic_survives_snapshot() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        w.try_add_joint(
+            Joint::try_prismatic(
+                a,
+                b,
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::ZERO,
+                maru_math::Vec3::new(0.0, 1.0, 0.0),
+                maru_math::Quat::IDENTITY,
+            )
+            .unwrap()
+            .with_limit(-1.0, 1.0)
+            .unwrap()
+            .with_motor(0.5, 25.0)
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..30 {
+            w.try_step(1.0 / 60.0).unwrap();
+        }
+        let snap = w.try_snapshot().unwrap();
+        let mut r = World::new(WorldParams::default());
+        r.restore(&snap).unwrap();
+        assert_eq!(r.try_state_hash().unwrap(), w.try_state_hash().unwrap());
+        for _ in 0..30 {
+            w.try_step(1.0 / 60.0).unwrap();
+            r.try_step(1.0 / 60.0).unwrap();
+        }
+        assert_eq!(
+            r.try_state_hash().unwrap(),
+            w.try_state_hash().unwrap(),
+            "복원 후 미래가 갈리면 안 된다"
+        );
+    }
+
+    /// prismatic 파라미터 검증 — 축·자세·한계·모터 전부.
+    #[test]
+    fn prismatic_parameters_are_validated() {
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+        let z = maru_math::Vec3::ZERO;
+        let x = maru_math::Vec3::new(1.0, 0.0, 0.0);
+        let id = maru_math::Quat::IDENTITY;
+        // 0 축 / NaN 축 — **생성 시점에** 걸려야 한다(정규화가 0을 살려내면 안 된다).
+        assert!(Joint::try_prismatic(a, b, z, z, z, id).is_err());
+        assert!(
+            Joint::try_prismatic(a, b, z, z, maru_math::Vec3::new(f32::NAN, 0.0, 0.0), id).is_err()
+        );
+        // 비단위 rel_rot
+        assert!(Joint::try_prismatic(
+            a,
+            b,
+            z,
+            z,
+            x,
+            maru_math::Quat {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 0.0
+            }
+        )
+        .is_err());
+        let ok = Joint::try_prismatic(a, b, z, z, x, id).unwrap();
+        // lo > hi
+        assert!(ok.clone().with_limit(1.0, -1.0).is_err());
+        // NaN 한계
+        assert!(ok.clone().with_limit(0.0, f32::NAN).is_err());
+        // 범위 밖 한계 (앵커 = 셰이프 범위)
+        assert!(ok.clone().with_limit(-1.0, 1.0e9).is_err());
+        // 음수 최대 힘 / NaN 목표 속도
+        assert!(ok.clone().with_motor(1.0, -1.0).is_err());
+        assert!(ok.clone().with_motor(f32::NAN, 1.0).is_err());
+        // 정상값은 통과
+        assert!(ok
+            .with_limit(-1.0, 1.0)
+            .unwrap()
+            .with_motor(1.0, 5.0)
+            .is_ok());
+    }
+
     /// 재질 설정자는 다른 쓰기 경로와 같은 규율을 따른다 — 바꾼 뒤 `validate`를 다시 통과해야 한다.
     #[test]
     fn material_setters_validate() {

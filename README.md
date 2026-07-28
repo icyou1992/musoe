@@ -8,7 +8,7 @@
 |---|---|
 | `maru-math` | 스칼라 `Vec3`/`Quat`/`Mat3` + `Vec3x4`/`Aabbx4`(SoA 4-wide, 핫패스 정본 — 설계 §3) |
 | `maru-collide` | 셰이프(convex radius) · 듀얼 4-ary 트리 브로드페이즈(트리 비의존 canonical 페어) · GJK/EPA · 클리핑 매니폴드(feature ID) |
-| `maru-dynamics` | TGS-soft 솔버(**SoA 제약 블록** — `solver_block`) · PCM warm-start · 아일랜드/슬리핑 · point·hinge 조인트 · 캐노니컬 스냅샷/L0 리플레이 해시 |
+| `maru-dynamics` | TGS-soft 솔버(**SoA 제약 블록** — `solver_block`) · PCM warm-start · 아일랜드/슬리핑 · 조인트 5종(point·hinge·fixed·distance·**prismatic**, 한계·모터) · 캐노니컬 스냅샷/L0 리플레이 해시 |
 | `maru-bench` | 마이크로벤치 + 피라미드 스택 벤치 + 진단 계측기(broadsplit·narrowsplit·boxsplit·cliff·spin) |
 | `maru-wasm` | 브라우저 바인딩 — **flat buffer + C ABI**(wasm-bindgen 없음). 데모: `web/` |
 

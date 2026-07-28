@@ -39,7 +39,9 @@ const MAGIC: u32 = 0x4d41_5255; // "MARU"
 /// **정책 변경은 wire 의미 변경이다.** v4 시절 빌드가 만든 33~1024점 스냅샷은 지금 거부되고,
 /// K-특이 조인트를 담은 v4도 거부된다 — 같은 버전 번호가 다른 계약을 뜻하면 안 되므로 올린다.
 /// (v4: WorldParams·OOB 플래그·앵커/최소 크기 / v3: 예약 슬롯·AddBody 핸들·last_report)
-const VERSION: u32 = 12;
+/// v13: `JointKind::Prismatic`(태그 4) 추가 + `Motor::max_torque` → `max_effort`
+///      (선형 조인트에서 단위가 힘이라 이름이 거짓말이 된다 — wire 값 자체는 그대로).
+const VERSION: u32 = 13;
 
 /// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
 /// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
@@ -514,7 +516,7 @@ fn write_joint(w: &mut Writer, j: &Joint) {
             w.vec3(*axis_a);
             w.vec3(*axis_b);
             write_opt2(w, limit.as_ref().map(|l| [l[0], l[1]]));
-            write_opt2(w, motor.as_ref().map(|m| [m.target_speed, m.max_torque]));
+            write_opt2(w, motor.as_ref().map(|m| [m.target_speed, m.max_effort]));
         }
         JointKind::Fixed { rel_rot } => {
             w.u8(2);
@@ -524,6 +526,18 @@ fn write_joint(w: &mut Writer, j: &Joint) {
             w.u8(3);
             w.f32(*min);
             w.f32(*max);
+        }
+        JointKind::Prismatic {
+            axis_a,
+            rel_rot,
+            limit,
+            motor,
+        } => {
+            w.u8(4);
+            w.vec3(*axis_a);
+            w.quat(*rel_rot);
+            write_opt2(w, limit.as_ref().map(|l| [l[0], l[1]]));
+            write_opt2(w, motor.as_ref().map(|m| [m.target_speed, m.max_effort]));
         }
     }
     w.u8(j.collide_connected as u8);
@@ -576,7 +590,7 @@ fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
             let limit = read_opt2(r)?;
             let motor = read_opt2(r)?.map(|m| crate::joint::Motor {
                 target_speed: m[0],
-                max_torque: m[1],
+                max_effort: m[1],
             });
             JointKind::Hinge {
                 axis_a,
@@ -590,6 +604,21 @@ fn read_joint(r: &mut Reader) -> Result<Joint, SnapshotError> {
             min: r.f32()?,
             max: r.f32()?,
         },
+        4 => {
+            let axis_a = r.vec3()?;
+            let rel_rot = r.quat()?;
+            let limit = read_opt2(r)?;
+            let motor = read_opt2(r)?.map(|m| crate::joint::Motor {
+                target_speed: m[0],
+                max_effort: m[1],
+            });
+            JointKind::Prismatic {
+                axis_a,
+                rel_rot,
+                limit,
+                motor,
+            }
+        }
         _ => return Err(SnapshotError::BadShape),
     };
     let collide_connected = r.u8()? != 0;
@@ -709,6 +738,8 @@ fn joint_size(j: &Joint) -> usize {
             JointKind::Hinge { .. } => 1 + 24 + 9 + 9,
             JointKind::Fixed { .. } => 1 + 16,
             JointKind::Distance { .. } => 1 + 8,
+            // 축 12 + rel_rot 16 + limit(태그1+8) + motor(태그1+8)
+            JointKind::Prismatic { .. } => 1 + 12 + 16 + 9 + 9,
         }
         + 1
         + 12
