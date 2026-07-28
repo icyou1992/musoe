@@ -290,6 +290,26 @@ cd web && cp ../target/wasm32-unknown-unknown/release/maru_wasm.wasm . && python
 게이트에 `wasm32-unknown-unknown` 빌드도 넣었다: wasip1만 통과하면 WASI import가 딸린
 산출물이 브라우저에서 조용히 죽는다.
 
+### 브라우저 실측 (2026-07-28, 헤드리스 크로미엄 v1.60 이미지)
+
+`web/bench.html`(브라우저) ↔ `cargo run --release -p maru-wasm --example abi_bench`(네이티브
+쌍둥이) — 같은 씬·같은 C ABI·같은 기본 파라미터. 드라이버 = `scripts/browser-bench.mjs`
+(호스트에 크로미엄 라이브러리가 없으면 파일 상단의 Docker 명령).
+
+| 씬 | 네이티브 full | 브라우저 full | 세금 | 브라우저 settled |
+|---|---|---|---|---|
+| pyramid20 (210) | 0.321 ms | 0.561 ms | 1.75× | 0.0042 ms |
+| pyramid40 (820) | 2.877 ms | 3.914 ms | 1.36× | 0.0050 ms |
+| spheres500 | 0.184 ms | 0.285 ms | 1.55× | 0.0042 ms |
+| spheres3000 | 1.968 ms | 2.767 ms | 1.41× | 0.0167 ms |
+
+- **브라우저 세금 ≈ 1.4–1.75×**, 정확성은 lowest/top이 네이티브와 소수 3자리 일치.
+- 설계 기준선(Havok WASM ~3,000 동적 바디 @60fps 단일스레드) 대비: spheres3000이
+  브라우저에서 2.77 ms/step — 60fps 예산(16.6 ms)의 **6배 여유**로 통과.
+- 이 실측이 잡은 BLOCKER: 진단 계측의 `Instant::now()`가 wasm32-unknown-unknown에서
+  panic→trap이라 **브라우저에서 엔진이 한 스텝도 못 돌았다**(WASI 게이트는 시계가
+  있어 못 잡는 사각지대). `Stopwatch` 심으로 그 타깃에서만 no-op.
+
 ## 조인트 · 감쇠 · 지형 (2026-07-27 신규)
 
 ```rust

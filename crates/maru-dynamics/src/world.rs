@@ -280,6 +280,36 @@ pub struct World {
     island_parent: Vec<usize>,
 }
 
+/// 진단 계측용 시계 — **wasm32-unknown-unknown에는 시계가 없다.**
+/// `Instant::now()`가 그 타깃에서 panic(=trap)하므로(브라우저 실측에서 첫 스텝에
+/// 발견 — WASI 게이트는 시계가 있어 못 잡는 사각지대), 진단 타이밍은 no-op으로
+/// 접는다. 브라우저 프로파일은 호스트의 `performance.now()` 몫이다.
+#[derive(Clone, Copy)]
+struct Stopwatch(
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))] std::time::Instant,
+);
+
+impl Stopwatch {
+    #[inline]
+    fn start() -> Self {
+        Self(
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            std::time::Instant::now(),
+        )
+    }
+    #[inline]
+    fn ns(self) -> u64 {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            self.0.elapsed().as_nanos() as u64
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            0
+        }
+    }
+}
+
 /// 읽기 전용 진단 (엔진 캐노니컬 상태가 아니다 — 스냅샷·해시에 포함되지 않는다).
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Diagnostics {
@@ -1780,7 +1810,7 @@ impl World {
         };
 
         // 1) 브로드페이즈 — canonical 페어 (트리 비의존 계약은 maru-collide가 보장)
-        let _t_aabb = std::time::Instant::now();
+        let _t_aabb = Stopwatch::start();
         let mut dyn_items: Vec<(u32, Aabb)> = Vec::new();
         let mut static_items: Vec<(u32, Aabb)> = Vec::new();
         // **캐시를 쓸 스텝이면 AABB를 아예 만들지 않는다.** 페어 캐시가 유효하면 아래에서
@@ -1893,8 +1923,8 @@ impl World {
                 ));
             }
         }
-        self.diag.phase_ns[0] = _t_aabb.elapsed().as_nanos() as u64;
-        let _t_bp = std::time::Instant::now();
+        self.diag.phase_ns[0] = _t_aabb.ns();
+        let _t_bp = Stopwatch::start();
         // 예산은 **살아있는 바디 수** 기준(슬롯 수가 아니라) + 절대 개수 상한 + **바이트 상한**.
         // 개수만 묶으면 페어 뒤에 따라붙는 constraint·키·HashSet·SoA가 남는다 —
         // 한 스텝이 잡을 수 있는 총 바이트를 정해 그것으로 페어 상한을 되돌려 계산한다.
@@ -2024,7 +2054,7 @@ impl World {
         let mut touch_sorted: Vec<(u32, u32)> = Vec::new();
         // 색 범위 [start,end) — Unit 3b SIMD warm_start 배치 디스패치용. 색은 최대 64개.
         let mut color_ranges: Vec<(u32, u32)> = Vec::new();
-        let _t_res = std::time::Instant::now();
+        let _t_res = Stopwatch::start();
         if constraints.try_reserve(ncap).is_err()
             || color_ranges
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
@@ -2055,7 +2085,7 @@ impl World {
             self.resource_limit = true;
             return;
         }
-        self.diag.sub_ns[0] = _t_res.elapsed().as_nanos() as u64;
+        self.diag.sub_ns[0] = _t_res.ns();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본).
         // excluded는 위 통합 블록에서 선점됨(실패 bail이 bp_pairs를 복원 — 캐시 재사용 스텝에
         // 빈 페어 집합이 유효 캐시로 남던 BLOCKER 차단, 교차검수 rev_ba3ca887). 여기선 채운다.
@@ -2120,7 +2150,7 @@ impl World {
         // `active`의 **초집합** 술어 — 뚱뚱한 `Body`를 안 건드리고 Vec<bool> 두 개만 읽는다.
         // static은 여기 쓰지 않는다(페어의 STATIC_BIT가 이미 구분한다). 근거는 호출부 주석.
         let maybe_active = |i: usize, this: &Self| !this.asleep[i] && !this.oob[i];
-        let _t_wake = std::time::Instant::now();
+        let _t_wake = Stopwatch::start();
         // **순회 제한 판정** — 활성 집합이 R에 포함되는가. 전체 스윕의 "첫 wake"는 스윕 시작
         // 상태에서 활성인 끝점을 가지므로, 활성 ⊆ R이면 그 페어는 반드시 fresh(R 접촉)에 있다.
         // 따라서 fresh **드라이런**(무변이)이 후보를 못 찾으면 전체 스윕은 no-op이 증명되고,
@@ -2238,26 +2268,26 @@ impl World {
         // 그러면 활성 끝점을 가진 페어의 정확한 상집합이 여전히 fresh다.
         let narrow_restricted = active_subset_of_r && !need_full_sweep;
 
-        self.diag.sub_ns[1] = _t_wake.elapsed().as_nanos() as u64;
-        self.diag.phase_ns[1] = _t_bp.elapsed().as_nanos() as u64;
-        let _t_np = std::time::Instant::now();
+        self.diag.sub_ns[1] = _t_wake.ns();
+        self.diag.phase_ns[1] = _t_bp.ns();
+        let _t_np = Stopwatch::start();
         // 2) 내로우페이즈 → 제약 준비 (A=첫 인덱스, B=둘째 — canonical 순서가 곧 해석 순서)
         //    PCM 캐시에서 feature 일치 접점의 임펄스를 warm load (설계 §3)
         // 제약 컨테이너도 페어 수 기준으로 **미리 fallible 예약**한다 — 접촉 페어마다
         // 암묵 성장이 일어나면 그 재할당이 abort가 된다.
         // constraints·constraint_keys·live_keys는 wake 이전에 선점됨 (위) — 여기선 채워 쓴다.
         let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
-        let _t_nw = std::time::Instant::now();
+        let _t_nw = Stopwatch::start();
         // 직전 기준선을 페어와 **같은 전순서**로 정렬해 둔다(둘 다 (a, b_raw) 오름차순).
         // 아래 루프가 단조 포인터 하나로 훑으므로 페어당 비용은 비교 1회다.
         // 제한 모드에서는 병합을 안 쓰므로(작은 fresh만 돌고 기준선은 touching 쪽에서 처리)
         // 정렬 자체를 건너뛴다.
-        let _t_sort = std::time::Instant::now();
+        let _t_sort = Stopwatch::start();
         if !narrow_restricted {
             touch_sorted.extend(self.touching.iter().copied());
             touch_sorted.sort_unstable();
         }
-        self.diag.sub_ns[4] = _t_sort.elapsed().as_nanos() as u64;
+        self.diag.sub_ns[4] = _t_sort.ns();
         self.diag.touching = self.touching.len();
         // **제한 모드의 dormant 기준선 보존** — 전체 경로는 24810 페어를 걸으며 dormant 분기에서
         // 보존했지만, 제한 모드에서는 같은 교집합을 touching(수백~수천) 쪽에서 O(1) 마스크
@@ -2435,7 +2465,7 @@ impl World {
             }
         }
 
-        self.diag.sub_ns[2] = _t_nw.elapsed().as_nanos() as u64;
+        self.diag.sub_ns[2] = _t_nw.ns();
 
         // **중력 방향 정렬** — Gauss-Seidel은 제약 순서에 민감하다. 스택에서 지지력은
         // 바닥에서 위로 전파되는데, 브로드페이즈가 내놓은 순서로 풀면 한 스윕에 한 층씩만
@@ -2523,8 +2553,8 @@ impl World {
             color_ranges.push((0, constraints.len() as u32));
         }
 
-        self.diag.phase_ns[2] = _t_np.elapsed().as_nanos() as u64;
-        let _t_sv = std::time::Instant::now();
+        self.diag.phase_ns[2] = _t_np.ns();
+        let _t_sv = Stopwatch::start();
         // 3) TGS-soft 서브스텝 루프
         let g = self.params.gravity;
         // 조인트는 접촉보다 강성 (Box2D v3: 2×contact hertz, ζ=2)
@@ -2843,9 +2873,9 @@ impl World {
             solver::apply_restitution(&mut st, c, self.params.solver.restitution_threshold);
         }
 
-        self.diag.phase_ns[3] = _t_sv.elapsed().as_nanos() as u64;
-        let _t_post = std::time::Instant::now();
-        let _t_wb = std::time::Instant::now();
+        self.diag.phase_ns[3] = _t_sv.ns();
+        let _t_post = Stopwatch::start();
+        let _t_wb = Stopwatch::start();
         st.write_back(&mut self.bodies, &self.alive);
         self.solver_state = st;
 
@@ -2862,8 +2892,8 @@ impl World {
         self.bp_pairs = pairs;
         self.bp_valid = !moved;
         self.bp_dt = dt;
-        self.diag.post_ns[0] = _t_wb.elapsed().as_nanos() as u64;
-        let _t_ev = std::time::Instant::now();
+        self.diag.post_ns[0] = _t_wb.ns();
+        let _t_ev = Stopwatch::start();
 
         // 5-a) **접촉 이벤트** = 직전 기준선(`touching`)과 이번 `live_keys`의 차집합.
         //
@@ -2909,8 +2939,8 @@ impl World {
         // 기준선 갱신 — 다음 스텝의 이벤트가 이 집합과의 차집합이다.
         self.touching.clear();
         self.touching.extend(live_keys.iter().copied());
-        self.diag.post_ns[1] = _t_ev.elapsed().as_nanos() as u64;
-        let _t_pcm = std::time::Instant::now();
+        self.diag.post_ns[1] = _t_ev.ns();
+        let _t_pcm = Stopwatch::start();
 
         // 5) PCM 캐시 갱신. **잠든 페어의 엔트리는 보존**한다 — 전체 clear는 첫 수면 스텝에
         //    지속 매니폴드를 날려, 나중에 깨어날 때 warm start 없이 거칠게 재정착한다(리뷰 지적).
@@ -2970,11 +3000,11 @@ impl World {
                 existing.extend(entry);
             }
         }
-        self.diag.post_ns[2] = _t_pcm.elapsed().as_nanos() as u64;
+        self.diag.post_ns[2] = _t_pcm.ns();
 
         // 6) 아일랜드 union-find (동적-동적 edge만 — static은 anchor 전용, 설계 §4.3)
         //    + island 단위 일괄 sleep (설계 §4.6)
-        let _t_isl = std::time::Instant::now();
+        let _t_isl = Stopwatch::start();
         let n = self.bodies.len();
         // 선점은 스텝 시작에 끝났다 — 여기서 실패할 수 없다.
         let mut parent = std::mem::take(&mut self.island_parent);
@@ -3052,10 +3082,10 @@ impl World {
             }
         }
         self.island_parent = parent;
-        self.diag.sub_ns[3] = _t_isl.elapsed().as_nanos() as u64;
+        self.diag.sub_ns[3] = _t_isl.ns();
 
         self.joints = joints;
-        let _t_hyg = std::time::Instant::now();
+        let _t_hyg = Stopwatch::start();
 
         // 7) denormal 위생 (설계 §8 flush 지점)
         // 잠든 바디는 건너뛴다 — 속도가 정확히 0이다(이번 스텝에 잠든 바디는 위 6절이 방금
@@ -3082,8 +3112,8 @@ impl World {
         self.enforce_world_bounds();
         // 캐시는 insert 시점에 닫았다(위 5절) — 그 hit도 이 스텝의 포화 카운트다.
         self.diag.state_saturations = cache_sat_hits + self.close_state_policy();
-        self.diag.post_ns[3] = _t_hyg.elapsed().as_nanos() as u64;
-        self.diag.phase_ns[4] = _t_post.elapsed().as_nanos() as u64;
+        self.diag.post_ns[3] = _t_hyg.ns();
+        self.diag.phase_ns[4] = _t_post.ns();
     }
 }
 

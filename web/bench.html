@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8" /><title>Maru — 브라우저 벤치</title></head>
+<body>
+<pre id="out">준비 중…</pre>
+<script type="module">
+// 브라우저 wasm 실측 — compare 하네스와 같은 씬 기하를 C ABI로 재현한다.
+// 네이티브 쌍둥이는 crates/maru-wasm/examples/abi_bench.rs (같은 씬·같은 ABI·같은 기본
+// 파라미터). 두 결과의 비율이 곧 "브라우저 세금"이다. 렌더 없음 — 스텝 루프만 잰다.
+const SHAPE_SPHERE = 0, SHAPE_BOX = 1;
+const BODY_STATIC = 0, BODY_DYNAMIC = 1;
+const STRIDE = 7, IDENT = [0, 0, 0, 1];
+
+const { instance } = await WebAssembly.instantiateStreaming(fetch('./maru_wasm.wasm'), {});
+const m = instance.exports;
+
+function buildPyramid(w, tiers) {
+  m.maru_add_body(w, BODY_STATIC, SHAPE_BOX, 200, 1, 40, 0, 0, -1, 0, ...IDENT, 1);
+  for (let t = 0; t < tiers; t++) {
+    const count = tiers - t, y = 0.5 + t;
+    for (let i = 0; i < count; i++) {
+      const x = (i - (count - 1) * 0.5) * 1.02;
+      m.maru_add_body(w, BODY_DYNAMIC, SHAPE_BOX, 0.5, 0.5, 0.5, 0, x, y, 0, ...IDENT, 1);
+    }
+  }
+}
+
+function buildSpheres(w, n) {
+  m.maru_add_body(w, BODY_STATIC, SHAPE_BOX, 30, 1, 30, 0, 0, -1, 0, ...IDENT, 1);
+  const side = Math.ceil(Math.cbrt(n));
+  let count = 0;
+  outer: for (let iy = 0; iy < side * 3; iy++) {
+    for (let ix = 0; ix < side; ix++) {
+      for (let iz = 0; iz < side; iz++) {
+        if (count >= n) break outer;
+        const x = ix * 1.1 - side * 0.55, z = iz * 1.1 - side * 0.55, y = 0.55 + iy * 1.1;
+        m.maru_add_body(w, BODY_DYNAMIC, SHAPE_SPHERE, 0.5, 0, 0, 0, x, y, z, ...IDENT, 1);
+        count++;
+      }
+    }
+  }
+}
+
+function runScene(name, build, steps) {
+  const w = m.maru_world_create(0, -9.81, 0, 0);   // 기본 파라미터(프로덕션: substep4·수면0.1)
+  build(w);
+  const dt = 1 / 60;
+  const times = new Float64Array(steps);
+  for (let s = 0; s < steps; s++) {
+    const t0 = performance.now();
+    const r = m.maru_step(w, dt);
+    times[s] = performance.now() - t0;
+    if (r !== 0) throw new Error(`${name}: step ${s} -> ${r}`);
+  }
+  // 검증값: 최저/최고 y — 시뮬레이션이 실제로 유효했는지(SIMD 브라우저 경로 정합) 확인.
+  const n = m.maru_slot_count(w);
+  const base = m.maru_transforms_ptr(w) >>> 2;
+  const t = new Float32Array(m.memory.buffer);
+  let lowest = Infinity, top = -Infinity;
+  for (let i = 1; i < n; i++) {              // 0번은 바닥
+    const y = t[base + i * STRIDE + 1];
+    lowest = Math.min(lowest, y); top = Math.max(top, y);
+  }
+  m.maru_world_destroy(w);
+  const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
+  const full = avg(Array.from(times));
+  const settled = avg(Array.from(times.slice(steps / 2)));   // 후반창 — 과도구간 오염 방지
+  return { name, bodies: n - 1, steps, full_ms: +full.toFixed(3), settled_ms: +settled.toFixed(4),
+           lowest: +lowest.toFixed(3), top: +top.toFixed(3) };
+}
+
+const results = [];
+for (const [name, build, steps] of [
+  ['pyramid20', w => buildPyramid(w, 20), 240],
+  ['pyramid40', w => buildPyramid(w, 40), 240],
+  ['spheres500', w => buildSpheres(w, 500), 240],
+  ['spheres3000', w => buildSpheres(w, 3000), 240],
+]) {
+  results.push(runScene(name, build, steps));
+  document.getElementById('out').textContent = JSON.stringify(results, null, 2);
+  await new Promise(r => setTimeout(r, 0));   // 씬 사이 이벤트 루프 양보
+}
+window.__RESULTS__ = results;
+document.title = 'DONE';
+</script>
+</body>
+</html>
