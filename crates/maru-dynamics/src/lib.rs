@@ -1374,6 +1374,99 @@ mod tests {
         }
     }
 
+    /// **f32 정규화는 비트 멱등이 아니다** — `normalize`를 두 번 적용하면 값이 1 ULP
+    /// 왔다 갔다 하는 주기 2 진동이 생긴다. 그래서 정규화를 여러 경계에서 반복하면
+    /// 적용 횟수의 홀짝에 따라 값이 갈리고, 삽입(2회)과 복원(3회)이 다른 표현을 갖는다
+    /// (교차검수 rev_2001abc9 NEW_DEFECT).
+    ///
+    /// **스텝을 돌리지 않고** 왕복해야 저장된 표현 자체를 시험한다. 복원도 두 번 한다 —
+    /// 한 번만 보면 주기 2 진동을 놓친다.
+    #[test]
+    fn quaternion_canonicalization_is_bitwise_idempotent_across_boundaries() {
+        // 검수가 제시한 반례. norm² = 0.95096 — 합법 범위 안이고 단위가 아니다.
+        let loose = maru_math::Quat {
+            x: -0.03805745,
+            y: 0.05848086,
+            z: -0.5699489,
+            w: 0.788194,
+        };
+        // 이 값이 실제로 진동하는 부류인지 먼저 확인한다 — 아니면 테스트가 무의미하다.
+        let n1 = loose.normalize();
+        let n2 = n1.normalize();
+        assert_ne!(
+            (
+                n1.x.to_bits(),
+                n1.y.to_bits(),
+                n1.z.to_bits(),
+                n1.w.to_bits()
+            ),
+            (
+                n2.x.to_bits(),
+                n2.y.to_bits(),
+                n2.z.to_bits(),
+                n2.w.to_bits()
+            ),
+            "반례가 더 이상 진동하지 않는다 — 이 테스트는 아무것도 증명하지 못한다"
+        );
+        // 캐노니컬화는 몇 번을 적용해도 같은 비트여야 한다.
+        let c1 = loose.try_canonicalize().unwrap();
+        let c2 = c1.try_canonicalize().unwrap();
+        let c3 = c2.try_canonicalize().unwrap();
+        assert_eq!(c1.x.to_bits(), c2.x.to_bits());
+        assert_eq!(c1.w.to_bits(), c3.w.to_bits());
+
+        for prismatic in [false, true] {
+            let mut w = World::new(WorldParams::default());
+            let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+            let j = if prismatic {
+                Joint::try_prismatic(
+                    a,
+                    b,
+                    maru_math::Vec3::ZERO,
+                    maru_math::Vec3::ZERO,
+                    maru_math::Vec3::new(1.0, 0.0, 0.0),
+                    loose,
+                )
+                .unwrap()
+            } else {
+                Joint::try_fixed(a, b, maru_math::Vec3::ZERO, maru_math::Vec3::ZERO, loose).unwrap()
+            };
+            w.try_add_joint(j).unwrap();
+            // **스텝 없이** 바로 왕복 — 저장된 표현 자체를 본다.
+            let snap = w.try_snapshot().unwrap();
+            let mut r = World::new(WorldParams::default());
+            r.restore(&snap).unwrap();
+            assert_eq!(
+                r.try_state_hash().unwrap(),
+                w.try_state_hash().unwrap(),
+                "prismatic={prismatic}: 왕복만으로 상태 해시가 갈렸다"
+            );
+            // 두 번째 왕복 — 주기 2 진동은 여기서 드러난다.
+            let snap2 = r.try_snapshot().unwrap();
+            assert_eq!(
+                snap, snap2,
+                "prismatic={prismatic}: 재직렬화 바이트가 갈렸다"
+            );
+            let mut r2 = World::new(WorldParams::default());
+            r2.restore(&snap2).unwrap();
+            assert_eq!(
+                r2.try_state_hash().unwrap(),
+                w.try_state_hash().unwrap(),
+                "prismatic={prismatic}: 두 번째 복원에서 갈렸다"
+            );
+            // 스텝을 돌려도 미래가 같아야 한다.
+            for _ in 0..20 {
+                w.try_step(1.0 / 60.0).unwrap();
+                r2.try_step(1.0 / 60.0).unwrap();
+            }
+            assert_eq!(
+                r2.try_state_hash().unwrap(),
+                w.try_state_hash().unwrap(),
+                "prismatic={prismatic}: 복원 후 미래가 갈렸다"
+            );
+        }
+    }
+
     /// prismatic 파라미터 검증 — 축·자세·한계·모터 전부.
     #[test]
     fn prismatic_parameters_are_validated() {

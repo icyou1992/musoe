@@ -219,7 +219,10 @@ impl Reader<'_> {
         if !(0.9..=1.1).contains(&l2) {
             return Err(SnapshotError::NonFinite);
         }
-        Ok(q.normalize())
+        // **`normalize`가 아니라 `try_canonicalize`다.** f32 정규화는 비트 멱등이 아니라
+        // (주기 2 진동), 쓰기 쪽이 이미 정규화한 값을 리더가 한 번 더 정규화하면
+        // 왕복만으로 상태 해시가 갈린다 — 바디 자세와 조인트 `rel_rot` 양쪽에 걸린다.
+        q.try_canonicalize().ok_or(SnapshotError::NonFinite)
     }
     fn handle(&mut self) -> Result<BodyHandle, SnapshotError> {
         Ok(BodyHandle {

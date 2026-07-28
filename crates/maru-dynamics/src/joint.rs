@@ -228,13 +228,13 @@ impl Joint {
         use crate::world::ApiError;
         match &mut self.kind {
             JointKind::Fixed { rel_rot } => {
-                *rel_rot = rel_rot.try_normalize().ok_or(ApiError::InvalidValue)?;
+                *rel_rot = rel_rot.try_canonicalize().ok_or(ApiError::InvalidValue)?;
             }
             JointKind::Prismatic {
                 axis_a, rel_rot, ..
             } => {
                 *axis_a = axis_a.try_normalize().ok_or(ApiError::InvalidValue)?;
-                *rel_rot = rel_rot.try_normalize().ok_or(ApiError::InvalidValue)?;
+                *rel_rot = rel_rot.try_canonicalize().ok_or(ApiError::InvalidValue)?;
             }
             JointKind::Hinge { axis_a, axis_b, .. } => {
                 *axis_a = axis_a.try_normalize().ok_or(ApiError::InvalidValue)?;
