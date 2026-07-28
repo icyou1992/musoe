@@ -2064,7 +2064,13 @@ impl World {
             + core::mem::size_of::<u32>()                                // grouped
             + core::mem::size_of::<Option<ContactConstraint>>()          // c_tmp (거의 한 벌 더)
             + core::mem::size_of::<(u32, u32)>()                         // new_keys
-            + core::mem::size_of::<solver_block::ContactBlock>() / 4      // SoA 블록(제약 4개당 1개)
+            // SoA 솔버 블록 3종. **개수 상한을 페어 수로 되돌려 계산한다**:
+            // 블록·block_starts는 제약 4개를 소비하므로 ≤ ⌊n/4⌋, `work` 항목은 하나가
+            // 최소 제약 1개를 소비하므로 ≤ n (색마다 4청크 + 꼬리 1개인데, 꼬리도 제약을
+            // 최소 1개 쓴다). 나눗셈은 **올림**이다 — 내림으로 깎으면 상한이 상한이 아니다.
+            + core::mem::size_of::<solver_block::ContactBlock>().div_ceil(4)
+            + core::mem::size_of::<usize>().div_ceil(4)                  // block_starts
+            + core::mem::size_of::<solver_block::Work>()                 // work
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
                   // per-body(슬롯당) 스크래치 전부: SolverState 7배열 + inv_inertia_local + ext_force +
                   // damping + 게이트 2 + island_parent + 컬러 body_color/conflict. 총상한에서 먼저 뺀다.
@@ -2191,14 +2197,16 @@ impl World {
         let mut work: Vec<solver_block::Work> = Vec::new();
         let _t_res = Stopwatch::start();
         if constraints.try_reserve(ncap).is_err()
+            // 여유 상수(`+1`·`+64`)를 붙이지 않는다: 페어가 0이면 이 버퍼들도 0이어야
+            // 총 바이트 회계(위 `per_pair_bytes`)가 실제 선점과 일치한다.
+            // 예산이 0페어로 잘린 월드에서 상수만큼 더 잡으면 128 MiB 계약을 넘긴다
+            // (교차검수 rev_d4f505e6 MAJOR).
             || self
                 .contact_blocks
-                .try_reserve((ncap / 4 + 1).saturating_sub(self.contact_blocks.len()))
+                .try_reserve((ncap / 4).saturating_sub(self.contact_blocks.len()))
                 .is_err()
-            || block_starts.try_reserve(ncap / 4 + 1).is_err()
-            || work
-                .try_reserve(ncap / 4 + solver::COLOR_OVERFLOW as usize + 2)
-                .is_err()
+            || block_starts.try_reserve(ncap / 4).is_err()
+            || work.try_reserve(ncap).is_err()
             || color_ranges
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
                 .is_err()
