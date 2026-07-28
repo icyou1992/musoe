@@ -4734,6 +4734,7 @@ mod tests {
         let (mut b, hb) = build(true); // 전체 재빌드 (대조군)
         assert_eq!(ha.len(), hb.len());
         let mut incr_steps = 0usize;
+        let mut limited_event_steps = 0usize;
         for step in 0..460 {
             // 중간 이벤트: 임펄스(정착 후) · 바디 추가 — 양쪽 동일 적용
             if step == 340 {
@@ -4749,9 +4750,19 @@ mod tests {
             a.step(DT);
             b.step(DT);
             incr_steps += a.diagnostics().bp_incremental as usize;
+            if a.diagnostics().narrow_limited && !a.contact_events().is_empty() {
+                limited_event_steps += 1;
+            }
             assert!(
                 !b.diagnostics().bp_incremental,
                 "대조군이 증분을 탔다 — 노브 고장, 테스트 무의미"
+            );
+            // 이벤트는 스냅샷 밖이다 — 제한 모드의 **델타 이벤트**(fresh에서만 차집합)가
+            // 전체 차집합과 같은 이벤트를 내는지 명시적으로 대조한다.
+            assert_eq!(
+                a.contact_events(),
+                b.contact_events(),
+                "step {step}: 증분 이벤트가 전체 재빌드 이벤트에서 이탈"
             );
             assert_eq!(
                 a.snapshot(),
@@ -4759,6 +4770,10 @@ mod tests {
                 "step {step}: 증분 궤적이 전체 재빌드 궤적에서 이탈"
             );
         }
+        assert!(
+            limited_event_steps > 0,
+            "제한 모드에서 이벤트가 발생한 스텝이 없다 — 델타 이벤트 경로가 검증되지 않았다"
+        );
         assert!(
             incr_steps > 60,
             "증분 경로가 거의 안 돌았다({incr_steps}스텝) — 테스트가 아무것도 증명 안 함"

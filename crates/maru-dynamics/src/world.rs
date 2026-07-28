@@ -246,6 +246,8 @@ pub struct World {
     /// 비트 동일하다 → **재사용은 근사가 아니라 항등**이다. 전원이 잠든 스택에서 매 스텝
     /// 트리 두 개를 새로 짓던 비용이 사라진다(10단 실측: 브로드페이즈가 스텝의 39%였다).
     bp_pairs: Vec<(u32, u32)>,
+    /// 증분 병합의 출력 버퍼 — `bp_pairs`와 핑퐁하며 재사용한다(캐노니컬 아님).
+    bp_pairs_scratch: Vec<(u32, u32)>,
     /// 캐시가 유효한가. 구조 변경·변이·적분이 있으면 무효화된다.
     bp_valid: bool,
     /// 캐시를 만들 때의 dt (sweep AABB가 dt에 비례하므로 바뀌면 무효).
@@ -329,6 +331,8 @@ pub struct Diagnostics {
     pub bp_reused: bool,
     /// 이번 스텝이 증분 브로드페이즈(움직인 바디만 갱신 + 페어 델타)를 탔는가.
     pub bp_incremental: bool,
+    /// 이번 스텝이 제한 순회(활성⊆R 증명 → wake/narrow/이벤트를 fresh로 한정)를 탔는가.
+    pub narrow_limited: bool,
     /// 이번 스텝 CCD linear cast가 이동을 절단한 횟수 (서브스텝×바디 누적).
     pub ccd_clamps: usize,
     /// 단계별 소요 (ns) — 프로파일용.
@@ -483,6 +487,7 @@ impl World {
             diag: Diagnostics::default(),
             resource_limit: false,
             bp_pairs: Vec::new(),
+            bp_pairs_scratch: Vec::new(),
             bp_valid: false,
             bp_dt: 0.0,
             bp: None,
@@ -1994,21 +1999,30 @@ impl World {
             // 결과는 전체 재빌드와 비트 동일하다 — 등가 논증은 incremental_pairs_bounded 문서에.
             self.diag.bp_incremental = true;
             let bp = self.bp.as_mut().expect("incremental ⇒ bp 존재");
-            bp.refresh_dynamic(&bp_updates);
+            if !bp.refresh_dynamic(&bp_updates) {
+                // 슬롯 캐시 할당 실패(첫 증분 스텝) — 구조를 버려 재빌드 폴백으로.
+                self.invalidate_bp();
+                self.resource_limit = true;
+                return;
+            }
             moved_mask = vec![false; self.bodies.len()];
             for &r in &moved_ids {
                 moved_mask[r as usize] = true;
             }
             let prev = std::mem::take(&mut self.bp_pairs);
-            match bp.incremental_pairs_bounded(&moved_ids, &moved_mask, &prev, budget) {
-                Some((p, fresh)) => {
+            // 병합 출력은 영속 스크래치 — 직전 prev 버퍼와 핑퐁해 워밍업 후 재할당이 없다.
+            let mut out = std::mem::take(&mut self.bp_pairs_scratch);
+            match bp.incremental_pairs_bounded(&moved_ids, &moved_mask, &prev, budget, &mut out) {
+                Some(fresh) => {
                     fresh_pairs = Some(fresh);
-                    p
+                    self.bp_pairs_scratch = prev;
+                    out
                 }
                 None => {
                     // 아이템은 이미 갱신됐는데 페어는 옛것 — 구조를 통째로 버려 다음 스텝이
                     // 재빌드하게 한다(스텝은 상태 불변으로 종료: 여기는 wake 폐쇄 이전이다).
                     self.bp_pairs = prev;
+                    self.bp_pairs_scratch = out;
                     self.invalidate_bp();
                     self.resource_limit = true;
                     return;
@@ -2267,6 +2281,7 @@ impl World {
         // 제한 narrow의 조건: 활성 ⊆ R **이고 이번 스텝에 아무도 깨지 않았다** —
         // 그러면 활성 끝점을 가진 페어의 정확한 상집합이 여전히 fresh다.
         let narrow_restricted = active_subset_of_r && !need_full_sweep;
+        self.diag.narrow_limited = narrow_restricted;
 
         self.diag.sub_ns[1] = _t_wake.ns();
         self.diag.phase_ns[1] = _t_bp.ns();
@@ -2289,12 +2304,22 @@ impl World {
         }
         self.diag.sub_ns[4] = _t_sort.ns();
         self.diag.touching = self.touching.len();
-        // **제한 모드의 dormant 기준선 보존** — 전체 경로는 24810 페어를 걸으며 dormant 분기에서
-        // 보존했지만, 제한 모드에서는 같은 교집합을 touching(수백~수천) 쪽에서 O(1) 마스크
-        // 판정으로 얻는다. 근거: t ∈ touching ⊆ 직전 pairs이고 ¬R접촉이면 t ∈ prev_minus ⊆
-        // 이번 pairs(증분 등가 논증) — 그리고 활성 ⊆ R ∧ 무wake이므로 ¬R접촉 페어는 전부
-        // dormant다. R접촉 키는 아래 fresh 순회의 dormant 분기가 담당한다(이중 삽입 없음).
-        // 필터 순서는 전체 경로의 dormant 분기와 동일(제외 → 그룹, rev_7f7bb07c).
+        // **제한 모드의 dormant 기준선** — 예전에는 touching 전량(수천)을 필터 재검사 후
+        // live_keys에 재삽입하고, 이벤트 패스가 그 전량을 양방향 대조한 뒤 기준선을 통째로
+        // 재구축했다(스텝당 해시 연산 ~4×|touching|). 지금은 **잔류를 기본값**으로 한다:
+        //
+        // 비-fresh(¬R접촉) 기준선 키는 필터 입력이 전 스텝과 동일하다 —
+        // ① 그룹(membership/filter)은 생성 후 불변(런타임 setter 없음)
+        // ② excluded는 add_joint로만 늘고, add_joint는 양끝을 깨워 그 스텝은 활성⊄R
+        //    (제거 API 없음). 필터가 거부한 키는 그 스텝에 이미 touching에서 떨어졌다.
+        // ③ 그 밖의 변이는 전부 wake 또는 invalidate_bp 경유 — 제한 모드 전제가 깨진다.
+        // 따라서 touching에 있었다 = 전 스텝 필터 통과 = 이번에도 통과. 재검사 없이 잔류하고,
+        // 그 논증을 debug_assert로 잠근다. **live_keys는 제한 모드에서 fresh 전용**이 되고,
+        // 이벤트·기준선 갱신·PCM retain이 전부 fresh 델타로 내려간다(아래 5-a).
+        //
+        // R접촉 기준선 키는 여기서 touch_sorted(제한 모드에서 병합 정렬이 안 쓰는 예약
+        // 스크래치 — 용량 = |touching| 선점 완료)에 모아 이벤트 패스의 Stopped 후보로 쓴다.
+        // 판정 자체는 아래 fresh 순회의 dormant 분기가 담당한다(rev_7f7bb07c 필터 순서 유지).
         if narrow_restricted {
             for &key in self.touching.iter() {
                 let (a_id, b_raw) = key;
@@ -2302,17 +2327,18 @@ impl World {
                 let r_touch = moved_mask[a_id as usize]
                     || (b_raw & STATIC_BIT == 0 && moved_mask[b_plain as usize]);
                 if r_touch {
+                    touch_sorted.push(key);
                     continue;
                 }
-                if !excluded.is_empty()
-                    && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain)))
-                {
-                    continue;
-                }
-                if !groups_collide(&self.bodies[a_id as usize], &self.bodies[b_plain as usize]) {
-                    continue;
-                }
-                live_keys.insert(key);
+                debug_assert!(
+                    excluded.is_empty()
+                        || !excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))),
+                    "dormant 기준선 키가 excluded에 있다 — 잔류 논증 붕괴(조인트 변이 경로가 wake를 안 함?)"
+                );
+                debug_assert!(
+                    groups_collide(&self.bodies[a_id as usize], &self.bodies[b_plain as usize]),
+                    "dormant 기준선 키가 그룹 필터에 거부됐다 — 그룹이 wake 없이 변이됐다"
+                );
             }
         }
         let narrow_pairs: &[(u32, u32)] = if narrow_restricted {
@@ -2895,24 +2921,58 @@ impl World {
         self.diag.post_ns[0] = _t_wb.ns();
         let _t_ev = Stopwatch::start();
 
-        // 5-a) **접촉 이벤트** = 직전 기준선(`touching`)과 이번 `live_keys`의 차집합.
+        // 5-a) **접촉 이벤트** = 직전 기준선(`touching`)과 이번 라이브 집합의 차집합.
         //
-        // 잠든 페어도 `live_keys`에 들어가므로 수면이 종료 이벤트를 거짓 발생시키지 않는다.
+        // 잠든 페어도 라이브에 남으므로 수면이 종료 이벤트를 거짓 발생시키지 않는다.
         // 순서는 전순서다(키 오름차순) — 이벤트 순서가 해시 순회에 의존하면 안 된다.
+        //
+        // 제한 모드: 라이브 집합은 "잔류한 비-fresh 기준선(위 잔류 논증) ∪ live_keys(fresh
+        // 전용)"이고, 차집합은 **fresh 안에서만** 생길 수 있다 — Started 후보는 live_keys,
+        // Stopped 후보는 touch_sorted(R접촉 기준선 키)뿐이다. 기준선도 통째 재구축 대신
+        // 그 델타만 반영한다. 전체 경로와의 등가는 락스텝 궤적 테스트가 이벤트까지 잠근다.
         {
-            let mut started: Vec<(u32, u32)> = live_keys
-                .iter()
-                .filter(|k| !self.touching.contains(*k))
-                .copied()
-                .collect();
-            let mut stopped: Vec<(u32, u32)> = self
-                .touching
-                .iter()
-                .filter(|k| !live_keys.contains(*k))
-                .copied()
-                .collect();
+            type KeyVec = Vec<(u32, u32)>;
+            let (mut started, mut stopped): (KeyVec, KeyVec) = if narrow_restricted {
+                (
+                    live_keys
+                        .iter()
+                        .filter(|k| !self.touching.contains(*k))
+                        .copied()
+                        .collect(),
+                    touch_sorted
+                        .iter()
+                        .filter(|k| !live_keys.contains(*k))
+                        .copied()
+                        .collect(),
+                )
+            } else {
+                (
+                    live_keys
+                        .iter()
+                        .filter(|k| !self.touching.contains(*k))
+                        .copied()
+                        .collect(),
+                    self.touching
+                        .iter()
+                        .filter(|k| !live_keys.contains(*k))
+                        .copied()
+                        .collect(),
+                )
+            };
             started.sort_unstable();
             stopped.sort_unstable();
+            // 기준선 갱신 — 다음 스텝의 이벤트가 이 집합과의 차집합이다.
+            if narrow_restricted {
+                for k in &stopped {
+                    self.touching.remove(k);
+                }
+                for k in &started {
+                    self.touching.insert(*k);
+                }
+            } else {
+                // 전체 경로: live_keys가 곧 새 기준선 — 수천 키 재삽입 대신 스왑.
+                std::mem::swap(&mut self.touching, &mut live_keys);
+            }
             for (k, kind) in started
                 .into_iter()
                 .map(|k| (k, ContactEventKind::Started))
@@ -2935,17 +2995,25 @@ impl World {
                 });
             }
         }
-
-        // 기준선 갱신 — 다음 스텝의 이벤트가 이 집합과의 차집합이다.
-        self.touching.clear();
-        self.touching.extend(live_keys.iter().copied());
         self.diag.post_ns[1] = _t_ev.ns();
         let _t_pcm = Stopwatch::start();
 
         // 5) PCM 캐시 갱신. **잠든 페어의 엔트리는 보존**한다 — 전체 clear는 첫 수면 스텝에
         //    지속 매니폴드를 날려, 나중에 깨어날 때 warm start 없이 거칠게 재정착한다(리뷰 지적).
         //    이번 스텝에 살아있지 않은(페어 소멸) 키만 폐기.
-        self.contact_cache.retain(|k, _| live_keys.contains(k));
+        //    제한 모드: live_keys는 fresh 전용이라 그대로 쓰면 dormant 엔트리가 전멸한다 —
+        //    비-fresh 키는 잔류(캐시 ⊆ touching이고 비-fresh touching은 위에서 불변),
+        //    fresh 키만 live_keys로 판정한다. 전체 경로는 스왑 후 touching == 새 라이브 집합.
+        if narrow_restricted {
+            self.contact_cache.retain(|k, _| {
+                let r_touch = moved_mask[k.0 as usize]
+                    || (k.1 & STATIC_BIT == 0 && moved_mask[(k.1 & !STATIC_BIT) as usize]);
+                !r_touch || live_keys.contains(k)
+            });
+        } else {
+            let touching = &self.touching;
+            self.contact_cache.retain(|k, _| touching.contains(k));
+        }
         // **캐시는 삽입 시점에 상태 정책으로 닫는다** — `close_state_policy`가 더는 캐시를
         // 순회하지 않는 근거다(그쪽 주석 참조). 포화는 멱등이라 예전처럼 "스텝 말에 닫는" 것과
         // 저장되는 값·`state_saturations` 카운트 모두 동일하다(예전에도 fixpoint 도달 후엔

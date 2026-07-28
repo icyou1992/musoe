@@ -1187,6 +1187,15 @@ fn validate_structure(
             return Err(SnapshotError::InconsistentState);
         }
     }
+    // **캐시 ⊆ touching** — 라이브 월드의 불변식이다(스텝 말 retain이 라이브 집합으로
+    // 거르고, touching이 곧 그 집합이다). 복원이 이걸 안 지키면 제한 모드의 델타 retain
+    // (비-fresh 키 잔류)이 전체 경로(라이브 집합 밖 폐기)와 갈린다 — 라이브 도달불가
+    // 상태는 받아주는 대신 거부한다.
+    for k in cache.keys() {
+        if !touching.contains(k) {
+            return Err(SnapshotError::InconsistentState);
+        }
+    }
     Ok(())
 }
 

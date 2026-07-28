@@ -214,6 +214,7 @@ mod maru_side {
         let t0 = Instant::now();
         let mut acc = [0u64; 5];
         let mut sub = [0u64; 5];
+        let mut post = [0u64; 4];
         let mut pairs_acc = 0usize;
         let mut reused = 0usize;
         let mut incr = 0usize;
@@ -223,6 +224,9 @@ mod maru_side {
             for j in 0..5 {
                 acc[j] += dgn.phase_ns[j];
                 sub[j] += dgn.sub_ns[j];
+            }
+            for j in 0..4 {
+                post[j] += dgn.post_ns[j];
             }
             pairs_acc += dgn.pairs;
             reused += dgn.bp_reused as usize;
@@ -246,6 +250,13 @@ mod maru_side {
             sub[2] as f64 / 1000.0 / sc,
             sub[3] as f64 / 1000.0 / sc,
             sub[4] as f64 / 1000.0 / sc,
+        );
+        eprintln!(
+            "    [maru mixed] post 하위: 라이트백={:.0} 이벤트={:.0} PCM={:.0} 위생={:.0} us",
+            post[0] as f64 / 1000.0 / sc,
+            post[1] as f64 / 1000.0 / sc,
+            post[2] as f64 / 1000.0 / sc,
+            post[3] as f64 / 1000.0 / sc,
         );
         let asleep = pile.iter().filter(|h| w.is_asleep(**h)).count();
         let finite = drops.iter().all(|h| w.body(*h).pose().pos.y.is_finite());

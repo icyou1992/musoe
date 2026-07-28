@@ -14,6 +14,12 @@ pub struct Broadphase {
     pub static_items: Vec<(u32, Aabb)>,
     dyn_tree: Tree,
     static_tree: Tree,
+    /// 슬롯 색인 캐시(id → AABB, 빈 슬롯 = 역전 AABB). 예전에는 증분 스텝마다 이 배열을
+    /// **세 번 새로 할당**했다(refit용 1 + 페어 판정용 2 — 3000바디에서 스텝당 ~216KB
+    /// 할당·초기화). 정적 캐시는 재빌드까지 불변이고 동적 캐시는 refresh가 변경분만
+    /// 덮으므로, 한 번 만들어 유지한다. `refresh_dynamic`이 (재)구축·갱신의 정본이다.
+    dyn_by_slot: Vec<Aabb>,
+    static_by_slot: Vec<Aabb>,
 }
 
 /// 페어의 상대가 정적임을 표시하는 비트 (id 공간 분리 — canonical 키의 일부).
@@ -24,7 +30,8 @@ pub const MAX_PAIRS: usize = 1 << 20;
 pub const STATIC_BIT: u32 = 1 << 31;
 
 /// 증분 갱신 결과: (병합된 canonical 페어 전체, fresh = R 접촉 페어만).
-pub type IncrementalPairs = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+/// 증분 병합 성공 시 반환 — fresh(R 접촉 페어)만. 병합 전체는 호출자의 `out` 버퍼에 채운다.
+pub type IncrementalPairs = Vec<(u32, u32)>;
 
 impl Broadphase {
     pub fn build(dynamic_items: Vec<(u32, Aabb)>, static_items: Vec<(u32, Aabb)>) -> Self {
@@ -42,7 +49,46 @@ impl Broadphase {
             static_items,
             dyn_tree,
             static_tree,
+            // 캐시는 증분 경로 첫 사용 시(fallible) 구축한다 — build는 무할당 계약 유지.
+            dyn_by_slot: Vec::new(),
+            static_by_slot: Vec::new(),
         }
+    }
+
+    fn empty_aabb() -> Aabb {
+        Aabb::new(
+            Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+            Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+        )
+    }
+
+    /// 슬롯 색인 캐시를 fallible하게 (재)구축한다. 이미 크기가 맞으면 무연산.
+    fn ensure_slot_caches(&mut self) -> bool {
+        let need = |items: &[(u32, Aabb)]| {
+            items
+                .iter()
+                .map(|(id, _)| *id)
+                .max()
+                .map_or(0, |m| m as usize + 1)
+        };
+        let fill = |cache: &mut Vec<Aabb>, items: &[(u32, Aabb)]| -> bool {
+            let n = need(items);
+            if cache.len() != n {
+                cache.clear();
+                if cache.try_reserve_exact(n).is_err() {
+                    return false;
+                }
+                cache.resize(n, Self::empty_aabb());
+                for &(id, a) in items {
+                    cache[id as usize] = a;
+                }
+            }
+            true
+        };
+        // 정적은 재빌드까지 불변 — 크기 일치면 내용도 최신이다. 동적은 refresh가 변경분을
+        // 즉시 덮으므로 마찬가지다(추가/제거는 재빌드 → 새 Broadphase → 빈 캐시부터).
+        fill(&mut self.dyn_by_slot, &self.dynamic_items)
+            && fill(&mut self.static_by_slot, &self.static_items)
     }
 
     /// canonical 페어 집합: 동적-동적 + 동적-정적. 정밀 판정 + 전순서 정렬 + dedup.
@@ -160,7 +206,14 @@ impl Broadphase {
     /// **증분 갱신 1/2**: 움직인 동적 아이템의 AABB를 교체하고 dyn 트리 바운드를 리핏한다.
     /// 위상은 그대로 — §4.1(페어 집합은 트리 비의존)이 이것을 합법으로 만든다.
     /// `updates`의 id는 build 때 존재했어야 한다(추가/제거는 구조 변경 → 재빌드가 정답).
-    pub fn refresh_dynamic(&mut self, updates: &[(u32, Aabb)]) {
+    ///
+    /// 반환 `false` = 슬롯 캐시 할당 실패(첫 증분 스텝만 할당한다) — 호출자는 구조를
+    /// 버리고 재빌드 폴백으로 간다. 실패해도 아이템·캐시는 일관 상태다(부분 갱신 없음).
+    #[must_use]
+    pub fn refresh_dynamic(&mut self, updates: &[(u32, Aabb)]) -> bool {
+        if !self.ensure_slot_caches() {
+            return false;
+        }
         for &(id, aabb) in updates {
             // build가 아이템을 id 순으로 받는 것이 보장은 아니지만(공개 API는 임의 순서),
             // 증분 경로의 호출자(world)는 항상 슬롯 오름차순으로 만든다 — 정렬이면 이분,
@@ -172,25 +225,11 @@ impl Broadphase {
                 .or_else(|| self.dynamic_items.iter().position(|e| e.0 == id))
                 .expect("refresh_dynamic: unknown id — 추가/제거는 재빌드로");
             self.dynamic_items[i].1 = aabb;
+            self.dyn_by_slot[id as usize] = aabb;
         }
-        // 리프 조회용 슬롯 색인 (canonical_pairs와 같은 규칙: 빈 슬롯 = 역전 AABB)
-        let n = self
-            .dynamic_items
-            .iter()
-            .map(|(id, _)| *id)
-            .max()
-            .map_or(0, |m| m as usize + 1);
-        let mut by_slot = vec![
-            Aabb::new(
-                Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
-                Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
-            );
-            n
-        ];
-        for &(id, a) in &self.dynamic_items {
-            by_slot[id as usize] = a;
-        }
+        let by_slot = &self.dyn_by_slot;
         self.dyn_tree.refit(|id| by_slot[id as usize]);
+        true
     }
 
     /// **증분 갱신 2/2**: 움직인 집합 R의 페어만 다시 만들어 직전 canonical 페어와 병합한다.
@@ -205,7 +244,8 @@ impl Broadphase {
     ///   병합 결과가 전순서 canonical이다.
     ///
     /// `moved_mask[id]`는 R 소속 판정(호출자가 슬롯 크기로 준비), `moved`는 R의 id 목록.
-    /// 반환 = (병합된 canonical 페어, **fresh** = R 접촉 페어만). fresh는 "활성 끝점을 가질 수
+    /// 반환 = **fresh**(R 접촉 페어만) — 병합된 canonical 전체는 `out`에 채운다(핑퐁 버퍼).
+    /// fresh는 "활성 끝점을 가질 수
     /// 있는 페어"의 정확한 상집합이라(활성 ⊆ R일 때) 호출자가 wake/narrow 순회를 이 목록으로
     /// 제한하는 근거가 된다.
     pub fn incremental_pairs_bounded(
@@ -214,6 +254,7 @@ impl Broadphase {
         moved_mask: &[bool],
         prev: &[(u32, u32)],
         budget: usize,
+        out: &mut Vec<(u32, u32)>,
     ) -> Option<IncrementalPairs> {
         let budget = budget.min(MAX_PAIRS);
         let in_r = |id: u32| moved_mask.get(id as usize).copied().unwrap_or(false);
@@ -239,8 +280,18 @@ impl Broadphase {
             }
             Some(v)
         };
-        let dyn_by_slot = slots(&self.dynamic_items)?;
-        let static_by_slot = slots(&self.static_items)?;
+        // 슬롯 캐시가 준비돼 있으면(정상 경로 — 호출 전 `refresh_dynamic` 필수) 그대로
+        // 쓴다. 캐시 없이 직접 호출된 경우(공개 API 오용·일부 테스트)만 로컬 구축으로
+        // 폴백한다 — 빈 캐시를 그대로 쓰면 전 슬롯이 역전 AABB라 페어가 조용히 0이 된다.
+        let (dyn_local, static_local);
+        let (dyn_by_slot, static_by_slot): (&[Aabb], &[Aabb]) =
+            if !self.dyn_by_slot.is_empty() || self.dynamic_items.is_empty() {
+                (&self.dyn_by_slot, &self.static_by_slot)
+            } else {
+                dyn_local = slots(&self.dynamic_items)?;
+                static_local = slots(&self.static_items)?;
+                (&dyn_local, &static_local)
+            };
 
         // R의 새 페어 — 리핏된 트리에 질의, 정밀 판정, canonical 키.
         let mut fresh: Vec<(u32, u32)> = Vec::new();
@@ -281,9 +332,11 @@ impl Broadphase {
         fresh.sort_unstable();
         fresh.dedup();
 
-        // prev에서 R 접촉 페어 제거 (정렬 보존) + fresh와 병합.
-        let mut out: Vec<(u32, u32)> = Vec::new();
-        out.try_reserve_exact((prev.len() + fresh.len()).min(MAX_PAIRS))
+        // prev에서 R 접촉 페어 제거 (정렬 보존) + fresh와 병합. `out`은 호출자의 영속
+        // 스크래치다 — 직전 스텝의 prev 버퍼와 핑퐁하면 워밍업 후 재할당이 없다
+        // (예전에는 매 스텝 ~200KB를 새로 할당·해제했다).
+        out.clear();
+        out.try_reserve((prev.len() + fresh.len()).min(MAX_PAIRS))
             .ok()?;
         let mut fi = 0usize;
         for &(a, b_raw) in prev {
@@ -314,7 +367,7 @@ impl Broadphase {
             out.windows(2).all(|w| w[0] < w[1]),
             "증분 병합 결과는 중복 없는 전순서여야 한다"
         );
-        Some((out, fresh))
+        Some(fresh)
     }
 }
 
@@ -432,9 +485,10 @@ mod tests {
                     (id, a)
                 })
                 .collect();
-            bp.refresh_dynamic(&updates);
-            let (merged, fresh) = bp
-                .incremental_pairs_bounded(&moved, &mask, &pairs, usize::MAX)
+            assert!(bp.refresh_dynamic(&updates));
+            let mut merged = Vec::new();
+            let fresh = bp
+                .incremental_pairs_bounded(&moved, &mask, &pairs, usize::MAX, &mut merged)
                 .expect("budget unbounded");
             // fresh 계약: 병합 결과 중 R 접촉 페어와 정확히 일치해야 한다
             let want_fresh: Vec<(u32, u32)> = merged
@@ -483,16 +537,17 @@ mod tests {
                 )
             })
             .collect();
-        bp.refresh_dynamic(&updates);
+        assert!(bp.refresh_dynamic(&updates));
         let moved: Vec<u32> = (0..10).collect();
         let mask = vec![true; 10];
         // 예산 = 정확히 canonical 페어 수. 중복을 세면 90에 닿아 실패한다.
-        let got = bp.incremental_pairs_bounded(&moved, &mask, &prev, 45);
+        let mut merged = Vec::new();
+        let got = bp.incremental_pairs_bounded(&moved, &mask, &prev, 45, &mut merged);
         assert!(
             got.is_some(),
             "canonical 45페어 == 예산 45인데 증분이 ResourceLimit — raw 중복이 과금됐다"
         );
-        assert_eq!(got.unwrap().0.len(), 45);
+        assert_eq!(merged.len(), 45);
     }
 
     /// 리핏 후 질의도 superset 계약을 유지해야 한다 (트리 위상은 낡고 바운드만 현재).
@@ -510,11 +565,11 @@ mod tests {
                 (id, a)
             })
             .collect();
-        bp.refresh_dynamic(&updates);
+        assert!(bp.refresh_dynamic(&updates));
         let moved: Vec<u32> = (0..100).collect();
         let mask = vec![true; 100];
-        let (got, _) = bp
-            .incremental_pairs_bounded(&moved, &mask, &[], usize::MAX)
+        let mut got = Vec::new();
+        bp.incremental_pairs_bounded(&moved, &mask, &[], usize::MAX, &mut got)
             .unwrap();
         let want = brute_force(&items, &[]);
         assert_eq!(got, want, "전량 이동 후 증분 페어가 브루트포스와 불일치");
