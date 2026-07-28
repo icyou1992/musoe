@@ -131,6 +131,7 @@ const hud = document.getElementById('hud');
 const M4 = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new THREE.Vector3(), S = new THREE.Vector3(1, 1, 1);
 let last = performance.now(), acc = 0, frames = 0;
 const prevAsleep = new Uint8Array(20 * 20 * 2 * 2 * 6);
+const prevBallAsleep = new Uint8Array(MAX_BALLS);
 let stepMsAvg = 0, fpsAvg = 0, stepMsNow = 0;
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -167,17 +168,22 @@ function frame(now) {
     prevAsleep[i] = sleeping;
     changed = true;
   }
+  let ballChanged = false;
   for (let i = 0; i < balls.length; i++) {
+    const sleeping = balls[i].isSleeping() ? 1 : 0;
+    if (sleeping && prevBallAsleep[i]) continue; // 포탄도 연속 수면은 스킵
     const tr = balls[i].translation(), rq = balls[i].rotation();
     P.set(tr.x, tr.y, tr.z);
     Q.set(rq.x, rq.y, rq.z, rq.w);
     ballMesh.setMatrixAt(i, M4.compose(P, Q, S));
+    prevBallAsleep[i] = sleeping;
+    ballChanged = true;
   }
   if (changed) {
     boxMesh.instanceMatrix.needsUpdate = true;
     boxMesh.instanceColor.needsUpdate = true;
   }
-  if (balls.length) ballMesh.instanceMatrix.needsUpdate = true;
+  if (ballChanged) ballMesh.instanceMatrix.needsUpdate = true;
   window.__ASLEEP__ = asleep;
   if ((frames++ & 15) === 0) {
     hud.textContent =

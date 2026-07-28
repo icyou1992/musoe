@@ -305,7 +305,13 @@ pub unsafe extern "C" fn maru_apply_impulse(
 ) -> i32 {
     let w = w_or!(p, ERR_NULL);
     match w.world.apply_impulse(unpack(h), Vec3::new(x, y, z)) {
-        Ok(()) => OK,
+        Ok(()) => {
+            // 자세는 안 변하지만 **수면 플래그가 변한다**(즉시 wake) — stale을 안 세우면
+            // 기상 직후 프레임에 낡은 1을 돌려줘 렌더러가 깨어난 바디를 스킵한다
+            // (검수 rev_ad4f38c7 MAJOR).
+            w.transforms_stale = true;
+            OK
+        }
         Err(e) => code(e),
     }
 }
@@ -322,7 +328,11 @@ pub unsafe extern "C" fn maru_apply_force(
 ) -> i32 {
     let w = w_or!(p, ERR_NULL);
     match w.world.apply_force(unpack(h), Vec3::new(x, y, z)) {
-        Ok(()) => OK,
+        Ok(()) => {
+            // impulse와 동일 — wake가 수면 플래그를 바꾼다(검수 rev_ad4f38c7 MAJOR).
+            w.transforms_stale = true;
+            OK
+        }
         Err(e) => code(e),
     }
 }
@@ -762,6 +772,16 @@ mod tests {
             let flags = maru_sleep_flags_ptr(w);
             assert!(!flags.is_null());
             assert_eq!(core::slice::from_raw_parts(flags, 2)[1], 1);
+            // 기상 즉시성(검수 rev_ad4f38c7 MAJOR): 임펄스는 자세를 안 바꾸지만 수면
+            // 플래그를 바꾼다 — 재취득 벌크 버퍼가 낡은 1을 돌려주면 안 된다.
+            assert_eq!(maru_apply_impulse(w, ball, 0.0, 2.0, 0.0), OK);
+            let flags = maru_sleep_flags_ptr(w);
+            assert!(!flags.is_null());
+            assert_eq!(
+                core::slice::from_raw_parts(flags, 2)[1],
+                0,
+                "임펄스 후 벌크 플래그가 낡은 수면 상태를 반환"
+            );
 
             // 변환 버퍼를 JS가 읽듯이 읽는다
             let n = maru_slot_count(w) as usize;
