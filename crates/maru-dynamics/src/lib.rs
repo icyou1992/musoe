@@ -5433,6 +5433,109 @@ mod tests {
         }
     }
 
+    /// **복원 정책이 바뀌면 버전을 올린다** — 같은 바이트가 다른 값으로 복원되기 때문이다.
+    ///
+    /// v13까지의 리더는 쿼터니언을 무조건 재정규화했고 v14는 비트 멱등 캐노니컬화를 한다.
+    /// 구 빌드가 저장한 주기-2 쿼터니언은 두 리더가 **다른 값**으로 복원하므로, 같은 버전
+    /// 번호가 두 계약을 뜻하게 두면 안 된다 (교차검수 rev_420ab223 MAJOR).
+    #[test]
+    fn snapshot_rejects_the_previous_version_after_the_quat_policy_change() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(0.0, 1.0, 0.0),
+            1.0,
+        ));
+        w.step(DT);
+        let mut snap = w.try_snapshot().unwrap();
+        // 헤더 = MAGIC(u32 LE) + VERSION(u32 LE). 버전만 13으로 되돌린다.
+        assert!(snap.len() > 8);
+        snap[4..8].copy_from_slice(&13u32.to_le_bytes());
+        let mut r = World::new(WorldParams::default());
+        match r.restore(&snap) {
+            Err(SnapshotError::BadVersion(13)) => {}
+            other => panic!("구 버전 스냅샷을 거부해야 한다: {other:?}"),
+        }
+    }
+
+    /// 복원은 **폐기한 미래의 스텝 출력**까지 지워야 한다.
+    ///
+    /// 히트 큐는 캐노니컬 상태가 아니라 남아 있었는데, 그러면 호스트가 되돌린 타임라인의
+    /// 히트를 다시 읽어 데미지·이펙트를 두 번 적용한다. `diag`는 복원 시 0이 되므로
+    /// `ccd_hits_dropped == 0`이라 온전한 목록처럼 보이기까지 한다
+    /// (교차검수 rev_5e74f64f MAJOR).
+    #[test]
+    fn restore_clears_ccd_hits_from_the_discarded_timeline() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.05, 5.0, 5.0),
+                radius: 0.0,
+            },
+            pose(10.0, 0.0, 0.0),
+        ));
+        let bullet = w.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(0.0, 0.0, 0.0), 1.0).with_ccd(),
+        );
+        w.set_linear_velocity(bullet, Vec3::new(400.0, 0.0, 0.0))
+            .unwrap();
+        // 충돌 **전** 스냅샷을 잡아 둔다.
+        let before = w.try_snapshot().unwrap();
+        let mut hit = false;
+        for _ in 0..4 {
+            w.step(DT);
+            if !w.ccd_hits().is_empty() {
+                hit = true;
+                break;
+            }
+        }
+        assert!(hit, "전제: 이 씬에서 CCD 히트가 나야 한다");
+        // 되돌린다 — 그 히트는 이제 없던 일이다.
+        w.restore(&before).unwrap();
+        assert!(
+            w.ccd_hits().is_empty(),
+            "복원이 폐기한 타임라인의 히트를 남겼다: {}건",
+            w.ccd_hits().len()
+        );
+    }
+
+    /// CCD 고정 버퍼도 **페어 예산을 역산하기 전에** 총 스크래치에서 빠져야 한다.
+    ///
+    /// 안 빼면 페어가 바이트 상한까지 찬 월드가 128 MiB를 거의 다 쓴 뒤 히트 버퍼를 더 잡아
+    /// 총상한을 넘긴다. 관측 가능한 형태로 잠근다: **같은 씬에서 CCD를 켜면 페어 예산이
+    /// 그만큼 줄어야 한다** (교차검수 rev_5e74f64f MAJOR).
+    #[test]
+    fn ccd_hit_buffer_is_charged_against_the_step_scratch_budget() {
+        let build = |ccd: bool| {
+            let mut w = World::new(WorldParams {
+                // 페어 예산을 **바이트 상한이 지배하도록** 개수 상한을 최대로 연다
+                // (개수 상한이 이기면 CCD 바이트를 빼도 예산이 안 변해 아무것도 못 잰다).
+                max_pairs_per_body: 4096,
+                ..WorldParams::default()
+            });
+            for i in 0..200 {
+                let b = Body::new_dynamic(
+                    Shape::Sphere { radius: 0.1 },
+                    pose(i as f32 * 3.0, 50.0, 0.0),
+                    1.0,
+                );
+                w.add_body(if ccd { b.with_ccd() } else { b });
+            }
+            w.step(DT);
+            w.diagnostics().pair_budget
+        };
+        let without = build(false);
+        let with = build(true);
+        assert!(
+            with < without,
+            "CCD를 켰는데 페어 예산이 그대로다 — 히트 버퍼가 회계에서 빠져 있다 \
+             (without={without}, with={with})"
+        );
+    }
+
     /// 클램프 평면은 단방향이다 — 바닥에 착지한 CCD 바디의 접선 이동(슬라이드)을 막지 않는다.
     #[test]
     fn ccd_clamp_allows_tangential_slide() {

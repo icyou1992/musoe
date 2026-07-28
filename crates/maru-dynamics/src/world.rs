@@ -1835,6 +1835,12 @@ impl World {
         // 진단은 캐노니컬 상태가 아니다 — 복원 후 **미래 동작에 영향을 주면 안 된다**
         // (stale `state_saturations`가 다음 `try_step`을 StateOverflow로 만들던 경로).
         self.diag = Diagnostics::default();
+        // **스텝 출력도 복원 경계에서 버린다.** 히트 큐는 캐노니컬 상태가 아니므로
+        // 복원해도 남아 있었는데, 그러면 폐기한 미래의 히트를 호스트가 다시 읽어
+        // 데미지·이펙트를 두 번 적용한다. `diag`가 0으로 초기화되어
+        // `ccd_hits_dropped == 0`이라 **온전한 현재 목록처럼 보이기까지 한다**
+        // (교차검수 rev_5e74f64f MAJOR). 용량은 재사용하고 길이만 비운다.
+        self.ccd_hits.clear();
         self.resource_limit = false;
         self.invalidate_bp();
     }
@@ -2163,7 +2169,24 @@ impl World {
         // (교차검수 rev_b86f5aea MAJOR). 페어를 0으로 막아도 아래 통합 블록이 body/joint 버퍼를
         // nbody/njoint 크기로 그대로 예약하므로, 여기서 막지 않으면 소수 바디+대량 조인트가
         // 128MiB를 넘겨 "총 스크래치 ≤ MAX" 계약을 깬다. 이 시점엔 pairs를 아직 안 건드렸다.
-        let fixed_bytes = fixed_body_bytes.saturating_add(fixed_joint_bytes);
+        // **CCD 히트 버퍼도 고정 스크래치다.** 상한이 고정(`MAX_CCD_HITS`)이라 페어 비례가
+        // 아니고, CCD 바디가 있으면 반드시 선점되므로 페어 예산을 역산하기 **전에** 빼야
+        // 한다. 안 빼면 페어가 `byte_cap`까지 찬 월드가 128 MiB를 거의 다 쓴 뒤 이 버퍼를
+        // 더 잡아 총상한을 넘긴다 (교차검수 rev_5e74f64f MAJOR).
+        // 커맨드는 이미 flush됐으므로 이번 스텝에 CCD 기록이 가능한 바디 집합은 확정돼 있다.
+        let ccd_any = self
+            .bodies
+            .iter()
+            .enumerate()
+            .any(|(i, b)| self.alive[i] && b.ccd);
+        let fixed_ccd_bytes = if ccd_any {
+            MAX_CCD_HITS.saturating_mul(core::mem::size_of::<CcdHit>())
+        } else {
+            0
+        };
+        let fixed_bytes = fixed_body_bytes
+            .saturating_add(fixed_joint_bytes)
+            .saturating_add(fixed_ccd_bytes);
         if fixed_bytes >= MAX_STEP_SCRATCH_BYTES {
             self.resource_limit = true;
             return;
@@ -2261,13 +2284,6 @@ impl World {
         // 블록은 제약 4개당 1개라 상한은 ncap/4 + 색 수(색마다 꼬리가 생길 수 있다).
         let mut block_starts: Vec<usize> = Vec::new();
         let mut work: Vec<solver_block::Work> = Vec::new();
-        // **CCD 히트 버퍼도 스텝 전에 선점한다** — 상한이 고정이라 첫 스텝에서만 실제로
-        // 잡히고 이후는 무연산이다. CCD 바디가 하나도 없으면 잡지 않는다(48KB 낭비 방지).
-        let ccd_any = self
-            .bodies
-            .iter()
-            .enumerate()
-            .any(|(i, b)| self.alive[i] && b.ccd);
         let _t_res = Stopwatch::start();
         if (ccd_any
             && self
