@@ -7,6 +7,7 @@ mod command;
 mod joint;
 mod snapshot;
 mod solver;
+mod solver_block;
 mod world;
 
 pub use body::{Body, BodyHandle, BodyType};

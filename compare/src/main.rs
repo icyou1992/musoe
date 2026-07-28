@@ -107,6 +107,7 @@ mod maru_side {
         }
         let t0 = Instant::now();
         let mut acc = [0u64; 5];
+        let mut sv = [0u64; 7];
         let mut pairs_acc = 0usize;
         let mut reused = 0usize;
         for _ in 0..steps {
@@ -114,6 +115,9 @@ mod maru_side {
             let d = w.diagnostics();
             for k in 0..5 {
                 acc[k] += d.phase_ns[k];
+            }
+            for k in 0..7 {
+                sv[k] += d.solve_ns[k];
             }
             pairs_acc += d.pairs;
             reused += d.bp_reused as usize;
@@ -127,6 +131,16 @@ mod maru_side {
             acc[3] as f64 / 1000.0 / steps as f64,
             acc[4] as f64 / 1000.0 / steps as f64,
             pairs_acc / steps
+        );
+        eprintln!(
+            "    [maru solve 내역 us] inv_i={:.0} anchors={:.0} warm={:.0} bias={:.0} relax={:.0} integ={:.0} joints={:.0}",
+            sv[0] as f64 / 1000.0 / steps as f64,
+            sv[1] as f64 / 1000.0 / steps as f64,
+            sv[2] as f64 / 1000.0 / steps as f64,
+            sv[3] as f64 / 1000.0 / steps as f64,
+            sv[4] as f64 / 1000.0 / steps as f64,
+            sv[5] as f64 / 1000.0 / steps as f64,
+            sv[6] as f64 / 1000.0 / steps as f64,
         );
         eprintln!("    [maru bp 재사용] {reused}/{steps}");
 

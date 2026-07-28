@@ -12,7 +12,7 @@ mod soa;
 
 pub use mat3::Mat3;
 pub use scalar::{Quat, Vec3};
-pub use soa::{Aabbx4, Mat3x4, Vec3x4};
+pub use soa::{Aabbx4, Mat3x4, Quatx4, Vec3x4};
 
 /// 물리적 무의미 임계(설계 §8 denormal 위생 계층). 속도·임펄스 누산 후 정의 지점에서 호출.
 pub const TINY_EPS: f32 = 1.0e-8;

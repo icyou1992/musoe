@@ -3,7 +3,7 @@
 //! `Vec3x4` = 벡터 4개를 성분별 f32x4로: 모든 연산이 셔플 없는 순수 레인별 SIMD.
 //! WASM SIMD128(4×f32)과 정확히 동형 — 설계 §4.1 브로드페이즈 4-ary와 같은 이유.
 
-use crate::{Mat3, Vec3};
+use crate::{Mat3, Quat, Vec3};
 use core::ops::{Add, Sub};
 use wide::{f32x4, CmpGe, CmpLe};
 
@@ -98,6 +98,53 @@ impl Sub for Vec3x4 {
 }
 
 /// AABB 4개 (SoA) — 브로드페이즈 4-ary 노드의 바운드 레이아웃과 동형 (설계 §4.1).
+/// 쿼터니언 4개를 레인에 실은 SoA — 회전을 4-wide로 돌린다.
+///
+/// 접촉 앵커 갱신(`refresh_anchors`)은 서브스텝마다 접점 전량을 두 번 회전시킨다.
+/// 레인마다 자세가 달라도 회전 식은 성분별 곱·덧셈뿐이라 셔플 없이 4-wide가 된다.
+/// 레인당 연산 순서가 스칼라 `Quat::rotate`와 같으므로 결과는 **비트 동일**하다.
+#[derive(Clone, Copy, Debug)]
+pub struct Quatx4 {
+    pub x: f32x4,
+    pub y: f32x4,
+    pub z: f32x4,
+    pub w: f32x4,
+}
+
+impl Quatx4 {
+    #[inline]
+    pub fn splat(q: Quat) -> Self {
+        Self {
+            x: f32x4::splat(q.x),
+            y: f32x4::splat(q.y),
+            z: f32x4::splat(q.z),
+            w: f32x4::splat(q.w),
+        }
+    }
+
+    #[inline]
+    pub fn from_array(q: [Quat; 4]) -> Self {
+        Self {
+            x: f32x4::from([q[0].x, q[1].x, q[2].x, q[3].x]),
+            y: f32x4::from([q[0].y, q[1].y, q[2].y, q[3].y]),
+            z: f32x4::from([q[0].z, q[1].z, q[2].z, q[3].z]),
+            w: f32x4::from([q[0].w, q[1].w, q[2].w, q[3].w]),
+        }
+    }
+
+    /// `v + 2w(u×v) + u×(2(u×v))` — 스칼라 `Quat::rotate`와 **같은 순서**.
+    #[inline]
+    pub fn rotate(self, v: Vec3x4) -> Vec3x4 {
+        let u = Vec3x4 {
+            x: self.x,
+            y: self.y,
+            z: self.z,
+        };
+        let t = u.cross(v).scale(f32x4::splat(2.0));
+        v + t.scale(self.w) + u.cross(t)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Aabbx4 {
     pub min: Vec3x4,

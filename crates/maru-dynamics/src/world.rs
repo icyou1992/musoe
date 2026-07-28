@@ -9,6 +9,7 @@ use crate::body::{Body, BodyHandle, BodyType};
 use crate::command::{Command, CommandReport, PendingCommand};
 use crate::joint::{self, Joint};
 use crate::solver::{self, CachedImpulse, ContactConstraint, Softness, SolverParams};
+use crate::solver_block;
 use maru_collide::{
     any_contact, for_each_contact, shape_cast_dispatch, Aabb, Broadphase, FeatureId, STATIC_BIT,
 };
@@ -281,6 +282,9 @@ pub struct World {
     integrate_gate: Vec<bool>,
     gravity_gate: Vec<bool>,
     island_parent: Vec<usize>,
+    /// SoA 솔버 블록 풀 (비캐노니컬 스크래치). 블록 1개가 ~1.5KB라 스텝마다 새로 할당하면
+    /// 조립 이득이 할당·이동 비용으로 되돌아간다 — 월드가 버퍼를 들고 제자리에서 덮어쓴다.
+    contact_blocks: Vec<solver_block::ContactBlock>,
 }
 
 /// 진단 계측용 시계 — **wasm32-unknown-unknown에는 시계가 없다.**
@@ -356,6 +360,13 @@ pub struct Diagnostics {
     /// 아일랜드는 `sub_ns[3]`에 이미 있다. 정착 씬에서 post가 스텝의 40%인데 아일랜드는
     /// 그중 1/9뿐이라 — 나머지가 어디 사는지 귀속하려고 둔다.
     pub post_ns: [u64; 4],
+    /// solve 단계 내역 (ns) — **서브스텝 전체의 누적**:
+    /// `[inv_i 갱신, refresh_anchors, warm_start(접촉), bias 솔브, relax 솔브, 적분+클램프(CCD 포함), 조인트]`.
+    /// 활성 레짐에서 solve가 스텝의 절반인데 그 안의 배분이 안 보이면 SIMD를 어디에 쓸지
+    /// 추측으로 정하게 된다 — 실제로 `refresh_anchors`·`inv_i`처럼 **솔버 산술이 아닌**
+    /// 준비 패스가 지배할 수 있고, 그것들은 제약 솔브와 최적화 방식이 다르다.
+    /// 서브스텝당 `inv_i`·`refresh_anchors`·솔브는 각각 2회 돌므로 합계로 누적한다.
+    pub solve_ns: [u64; 7],
     /// 직전 스텝의 접촉 기준선 크기 — 정착 씬에서 페어 수와 함께 비용을 결정한다.
     pub touching: usize,
     /// 이번 스텝에 상한으로 잘린 캐노니컬 값의 개수. **0이 정상이다** —
@@ -491,6 +502,7 @@ impl World {
             resource_limit: false,
             bp_pairs: Vec::new(),
             bp_pairs_scratch: Vec::new(),
+            contact_blocks: Vec::new(),
             bp_valid: false,
             bp_dt: 0.0,
             bp: None,
@@ -2052,6 +2064,7 @@ impl World {
             + core::mem::size_of::<u32>()                                // grouped
             + core::mem::size_of::<Option<ContactConstraint>>()          // c_tmp (거의 한 벌 더)
             + core::mem::size_of::<(u32, u32)>()                         // new_keys
+            + core::mem::size_of::<solver_block::ContactBlock>() / 4      // SoA 블록(제약 4개당 1개)
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
                   // per-body(슬롯당) 스크래치 전부: SolverState 7배열 + inv_inertia_local + ext_force +
                   // damping + 게이트 2 + island_parent + 컬러 body_color/conflict. 총상한에서 먼저 뺀다.
@@ -2172,8 +2185,20 @@ impl World {
         let mut touch_sorted: Vec<(u32, u32)> = Vec::new();
         // 색 범위 [start,end) — Unit 3b SIMD warm_start 배치 디스패치용. 색은 최대 64개.
         let mut color_ranges: Vec<(u32, u32)> = Vec::new();
+        // SoA 솔버 블록과 그 잔여 스칼라 구간 — 스텝당 1회 조립(설계 §3, solver_block 모듈 주석).
+        // 블록은 제약 4개당 1개라 상한은 ncap/4 + 색 수(색마다 꼬리가 생길 수 있다).
+        let mut block_starts: Vec<usize> = Vec::new();
+        let mut work: Vec<solver_block::Work> = Vec::new();
         let _t_res = Stopwatch::start();
         if constraints.try_reserve(ncap).is_err()
+            || self
+                .contact_blocks
+                .try_reserve((ncap / 4 + 1).saturating_sub(self.contact_blocks.len()))
+                .is_err()
+            || block_starts.try_reserve(ncap / 4 + 1).is_err()
+            || work
+                .try_reserve(ncap / 4 + solver::COLOR_OVERFLOW as usize + 2)
+                .is_err()
             || color_ranges
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
                 .is_err()
@@ -2590,6 +2615,10 @@ impl World {
                         }
                         // narrowphase는 wake 이후이고 pairs를 대여 중이라 bp_pairs를 되돌릴 수
                         // 없다. 접점 Vec 할당(≤4점) 실패는 극단 OOM — bail로 모아 아래서 처리.
+                        // 페어당 계측은 두지 않는다 — `Instant::now()` 두 번이 페어당
+                        // 실제 작업의 몇 %가 되어 계측기가 대상을 왜곡한다(2026-07-29 실측:
+                        // 40단에서 스텝당 ~0.2ms). 내역이 필요하면 `maru-bench --bin boxsplit`
+                        // (매니폴드 생성)과 아래 `narrow` 총계의 차로 귀속한다.
                         let Ok(c) = solver::prepare(bodies, a_id, b_id, &m, cached, dt) else {
                             bail = true;
                             return;
@@ -2701,6 +2730,25 @@ impl World {
         // 비지 않도록 전체를 한 범위(스칼라)로 둔다.
         if color_ranges.is_empty() && !constraints.is_empty() {
             color_ranges.push((0, constraints.len() as u32));
+        }
+        // === SoA 블록 조립 (스텝당 1회) ===
+        // 같은 색의 연속 4제약은 공유 dynamic 바디가 없으므로 레인 독립이다. 그 4개를
+        // SoA 블록으로 미리 실어 두면 서브스텝 루프(스텝당 12패스)가 게더 없이 돈다.
+        // 분할 규칙은 `solve_batched`의 chunk(4)와 동일하므로 두 경로의 처리 순서가 같다.
+        // 블록 풀을 꺼내 온다 — 여기까지 오면 이 스텝의 조기 반환은 없다(bail은 위에서 끝났다).
+        let mut blocks = std::mem::take(&mut self.contact_blocks);
+        solver_block::plan(&constraints, &color_ranges, &mut work, &mut block_starts);
+        // 풀을 필요한 길이까지만 늘리고(용량은 위에서 확보), 기존 원소는 제자리에서 덮어쓴다.
+        if blocks.len() < block_starts.len() {
+            blocks.resize_with(block_starts.len(), Default::default);
+        }
+        for (bi, &s) in block_starts.iter().enumerate() {
+            blocks[bi].assemble_into([
+                &constraints[s],
+                &constraints[s + 1],
+                &constraints[s + 2],
+                &constraints[s + 3],
+            ]);
         }
 
         self.diag.phase_ns[2] = _t_np.ns();
@@ -2834,7 +2882,9 @@ impl World {
         for _ in 0..n_sub {
             // 역관성 갱신을 **외력보다 먼저** — 토크는 현재 자세의 월드 역관성을 쓴다
             // (뒤에 두면 첫 서브스텝에서 `inv_i`가 아직 0이라 토크가 통째로 사라진다).
+            let _t_ii = Stopwatch::start();
             st.refresh_inv_i_active(inv_i_local, &active);
+            self.diag.solve_ns[0] += _t_ii.ns();
             for &i in &grav_active {
                 let i = i as usize;
                 st.lin[i] += g * h;
@@ -2869,16 +2919,21 @@ impl World {
                 }
             }
 
-            for c in constraints.iter_mut() {
-                solver::refresh_anchors(&st, c);
-            }
+            let _t_ra = Stopwatch::start();
+            solver_block::refresh_anchors_all(&st, &mut blocks, &mut constraints, &work);
+            self.diag.solve_ns[1] += _t_ra.ns();
             // warm start + bias 솔브 (조인트 먼저 — Box2D 순서)
+            let _t_jw = Stopwatch::start();
             for &ji in &active_joints {
                 joint::warm_start(&mut st, &joints[ji]);
             }
+            self.diag.solve_ns[6] += _t_jw.ns();
             // 접촉 warm_start — 색 배치 SIMD 디스패치(Unit 3b). 색 내 4제약은 4-wide, 나머지는
             // 스칼라. 콜러드-스칼라와 비트 동일이라 L0 해시 불변(아래 state_hash 테스트가 잠금).
-            solver::warm_start_batched(&mut st, &constraints, &color_ranges);
+            let _t_ws = Stopwatch::start();
+            solver_block::warm_start_all(&mut st, &blocks, &constraints, &work);
+            self.diag.solve_ns[2] += _t_ws.ns();
+            let _t_js = Stopwatch::start();
             for &ji in &active_joints {
                 joint::solve(
                     &mut st,
@@ -2891,9 +2946,13 @@ impl World {
                     )),
                 );
             }
+            self.diag.solve_ns[6] += _t_js.ns();
             // bias 솔브 — 색 배치 SIMD 디스패치(Unit 3c). 콜러드-스칼라와 비트 동일.
-            solver::solve_batched(&mut st, &mut constraints, &color_ranges, &bias_params);
+            let _t_bs = Stopwatch::start();
+            solver_block::solve_all(&mut st, &mut blocks, &mut constraints, &work, &bias_params);
+            self.diag.solve_ns[3] += _t_bs.ns();
             // 속도 상한 — 위치 적분 **전에** 걸어야 변위도 유계가 된다
+            let _t_int = Stopwatch::start();
             for &i in &active {
                 let i = i as usize;
                 let l2 = st.lin[i].length_sq();
@@ -3072,17 +3131,37 @@ impl World {
                 }
                 st.rot[i] = st.rot[i].integrate(st.ang[i], h);
             }
+            self.diag.solve_ns[5] += _t_int.ns();
             // relax — bias 에너지 제거 (위치 적분으로 자세가 바뀌었으므로 갱신)
+            let _t_ii2 = Stopwatch::start();
             st.refresh_inv_i_active(inv_i_local, &active);
-            for c in constraints.iter_mut() {
-                solver::refresh_anchors(&st, c);
-            }
+            self.diag.solve_ns[0] += _t_ii2.ns();
+            let _t_ra2 = Stopwatch::start();
+            solver_block::refresh_anchors_all(&st, &mut blocks, &mut constraints, &work);
+            self.diag.solve_ns[1] += _t_ra2.ns();
+            let _t_js2 = Stopwatch::start();
             for &ji in &active_joints {
                 joint::solve(&mut st, &mut joints[ji], h, None);
             }
+            self.diag.solve_ns[6] += _t_js2.ns();
             // relax 솔브 — 색 배치 SIMD 디스패치(Unit 3c).
-            solver::solve_batched(&mut st, &mut constraints, &color_ranges, &relax_params);
+            let _t_rs = Stopwatch::start();
+            solver_block::solve_all(&mut st, &mut blocks, &mut constraints, &work, &relax_params);
+            self.diag.solve_ns[4] += _t_rs.ns();
         }
+
+        // 블록의 누적 임펄스를 스칼라 제약으로 되쓴다 — restitution 패스와 PCM 갱신이
+        // 스칼라 제약을 읽는다. 스텝당 1회면 충분하다(서브스텝 안에서는 블록이 정본).
+        // **풀은 직전 스텝의 길이를 남길 수 있다** — 이번 스텝의 블록 수만 훑는다.
+        for (bi, blk) in blocks.iter().enumerate().take(block_starts.len()) {
+            let s = block_starts[bi];
+            let (l, r) = constraints.split_at_mut(s + 1);
+            let (c1, c2) = r.split_at_mut(1);
+            let (c3, c4) = c2.split_at_mut(1);
+            blk.scatter_impulses([&mut l[s], &mut c1[0], &mut c3[0], &mut c4[0]]);
+        }
+
+        self.contact_blocks = blocks;
 
         // 4) restitution 패스 (임팩트 게이트)
         for c in constraints.iter_mut() {

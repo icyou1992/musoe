@@ -7,7 +7,11 @@
 
 use crate::body::Body;
 use maru_collide::Manifold;
-use maru_math::{Mat3, Mat3x4, Quat, Vec3, Vec3x4};
+use maru_math::{Mat3, Quat, Vec3};
+// SIMD 타입은 참조 구현(cfg(test) x4 경로)에서만 쓴다 — 프로덕션 SIMD는 `solver_block`이다.
+#[cfg(test)]
+use maru_math::{Mat3x4, Vec3x4};
+#[cfg(test)]
 use wide::{f32x4, CmpGt};
 
 #[derive(Clone)]
@@ -93,6 +97,20 @@ pub struct ContactConstraint {
     pub tangents: [Vec3; 2],
     pub friction: f32,
     pub restitution: f32,
+    /// **각 야코비안을 접점에 선계산해 두지 말 것** (2026-07-29 실측으로 기각).
+    /// 임펄스 적용마다 도는 `cross(r, imp)` + `Mat3::mul_vec`(24 flops)을
+    /// `g = I⁻¹(r×axis)`를 미리 두고 `ang += g·λ`(6 flops)로 바꾸는, rapier
+    /// `ii_torque_dir`과 같은 구조를 시도했다. 결과:
+    /// - 산술은 실제로 ~40% 빠졌는데 **시간은 7.6%만** 줄었다 → 이 루프는 flop-bound가 아니다.
+    /// - `g`를 스텝당 1회(prepare)만 만들면 회전이 빠른 장면이 **깨진다**:
+    ///   `maru-bench --bin spin`(50 rad/s 이방성 막대)에서 600스텝 잔류 에너지비가
+    ///   0.0014 → 0.0503, 각속도가 0 → 21.9 rad/s로 남았다. 크기(K⁻¹)가 낡은 것과
+    ///   **적용 방향이 낡은 것은 다르다** — 방향이 틀리면 감쇠 자체가 성립하지 않는다.
+    /// - 정확한 주기(서브스텝당 2회, 적용과 같은 자세)로 갱신하면 재계산 288 flops가
+    ///   절약 324 flops를 먹어 **순손해**였다: 40단 7.40 → **8.52 ms**.
+    ///
+    /// 대신 이긴 것은 데이터 배치였다 — `solver_block`(SoA 블록) 참조.
+    ///
     /// **인라인 배열로 바꾸지 말 것** (2026-07-26 실측으로 기각).
     /// "제약 배열을 스텝당 40번 훑으니 포인터 추적이 비쌀 것"이라는 가설로
     /// `[ContactPointConstraint; 4] + count`(≈400B)로 바꿔봤다. 결과:
@@ -472,7 +490,13 @@ pub fn warm_start(st: &mut SolverState, c: &ContactConstraint) {
     bb.store(st, c.b);
 }
 
-// ===== SIMD 배치 (Unit 3 — 설계 §5) =====
+// ===== SIMD 배치 (Unit 3 — 설계 §5) — 지금은 **참조 구현**이다 =====
+//
+// 프로덕션 경로는 `solver_block`(SoA 블록)이다. 아래 AoS-게더 x4 경로는 지우지 않고
+// **차등 테스트의 오라클**로 남긴다: 블록 경로가 이것과 레인당 비트 동일하다는 것이
+// "SoA 전환은 성능 변경이지 물리 변경이 아니다"의 증거이고, 그 증거는 구현이 바뀔 때마다
+// 다시 돌아야 한다(`solver_block::tests::block_path_matches_x4_path_bit_for_bit`).
+// 그래서 `cfg(test)`다 — 릴리스 바이너리에는 들어가지 않는다.
 //
 // 같은 색의 4제약을 레인에 실어 warm_start/solve를 4-wide로 돈다. 같은 색은 공유 dynamic 바디가
 // 없으므로 레인이 서로 독립 — 스캐터 충돌이 없다(static/kinematic만 겹칠 수 있고 그건 write 대상
@@ -484,6 +508,7 @@ pub fn warm_start(st: &mut SolverState, c: &ContactConstraint) {
 
 /// Vec3x4 → 레인별 Vec3 4개 (스캐터용).
 #[inline]
+#[cfg(test)]
 fn vec3x4_lanes(v: Vec3x4) -> [Vec3; 4] {
     let (x, y, z) = (v.x.to_array(), v.y.to_array(), v.z.to_array());
     [
@@ -495,6 +520,7 @@ fn vec3x4_lanes(v: Vec3x4) -> [Vec3; 4] {
 }
 
 #[inline]
+#[cfg(test)]
 fn negx4(v: Vec3x4) -> Vec3x4 {
     Vec3x4 {
         x: -v.x,
@@ -505,6 +531,7 @@ fn negx4(v: Vec3x4) -> Vec3x4 {
 
 /// 레인별 blend: gate 마스크가 참인 레인은 `t`, 아니면 `f`(원본 보존).
 #[inline]
+#[cfg(test)]
 fn blend_vec(gate: f32x4, t: Vec3x4, f: Vec3x4) -> Vec3x4 {
     Vec3x4 {
         x: gate.blend(t.x, f.x),
@@ -515,6 +542,7 @@ fn blend_vec(gate: f32x4, t: Vec3x4, f: Vec3x4) -> Vec3x4 {
 
 /// 4제약 배치의 바디 상태 (SoA 레인) — 스칼라 `BodyReg`의 4-wide 대응.
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct BodyRegx4 {
     lin: Vec3x4,
     ang: Vec3x4,
@@ -524,6 +552,7 @@ struct BodyRegx4 {
     dyn_mask: f32x4,
 }
 
+#[cfg(test)]
 impl BodyRegx4 {
     #[inline]
     fn load(st: &SolverState, idx: [usize; 4]) -> Self {
@@ -595,6 +624,7 @@ impl BodyRegx4 {
 /// warm start의 4제약 배치판. 레인당 결과는 스칼라 `warm_start`와 **비트 동일**하다
 /// (연산 순서 동일·비FMA·게이트 blend). 점 수가 다른 레인은 없는 점을 0/ZERO로 채우되,
 /// blend `active` 마스크로 걸러 그 레인 값을 건드리지 않는다.
+#[cfg(test)]
 pub fn warm_start_x4(st: &mut SolverState, cs: [&ContactConstraint; 4]) {
     let a_idx = [cs[0].a, cs[1].a, cs[2].a, cs[3].a];
     let b_idx = [cs[0].b, cs[1].b, cs[2].b, cs[3].b];
@@ -671,6 +701,7 @@ pub fn warm_start_x4(st: &mut SolverState, cs: [&ContactConstraint; 4]) {
 /// 바디 없음 → 레인 독립), 나머지(<4)와 오버플로 색(63, 공유 바디 가능)은 스칼라. 색 안의 제약은
 /// dynamic 바디가 서로 겹치지 않아 처리 순서와 무관하고, 색 그룹 순서는 콜러드-스칼라와 동일하므로
 /// 결과는 **비트 동일**하다(L0 해시 불변 — 기존 state_hash 테스트가 이를 잠근다).
+#[cfg(test)]
 pub fn warm_start_batched(
     st: &mut SolverState,
     constraints: &[ContactConstraint],
@@ -718,6 +749,7 @@ pub struct BatchSolveParams {
 /// 비FMA, 분기(s>0 speculative·Coulomb 원판)는 blend, 없는 점·비cond 레인은 마스크로 원본 보존
 /// (x+0.0 부호0 뒤집힘·0/0 NaN 오염 차단 — NaN은 select 밖으로 못 샌다). 점 변이(normal/tangent
 /// impulse·max)는 레인별로 각 제약 점에 스캐터. 같은 색이라 dynamic 바디 disjoint → 레인 독립.
+#[cfg(test)]
 pub fn solve_x4(st: &mut SolverState, mut cs: [&mut ContactConstraint; 4], p: &BatchSolveParams) {
     let a_idx = [cs[0].a, cs[1].a, cs[2].a, cs[3].a];
     let b_idx = [cs[0].b, cs[1].b, cs[2].b, cs[3].b];
@@ -910,6 +942,7 @@ pub fn solve_x4(st: &mut SolverState, mut cs: [&mut ContactConstraint; 4], p: &B
 }
 
 /// solve를 색 범위 단위로 배치 디스패치 (Unit 3c). 색 내 4제약 SIMD, 나머지·오버플로 스칼라.
+#[cfg(test)]
 pub fn solve_batched(
     st: &mut SolverState,
     constraints: &mut [ContactConstraint],
