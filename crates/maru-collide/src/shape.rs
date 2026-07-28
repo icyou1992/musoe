@@ -242,6 +242,41 @@ impl Shape {
         }
     }
 
+    /// **각 스윕 반지름** — 단위 회전축 `axis`(로컬)에 대한 회전이 점유를 바꾸는
+    /// 정도의 상한: 코어 점들의 축 수직 거리 최댓값. 표면 = 코어 ⊕ 반지름 볼이고
+    /// 볼은 자기 중심 기준 회전 불변이므로, 점유 변화는 코어 점의 호 `angle × r⊥`에
+    /// 유계다. 구는 0(회전 불변), 캡슐은 자기 축 회전에서 0 — 회전 CCD 게이트가
+    /// 회전 불변 형상을 공짜로 걸러내는 근거(확인 검수 rev_477d7366 MAJOR).
+    /// 축 대비 로컬 기하는 그 축 회전 아래 불변이므로 t=0에 잰 값이 캐스트 내내 유효하다.
+    pub fn angular_sweep_radius(&self, axis: Vec3) -> f32 {
+        let perp = |p: Vec3| (p - axis * p.dot(axis)).length();
+        match self {
+            Shape::Sphere { .. } => 0.0,
+            Shape::Capsule { half_height, .. } => perp(Vec3::new(0.0, *half_height, 0.0)),
+            Shape::Box { half, radius } => {
+                // 코어 꼭짓점 8개(부호 대칭으로 4개만) 중 축 수직 거리 최대.
+                let h = Vec3::new(
+                    (half.x - radius).max(0.0),
+                    (half.y - radius).max(0.0),
+                    (half.z - radius).max(0.0),
+                );
+                let mut m = 0.0f32;
+                for sx in [-1.0f32, 1.0] {
+                    for sy in [-1.0f32, 1.0] {
+                        m = m.max(perp(Vec3::new(sx * h.x, sy * h.y, h.z)));
+                    }
+                }
+                m
+            }
+            Shape::Hull { points, .. } => points.iter().fold(0.0f32, |m, p| m.max(perp(*p))),
+            Shape::Compound { children } => children.iter().fold(0.0f32, |m, (cp, cs)| {
+                // 자식 원점의 축 수직 거리 + 자식 자체의 스윕 반지름(자식 로컬 축).
+                let child_axis = cp.rot.conjugate().rotate(axis);
+                m.max(perp(cp.pos) + cs.angular_sweep_radius(child_axis))
+            }),
+        }
+    }
+
     /// 방향 d(비정규화 허용, 0이면 임의점)의 **코어** support point (로컬 공간).
     pub fn support_core(&self, d: Vec3) -> Vec3 {
         match self {
@@ -335,6 +370,38 @@ pub fn transformed_aabb(local: Aabb, pose: &Pose) -> Aabb {
         ax.z.abs() * hl.x + ay.z.abs() * hl.y + az.z.abs() * hl.z,
     );
     Aabb::from_center(pose.pos + pose.rot.rotate(c), ext)
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// 회전 불변·축 대칭 형상의 각 스윕 반지름 — 게이트가 이 값으로 꺼진다.
+    #[test]
+    fn angular_sweep_radius_respects_rotational_symmetry() {
+        let y = Vec3::new(0.0, 1.0, 0.0);
+        let x = Vec3::new(1.0, 0.0, 0.0);
+        // 구: 어느 축이든 0.
+        assert_eq!(Shape::Sphere { radius: 0.5 }.angular_sweep_radius(y), 0.0);
+        assert_eq!(Shape::Sphere { radius: 0.5 }.angular_sweep_radius(x), 0.0);
+        // 캡슐: 자기 축(Y) 회전은 0, 수직 축은 half_height.
+        let cap = Shape::Capsule {
+            half_height: 0.7,
+            radius: 0.2,
+        };
+        assert!(cap.angular_sweep_radius(y).abs() < 1e-6);
+        assert!((cap.angular_sweep_radius(x) - 0.7).abs() < 1e-6);
+        // 박스: Y축 회전이면 코어 꼭짓점의 XZ 평면 거리 — half=(1.5,0.05,0.05), r=0이면
+        // 코어 (1.5,·,0.05)의 수직 거리 √(1.5²+0.05²).
+        let blade = Shape::Box {
+            half: Vec3::new(1.5, 0.05, 0.05),
+            radius: 0.0,
+        };
+        let want = (1.5f32 * 1.5 + 0.05 * 0.05).sqrt();
+        assert!((blade.angular_sweep_radius(y) - want).abs() < 1e-5);
+        // 외접 반지름보다 크지 않다 (상한 정합).
+        assert!(blade.angular_sweep_radius(x) <= blade.bounding_radius() + 1e-6);
+    }
 }
 
 #[cfg(test)]

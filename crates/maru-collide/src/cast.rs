@@ -130,9 +130,16 @@ pub fn shape_cast_rotational(
     skin: f32,
 ) -> Option<ShapeCastHit> {
     let (ra, rb) = (sa.radius(), sb.radius());
-    let r_arc = (pa.pos - pivot).length() + sa.bounding_radius();
-    let ang_bound = angle.abs() * r_arc;
     let offset = pa.pos - pivot;
+    // 각 기여 상한 = 축 수직 오프셋 + **각 스윕 반지름**(코어의 축 수직 거리 —
+    // 표면 = 코어 ⊕ 반지름 볼이고 볼은 중심 기준 회전 불변이라 이것으로 충분하다).
+    // 외접 반지름보다 조여서 회전 불변 형상(구)의 전진이 각 항으로 불필요하게
+    // 잘게 쪼개지지 않는다. 축 대비 로컬 기하는 그 축 회전 아래 불변이므로
+    // t=0에 잰 값이 캐스트 내내 유효하다.
+    let axis_local = pa.rot.conjugate().rotate(axis);
+    let off_perp = (offset - axis * offset.dot(axis)).length();
+    let r_arc = off_perp + sa.angular_sweep_radius(axis_local);
+    let ang_bound = angle.abs() * r_arc;
     let mut t = 0.0f32;
     let mut pose_a = *pa;
     let mut last: Option<(Vec3, Vec3)> = None;

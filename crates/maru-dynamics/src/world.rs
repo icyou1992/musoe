@@ -2923,7 +2923,18 @@ impl World {
                     // 전체로는 수십 cm를 도는 블레이드가 캐스트 없이 회전한다(서브스텝
                     // 사이에는 내로우페이즈가 없어 침투가 무검사로 누적된다 — 확인 검수
                     // rev_8672a3eb MAJOR). 캐스트 자체는 서브스텝 각(sub_angle)으로 돈다.
-                    let arc = sub_angle * (n_sub as f32) * self.bodies[i].shape.bounding_radius();
+                    // 반지름은 **각 스윕 반지름**(코어의 축 수직 거리) — 구·자기 축
+                    // 캡슐처럼 회전이 점유를 안 바꾸는 형상은 0이라 게이트가 꺼진다.
+                    // 굴러가는 CCD 탄환 구가 매 서브스텝 회전 캐스트를 도는 낭비와
+                    // 보수적 절단을 막는다(확인 검수 rev_477d7366 MAJOR).
+                    let sweep_r = if sub_angle > 0.0 {
+                        let axis_local =
+                            st.rot[i].conjugate().rotate(omega * (1.0 / omega.length()));
+                        self.bodies[i].shape.angular_sweep_radius(axis_local)
+                    } else {
+                        0.0
+                    };
+                    let arc = sub_angle * (n_sub as f32) * sweep_r;
                     let rot_sweep = arc > 0.25 * skin;
                     let mut rot_toi = 1.0f32;
                     if ccd_frozen[ci] {
