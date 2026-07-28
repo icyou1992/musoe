@@ -5355,6 +5355,107 @@ mod tests {
         assert!(w1.diagnostics().ccd_clamps > 0 || tip_x(&w1, h1) < 1.0);
     }
 
+    /// 회귀(rev_3398738c MAJOR ①②): 내부 에지 판정은 각도 기반·대칭이고, 같은 쪽
+    /// 중복면은 "2면 공유"라도 용접하지 않는다.
+    #[test]
+    fn welding_rejects_skinny_ridges_and_same_side_duplicates() {
+        let mut w = World::new(WorldParams::default());
+        let mask = |h: BodyHandle, w: &World| w.body(h).weld_edges;
+
+        // 같은 삼각형 두 번(같은 쪽 겹침) — 모든 에지가 정확히 2면 공유지만 반대쪽
+        // 검증이 걸러야 한다. 예전 판정(공면만)은 세 에지를 전부 용접했다.
+        let v = [
+            Vec3::new(-1.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.0, -1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        let hs = w
+            .try_add_terrain(&v, &[[0, 1, 2], [0, 1, 2]], 0.02)
+            .unwrap();
+        assert_eq!(mask(hs[0], &w), 0, "같은 쪽 중복면이 용접됐다");
+        assert_eq!(mask(hs[1], &w), 0, "같은 쪽 중복면이 용접됐다");
+
+        // 스키니 삼각형 + 실각 45° 능선: 예전 판정은 t1의 최대 변(~707m)으로 임계를
+        // 부풀려(7e-4) 0.6mm 능선을 공면으로 봤다. 각도 판정은 스케일 불변이라 거른다.
+        let v = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.02, 0.0, 0.0),        // 공유 에지 2cm
+            Vec3::new(500.0, 0.0, 500.0),     // t1의 먼 정점 (스케일 ~707m)
+            Vec3::new(0.01, 6.0e-4, -6.0e-4), // t2 반대 정점 — 평면 위 0.6mm (실각 45°)
+        ];
+        let hs = w
+            .try_add_terrain(&v, &[[0, 1, 2], [1, 0, 3]], 0.001)
+            .unwrap();
+        assert_eq!(mask(hs[0], &w), 0, "스키니 능선이 용접됐다");
+        assert_eq!(mask(hs[1], &w), 0, "스키니 능선이 용접됐다");
+
+        // 대조: 같은 스키니 t1이라도 진짜 공면 이웃(반대쪽·각 0°)은 용접된다.
+        let v = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.02, 0.0, 0.0),
+            Vec3::new(500.0, 0.0, 500.0),
+            Vec3::new(0.01, 0.0, -0.01),
+        ];
+        let hs = w
+            .try_add_terrain(&v, &[[0, 1, 2], [1, 0, 3]], 0.001)
+            .unwrap();
+        assert_ne!(mask(hs[0], &w), 0, "공면 이웃이 용접되지 않았다");
+        assert_ne!(mask(hs[1], &w), 0, "공면 이웃이 용접되지 않았다");
+    }
+
+    /// 회귀(rev_3398738c MAJOR ③): frozen(평면 5개째)이 돼도 회전 스윕은 계속
+    /// 캐스트·절단된다 — 이동만 얼리면 팁이 남은 서브스텝 동안 벽을 쓸고 지나간다.
+    #[test]
+    fn frozen_ccd_body_keeps_rotation_clamped() {
+        // 서브스텝 8 — 평면은 서브스텝당 최대 1개 쌓이므로 5개째(frozen)에 도달하려면
+        // 기본 4로는 불가능하다. toi=0 접촉 히트가 같은 법선을 반복해서 쌓는다.
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            substeps: 8,
+            ..WorldParams::default()
+        });
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.05, 3.0, 3.0),
+                radius: 0.0,
+            },
+            pose(1.2, 0.0, 0.0),
+        ));
+        let b = Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(1.5, 0.05, 0.05),
+                radius: 0.0,
+            },
+            Pose {
+                pos: Vec3::ZERO,
+                rot: Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::FRAC_PI_2),
+            },
+            1.0,
+        )
+        .with_ccd();
+        let h = w.add_body(b);
+        w.set_angular_velocity(h, Vec3::new(0.0, 30.0, 0.0))
+            .unwrap();
+        let skin = w.params().speculative_margin;
+        let mut froze = false;
+        for step in 0..120 {
+            w.step(DT);
+            froze |= w.diagnostics().ccd_frozen > 0;
+            let p = w.body(h).pose();
+            let tip = (p.pos + p.rot.rotate(Vec3::new(1.5, 0.0, 0.0)))
+                .x
+                .max((p.pos + p.rot.rotate(Vec3::new(-1.5, 0.0, 0.0))).x);
+            assert!(
+                tip <= 1.15 + skin + 0.02,
+                "step {step}: frozen 후 회전이 벽을 쓸었다 (tip_x={tip})"
+            );
+        }
+        assert!(
+            froze,
+            "frozen이 발동하지 않았다 — 테스트가 경로를 증명하지 못함"
+        );
+    }
+
     /// 회귀(rev_e4075e85): 센서+CCD 바디는 벽에 물리적으로 멈추면 안 된다 — 센서 계약.
     #[test]
     fn sensor_with_ccd_is_not_clamped_by_walls() {

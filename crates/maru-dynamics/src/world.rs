@@ -335,6 +335,8 @@ pub struct Diagnostics {
     pub narrow_limited: bool,
     /// 이번 스텝 CCD linear cast가 이동을 절단한 횟수 (서브스텝×바디 누적).
     pub ccd_clamps: usize,
+    /// 이번 스텝 frozen(평면 5개째 = 구석에 낌) 상태로 돈 서브스텝×바디 누적.
+    pub ccd_frozen: usize,
     /// 단계별 소요 (ns) — 프로파일용.
     /// `[aabb, broad, narrow, solve, post]`
     /// - `aabb`: 바디 순회 + 회전 월드 AABB 구성 (예전에는 broad에서 **빠져 있었다**)
@@ -651,6 +653,19 @@ impl World {
                         .push((ti, e));
                 }
             }
+            let unit_normal = |ti: usize| -> Option<Vec3> {
+                let p0 = vertices[triangles[ti][0] as usize];
+                let p1 = vertices[triangles[ti][1] as usize];
+                let p2 = vertices[triangles[ti][2] as usize];
+                let n = (p1 - p0).cross(p2 - p0);
+                let scale = (p1 - p0)
+                    .length()
+                    .max((p2 - p0).length())
+                    .max((p2 - p1).length());
+                let len = n.length();
+                // 퇴화는 위에서 이미 거부됐지만 나눗셈 방어.
+                (len > maru_collide::area_eps(scale)).then(|| n * (1.0 / len))
+            };
             for (&(va, vb), users) in &edge_map {
                 let [(t1, e1), (t2, e2)] = users[..] else {
                     continue; // 경계(1) 또는 비-다양체(3+) — 용접하지 않는다
@@ -662,21 +677,33 @@ impl World {
                         .expect("삼각형은 에지 밖 정점이 정확히 하나");
                     vertices[t[i] as usize]
                 };
-                let p0 = vertices[triangles[t1][0] as usize];
-                let p1 = vertices[triangles[t1][1] as usize];
-                let p2 = vertices[triangles[t1][2] as usize];
-                let n1 = (p1 - p0).cross(p2 - p0);
-                let n1_len = n1.length();
-                let scale = (p1 - p0)
-                    .length()
-                    .max((p2 - p0).length())
-                    .max((p2 - p1).length());
-                // 퇴화는 위에서 이미 거부됐지만 나눗셈 방어.
-                if n1_len <= maru_collide::area_eps(scale) {
+                let (Some(n1), Some(n2)) = (unit_normal(t1), unit_normal(t2)) else {
+                    continue;
+                };
+                // **공면 판정은 각도(무차원)로** — "반대 정점의 평면 거리 ≤ 한쪽 삼각형
+                // 스케일"은 스키니 삼각형에서 임계가 부풀어(에지 1cm·먼 정점 수 km →
+                // 수 cm 허용) 진짜 능선을 용접했고, 어느 쪽이 t1이냐에도 비대칭이었다
+                // (검수 rev_3398738c MAJOR). 단위 법선의 정렬은 스케일 불변·대칭이다.
+                // 와인딩 정합: 다양체 메시는 공유 에지를 서로 반대 방향으로 순회한다 —
+                // 같은 방향이면 이웃 와인딩이 뒤집힌 것이므로 법선을 뒤집어 비교한다.
+                let same_dir = triangles[t1][e1 as usize] == triangles[t2][e2 as usize];
+                let n2o = if same_dir { -n2 } else { n2 };
+                // Jolt ActiveEdges 기본 임계와 동급(~5.7°) — 완만한 지형 테셀레이션은
+                // 용접하고, 진짜 능선·골짜기는 남긴다.
+                const COS_COPLANAR: f32 = 0.995;
+                if n1.dot(n2o) < COS_COPLANAR {
                     continue;
                 }
-                let dist = (opp(&triangles[t2]) - p0).dot(n1 * (1.0 / n1_len)).abs();
-                if dist <= maru_collide::length_eps(scale) {
+                // **반대쪽 검증** — 두 반대 정점이 공유 에지의 서로 반대쪽이어야 진짜
+                // 이웃이다. 같은 쪽(중복·겹침면)을 용접하면 실제 외곽 경계의 에지 법선이
+                // 사라져 경계 충돌이 소실된다(검수 rev_3398738c MAJOR). 부호 곱이
+                // 음수일 때만 용접(0·NaN = 보수적으로 제외).
+                let ea = vertices[va as usize];
+                let edge = vertices[vb as usize] - ea;
+                let side = |o: Vec3| edge.cross(n1).dot(o - ea);
+                let s1 = side(opp(&triangles[t1]));
+                let s2 = side(opp(&triangles[t2]));
+                if s1 * s2 < 0.0 {
                     bodies[t1].weld_edges |= 1 << e1;
                     bodies[t2].weld_edges |= 1 << e2;
                 }
@@ -2895,8 +2922,16 @@ impl World {
                     let rot_sweep = arc > 0.25 * skin;
                     let mut rot_toi = 1.0f32;
                     if ccd_frozen[ci] {
+                        // frozen = 이번 스텝 **이동** 종료. 회전 스윕은 캐스트를 계속
+                        // 돌려 TOI 절단한다 — 이동만 얼리고 회전을 무검사로 적분하면
+                        // 구석에 낀 블레이드의 팁이 남은 서브스텝 동안 벽을 쓸고
+                        // 지나간다(검수 rev_3398738c MAJOR).
                         d = Vec3::ZERO;
-                    } else if d != Vec3::ZERO || rot_sweep {
+                        self.diag.ccd_frozen += 1;
+                    }
+                    if (!ccd_frozen[ci] && (d != Vec3::ZERO || rot_sweep))
+                        || (ccd_frozen[ci] && rot_sweep)
+                    {
                         let body = &self.bodies[i];
                         let pose_now = maru_collide::Pose {
                             pos: st.pos[i],
