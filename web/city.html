@@ -33,6 +33,9 @@ const STRIDE = 7, IDENT = [0, 0, 0, 1];
 const { instance } = await WebAssembly.instantiateStreaming(fetch('./maru_wasm.wasm'), {});
 const m = instance.exports;
 const world = m.maru_world_create(0, -9.81, 0, 0);
+// 수면 임계를 rapier 기본과 동일선(0.4/0.5)으로 — 대량 잔해 데모는 빨리 잠드는 게
+// 성능·안정 둘 다 이득이다(수면=절벽 해법이라는 실측 결론). 기본값(0.1)은 4배 엄격.
+m.maru_set_sleep_thresholds(world, 0.4, 0.5, 0.4);
 
 // ---- 도시: 바닥 + 타워 그리드 (1m 큐브, 완전 정렬 적층 → 빠르게 정착·수면) ----
 m.maru_add_body(world, BODY_STATIC, SHAPE_BOX, 80, 1, 80, 0, 0, -1, 0, ...IDENT, 1);
@@ -65,9 +68,11 @@ const BALL_R = 0.6, BALL_DENSITY = 3;
 const BALL_MASS = BALL_DENSITY * (4 / 3) * Math.PI * BALL_R ** 3;
 
 // ---- three.js ----
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// 모바일: AA·고픽셀비가 GPU를 지배한다 — 폰에서는 둘 다 끈다(두 비교판 동일 적용).
+const MOBILE = /Mobi|Android/i.test(navigator.userAgent);
+const renderer = new THREE.WebGLRenderer({ antialias: !MOBILE });
 renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(MOBILE ? 1 : Math.min(devicePixelRatio, 2));
 document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d14);

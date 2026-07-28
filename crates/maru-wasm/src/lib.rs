@@ -515,6 +515,29 @@ pub unsafe extern "C" fn maru_set_damping(
     }
 }
 
+/// 수면 임계 조정 (설계 §4.6). 장면 성격에 따라 수면 공격성을 고른다 — 대량 잔해
+/// 장면은 높게(빨리 잠듦 = 성능·안정), 톨 스택 정밀 장면은 낮게. 기본값(0.1/0.15/0.5)은
+/// 보수적이다 — rapier 기본(0.4)의 4배 엄격. 실패하면 음수 오류 코드.
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_set_sleep_thresholds(
+    p: *mut WasmWorld,
+    linear: f32,
+    angular: f32,
+    time_to_sleep: f32,
+) -> i32 {
+    let w = w_or!(p, ERR_NULL);
+    match w
+        .world
+        .try_set_sleep_thresholds(linear, angular, time_to_sleep)
+    {
+        Ok(()) => OK,
+        Err(e) => code(e),
+    }
+}
+
 /// 잠들어 있으면 1 (죽은 핸들·비수면 0). 호스트 시각화·LOD용 — 수면 도시가 어둡게,
 /// 충격 전파가 깨어나는 것으로 보인다.
 ///

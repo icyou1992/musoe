@@ -5503,6 +5503,33 @@ mod tests {
         }
     }
 
+    /// 수면 임계 런타임 조정: 진입만 게이트하고(관대해지면 더 빨리 잠듦) 잠든 바디는
+    /// 깨우지 않으며, 파라미터는 캐노니컬이라 스냅샷 왕복에 실린다. 검증은 생성 정본.
+    #[test]
+    fn sleep_thresholds_can_be_retuned_at_runtime() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let b = dyn_box(&mut w, 0.0, 0.5);
+        for _ in 0..120 {
+            w.step(DT);
+        }
+        assert!(w.is_asleep(b), "정착한 박스가 기본 임계로 잠들어야 한다");
+        // 관대한 임계로 조정 — 잠든 바디는 그대로 잠들어 있다(기상 없음).
+        w.try_set_sleep_thresholds(0.4, 0.5, 0.25).unwrap();
+        w.step(DT);
+        assert!(w.is_asleep(b), "임계 조정이 잠든 바디를 깨웠다");
+        assert_eq!(w.params().sleep_linear_threshold, 0.4);
+        // 스냅샷 왕복 — 파라미터가 캐노니컬로 실린다.
+        let snap = w.snapshot();
+        let mut w2 = World::new(WorldParams::default());
+        w2.restore(&snap).unwrap();
+        assert_eq!(w2.params().sleep_linear_threshold, 0.4);
+        assert_eq!(snap, w2.snapshot());
+        // 검증은 생성과 같은 정본 — NaN·음수는 거부.
+        assert!(w.try_set_sleep_thresholds(f32::NAN, 0.5, 0.25).is_err());
+        assert!(w.try_set_sleep_thresholds(-1.0, 0.5, 0.25).is_err());
+    }
+
     /// 회귀(rev_e4075e85): 센서+CCD 바디는 벽에 물리적으로 멈추면 안 된다 — 센서 계약.
     #[test]
     fn sensor_with_ccd_is_not_clamped_by_walls() {

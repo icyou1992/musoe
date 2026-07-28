@@ -10,6 +10,7 @@ use maru_collide::Manifold;
 use maru_math::{Mat3, Mat3x4, Quat, Vec3, Vec3x4};
 use wide::{f32x4, CmpGt};
 
+#[derive(Clone)]
 pub struct SolverParams {
     pub contact_hertz: f32,
     pub contact_damping: f32,

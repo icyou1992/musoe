@@ -61,9 +61,11 @@ const BALL_R = 0.6, BALL_DENSITY = 3;
 const BALL_MASS = BALL_DENSITY * (4 / 3) * Math.PI * BALL_R ** 3;
 
 // ---- three.js ----
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// 모바일: AA·고픽셀비가 GPU를 지배한다 — 폰에서는 둘 다 끈다(두 비교판 동일 적용).
+const MOBILE = /Mobi|Android/i.test(navigator.userAgent);
+const renderer = new THREE.WebGLRenderer({ antialias: !MOBILE });
 renderer.setSize(innerWidth, innerHeight);
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setPixelRatio(MOBILE ? 1 : Math.min(devicePixelRatio, 2));
 document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d14);

@@ -133,6 +133,7 @@ pub struct RayHit {
     pub started_inside: bool,
 }
 
+#[derive(Clone)]
 pub struct WorldParams {
     pub gravity: Vec3,
     pub substeps: u32,
@@ -507,6 +508,29 @@ impl World {
     }
 
     #[inline]
+    /// 수면 임계 런타임 조정 (설계 §4.6 파라미터의 유일한 가변 노출). 게임은 장면
+    /// 성격에 따라 수면 공격성을 고른다 — 톨 스택 정밀 장면은 낮게, 대량 잔해 장면은
+    /// 높게(수면이 곧 성능·안정 레버라는 절벽 규명 결론). 검증은 생성과 **같은 정본**
+    /// (`check_params`)으로 한다 — 필드별 검사를 따로 적으면 비대칭이 재발한다.
+    ///
+    /// 잠든 바디는 깨우지 않는다: 임계는 수면 **진입**만 게이트하고, 이미 잠든
+    /// 바디의 유지·기상은 wake 경로 소관이다(전 엔진 공통 시맨틱). 파라미터는
+    /// 캐노니컬 상태라 스냅샷에 그대로 실린다.
+    pub fn try_set_sleep_thresholds(
+        &mut self,
+        linear: f32,
+        angular: f32,
+        time_to_sleep: f32,
+    ) -> Result<(), ApiError> {
+        let mut p = self.params.clone();
+        p.sleep_linear_threshold = linear;
+        p.sleep_angular_threshold = angular;
+        p.time_to_sleep = time_to_sleep;
+        check_params(&p)?;
+        self.params = p;
+        Ok(())
+    }
+
     pub fn params(&self) -> &WorldParams {
         &self.params
     }
