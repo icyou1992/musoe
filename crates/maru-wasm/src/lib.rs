@@ -79,6 +79,11 @@ pub struct WasmWorld {
     /// 월드 쪽 원본은 다음 스텝까지 살아 있으므로, 그 전에 동기화하면 복구된다
     /// (확인 검수 rev_b438e81e MAJOR: 복구 경로가 없으면 Started가 영구 유실).
     events_stale: bool,
+    /// 월드의 `contact_events`가 **이미 발행 완료된 스텝** 것이라 재스테이징 금지.
+    /// `ERR_INVALID_VALUE`(스텝 미실행)가 스테이징을 비운 뒤에도 월드 원본에는 직전
+    /// 성공 스텝의 이벤트가 남는다 — 이 상태에서 동기화가 원본을 재복사하면 중복
+    /// 재발행 결함이 명시 경로로 부활한다(확인 검수 rev_697a9d54 MAJOR).
+    events_suppressed: bool,
     /// 광선·질의 결과 스테이징. 용량은 생성 시 선점(7·2) — 핫패스에서 할당하지 않는다.
     query: Vec<f32>,
     hits: Vec<u32>,
@@ -151,6 +156,7 @@ pub extern "C" fn maru_world_create(gx: f32, gy: f32, gz: f32, substeps: u32) ->
         transforms_stale: false,
         events: Vec::new(),
         events_stale: false,
+        events_suppressed: false,
         query,
         hits,
     }))
@@ -341,11 +347,15 @@ pub unsafe extern "C" fn maru_step(p: *mut WasmWorld, dt: f32) -> i32 {
     // 스텝이 실패해도 변환 버퍼는 최신 상태로 맞춰둔다 — 호스트가 마지막 유효 자세를 그린다.
     let staged_t = w.refresh_transforms().is_ok();
     let staged_e = if matches!(step, Err(ApiError::InvalidValue)) {
-        // 실행되지 않은 스텝: 빈 버퍼가 곧 정답이다 — stale이 아니다.
+        // 실행되지 않은 스텝: 빈 버퍼가 곧 정답이다 — stale이 아니고, 월드 원본
+        // (직전 성공 스텝 것)은 재스테이징 금지로 봉인한다.
         w.events.clear();
         w.events_stale = false;
+        w.events_suppressed = true;
         true
     } else {
+        // step_inner가 실행됐다 — 월드의 이벤트는 이번 시도 것이고 발행 대상이다.
+        w.events_suppressed = false;
         w.refresh_events().is_ok()
     };
     match step {
@@ -414,6 +424,19 @@ impl WasmWorld {
         self.events_stale = false;
         Ok(())
     }
+
+    /// 호스트 대면 재스테이징의 단일 정본 — 억제 상태를 소비한다. `maru_step` 내부는
+    /// 억제를 직접 갱신하므로 `refresh_events`를 그대로 쓰고, sync·getter는 전부
+    /// 이 경로여야 한다(우회하면 rev_697a9d54의 중복 재발행이 부활한다).
+    fn restage_events(&mut self) -> Result<(), ()> {
+        if self.events_suppressed {
+            // 원본은 이미 발행 완료된 스텝 것 — 빈 버퍼가 정답이다.
+            self.events.clear();
+            self.events_stale = false;
+            return Ok(());
+        }
+        self.refresh_events()
+    }
 }
 
 /// 변환 버퍼를 월드와 명시적으로 동기화한다. 성공 0, 실패 `ERR_STAGING_LIMIT`.
@@ -480,12 +503,16 @@ pub unsafe extern "C" fn maru_is_alive(p: *mut WasmWorld, h: u64) -> u32 {
 /// `maru_step`이 `ERR_STAGING_LIMIT`을 돌려줬을 때의 복구 경로다. 월드의 이벤트
 /// 원본은 다음 스텝까지 불변이므로 **다음 스텝 전에** 부르면 유실이 없다.
 ///
+/// 직전 호출이 `ERR_INVALID_VALUE`(스텝 미실행)였다면 빈 버퍼를 유지하고 성공을
+/// 돌려준다 — 월드에 남은 원본은 이미 발행 완료된 스텝 것이라 재복사하면 중복
+/// 재발행이다(확인 검수 rev_697a9d54 MAJOR). 아무 때나 불러도 안전한 이유다.
+///
 /// # Safety
 /// `p`는 살아있는 월드 포인터여야 한다.
 #[no_mangle]
 pub unsafe extern "C" fn maru_sync_events(p: *mut WasmWorld) -> i32 {
     let w = w_or!(p, ERR_NULL);
-    match w.refresh_events() {
+    match w.restage_events() {
         Ok(()) => OK,
         Err(()) => ERR_STAGING_LIMIT,
     }
@@ -503,7 +530,7 @@ pub unsafe extern "C" fn maru_sync_events(p: *mut WasmWorld) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn maru_events_ptr(p: *mut WasmWorld) -> *const u32 {
     let w = w_or!(p, core::ptr::null());
-    if w.events_stale && w.refresh_events().is_err() {
+    if w.events_stale && w.restage_events().is_err() {
         return core::ptr::null();
     }
     w.events.as_ptr()
@@ -520,7 +547,7 @@ pub unsafe extern "C" fn maru_events_ptr(p: *mut WasmWorld) -> *const u32 {
 #[no_mangle]
 pub unsafe extern "C" fn maru_events_len(p: *mut WasmWorld) -> u32 {
     let w = w_or!(p, 0);
-    if w.events_stale && w.refresh_events().is_err() {
+    if w.events_stale && w.restage_events().is_err() {
         return 0;
     }
     (w.events.len() / 5) as u32
@@ -770,6 +797,15 @@ mod tests {
                         maru_events_len(w),
                         0,
                         "실행되지 않은 스텝이 이벤트를 재발행했다"
+                    );
+                    // 명시 동기화도 같은 답이어야 한다 — 월드 원본(직전 성공 스텝의
+                    // Started)을 재복사하면 중복 재발행이 명시 경로로 부활한다
+                    // (확인 검수 rev_697a9d54 MAJOR).
+                    assert_eq!(maru_sync_events(w), OK);
+                    assert_eq!(
+                        maru_events_len(w),
+                        0,
+                        "명시 동기화가 발행 완료된 이벤트를 재복사했다"
                     );
                     break;
                 }
