@@ -214,6 +214,37 @@ impl Joint {
         Ok(())
     }
 
+    /// 캐노니컬 표현으로 정규화한다 — **리더가 정규화하므로 라이브 경로도 해야 한다**.
+    ///
+    /// `Reader::quat`는 norm²가 0.9~1.1이면 받아주되 **정규화해서** 돌려준다(비단위
+    /// 쿼터니언은 자세를 조용히 붕괴시키므로). 그런데 생성 경로는 준 값을 그대로 들고
+    /// 있었다 — 그래서 norm² 0.81짜리 `rel_rot`으로 만든 조인트는 snapshot → restore가
+    /// **다른 값·다른 상태 해시**를 내고 목표 상대 자세까지 미세하게 달라졌다
+    /// (교차검수 rev_d2e60241 MAJOR). `Fixed`에도 있던 결함이라 둘 다 여기서 닫는다.
+    ///
+    /// 축(`axis_a`/`axis_b`)은 이미 생성자가 정규화하고 리더는 `vec3`로 **그대로** 읽으므로
+    /// 왕복이 정확하다 — 비대칭이 재생산되지 않게 여기서 함께 정규화해 둔다.
+    pub(crate) fn canonicalize(&mut self) -> Result<(), crate::world::ApiError> {
+        use crate::world::ApiError;
+        match &mut self.kind {
+            JointKind::Fixed { rel_rot } => {
+                *rel_rot = rel_rot.try_normalize().ok_or(ApiError::InvalidValue)?;
+            }
+            JointKind::Prismatic {
+                axis_a, rel_rot, ..
+            } => {
+                *axis_a = axis_a.try_normalize().ok_or(ApiError::InvalidValue)?;
+                *rel_rot = rel_rot.try_normalize().ok_or(ApiError::InvalidValue)?;
+            }
+            JointKind::Hinge { axis_a, axis_b, .. } => {
+                *axis_a = axis_a.try_normalize().ok_or(ApiError::InvalidValue)?;
+                *axis_b = axis_b.try_normalize().ok_or(ApiError::InvalidValue)?;
+            }
+            JointKind::Point | JointKind::Distance { .. } => {}
+        }
+        Ok(())
+    }
+
     /// 누적 임펄스 초기화 (OOB 전이 등 연속성이 끊기는 지점).
     pub(crate) fn clear_impulses(&mut self) {
         self.linear_impulse = Vec3::ZERO;
@@ -312,6 +343,7 @@ impl Joint {
         let mut j = Self::try_point(body_a, body_b, anchor_a, anchor_b)?;
         j.kind = JointKind::Fixed { rel_rot };
         j.validate()?;
+        j.canonicalize()?;
         Ok(j)
     }
 
@@ -354,6 +386,7 @@ impl Joint {
             motor: None,
         };
         j.validate()?;
+        j.canonicalize()?;
         Ok(j)
     }
 
@@ -459,6 +492,16 @@ pub fn warm_start(st: &mut crate::solver::SolverState, j: &Joint) {
                 st.apply_pub(j.ia(), imp, ra);
                 st.apply_pub(j.ib(), -imp, rb);
             }
+        }
+        JointKind::Prismatic { axis_a, .. } => {
+            // **현재 축의 수직 평면으로 투영한 뒤 싣는다.** 누적은 월드 벡터인데
+            // 축이 회전하면(kinematic A가 도는 엘리베이터 팔 등) 이전 프레임의 수직
+            // 반력이 **새 자유축 성분**을 얻는다. 그대로 실으면 warm start가 자유축
+            // 속도를 주입해 1-DOF 계약이 깨진다 (교차검수 rev_d2e60241 MAJOR).
+            let n = st.rot[j.ia()].rotate(axis_a);
+            let imp = j.linear_impulse - n * n.dot(j.linear_impulse);
+            st.apply_pub(j.ia(), imp, ra);
+            st.apply_pub(j.ib(), -imp, rb);
         }
         _ => {
             st.apply_pub(j.ia(), j.linear_impulse, ra);
@@ -939,6 +982,11 @@ fn solve_prismatic(
     // 행별 Gauss-Seidel로 풀면 두 방향의 커플링(K의 비대각)이 서브스텝 안에서 남아
     // 하중이 실린 슬라이더가 축에서 벗어난 채 진동한다. 2×2는 닫힌 형태라 공짜다.
     let (u, v) = perp_basis(n);
+    // **캐노니컬 상태를 현재 수직 평면으로 재표현한다.** warm start와 같은 이유이고,
+    // 여기서 지우지 않으면 축 성분이 캐시에 계속 남아 다음 서브스텝에 되살아난다.
+    let old0 = u.dot(j.linear_impulse);
+    let old1 = v.dot(j.linear_impulse);
+    j.linear_impulse = u * old0 + v * old1;
     let c_pos = (st.pos[j.ia()] + ra) - (st.pos[j.ib()] + rb);
     let cdot = st.vel_at_pub(j.ia(), ra) - st.vel_at_pub(j.ib(), rb);
     let (ku, kv) = (k.mul_vec(u), k.mul_vec(v));
@@ -973,9 +1021,7 @@ fn solve_prismatic(
         let x0 = (a22 * r0 - a12 * r1) * inv_det;
         let x1 = (a11 * r1 - a12 * r0) * inv_det;
         // 누적은 월드 벡터로 들고 있다(기저 u·v는 축과 함께 돈다) — 접촉의 마찰 임펄스가
-        // 접평면 기저 회전에 대응하는 방식과 같다.
-        let old0 = u.dot(j.linear_impulse);
-        let old1 = v.dot(j.linear_impulse);
+        // 접평면 기저 회전에 대응하는 방식과 같다. `old0`/`old1`은 위에서 투영과 함께 뽑았다.
         let i0 = x0 * ms - old0 * is_;
         let i1 = x1 * ms - old1 * is_;
         let imp = u * i0 + v * i1;

@@ -1664,6 +1664,9 @@ impl World {
         // 대입으로 생성 후 축을 NaN으로 바꿀 수 있었고, `length_sq() < 0.5` 비교는
         // NaN에서 false라 그대로 통과했다).
         joint.validate()?;
+        // **삽입 경계에서 캐노니컬화한다** — 생성자를 안 거친 경로(공개 필드 대입·
+        // `with_*` 체인)도 리더와 같은 표현으로 저장돼야 snapshot 왕복이 항등이다.
+        joint.canonicalize()?;
         let (a, b) = (self.resolve(joint.body_a)?, self.resolve(joint.body_b)?);
         if a == b {
             return Err(ApiError::InvalidValue);

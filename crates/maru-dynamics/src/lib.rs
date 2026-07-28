@@ -1279,6 +1279,101 @@ mod tests {
         );
     }
 
+    /// **축이 회전하면 캐시된 수직 반력이 자유축으로 샌다** — warm start가 그걸
+    /// 그대로 실으면 슬라이더가 스스로 미끄러진다 (교차검수 rev_d2e60241 MAJOR).
+    ///
+    /// 솔버 상태를 직접 만들어 그 상황을 재현한다: 누적 임펄스를 **현재 자유축과
+    /// 나란하게** 두고 warm start를 돌린 뒤, 자유축 상대속도가 그대로인지 본다.
+    #[test]
+    fn prismatic_warm_start_does_not_leak_into_the_free_axis() {
+        use crate::solver::SolverState;
+        let axis = maru_math::Vec3::new(1.0, 0.0, 0.0);
+        let mut w = World::new(WorldParams::default());
+        let (a, b) = hung_pair(&mut w, maru_math::Vec3::ZERO);
+        let mut j = Joint::try_prismatic(
+            a,
+            b,
+            maru_math::Vec3::ZERO,
+            maru_math::Vec3::ZERO,
+            axis,
+            maru_math::Quat::IDENTITY,
+        )
+        .unwrap();
+        // 이전 프레임에 축이 다른 방향이었을 때 쌓인 수직 반력 — 지금은 자유축과 나란하다.
+        j.linear_impulse = axis * 5.0;
+
+        let mut st = SolverState::default();
+        st.reserve_for(2).unwrap();
+        st.lin = vec![maru_math::Vec3::ZERO; 2];
+        st.ang = vec![maru_math::Vec3::ZERO; 2];
+        st.pos = vec![maru_math::Vec3::ZERO, maru_math::Vec3::new(1.0, 0.0, 0.0)];
+        st.rot = vec![maru_math::Quat::IDENTITY; 2];
+        st.inv_m = vec![0.0, 1.0]; // A는 static, B는 dynamic
+        st.inv_i = vec![maru_math::Mat3::from_diagonal(maru_math::Vec3::ZERO); 2];
+        st.inv_i[1] = maru_math::Mat3::from_diagonal(maru_math::Vec3::new(1.0, 1.0, 1.0));
+        st.dynamic = vec![false, true];
+
+        crate::joint::warm_start(&mut st, &j);
+        let free = axis.dot(st.lin[1] - st.lin[0]);
+        assert!(
+            free.abs() < 1.0e-6,
+            "warm start가 자유축 속도를 주입했다: {free} m/s"
+        );
+    }
+
+    /// 비단위(허용 범위 안) `rel_rot`은 **생성 시점에** 캐노니컬화돼야 한다 —
+    /// 스냅샷 리더가 정규화하므로, 안 하면 왕복이 항등이 아니다.
+    #[test]
+    fn joint_rel_rot_is_canonicalized_so_snapshots_round_trip() {
+        // norm² = 0.9549 — validate 허용 범위(0.9~1.1) 안이지만 **단위가 아니다**.
+        // 경계값(0.9 정확)은 f32 반올림으로 검증에 걸릴 수 있어 안쪽을 고른다.
+        // 항등이 아닌 회전을 써야 정규화가 값을 실제로 바꾼다.
+        let loose = maru_math::Quat {
+            x: 0.3,
+            y: 0.0,
+            z: 0.0,
+            w: 0.93,
+        };
+        for prismatic in [false, true] {
+            let mut w = World::new(WorldParams::default());
+            let (a, b) = hung_pair(&mut w, maru_math::Vec3::new(1.0, 0.0, 0.0));
+            let j = if prismatic {
+                Joint::try_prismatic(
+                    a,
+                    b,
+                    maru_math::Vec3::ZERO,
+                    maru_math::Vec3::ZERO,
+                    maru_math::Vec3::new(1.0, 0.0, 0.0),
+                    loose,
+                )
+                .unwrap()
+            } else {
+                Joint::try_fixed(a, b, maru_math::Vec3::ZERO, maru_math::Vec3::ZERO, loose).unwrap()
+            };
+            w.try_add_joint(j).unwrap();
+            for _ in 0..10 {
+                w.try_step(1.0 / 60.0).unwrap();
+            }
+            let snap = w.try_snapshot().unwrap();
+            let mut r = World::new(WorldParams::default());
+            r.restore(&snap).unwrap();
+            assert_eq!(
+                r.try_state_hash().unwrap(),
+                w.try_state_hash().unwrap(),
+                "prismatic={prismatic}: 비단위 rel_rot이 왕복에서 갈렸다"
+            );
+            for _ in 0..10 {
+                w.try_step(1.0 / 60.0).unwrap();
+                r.try_step(1.0 / 60.0).unwrap();
+            }
+            assert_eq!(
+                r.try_state_hash().unwrap(),
+                w.try_state_hash().unwrap(),
+                "prismatic={prismatic}: 복원 후 미래가 갈렸다"
+            );
+        }
+    }
+
     /// prismatic 파라미터 검증 — 축·자세·한계·모터 전부.
     #[test]
     fn prismatic_parameters_are_validated() {
