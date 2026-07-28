@@ -72,6 +72,11 @@ pub struct Body {
     pub(crate) filter: u32,
     /// 감지 전용(트리거). 접촉 이벤트는 내지만 임펄스는 주고받지 않는다.
     pub(crate) sensor: bool,
+    /// 지형 삼각형의 **내부 에지 비트마스크**(비트 i = 에지 (pᵢ, p₍ᵢ₊₁₎%₃)이 이웃
+    /// 삼각형과 공면 공유 — 접점 법선을 면 법선으로 용접한다, §4.2 ghost edge).
+    /// 0 = 용접 없음(일반 바디 전부). 비영은 **static 3점 hull에만** 허용(validate).
+    /// 캐노니컬 상태다 — 법선을 바꾸므로 스냅샷에 빠지면 복원 궤적이 갈린다.
+    pub(crate) weld_edges: u8,
     /// CCD linear cast opt-in (설계 §4 CCD 계약 v0.5, 대상 static 한정).
     /// 고속 소형 바디(총알)가 얇은 static을 관통하지 않도록 서브스텝 적분마다
     /// 이동 경로를 static 트리에 캐스트해 TOI에서 위치를 절단한다. dynamic 전용 의미 —
@@ -194,6 +199,18 @@ impl Body {
     pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
         use crate::world::ApiError;
         self.shape.validate().map_err(|_| ApiError::InvalidValue)?;
+        // 용접 마스크: 3비트뿐이고, 비영이면 static 3점 hull(지형 삼각형)이어야 한다 —
+        // 다른 셰이프에 물리면 면 법선 정의가 없어 보정이 무의미하거나 틀린다.
+        if self.weld_edges >= 8 {
+            return Err(ApiError::InvalidValue);
+        }
+        if self.weld_edges != 0 {
+            let is_tri_hull =
+                matches!(&self.shape, Shape::Hull { points, .. } if points.len() == 3);
+            if self.body_type != BodyType::Static || !is_tri_hull {
+                return Err(ApiError::InvalidValue);
+            }
+        }
         // 크기 상한(MAX_INPUT)까지 여기서 강제한다 — 스냅샷 리더와 **같은 정책**이라야
         // `restore(snapshot())`가 항상 성립한다(리뷰 BLOCKER: 비대칭).
         if !vec_in_range(self.pose.pos) || self.pose.rot.try_normalize().is_none() {
@@ -325,6 +342,7 @@ impl Body {
             filter: ALL_GROUPS,
             sensor: false,
             ccd: false,
+            weld_edges: 0,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -376,6 +394,7 @@ impl Body {
             filter: ALL_GROUPS,
             sensor: false,
             ccd: false,
+            weld_edges: 0,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -452,6 +471,7 @@ impl Body {
             filter: ALL_GROUPS,
             sensor: false,
             ccd: false,
+            weld_edges: 0,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -483,6 +503,7 @@ impl Body {
             filter: ALL_GROUPS,
             sensor: false,
             ccd: false,
+            weld_edges: 0,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };

@@ -880,6 +880,172 @@ fn reduce_to_4(pts: Vec<ContactPoint>, n: Vec3) -> Vec<ContactPoint> {
     out
 }
 
+/// **지형 내부 에지 용접** (§4.2 ghost edge, Jolt ActiveEdges 동형).
+///
+/// 삼각형 지형은 삼각형마다 독립 바디라, 이웃과 **공면으로 공유하는 에지**(내부 에지)의
+/// 둥근 밴드에서 접촉이 생기면 법선이 면이 아니라 에지에서 나온다 — 평평한 바닥을
+/// 구르는 구가 이음새마다 옆으로 차이는 유령 충돌. 등록부(try_add_terrain)가 인접성 +
+/// 공면성으로 내부 에지를 판정해 마스크를 주면, 여기서 그 에지 근방 접점의 법선을
+/// 면 법선으로 스냅한다.
+///
+/// 보정 규칙(전부 보수적 — 확신 없으면 무변경):
+/// - 법선이 이미 면 법선 원뿔 안(±5°)이면 무변경 (면 접촉은 원래 맞다).
+/// - 접점 중 하나라도 내부 에지 세그먼트에서 `radius + tol` 안이어야 스냅한다 —
+///   외부 에지·꼭짓점 접촉은 그대로 (경계에서는 에지 법선이 물리적으로 옳다).
+/// - 면 법선 부호는 현재 법선 쪽으로 정렬한다(지형은 양면 — A가 어느 쪽이든 성립).
+/// - separation은 재계산하지 않는다: 오차는 O(θ·침투)이고 소프트 위치 보정이 흡수한다.
+///   (Jolt도 거리 유지 — 방향만 고친다.)
+///
+/// 볼록 능선·오목 골짜기는 등록부가 마스크를 세우지 않으므로 여기 오지 않는다.
+pub fn weld_internal_edges(m: &mut Manifold, tri: [Vec3; 3], radius: f32, internal: u8) {
+    if internal == 0 || m.is_empty() {
+        return;
+    }
+    let n_face = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+    let scale = (tri[1] - tri[0])
+        .length()
+        .max((tri[2] - tri[0]).length())
+        .max((tri[2] - tri[1]).length());
+    // cross 길이는 L² — 면적 차원 임계로 퇴화 방지(등록부가 이미 거르지만 방어).
+    let len = n_face.length();
+    if len <= crate::tolerance::area_eps(scale) {
+        return;
+    }
+    let n_face = n_face * (1.0 / len);
+    let n_signed = if n_face.dot(m.normal) >= 0.0 {
+        n_face
+    } else {
+        -n_face
+    };
+    // 5° 원뿔 — Jolt ActiveEdges 기본 임계와 동급. 면 접촉은 여기서 끝난다.
+    const COS_FACE: f32 = 0.996;
+    if m.normal.dot(n_signed) >= COS_FACE {
+        return;
+    }
+    let band = radius + crate::tolerance::length_eps(scale);
+    let near_internal = m.points().iter().any(|p| {
+        (0..3u8).any(|i| {
+            internal & (1 << i) != 0
+                && dist_point_segment(p.position, tri[i as usize], tri[((i + 1) % 3) as usize])
+                    <= band
+        })
+    });
+    if near_internal {
+        m.normal = n_signed;
+    }
+}
+
+/// 점-세그먼트 거리 (용접 밴드 판정 전용).
+fn dist_point_segment(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let ab = b - a;
+    let denom = ab.length_sq();
+    // 퇴화 세그먼트(등록부가 거르지만 방어): 점 거리로.
+    if denom <= 0.0 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / denom).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+#[cfg(test)]
+mod weld_tests {
+    use super::*;
+    use maru_math::Quat;
+
+    // 바닥 평면의 삼각형: (−1,0,−1)·(1,0,−1)·(0,0,1), 에지 0 = 앞쪽 (−1..1, z=−1).
+    fn tri() -> [Vec3; 3] {
+        [
+            Vec3::new(-1.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.0, -1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ]
+    }
+
+    fn edge_manifold(tilt: Vec3) -> Manifold {
+        let mut m = Manifold {
+            normal: (Vec3::new(0.0, 1.0, 0.0) + tilt).normalize_or_zero(),
+            ..Default::default()
+        };
+        m.push(ContactPoint {
+            position: Vec3::new(0.0, 0.0, -1.0), // 에지 0 위
+            separation: -0.01,
+            feature: FeatureId(3),
+        });
+        m
+    }
+
+    /// 내부 에지 근방의 기운 법선은 면 법선으로 스냅된다.
+    #[test]
+    fn tilted_normal_on_internal_edge_snaps_to_face() {
+        let mut m = edge_manifold(Vec3::new(0.0, 0.0, -0.6)); // 에지 0 밖으로 기움
+        weld_internal_edges(&mut m, tri(), 0.05, 0b001);
+        assert!((m.normal - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-6);
+    }
+
+    /// 아래에서 온 접촉은 아래쪽 면 법선으로 — 부호는 현재 법선 쪽으로 정렬된다.
+    #[test]
+    fn snap_keeps_the_side_the_contact_came_from() {
+        let mut m = edge_manifold(Vec3::new(0.0, 0.0, -0.6));
+        m.normal = Vec3::new(0.0, -1.0, 0.3).normalize_or_zero();
+        weld_internal_edges(&mut m, tri(), 0.05, 0b001);
+        assert!((m.normal - Vec3::new(0.0, -1.0, 0.0)).length() < 1e-6);
+    }
+
+    /// 마스크가 0이거나(용접 없음) 접점이 외부 에지에 있으면 무변경.
+    #[test]
+    fn external_edges_and_unmasked_triangles_are_untouched() {
+        let before = edge_manifold(Vec3::new(0.0, 0.0, -0.6));
+        let mut m = before;
+        weld_internal_edges(&mut m, tri(), 0.05, 0);
+        assert_eq!(m.normal, before.normal);
+        // 에지 1·2만 내부라고 표시 — 접점은 에지 0 위라 밴드 밖.
+        let mut m = before;
+        weld_internal_edges(&mut m, tri(), 0.05, 0b110);
+        assert_eq!(m.normal, before.normal);
+    }
+
+    /// 면 접촉(법선이 이미 원뿔 안)은 내부 에지 위 접점이라도 무변경 — 보정은 방향만.
+    #[test]
+    fn face_contacts_are_left_alone() {
+        let mut m = edge_manifold(Vec3::ZERO);
+        let before = m.normal;
+        weld_internal_edges(&mut m, tri(), 0.05, 0b111);
+        assert_eq!(m.normal, before);
+    }
+
+    /// 실제 협폭 경로로도 성립: 구가 내부 에지의 둥근 밴드에 접촉 → 기운 법선 → 용접.
+    #[test]
+    fn real_sphere_edge_contact_gets_welded() {
+        let hull = Shape::Hull {
+            points: tri().to_vec(),
+            radius: 0.05,
+        };
+        let sphere = Shape::Sphere { radius: 0.3 };
+        let id = Pose {
+            pos: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+        };
+        // 에지 0(z=−1) 바로 바깥 위 — 에지 밴드 접촉이라 법선이 −z로 기운다.
+        let pa = Pose {
+            pos: Vec3::new(0.0, 0.32, -1.12),
+            rot: Quat::IDENTITY,
+        };
+        let m0 = contact(&sphere, &pa, &hull, &id, 0.1).expect("접촉이 있어야 한다");
+        assert!(
+            m0.normal.z < -0.2,
+            "전제: 에지 접촉 법선이 기울어야 한다 (n={:?})",
+            m0.normal
+        );
+        let mut m = m0;
+        weld_internal_edges(&mut m, tri(), 0.05, 0b001);
+        assert!(
+            (m.normal - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-6,
+            "용접 후 면 법선이어야 한다 (n={:?})",
+            m.normal
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

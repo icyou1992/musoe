@@ -2104,9 +2104,9 @@ mod tests {
 
         // 슬롯(Box): alive1+oob1+reserved1+gen4
         //            + 본문(106 + force12 + torque12 + membership4 + filter4 + sensor1
-        //                   + ccd1(v11) + damping8 = 148)
-        //            + sleep4+asleep1+island4 = 164
-        const SLOT: usize = 164;
+        //                   + ccd1(v11) + weld1(v12) + damping8 = 149)
+        //            + sleep4+asleep1+island4 = 165
+        const SLOT: usize = 165;
         let type_off = HDR + 4 + SLOT + 1 + 1 + 1 + 4;
         assert_eq!(
             good[type_off], 1,
@@ -5145,6 +5145,138 @@ mod tests {
         assert!(w.try_add_terrain(&verts, &[[0, 1, 99]], 0.02).is_err());
         assert!(w.try_add_terrain(&verts, &[[0, 1, 3]], 0.0).is_err());
         let _ = n_before;
+    }
+
+    /// 내부 에지 판정(§4.2 ghost edge): 공면 공유 에지만 용접 마스크가 선다 —
+    /// 경계·볼록 능선·비-다양체 에지는 제외.
+    #[test]
+    fn terrain_marks_only_coplanar_shared_edges_internal() {
+        let mut w = World::new(WorldParams::default());
+        // 평평한 사각형 = 2 삼각형, 공유 에지 (1,2)는 공면 → 양쪽 용접.
+        let quad = [
+            Vec3::new(-1.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.0, -1.0),
+            Vec3::new(-1.0, 0.0, 1.0),
+            Vec3::new(1.0, 0.0, 1.0),
+        ];
+        let hs = w
+            .try_add_terrain(&quad, &[[0, 1, 2], [1, 3, 2]], 0.02)
+            .unwrap();
+        let mask = |h: BodyHandle, w: &World| w.body(h).weld_edges;
+        // T0의 공유 에지 = (v1,v2) = 에지 1, T1의 공유 에지 = (v1,v2)… T1=[1,3,2]에서
+        // (1,2)는 에지 2다. 경계 에지는 비트가 서면 안 된다.
+        assert_eq!(mask(hs[0], &w), 0b010, "T0: 공유 에지(1→2)만 내부");
+        assert_eq!(mask(hs[1], &w), 0b100, "T1: 공유 에지(2→1)만 내부");
+
+        // 90° 능선: 공유 에지가 공면이 아니다 → 용접 없음.
+        let ridge = [
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, -1.0), // 수평 면
+            Vec3::new(0.0, 1.0, 0.0),  // 수직 면
+        ];
+        let hs = w
+            .try_add_terrain(&ridge, &[[0, 1, 2], [0, 3, 1]], 0.02)
+            .unwrap();
+        assert_eq!(mask(hs[0], &w), 0, "능선은 용접 금지");
+        assert_eq!(mask(hs[1], &w), 0, "능선은 용접 금지");
+
+        // 비-다양체(3면 공유): 보수적으로 용접 없음.
+        let fan = [
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 0.5),
+        ];
+        let hs = w
+            .try_add_terrain(&fan, &[[0, 1, 2], [0, 1, 3], [0, 1, 4]], 0.02)
+            .unwrap();
+        for h in &hs {
+            assert_eq!(mask(*h, &w), 0, "비-다양체 에지는 용접 금지");
+        }
+    }
+
+    /// 용접 마스크는 캐노니컬이다: 스냅샷 왕복에서 보존되고, validate는 지형 삼각형이
+    /// 아닌 바디의 비영 마스크를 거부한다.
+    #[test]
+    fn weld_mask_roundtrips_and_is_rejected_off_terrain() {
+        let mut w = World::new(WorldParams::default());
+        let quad = [
+            Vec3::new(-1.0, 0.0, -1.0),
+            Vec3::new(1.0, 0.0, -1.0),
+            Vec3::new(-1.0, 0.0, 1.0),
+            Vec3::new(1.0, 0.0, 1.0),
+        ];
+        let hs = w
+            .try_add_terrain(&quad, &[[0, 1, 2], [1, 3, 2]], 0.02)
+            .unwrap();
+        let snap = w.snapshot();
+        let mut w2 = World::new(WorldParams::default());
+        w2.restore(&snap).expect("정상 스냅샷 복원 실패");
+        assert_eq!(w2.body(hs[0]).weld_edges, 0b010);
+        assert_eq!(snap, w2.snapshot(), "왕복 바이트 불일치");
+
+        // 지형 삼각형이 아닌 바디의 비영 마스크 = 도달 불가 상태 → validate 거부.
+        let mut bad = Body::new_static(Shape::Sphere { radius: 0.5 }, pose(0.0, 0.0, 0.0));
+        bad.weld_edges = 1;
+        assert!(bad.validate().is_err(), "구에 용접 마스크가 허용됨");
+        // 3점이 아닌 hull도 거부 — 면 법선·에지 인덱스 의미가 없다.
+        let mut bad = Body::new_static(
+            Shape::Hull {
+                points: vec![
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                    Vec3::new(0.3, 1.0, 0.3),
+                ],
+                radius: 0.02,
+            },
+            pose(0.0, 1.0, 0.0),
+        );
+        bad.weld_edges = 1;
+        assert!(bad.validate().is_err(), "4점 hull에 용접 마스크가 허용됨");
+    }
+
+    /// 거동: 평평한 이음새를 미끄러져 건너는 구가 옆으로 차이지 않는다.
+    #[test]
+    fn sphere_slides_across_welded_seam_without_lateral_kick() {
+        let mut w = World::new(WorldParams::default());
+        // z축 이음새를 가진 평평한 2×1 바닥 (x = −2..2, 이음새 x=0).
+        let verts = [
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(0.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+        ];
+        let tris = [[0u32, 1, 3], [1, 4, 3], [1, 2, 4], [2, 5, 4]];
+        w.try_add_terrain(&verts, &tris, 0.02).unwrap();
+        let mut b = Body::new_dynamic(Shape::Sphere { radius: 0.3 }, pose(-1.2, 0.33, 0.1), 1.0);
+        b.linvel = Vec3::new(2.5, 0.0, 0.0);
+        let ball = w.add_body(b);
+        let mut crossed = false;
+        for _ in 0..90 {
+            w.step(DT);
+            let p = w.body(ball).pose().pos;
+            let v = w.body(ball).linvel();
+            assert!(
+                v.z.abs() < 0.05,
+                "이음새에서 측면 속도 발생: vz={} (x={})",
+                v.z,
+                p.x
+            );
+            assert!(v.y < 0.5, "이음새에서 수직 킥: vy={} (x={})", v.y, p.x);
+            if p.x > 0.5 {
+                crossed = true;
+                break;
+            }
+        }
+        assert!(
+            crossed,
+            "이음새를 건너지 못했다 — 테스트가 아무것도 증명 안 함"
+        );
     }
 
     /// 회귀(rev_e4075e85): 센서+CCD 바디는 벽에 물리적으로 멈추면 안 된다 — 센서 계약.

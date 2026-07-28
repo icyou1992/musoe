@@ -28,8 +28,9 @@ pub use limits::{
     MAX_INPUT, MAX_SHAPE_EXTENT, MAX_SPEED, MAX_STATE, MIN_DT, MIN_INV_MASS, MIN_SHAPE_EXTENT,
 };
 pub use manifold::{
-    any_contact, contact, for_each_contact, ContactPoint, FeatureId, Manifold, FEATURE_ANALYTIC,
-    FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT, FEATURE_GENERIC, MAX_MANIFOLD_POINTS,
+    any_contact, contact, for_each_contact, weld_internal_edges, ContactPoint, FeatureId, Manifold,
+    FEATURE_ANALYTIC, FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT, FEATURE_GENERIC,
+    MAX_MANIFOLD_POINTS,
 };
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};

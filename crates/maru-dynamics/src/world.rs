@@ -583,10 +583,11 @@ impl World {
     /// 두께 0이라 최소 특징 크기를 radius로만 얻고, radius가 얇으면 hull validate가 거부한다.
     /// static 트리는 구조 변경 시에만 빌드되므로 수천 삼각형도 스텝 비용에 영향이 없다.
     ///
-    /// **v1 명시 한계 — internal edge welding 없음**: 인접 삼각형이 공유하는 에지에도
-    /// 독립 접촉이 생겨, 구가 평평한 메시를 굴러갈 때 에지 법선의 유령 충돌로 미세하게
-    /// 튈 수 있다(모든 per-triangle 메시의 고전 문제). welding(인접 법선 콘 필터)은 설계
-    /// §4.2 canonical feature ID의 예약 확장이다 — 요구 실증 시 구현.
+    /// **내부 에지 용접(§4.2)**: 정확히 두 삼각형이 공면으로 공유하는 에지는 등록 시
+    /// `weld_edges` 마스크로 표시되고, 내로우페이즈가 그 에지 밴드의 접점 법선을 면
+    /// 법선으로 스냅한다(Jolt ActiveEdges 동형) — 평평한 메시의 유령 충돌(이음새 킥)을
+    /// 제거한다. 볼록 능선·오목 골짜기·경계·비-다양체 에지는 보수적으로 용접하지 않는다
+    /// (에지 법선이 물리적으로 옳은 곳이다).
     ///
     /// 반환: 삼각형별 핸들. 퇴화 삼각형(validate 실패)은 `Err`로 전체 거부(부분 삽입 없음).
     pub fn try_add_terrain(
@@ -633,6 +634,53 @@ impl World {
                     rot: maru_math::Quat::IDENTITY,
                 },
             ));
+        }
+        // **내부 에지 판정** (§4.2 ghost edge): 정확히 두 삼각형이 공유하고 **공면**인
+        // 에지만 용접 대상이다. 볼록 능선(절벽 모서리)·오목 골짜기는 에지 법선이
+        // 물리적으로 옳으므로 제외하고, 3면 이상이 공유하는 비-다양체 에지도 보수적으로
+        // 제외한다. 공면 판정은 상대 삼각형 반대 정점의 평면 거리 — 길이 차원이므로
+        // 에지 스케일 상대 임계를 쓴다(절대 상수 금지).
+        {
+            let mut edge_map: HashMap<(u32, u32), Vec<(usize, u8)>> = HashMap::new();
+            for (ti, t) in triangles.iter().enumerate() {
+                for e in 0..3u8 {
+                    let (a, b) = (t[e as usize], t[((e + 1) % 3) as usize]);
+                    edge_map
+                        .entry((a.min(b), a.max(b)))
+                        .or_default()
+                        .push((ti, e));
+                }
+            }
+            for (&(va, vb), users) in &edge_map {
+                let [(t1, e1), (t2, e2)] = users[..] else {
+                    continue; // 경계(1) 또는 비-다양체(3+) — 용접하지 않는다
+                };
+                let opp = |t: &[u32; 3]| {
+                    let i = t
+                        .iter()
+                        .position(|&v| v != va && v != vb)
+                        .expect("삼각형은 에지 밖 정점이 정확히 하나");
+                    vertices[t[i] as usize]
+                };
+                let p0 = vertices[triangles[t1][0] as usize];
+                let p1 = vertices[triangles[t1][1] as usize];
+                let p2 = vertices[triangles[t1][2] as usize];
+                let n1 = (p1 - p0).cross(p2 - p0);
+                let n1_len = n1.length();
+                let scale = (p1 - p0)
+                    .length()
+                    .max((p2 - p0).length())
+                    .max((p2 - p1).length());
+                // 퇴화는 위에서 이미 거부됐지만 나눗셈 방어.
+                if n1_len <= maru_collide::area_eps(scale) {
+                    continue;
+                }
+                let dist = (opp(&triangles[t2]) - p0).dot(n1 * (1.0 / n1_len)).abs();
+                if dist <= maru_collide::length_eps(scale) {
+                    bodies[t1].weld_edges |= 1 << e1;
+                    bodies[t2].weld_edges |= 1 << e2;
+                }
+            }
         }
         let mut handles = Vec::new();
         handles
@@ -2443,6 +2491,23 @@ impl World {
                 let constraints = &mut constraints;
                 let constraint_keys = &mut constraint_keys;
                 let live_keys = &mut live_keys;
+                // 지형 삼각형(내부 에지 마스크 보유)이면 월드 좌표 삼각형을 미리 풀어 둔다 —
+                // 접점 법선 용접(§4.2 ghost edge)은 매니폴드 생성 직후, 소비(prepare) 전이다.
+                // 지형은 항상 static = B 쪽이다(validate가 static 3점 hull에만 마스크 허용).
+                let weld = match &bodies[b_id].shape {
+                    maru_collide::Shape::Hull { points, radius }
+                        if bodies[b_id].weld_edges != 0 && points.len() == 3 =>
+                    {
+                        let pb = &bodies[b_id].pose;
+                        let t = |p: Vec3| pb.pos + pb.rot.rotate(p);
+                        Some((
+                            [t(points[0]), t(points[1]), t(points[2])],
+                            *radius,
+                            bodies[b_id].weld_edges,
+                        ))
+                    }
+                    _ => None,
+                };
                 for_each_contact(
                     &bodies[a_id].shape,
                     &bodies[a_id].pose,
@@ -2452,6 +2517,9 @@ impl World {
                     &mut |ca, cb, mut m| {
                         if bail || m.is_empty() {
                             return;
+                        }
+                        if let Some((tri, r, mask)) = weld {
+                            maru_collide::weld_internal_edges(&mut m, tri, r, mask);
                         }
                         touched = true;
                         if sensor_pair {
