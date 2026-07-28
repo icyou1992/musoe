@@ -35,7 +35,7 @@ world.timestep = 1 / 60;
 // ---- 도시: 바닥 + 타워 그리드 (1m 큐브, 완전 정렬 적층 → 빠르게 정착·수면) ----
 world.createCollider(RAPIER.ColliderDesc.cuboid(80, 1, 80).setTranslation(0, -1, 0));
 const boxes = [];        // RigidBody 객체
-const GRID = 12, SPACING = 6.0, BASE = 2, HEIGHT = 8;
+const GRID = 20, SPACING = 6.0, BASE = 2, HEIGHT = 6;
 for (let gx = 0; gx < GRID; gx++) {
   for (let gz = 0; gz < GRID; gz++) {
     const cx = (gx - (GRID - 1) / 2) * SPACING;
@@ -71,7 +71,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0d14);
 scene.fog = new THREE.Fog(0x0b0d14, 80, 220);
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 500);
-camera.position.set(42, 30, 42);
+camera.position.set(62, 42, 62);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 6, 0);
 controls.enableDamping = true;
@@ -189,6 +189,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
+window.__TOTAL__ = boxes.length;
 window.__READY__ = true;
 </script>
 </body>

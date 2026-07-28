@@ -37,7 +37,7 @@ await page.goto(`http://127.0.0.1:${port}/${process.env.PAGE ?? 'city.html'}`);
 await page.waitForFunction(() => window.__READY__ === true, null, { timeout: 120_000 });
 
 // 정착 대기 — 전량 수면(또는 25초 상한)까지. 네이티브 재현 기준 ~6초.
-await page.waitForFunction(() => window.__ASLEEP__ >= 4608, null, { timeout: 25_000 });
+await page.waitForFunction(() => window.__ASLEEP__ >= window.__TOTAL__, null, { timeout: 90_000 });
 const settled = await page.evaluate(() => ({ ...window.__STATS__, asleep: window.__ASLEEP__ }));
 console.log('settled:', JSON.stringify(settled));
 
