@@ -718,16 +718,10 @@ fn clip_box_box(
     };
 
     let rn = box_face_normal(rf, rp.rot); // reference 바깥 법선 (월드)
-    let rverts: Vec<Vec3> = box_face_verts(rf, rh, rr)
-        .iter()
-        .map(|v| rp.pos + rp.rot.rotate(*v))
-        .collect();
+    let rverts: [Vec3; 4] = box_face_verts(rf, rh, rr).map(|v| rp.pos + rp.rot.rotate(v));
     // incident = 상대 박스에서 rn과 가장 반대인 면
     let (inc_f, _) = best_face(ip.rot, -rn);
-    let iverts: Vec<Vec3> = box_face_verts(inc_f, ih, ir)
-        .iter()
-        .map(|v| ip.pos + ip.rot.rotate(*v))
-        .collect();
+    let iverts: [Vec3; 4] = box_face_verts(inc_f, ih, ir).map(|v| ip.pos + ip.rot.rotate(v));
     // radius가 half를 잠식해 평면 패치가 선/점으로 퇴화하면 클리핑 불가 → witness 폴백
     // cross 길이 = 면적(L²) → L² 임계와 비교 (length_sq는 L⁴)
     if (rverts[1] - rverts[0])
@@ -742,16 +736,25 @@ fn clip_box_box(
         return None;
     }
 
-    // Sutherland–Hodgman: incident 폴리곤을 reference 4 측면 평면으로 클리핑 (계보 추적)
-    let mut poly: Vec<ClipVertex> = iverts
-        .iter()
-        .enumerate()
-        .map(|(i, v)| ClipVertex {
+    // Sutherland–Hodgman: incident 폴리곤을 reference 4 측면 평면으로 클리핑 (계보 추적).
+    // **힙 할당 없음** — 볼록 4각형을 반평면 4개로 자르면 정점은 단계마다 최대 +1이라
+    // 상한이 8이다. 예전에는 여기서 페어당 Vec 6개(poly + 측면마다 out)를 할당해
+    // 스텝당 수만 회의 allocator 왕복이 narrow의 상수를 먹었다.
+    const CLIP_CAP: usize = 8;
+    let mut poly = [ClipVertex {
+        position: Vec3::ZERO,
+        incident_mask: 0,
+        reference_mask: 0,
+    }; CLIP_CAP];
+    let mut poly_len = 4usize;
+    for (i, v) in iverts.iter().enumerate() {
+        poly[i] = ClipVertex {
             position: *v,
             incident_mask: 1u8 << i,
             reference_mask: 0,
-        })
-        .collect();
+        };
+    }
+    let mut buf = poly;
     for side in 0..4 {
         let e0 = rverts[side];
         let e1 = rverts[(side + 1) % 4];
@@ -761,14 +764,24 @@ fn clip_box_box(
         if pn.dot(center - e0) < 0.0 {
             pn = -pn;
         }
-        let mut out: Vec<ClipVertex> = Vec::with_capacity(8);
-        for i in 0..poly.len() {
+        let mut out_len = 0usize;
+        // 볼록 입력에서 상한 초과는 수학적으로 불가 — 부동소수 퇴화 방어로만 잘라낸다
+        // (wasm에서 인덱스 패닉 = trap이라, 불가능 케이스도 조용히 버리는 쪽이 계약이다).
+        let push = |buf: &mut [ClipVertex; CLIP_CAP], len: &mut usize, v: ClipVertex| {
+            if *len < CLIP_CAP {
+                buf[*len] = v;
+                *len += 1;
+            } else {
+                debug_assert!(false, "볼록 클리핑이 상한 8을 넘었다");
+            }
+        };
+        for i in 0..poly_len {
             let v0 = poly[i];
-            let v1 = poly[(i + 1) % poly.len()];
+            let v1 = poly[(i + 1) % poly_len];
             let d0 = pn.dot(v0.position - e0);
             let d1 = pn.dot(v1.position - e0);
             if d0 >= 0.0 {
-                out.push(v0);
+                push(&mut buf, &mut out_len, v0);
             }
             // 교점은 **엄격한 부호 반대**일 때만 생성 (확인 라운드 MAJOR 반영 — d0==0인 경계
             // 정점은 위에서 이미 보존되므로 t=0 교점까지 만들면 같은 위치가 서로 다른 계보
@@ -776,22 +789,28 @@ fn clip_box_box(
             if (d0 > 0.0 && d1 < 0.0) || (d0 < 0.0 && d1 > 0.0) {
                 let t = d0 / (d0 - d1);
                 let x = v0.position + (v1.position - v0.position) * t;
-                out.push(ClipVertex {
-                    position: x,
-                    incident_mask: v0.incident_mask | v1.incident_mask,
-                    reference_mask: v0.reference_mask | v1.reference_mask | (1u8 << side),
-                });
+                push(
+                    &mut buf,
+                    &mut out_len,
+                    ClipVertex {
+                        position: x,
+                        incident_mask: v0.incident_mask | v1.incident_mask,
+                        reference_mask: v0.reference_mask | v1.reference_mask | (1u8 << side),
+                    },
+                );
             }
         }
-        poly = out;
-        if poly.is_empty() {
+        poly = buf;
+        poly_len = out_len;
+        if poly_len == 0 {
             return None;
         }
     }
 
     // reference 평면 아래(margin 이내)만 채택, separation = 평면까지 부호 거리
-    let mut pts: Vec<ContactPoint> = Vec::with_capacity(8);
-    for v in poly {
+    let mut pts = [ContactPoint::default(); CLIP_CAP];
+    let mut pts_len = 0usize;
+    for v in poly.iter().take(poly_len) {
         let sep = rn.dot(v.position - rverts[0]);
         if sep <= margin {
             // 접점 위치는 reference 면 위로 투영한 점과 incident 점의 중간
@@ -801,30 +820,35 @@ fn clip_box_box(
                 | ((inc_f as u32) << 25)
                 | ((v.reference_mask as u32) << 4)
                 | v.incident_mask as u32;
-            pts.push(ContactPoint {
+            pts[pts_len] = ContactPoint {
                 position: (v.position + proj) * 0.5,
                 separation: sep,
                 feature: FeatureId(feature),
-            });
+            };
+            pts_len += 1;
         }
     }
-    if pts.is_empty() {
+    if pts_len == 0 {
         return None;
     }
 
     // 4점 축소 (설계 §4.2): 최심점 고정 + 나머지는 면적 최대 조합(그리디, 결정적)
-    if pts.len() > 4 {
-        pts = reduce_to_4(pts, rn);
-    }
+    let reduced;
+    let final_pts: &[ContactPoint] = if pts_len > 4 {
+        reduced = reduce_to_4(&pts[..pts_len], rn);
+        &reduced
+    } else {
+        &pts[..pts_len]
+    };
     // manifold 법선은 push-A 관례로: reference가 A면 rn은 A→B → 뒤집기
     let m_normal = if ref_is_a { -rn } else { rn };
-    Some(Manifold::from_points(m_normal, &pts))
+    Some(Manifold::from_points(m_normal, final_pts))
 }
 
 /// 최심점 고정 → 나머지 3점 전수 조합으로 접촉 사각형 면적 최대 선택 (설계 §4.2 원문,
 /// 리뷰 MAJOR 반영 — 구 그리디(최원점 선고정)는 면적 최대 조합을 보장하지 않았다).
 /// pts는 클리핑 다각형의 순환 순서 — 인덱스 정렬로 부분집합의 순환 순서를 보존해 면적 계산.
-fn reduce_to_4(pts: Vec<ContactPoint>, n: Vec3) -> Vec<ContactPoint> {
+fn reduce_to_4(pts: &[ContactPoint], n: Vec3) -> [ContactPoint; 4] {
     use core::cmp::Ordering;
     let deepest = pts
         .iter()
@@ -836,7 +860,16 @@ fn reduce_to_4(pts: Vec<ContactPoint>, n: Vec3) -> Vec<ContactPoint> {
         })
         .map(|(i, _)| i)
         .unwrap();
-    let candidates: Vec<usize> = (0..pts.len()).filter(|i| *i != deepest).collect();
+    // 입력 상한 8 (클리핑 상한) — 후보는 최대 7. 고정 배열로 할당 제거.
+    let mut candidates = [0usize; 8];
+    let mut cand_len = 0usize;
+    for i in 0..pts.len() {
+        if i != deepest {
+            candidates[cand_len] = i;
+            cand_len += 1;
+        }
+    }
+    let candidates = &candidates[..cand_len];
     let mut best_indices = [deepest, candidates[0], candidates[1], candidates[2]];
     let mut best_area = -1.0f32;
     let mut best_key = [FeatureId(u32::MAX); 4];
@@ -875,7 +908,12 @@ fn reduce_to_4(pts: Vec<ContactPoint>, n: Vec3) -> Vec<ContactPoint> {
         }
     }
 
-    let mut out: Vec<ContactPoint> = best_indices.iter().map(|&i| pts[i]).collect();
+    let mut out = [
+        pts[best_indices[0]],
+        pts[best_indices[1]],
+        pts[best_indices[2]],
+        pts[best_indices[3]],
+    ];
     out.sort_by_key(|p| p.feature);
     out
 }
