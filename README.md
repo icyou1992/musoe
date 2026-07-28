@@ -276,6 +276,11 @@ cd web && cp ../target/wasm32-unknown-unknown/release/maru_wasm.wasm . && python
 - **패닉이 경계를 넘지 않는다.** 엔진의 `try_*`만 쓰고 실패는 음수 오류 코드다 —
   wasm에서 unwind는 곧 trap이라 호스트가 진단할 수 없다.
 - `maru_transforms_ptr`은 `maru_step` 뒤 **다시 물어봐야 한다**(재할당 시 무효화).
+  콜드 변이(스텝 없는 add/remove/set_pose) 후엔 포인터 취득이 자동 동기화하고,
+  명시 경로는 `maru_sync_transforms`다.
+- 핸들 `u64`는 JS에서 **BigInt**다(Number 아님 — i64 ABI). 센티널 `u64::MAX`는 `-1n`.
+- 스테이징 버퍼 성장도 `try_reserve`다 — 실패는 trap이 아니라 `ERR_STAGING_LIMIT(-7)`
+  (엔진 상태는 정상, 버퍼만 stale). 실행되지 않은 스텝은 이벤트를 재발행하지 않는다.
 
 `crate-type`에 `rlib`을 함께 둬서 **게이트가 같은 C ABI를 네이티브로 돈다** —
 바인딩만 브라우저에서 손으로 확인하는 층이 되면 조용히 썩는다.

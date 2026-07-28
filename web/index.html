@@ -27,6 +27,8 @@ const { instance } = await WebAssembly.instantiateStreaming(
 const m = instance.exports;
 const mem = () => new Float32Array(m.memory.buffer);
 
+// 핸들(u64)은 JS에서 **BigInt**다 — Number로 변환하지 말고 불투명하게 보관·전달한다.
+// 실패 센티널 u64::MAX는 -1n으로 관측된다.
 const world = m.maru_world_create(0, -9.81, 0, 0);
 
 // 바닥
@@ -64,8 +66,10 @@ function frame(now) {
   stepMs = stepMs * 0.9 + (performance.now() - t0) * 0.1;
 
   // **핫패스는 여기가 전부다**: 포인터 한 번, 뷰 한 번.
+  // (첫 RAF에서 스텝이 한 번도 안 돌아도 안전하다 — 포인터 취득이 콜드 변이를
+  // 자동 동기화한다. 부호 없는 시프트: 포인터가 2GiB를 넘으면 >>는 음수가 된다.)
   const n = m.maru_slot_count(world);
-  const base = m.maru_transforms_ptr(world) >> 2;
+  const base = m.maru_transforms_ptr(world) >>> 2;
   const t = mem();
 
   ctx.fillStyle = '#11131a';
