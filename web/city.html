@@ -139,6 +139,7 @@ addEventListener('pointerdown', (e) => {
 const hud = document.getElementById('hud');
 const M4 = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new THREE.Vector3(), S = new THREE.Vector3(1, 1, 1);
 let last = performance.now(), acc = 0, frames = 0;
+const prevAsleep = new Uint8Array(20 * 20 * 2 * 2 * 6);
 let stepMsAvg = 0, fpsAvg = 0, stepMsNow = 0;
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -159,16 +160,27 @@ function frame(now) {
     stepMsAvg = stepMsAvg * 0.9 + stepMsNow * 0.1;
   }
 
-  // 핫패스: 포인터 1회 + Float32Array 뷰 1회. null = 스테이징 실패 프레임 스킵.
+  // 핫패스: 포인터 2회 + 뷰 2회. **잠든 바디는 행렬 갱신·업로드를 건너뛴다** —
+  // 안 움직였으니 행렬이 이미 맞다. 이 스킵이 없으면 매 프레임 9,600개 compose +
+  // 614KB GPU 업로드가 프레임을 지배해 물리 격차가 렌더에 묻힌다(폰 실증).
   const ptr = m.maru_transforms_ptr(world);
-  if (ptr) {
+  const fptr = m.maru_sleep_flags_ptr(world);
+  if (ptr && fptr) {
     const base = ptr >>> 2;
     const t = new Float32Array(m.memory.buffer);
+    const flags = new Uint8Array(m.memory.buffer, fptr, boxes.length + balls.length + 1);
+    let asleep = 0, changed = false;
     for (let i = 0; i < boxes.length; i++) {
-      const o = base + (i + 1) * STRIDE; // 0번 슬롯 = 바닥
+      const sleeping = flags[i + 1]; // 0번 슬롯 = 바닥
+      asleep += sleeping;
+      if (sleeping && prevAsleep[i]) continue; // 연속 수면 — 행렬·색 이미 맞다
+      const o = base + (i + 1) * STRIDE;
       P.set(t[o], t[o + 1], t[o + 2]);
       Q.set(t[o + 3], t[o + 4], t[o + 5], t[o + 6]);
       boxMesh.setMatrixAt(i, M4.compose(P, Q, S));
+      boxMesh.setColorAt(i, sleeping ? ASLEEP : AWAKE);
+      prevAsleep[i] = sleeping;
+      changed = true;
     }
     for (let i = 0; i < balls.length; i++) {
       const o = base + (boxes.length + 1 + i) * STRIDE;
@@ -176,19 +188,11 @@ function frame(now) {
       Q.set(t[o + 3], t[o + 4], t[o + 5], t[o + 6]);
       ballMesh.setMatrixAt(i, M4.compose(P, Q, S));
     }
-    boxMesh.instanceMatrix.needsUpdate = true;
-    if (balls.length) ballMesh.instanceMatrix.needsUpdate = true;
-  }
-
-  // 수면 색 갱신 (4프레임마다 — 스칼라 ABI 콜 N회는 그때만)
-  let asleep = 0;
-  if ((frames & 3) === 0) {
-    for (let i = 0; i < boxes.length; i++) {
-      const s = m.maru_is_asleep(world, boxes[i]);
-      asleep += s;
-      boxMesh.setColorAt(i, s ? ASLEEP : AWAKE);
+    if (changed) {
+      boxMesh.instanceMatrix.needsUpdate = true;
+      boxMesh.instanceColor.needsUpdate = true;
     }
-    boxMesh.instanceColor.needsUpdate = true;
+    if (balls.length) ballMesh.instanceMatrix.needsUpdate = true;
     window.__ASLEEP__ = asleep;
   }
   if ((frames++ & 15) === 0) {

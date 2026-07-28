@@ -1666,6 +1666,11 @@ impl World {
         Ok(self.joints.len() - 1)
     }
 
+    /// 슬롯 인덱스의 수면 여부 (죽은 슬롯 = false). 벌크 스테이징용.
+    pub fn is_asleep_at_slot(&self, i: usize) -> bool {
+        i < self.asleep.len() && self.alive[i] && self.asleep[i]
+    }
+
     /// 슬롯 인덱스로 바디를 읽는다 (살아있지 않으면 `None`).
     ///
     /// 핸들 경로(`body`/`try_body`)와 달리 **세대를 보지 않는다**. flat buffer 바인딩이

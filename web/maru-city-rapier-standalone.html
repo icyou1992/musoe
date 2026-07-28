@@ -130,6 +130,7 @@ addEventListener('pointerdown', (e) => {
 const hud = document.getElementById('hud');
 const M4 = new THREE.Matrix4(), Q = new THREE.Quaternion(), P = new THREE.Vector3(), S = new THREE.Vector3(1, 1, 1);
 let last = performance.now(), acc = 0, frames = 0;
+const prevAsleep = new Uint8Array(20 * 20 * 2 * 2 * 6);
 let stepMsAvg = 0, fpsAvg = 0, stepMsNow = 0;
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -150,12 +151,21 @@ function frame(now) {
     stepMsAvg = stepMsAvg * 0.9 + stepMsNow * 0.1;
   }
 
-  // 변환 읽기 — rapier.js 관례 그대로(바디별 객체 호출).
+  // 변환 읽기 — rapier.js 관례(바디별 객체 호출). **잠든 바디는 행렬 갱신·업로드
+  // 스킵**(maru판과 동일 로직 — 렌더 공정성 유지). 수면 조회는 rapier API 관례대로
+  // 바디별 isSleeping() 호출.
+  let asleep = 0, changed = false;
   for (let i = 0; i < boxes.length; i++) {
+    const sleeping = boxes[i].isSleeping() ? 1 : 0;
+    asleep += sleeping;
+    if (sleeping && prevAsleep[i]) continue;
     const tr = boxes[i].translation(), rq = boxes[i].rotation();
     P.set(tr.x, tr.y, tr.z);
     Q.set(rq.x, rq.y, rq.z, rq.w);
     boxMesh.setMatrixAt(i, M4.compose(P, Q, S));
+    boxMesh.setColorAt(i, sleeping ? ASLEEP : AWAKE);
+    prevAsleep[i] = sleeping;
+    changed = true;
   }
   for (let i = 0; i < balls.length; i++) {
     const tr = balls[i].translation(), rq = balls[i].rotation();
@@ -163,20 +173,12 @@ function frame(now) {
     Q.set(rq.x, rq.y, rq.z, rq.w);
     ballMesh.setMatrixAt(i, M4.compose(P, Q, S));
   }
-  boxMesh.instanceMatrix.needsUpdate = true;
-  if (balls.length) ballMesh.instanceMatrix.needsUpdate = true;
-
-  // 수면 색 갱신 (4프레임마다 — 스칼라 ABI 콜 N회는 그때만)
-  let asleep = 0;
-  if ((frames & 3) === 0) {
-    for (let i = 0; i < boxes.length; i++) {
-      const s = boxes[i].isSleeping() ? 1 : 0;
-      asleep += s;
-      boxMesh.setColorAt(i, s ? ASLEEP : AWAKE);
-    }
+  if (changed) {
+    boxMesh.instanceMatrix.needsUpdate = true;
     boxMesh.instanceColor.needsUpdate = true;
-    window.__ASLEEP__ = asleep;
   }
+  if (balls.length) ballMesh.instanceMatrix.needsUpdate = true;
+  window.__ASLEEP__ = asleep;
   if ((frames++ & 15) === 0) {
     hud.textContent =
       `Rapier 물리엔진 — 수면 도시 포격 (비교판)\n` +

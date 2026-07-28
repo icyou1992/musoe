@@ -69,6 +69,10 @@ pub const TRANSFORM_STRIDE: usize = 7;
 pub struct WasmWorld {
     world: World,
     transforms: Vec<f32>,
+    /// 슬롯별 수면 플래그(0/1) — transforms와 같은 주기로 갱신되는 벌크 뷰.
+    /// 바디마다 maru_is_asleep을 부르면 수천 슬롯에서 호출 오버헤드가 렌더 루프를
+    /// 지배한다(수면 도시 데모 실증) — 핫패스는 버퍼로만 오간다는 규칙 그대로.
+    sleep_flags: Vec<u8>,
     /// 콜드 변이(add/remove/set_pose)가 스텝 없이 일어나면 변환 버퍼가 실제 자세와
     /// 어긋난다(검수 rev_05c33550 MAJOR: 첫 스텝 전 렌더가 쓰레기 좌표를 읽음).
     /// 포인터를 내주기 전에 이 플래그로 동기화한다.
@@ -153,6 +157,7 @@ pub extern "C" fn maru_world_create(gx: f32, gy: f32, gz: f32, substeps: u32) ->
     Box::into_raw(Box::new(WasmWorld {
         world,
         transforms: Vec::new(),
+        sleep_flags: Vec::new(),
         transforms_stale: false,
         events: Vec::new(),
         events_stale: false,
@@ -380,6 +385,11 @@ impl WasmWorld {
         // 충분하면 무연산 — 정착 프레임에서 재할당하지 않는다.
         self.transforms.try_reserve(len).map_err(|_| ())?;
         self.transforms.resize(len, 0.0);
+        self.sleep_flags.clear();
+        self.sleep_flags.try_reserve(n).map_err(|_| ())?;
+        for i in 0..n {
+            self.sleep_flags.push(self.world.is_asleep_at_slot(i) as u8);
+        }
         for i in 0..n {
             // 살아있지 않은 슬롯은 0으로 남긴다 — 호스트는 `maru_is_alive`로 거른다.
             let Some(b) = self.world.body_at_slot(i) else {
@@ -536,6 +546,21 @@ pub unsafe extern "C" fn maru_set_sleep_thresholds(
         Ok(()) => OK,
         Err(e) => code(e),
     }
+}
+
+/// 슬롯별 수면 플래그 버퍼(u8 0/1, 길이 = slot_count) — `Uint8Array`로 벌크 읽기.
+/// transforms와 같은 주기·같은 stale 규칙으로 갱신된다(stale이면 동기화, 실패 = null).
+/// 렌더 루프가 잠든 바디의 행렬 갱신을 건너뛰는 근거다.
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_sleep_flags_ptr(p: *mut WasmWorld) -> *const u8 {
+    let w = w_or!(p, core::ptr::null());
+    if w.transforms_stale && w.refresh_transforms().is_err() {
+        return core::ptr::null();
+    }
+    w.sleep_flags.as_ptr()
 }
 
 /// 잠들어 있으면 1 (죽은 핸들·비수면 0). 호스트 시각화·LOD용 — 수면 도시가 어둡게,
@@ -733,6 +758,10 @@ mod tests {
             // 3초 정착이면 잠들어 있어야 하고, 수면 관측 ABI가 그걸 보여야 한다.
             assert_eq!(maru_is_asleep(w, ball), 1, "정착한 공이 잠들지 않았다");
             assert_eq!(maru_is_asleep(w, u64::MAX), 0, "죽은 핸들은 0");
+            // 벌크 플래그 버퍼도 같은 사실을 보여야 한다 (슬롯 1 = ball).
+            let flags = maru_sleep_flags_ptr(w);
+            assert!(!flags.is_null());
+            assert_eq!(core::slice::from_raw_parts(flags, 2)[1], 1);
 
             // 변환 버퍼를 JS가 읽듯이 읽는다
             let n = maru_slot_count(w) as usize;
