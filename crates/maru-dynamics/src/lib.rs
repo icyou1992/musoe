@@ -5536,6 +5536,75 @@ mod tests {
         );
     }
 
+    /// 복원의 스텝-출력 정책은 **원자적**이다: 성공하면 두 큐를 다 비우고,
+    /// 실패하면 둘 다 보존한다.
+    ///
+    /// 하나만 비우면 폐기한 타임라인의 접촉 이벤트가 남아 호스트가 데미지·사운드를
+    /// 다시 적용한다 — 히트 큐만 고쳤을 때 남았던 비대칭이다
+    /// (교차검수 rev_6da1d7ba NEW_DEFECT).
+    #[test]
+    fn restore_discards_both_step_output_queues_atomically() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.05, 5.0, 5.0),
+                radius: 0.0,
+            },
+            pose(10.0, 0.0, 0.0),
+        ));
+        let bullet = w.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(0.0, 0.0, 0.0), 1.0).with_ccd(),
+        );
+        w.set_linear_velocity(bullet, Vec3::new(400.0, 0.0, 0.0))
+            .unwrap();
+        // 충돌 **전** 스냅샷.
+        let before = w.try_snapshot().unwrap();
+        // 벽에 닿는 스텝까지 — 그 스텝은 접촉 `Started`와 CCD 히트를 **둘 다** 낸다.
+        // (히트는 절단한 스텝에, Started는 접촉 기준선이 바뀐 스텝에 난다.)
+        let mut both = false;
+        for _ in 0..12 {
+            w.step(DT);
+            if !w.contact_events().is_empty() && !w.ccd_hits().is_empty() {
+                both = true;
+                break;
+            }
+        }
+        assert!(
+            both,
+            "전제: 한 스텝에 접촉 이벤트와 CCD 히트가 함께 나야 두 큐를 동시에 검증한다"
+        );
+
+        // ── 실패한 복원: 두 큐 모두 보존돼야 한다 ──
+        let events_before = w.contact_events().to_vec();
+        let hits_before = w.ccd_hits().to_vec();
+        let mut broken = before.clone();
+        broken[4..8].copy_from_slice(&999u32.to_le_bytes()); // 잘못된 버전
+        assert!(w.restore(&broken).is_err(), "잘못된 스냅샷은 실패해야 한다");
+        assert_eq!(
+            w.contact_events(),
+            events_before.as_slice(),
+            "실패한 복원이 접촉 이벤트를 건드렸다"
+        );
+        assert_eq!(
+            w.ccd_hits(),
+            hits_before.as_slice(),
+            "실패한 복원이 CCD 히트를 건드렸다"
+        );
+
+        // ── 성공한 복원: 두 큐 모두 비어야 한다 ──
+        w.restore(&before).unwrap();
+        assert!(
+            w.contact_events().is_empty(),
+            "복원이 폐기한 타임라인의 접촉 이벤트를 남겼다: {}건",
+            w.contact_events().len()
+        );
+        assert!(
+            w.ccd_hits().is_empty(),
+            "복원이 폐기한 타임라인의 CCD 히트를 남겼다: {}건",
+            w.ccd_hits().len()
+        );
+    }
+
     /// 클램프 평면은 단방향이다 — 바닥에 착지한 CCD 바디의 접선 이동(슬라이드)을 막지 않는다.
     #[test]
     fn ccd_clamp_allows_tangential_slide() {
