@@ -251,6 +251,17 @@ pub enum ApiError {
     FpEnvironment,
 }
 
+/// 셰이프 스윕 질의 결과.
+#[derive(Clone, Copy, Debug)]
+pub struct SweepHit {
+    pub body: BodyHandle,
+    /// 이동 비율 [0,1] — `pose.pos + motion·toi`가 접촉 순간의 위치다.
+    pub toi: f32,
+    pub point: Vec3,
+    /// 맞은 표면의 법선 (스윕하는 쪽을 향한다).
+    pub normal: Vec3,
+}
+
 pub struct World {
     /// **비공개** — 무검증 대입을 막는다(리뷰 MAJOR). 읽기는 `params()`, 변경은 `set_params()`.
     params: WorldParams,
@@ -1229,6 +1240,60 @@ impl World {
             }
         }
         Ok(())
+    }
+
+    /// **셰이프 스윕 질의** — 형상을 `motion`만큼 밀었을 때 처음 닿는 것.
+    ///
+    /// 캐릭터 컨트롤러(설계 §9 CharacterVirtual)와 호스트의 "이 상자가 여기로 갈 수 있나"
+    /// 류 질의의 정본이다. 레이 캐스트와 달리 **두께가 있는** 이동을 본다.
+    ///
+    /// 순서 규약: 후보를 슬롯 오름차순으로 훑고 최소 TOI를 고른다. 동률은 **낮은 슬롯**이
+    /// 이긴다 — 같은 장면이면 같은 답이어야 한다(L0).
+    pub fn sweep_shape(
+        &self,
+        shape: &maru_collide::Shape,
+        pose: maru_collide::Pose,
+        motion: Vec3,
+        filter: QueryFilter,
+    ) -> Result<Option<SweepHit>, ApiError> {
+        if !maru_collide::vec_in_range(pose.pos) || !maru_collide::vec_in_range(motion) {
+            return Err(ApiError::InvalidValue);
+        }
+        if shape.validate().is_err() {
+            return Err(ApiError::InvalidValue);
+        }
+        // 스윕 봉투로 후보를 거른다 — 전수 검사보다 싸고 결과는 같다.
+        let a0 = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
+        let sweep = a0.merge(Aabb::new(a0.min + motion, a0.max + motion));
+        let mut best: Option<SweepHit> = None;
+        for i in 0..self.bodies.len() {
+            if !self.passes(i, filter) {
+                continue;
+            }
+            if !sweep.overlaps(self.body_aabb(i)) {
+                continue;
+            }
+            let hit = maru_collide::shape_cast_dispatch(
+                shape,
+                &pose,
+                motion,
+                &self.bodies[i].shape,
+                &self.bodies[i].pose,
+                self.params.speculative_margin,
+            );
+            if let Some(h) = hit {
+                let better = best.as_ref().is_none_or(|b| h.toi < b.toi);
+                if better {
+                    best = Some(SweepHit {
+                        body: self.handle_of(i),
+                        toi: h.toi,
+                        point: h.point,
+                        normal: h.normal,
+                    });
+                }
+            }
+        }
+        Ok(best)
     }
 
     /// 점을 품은 물체들 (슬롯 오름차순). 겉면 기준 — convex radius를 포함한다.

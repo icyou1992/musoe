@@ -3,6 +3,7 @@
 //! 설계 계약(02-architecture.md): §4.4 TGS-soft, §4.6 슬리핑, §8 결정론·denormal 위생, §9 바디 3종.
 
 mod body;
+mod character;
 mod command;
 mod joint;
 mod snapshot;
@@ -12,12 +13,14 @@ mod threads;
 mod world;
 
 pub use body::{Body, BodyHandle, BodyType};
+pub use character::{CharacterVirtual, MoveResult};
 pub use command::{Command, CommandReport};
 pub use joint::{Joint, JointKind, Motor};
 pub use snapshot::{SnapshotError, SNAPSHOT_VERSION};
 pub use solver::SolverParams;
 pub use world::{
-    ApiError, ContactEvent, ContactEventKind, Diagnostics, QueryFilter, RayHit, World, WorldParams,
+    ApiError, ContactEvent, ContactEventKind, Diagnostics, QueryFilter, RayHit, SweepHit, World,
+    WorldParams,
 };
 
 #[cfg(test)]
@@ -2718,6 +2721,188 @@ mod tests {
         let q = w.body(arm).pose().rot;
         let ang = 2.0 * maru_math::atan2(q.z.abs(), q.w.abs());
         assert!(ang.is_finite() && ang > 0.01, "회전이 없다: {ang}");
+    }
+
+    // ===== M5: CharacterVirtual (설계 §9) =====
+
+    fn char_world() -> World {
+        let mut w = World::new(WorldParams::default());
+        // 넓은 바닥
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(20.0, 0.5, 20.0),
+                radius: 0.0,
+            },
+            pose(0.0, -0.5, 0.0),
+        ));
+        w
+    }
+
+    /// 평평한 바닥 캐릭터 — 계단 경로를 검증할 때 쓴다(둥근 바닥은 그냥 타고 오른다).
+    fn box_char(x: f32, y: f32, z: f32) -> CharacterVirtual {
+        CharacterVirtual::new(
+            Shape::Box {
+                half: Vec3::new(0.3, 0.5, 0.3),
+                radius: 0.0,
+            },
+            Vec3::new(x, y, z),
+        )
+    }
+
+    fn capsule_char(x: f32, y: f32, z: f32) -> CharacterVirtual {
+        CharacterVirtual::new(
+            Shape::Capsule {
+                half_height: 0.5,
+                radius: 0.3,
+            },
+            Vec3::new(x, y, z),
+        )
+    }
+
+    /// 빈 공간에서는 원하는 만큼 그대로 간다 — 그리고 바닥 위면 `on_ground`다.
+    #[test]
+    fn character_moves_freely_and_detects_ground() {
+        let w = char_world();
+        let mut c = capsule_char(0.0, 0.8, 0.0);
+        let r = c
+            .move_and_slide(&w, Vec3::new(1.0, 0.0, 0.0), QueryFilter::ALL)
+            .expect("이동");
+        assert!(
+            (r.position.x - 1.0).abs() < 1e-3,
+            "막힌 것이 없는데 못 갔다: {:?}",
+            r.position
+        );
+        assert!(r.on_ground, "바닥 위인데 지면 판정이 안 됐다");
+        assert!(r.ground_normal.y > 0.9, "지면 법선 {:?}", r.ground_normal);
+        assert_eq!(r.remaining, Vec3::ZERO);
+    }
+
+    /// 벽에 부딪히면 **멈추지 않고 벽을 따라 미끄러진다** — 캐릭터 컨트롤러의 핵심 거동.
+    #[test]
+    fn character_slides_along_a_wall_instead_of_stopping() {
+        let mut w = char_world();
+        // x = 1.0에 z축으로 긴 벽
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.2, 2.0, 5.0),
+                radius: 0.0,
+            },
+            pose(1.5, 2.0, 0.0),
+        ));
+        let mut c = capsule_char(0.0, 0.8, 0.0);
+        // 벽을 45°로 밀어붙인다 — x는 막히고 z는 살아야 한다.
+        let r = c
+            .move_and_slide(&w, Vec3::new(2.0, 0.0, 2.0), QueryFilter::ALL)
+            .expect("이동");
+        assert!(r.position.x < 1.1, "벽을 통과했다: {:?}", r.position);
+        assert!(
+            r.position.z > 1.0,
+            "벽을 따라 못 미끄러졌다(그냥 멈춤): {:?}",
+            r.position
+        );
+        assert!(r.slides >= 1, "미끄러짐이 기록되지 않았다");
+    }
+
+    /// 낮은 턱은 **걸어 올라간다**(계단), 높은 벽은 못 올라간다 — 같은 코드가 둘을 가른다.
+    ///
+    /// 캐릭터를 **상자**로 둔다(캡슐이 아니라): 캡슐은 둥근 바닥이 턱 모서리를 타고 올라가서
+    /// 계단 로직을 꺼도 통과한다 — 그러면 이 테스트가 계단을 증명하지 않는다(실제로 확인했다).
+    /// 평평한 바닥은 수직면에서 순수 수평 법선만 얻으므로 오직 계단 경로로만 오를 수 있다.
+    #[test]
+    fn character_steps_up_low_ledges_but_not_high_walls() {
+        let step_h = 0.25;
+        let mut low = char_world();
+        low.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(1.0, step_h / 2.0, 5.0),
+                radius: 0.0,
+            },
+            pose(2.0, step_h / 2.0, 0.0),
+        ));
+        let mut c = box_char(0.0, 0.55, 0.0);
+        for _ in 0..6 {
+            c.move_and_slide(&low, Vec3::new(0.5, 0.0, 0.0), QueryFilter::ALL)
+                .expect("이동");
+        }
+        assert!(c.position.x > 1.5, "낮은 턱을 못 넘었다: {:?}", c.position);
+        assert!(
+            c.position.y > 0.55 + step_h * 0.5,
+            "턱 위로 올라서지 못했다: y={}",
+            c.position.y
+        );
+
+        // 같은 장면인데 턱만 높으면 막혀야 한다.
+        let mut high = char_world();
+        high.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(1.0, 1.0, 5.0),
+                radius: 0.0,
+            },
+            pose(2.0, 1.0, 0.0),
+        ));
+        let mut c2 = box_char(0.0, 0.55, 0.0);
+        for _ in 0..6 {
+            c2.move_and_slide(&high, Vec3::new(0.5, 0.0, 0.0), QueryFilter::ALL)
+                .expect("이동");
+        }
+        assert!(c2.position.x < 1.3, "높은 벽을 올라갔다: {:?}", c2.position);
+    }
+
+    /// 급경사는 지면으로 치지 않는다 — `on_ground`가 거짓이어야 호스트가 미끄러뜨릴 수 있다.
+    #[test]
+    fn steep_slopes_are_not_walkable_ground() {
+        let mut w = World::new(WorldParams::default());
+        // 60° 경사면(축 회전한 큰 박스)
+        let tilt = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 1.05);
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(10.0, 0.5, 10.0),
+                radius: 0.0,
+            },
+            maru_collide::Pose {
+                pos: Vec3::new(0.0, 0.0, 0.0),
+                rot: tilt,
+            },
+        ));
+        let mut c = capsule_char(0.0, 1.6, 0.0);
+        // 경사면 위로 내려서 접촉시킨다
+        let r = c
+            .move_and_slide(&w, Vec3::new(0.0, -1.0, 0.0), QueryFilter::ALL)
+            .expect("이동");
+        assert!(
+            !r.on_ground,
+            "60° 경사(한계 45°)를 걸을 수 있는 지면으로 판정했다: n={:?}",
+            r.ground_normal
+        );
+    }
+
+    /// 같은 입력이면 같은 결과 — 캐릭터도 L0 규약 안에 있다.
+    #[test]
+    fn character_movement_is_deterministic() {
+        let mut w = char_world();
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.2, 2.0, 5.0),
+                radius: 0.0,
+            },
+            pose(1.5, 2.0, 0.0),
+        ));
+        let run = || {
+            let mut c = capsule_char(0.0, 0.8, 0.0);
+            let mut path = Vec::new();
+            for i in 0..20 {
+                let d = Vec3::new(0.2, 0.0, 0.05 * (i % 3) as f32);
+                let r = c.move_and_slide(&w, d, QueryFilter::ALL).expect("이동");
+                path.push((
+                    r.position.x.to_bits(),
+                    r.position.y.to_bits(),
+                    r.position.z.to_bits(),
+                    r.on_ground,
+                ));
+            }
+            path
+        };
+        assert_eq!(run(), run(), "같은 입력이 다른 경로를 냈다");
     }
 
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
