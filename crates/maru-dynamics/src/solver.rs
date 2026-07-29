@@ -243,6 +243,11 @@ impl SolverState {
         self.lin.capacity()
     }
 
+    /// 보유 용량(위생 판정용).
+    pub fn lin_capacity_pub(&self) -> usize {
+        self.lin.capacity()
+    }
+
     /// 용량이 확보된 상태에서 값을 채운다 (실패하지 않는다).
     pub fn fill_from(&mut self, bodies: &[Body], alive: &[bool], oob: &[bool]) {
         let n = bodies.len();

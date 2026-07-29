@@ -2369,6 +2369,51 @@ mod tests {
         assert!(w.try_step(DT).is_ok(), "반납 뒤 스텝이 실패했다");
     }
 
+    /// **큰 장면이 남긴 스크래치는 다음 스텝 시작에 놓아준다** (확인검수 rev_51f69fbd BLOCKER).
+    ///
+    /// 총상한 검사와 반납은 브로드페이즈가 새 페어 배열을 만든 뒤에 돈다 — 그 전에 이미
+    /// 부풀어 있으면 그 할당에서 죽는다(fallible이 아니다). 그래서 스텝 시작에 "현재 필요의
+    /// 4배" 안으로 눌러 둔다. 되돌리면(위생 패스 제거) 이 테스트가 실패한다.
+    #[test]
+    fn stale_scratch_is_released_before_the_next_broadphase() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let mut hs = Vec::new();
+        for i in 0..600 {
+            hs.push(w.add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.2 },
+                pose(i as f32 * 0.5, 3.0, 0.0),
+                1.0,
+            )));
+        }
+        w.step(DT);
+        let big = w.body_scratch_capacities();
+        assert!(big[0] >= 600, "큰 장면에서 스크래치가 안 자랐다: {big:?}");
+        // 작은 월드로 **복원**한다 — 슬롯 수가 실제로 줄어드는 유일한 경로다.
+        let mut small = World::new(WorldParams::default());
+        ground(&mut small);
+        for i in 0..4 {
+            small.add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.2 },
+                pose(i as f32 * 0.5, 3.0, 0.0),
+                1.0,
+            ));
+        }
+        w.restore(&small.snapshot()).expect("복원");
+        w.step(DT);
+        let after = w.body_scratch_capacities();
+        for (i, (b, a)) in big.iter().zip(after.iter()).enumerate() {
+            // #1은 적분 게이트 — 증분 경로 입력이라 위생 패스가 건드리지 않는다(1바이트/원소).
+            if i == 1 {
+                continue;
+            }
+            assert!(
+                *a <= 4 * 64 + 64,
+                "스크래치 #{i}가 큰 장면 용량을 그대로 쥐고 있다: {b} → {a}"
+            );
+        }
+    }
+
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
     /// `cargo test --release -p maru-dynamics -- --ignored`
     #[test]

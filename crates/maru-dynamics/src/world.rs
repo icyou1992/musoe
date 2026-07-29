@@ -1723,6 +1723,43 @@ impl World {
             ))
     }
 
+    /// 스텝 시작 위생: **지금 필요한 것보다 터무니없이 크게 쥐고 있으면 미리 놓아준다.**
+    ///
+    /// 총상한 검사와 반납은 브로드페이즈가 새 페어 배열을 만든 **뒤에** 돈다. 그래서 이전
+    /// 큰 장면이 남긴 스크래치를 그대로 쥔 채 새 페어 배열을 잡는 순간 상한을 넘길 수 있고,
+    /// 그 할당은 fallible이 아니다 — 검사에 도달하기 전에 죽는다(확인검수 rev_51f69fbd
+    /// BLOCKER). 여기서 보유량을 "현재 필요의 4배" 안으로 미리 눌러 그 창을 없앤다.
+    ///
+    /// 4배는 이력 현상(hysteresis)이다 — 장면이 조금 출렁일 때마다 반납·재예약을 반복하면
+    /// 그게 더 비싸다. 평상시에는 조건이 거짓이라 아무 일도 하지 않는다.
+    ///
+    /// **페어 두 벌(`bp_pairs`·`bp_pairs_scratch`)과 `integrate_gate`는 건드리지 않는다** —
+    /// 앞의 둘은 이번 스텝 증분 경로의 입력이고, 게이트는 직전 스텝 값으로 읽힌다.
+    fn release_stale_scratch(&mut self, nbody: usize) {
+        let bloated = |cap: usize, need: usize| cap > 4 * need.max(64);
+        if bloated(self.solver_state.lin_capacity_pub(), nbody) {
+            self.solver_state.release();
+        }
+        macro_rules! trim {
+            ($v:expr, $need:expr) => {
+                if bloated($v.capacity(), $need) {
+                    $v = Vec::new();
+                }
+            };
+        }
+        trim!(self.inv_inertia_local, nbody);
+        trim!(self.ext_force, nbody);
+        trim!(self.damping, nbody);
+        trim!(self.island_parent, nbody);
+        trim!(self.gravity_gate, nbody);
+        // 블록·참여자 버퍼는 이 시점에 목표를 모른다 — 직전 스텝 사용량(len)을 근사로 쓴다.
+        let blocks_need = self.contact_blocks.len();
+        trim!(self.contact_blocks, blocks_need);
+        for b in self.narrow_bufs.iter_mut() {
+            b.trim_if_bloated();
+        }
+    }
+
     /// 목표를 넘겨 쥐고 있는 영속 스크래치를 **반납**한다.
     ///
     /// 상한을 넘었다고 스텝을 거절하는 것은 답이 아니다 — 용량은 저절로 줄지 않으므로
@@ -2160,6 +2197,9 @@ impl World {
         if self.bodies.is_empty() {
             return;
         }
+        // 브로드페이즈가 새 페어 배열을 잡기 **전에** 과거 장면이 남긴 부풀린 스크래치를
+        // 놓아준다(위 함수 주석 — 그 할당은 fallible이 아니라 검사 전에 죽을 수 있다).
+        self.release_stale_scratch(self.bodies.len());
         let n_sub = self.params.substeps.max(1);
         let h = dt / n_sub as f32;
         let inv_h = 1.0 / h;
@@ -4023,6 +4063,17 @@ impl NarrowOut {
         self.constraints = Vec::new();
         self.keys = Vec::new();
         self.live = Vec::new();
+    }
+
+    /// 직전 사용량(len)의 4배를 넘게 쥐고 있으면 놓아준다 (스텝 시작 위생).
+    fn trim_if_bloated(&mut self) {
+        let bloated = |cap: usize, need: usize| cap > 4 * need.max(64);
+        if bloated(self.constraints.capacity(), self.constraints.len())
+            || bloated(self.keys.capacity(), self.keys.len())
+            || bloated(self.live.capacity(), self.live.len())
+        {
+            self.release();
+        }
     }
 
     fn reset(&mut self) {
