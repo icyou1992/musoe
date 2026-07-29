@@ -2645,6 +2645,81 @@ mod tests {
         }
     }
 
+    // ===== M5: L1 결정론 (설계 §8) =====
+
+    /// **FP 환경 가드가 실제로 잡는다** — 플러시 모드를 켠 스레드에서 스텝을 부르면
+    /// 조용히 다른 물리를 내는 대신 오류를 돌려주고, **상태는 그대로**여야 한다.
+    #[test]
+    fn step_refuses_to_run_in_a_non_canonical_fp_environment() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 2.0, 0.0),
+            1.0,
+        ));
+        w.step(DT);
+        let before = w.state_hash();
+        if !maru_math::force_flush_to_zero_for_test() {
+            return; // 뒤집을 레지스터가 없는 타깃(wasm) — 계약상 항상 캐노니컬이다
+        }
+        let r = w.try_step(DT);
+        assert_eq!(
+            r,
+            Err(ApiError::FpEnvironment),
+            "플러시 모드에서 스텝이 그냥 돌았다 — 결정론 계약이 거짓이 된다"
+        );
+        assert_eq!(w.state_hash(), before, "거부된 스텝이 상태를 건드렸다");
+        // 되돌리면 다시 돈다
+        assert!(World::canonicalize_fp_environment());
+        assert!(w.try_step(DT).is_ok());
+        assert!(w.body(h).pose().pos.y.is_finite());
+    }
+
+    /// 조인트 각이 **결정적 atan2**를 쓴다 — 플랫폼 libm에 의존하지 않는다.
+    /// (값 자체는 std와 2e-6 안에서 같다는 것을 maru-math가 잠그고, 여기서는 그 함수가
+    /// 실제로 물리 경로에 연결돼 있는지를 본다.)
+    #[test]
+    fn hinge_angle_uses_the_deterministic_atan2() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..WorldParams::default()
+        });
+        let anchor = w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.2, 0.2, 0.2),
+                radius: 0.0,
+            },
+            pose(0.0, 0.0, 0.0),
+        ));
+        let arm = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.1, 0.1),
+                radius: 0.0,
+            },
+            pose(0.7, 0.0, 0.0),
+            1.0,
+        ));
+        w.try_add_joint(Joint::hinge(
+            anchor,
+            arm,
+            Vec3::new(0.2, 0.0, 0.0),
+            Vec3::new(-0.5, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        ))
+        .expect("힌지");
+        w.set_angular_velocity(arm, Vec3::new(0.0, 0.0, 1.5))
+            .expect("각속도");
+        for _ in 0..30 {
+            w.step(DT);
+        }
+        // 각도가 유한하고 회전이 실제로 일어났으면 경로가 살아 있다.
+        let q = w.body(arm).pose().rot;
+        let ang = 2.0 * maru_math::atan2(q.z.abs(), q.w.abs());
+        assert!(ang.is_finite() && ang > 0.01, "회전이 없다: {ang}");
+    }
+
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
     /// `cargo test --release -p maru-dynamics -- --ignored`
     #[test]

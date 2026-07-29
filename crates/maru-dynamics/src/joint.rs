@@ -867,7 +867,9 @@ fn hinge_angle(st: &crate::solver::SolverState, j: &Joint, axis_a: Vec3, _axis_b
     // 정규화하지 않으면 twist가 ±π 부근에서 튀어 한계 판정이 뒤집힌다.
     let sgn = if q_rel.w < 0.0 { -1.0 } else { 1.0 };
     let s = (q_rel.x * axis_a.x + q_rel.y * axis_a.y + q_rel.z * axis_a.z) * sgn;
-    2.0 * s.atan2(q_rel.w * sgn)
+    // **결정적 atan2** — 이 각은 캐노니컬 상태(조인트 한계·모터)를 움직이므로
+    // 플랫폼 libm의 마지막 ulp 차이가 그대로 궤적 차이가 된다(설계 §8 L1).
+    2.0 * maru_math::atan2(s, q_rel.w * sgn)
 }
 
 /// Distance: 두 앵커 거리를 `[min, max]`로 묶는다.

@@ -6,10 +6,16 @@
 //!   배치의 정본 레이아웃.
 //! - §8: 재결합 금지(기본 프로파일), denormal은 정의 지점 flush(`flush_tiny`).
 
+pub(crate) mod det;
+mod fp_env;
 mod mat3;
 mod scalar;
 mod soa;
 
+pub use det::{acos, asin, atan, atan2};
+#[cfg(feature = "test-hooks")]
+pub use fp_env::force_flush_to_zero_for_test;
+pub use fp_env::{canonicalize as fp_canonicalize, verify as fp_verify};
 pub use mat3::Mat3;
 pub use scalar::{Quat, Vec3};
 pub use soa::{Aabbx4, Mat3x4, Quatx4, Vec3x4};

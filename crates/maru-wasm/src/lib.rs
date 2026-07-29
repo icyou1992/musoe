@@ -39,6 +39,11 @@ pub const ERR_STATE_OVERFLOW: i32 = -6;
 /// 엔진의 `ResourceLimit`(스텝 자체가 거부됨)과 구분해야 해서 코드를 나눈다.
 pub const ERR_STAGING_LIMIT: i32 = -7;
 
+/// FP 환경이 캐노니컬 상태가 아니다 (설계 §8) — 호스트/다른 라이브러리가 호출 스레드에
+/// 플러시 모드를 켠 경우. `maru_canonicalize_fp()`로 되돌린 뒤 재시도한다.
+/// **상태는 변하지 않았다**(검증이 모든 변이보다 앞이다).
+pub const ERR_FP_ENVIRONMENT: i32 = -8;
+
 fn code(e: ApiError) -> i32 {
     match e {
         ApiError::InvalidValue => ERR_INVALID_VALUE,
@@ -46,6 +51,7 @@ fn code(e: ApiError) -> i32 {
         ApiError::ImmutableStatic => ERR_IMMUTABLE_STATIC,
         ApiError::ResourceLimit => ERR_RESOURCE_LIMIT,
         ApiError::StateOverflow => ERR_STATE_OVERFLOW,
+        ApiError::FpEnvironment => ERR_FP_ENVIRONMENT,
     }
 }
 

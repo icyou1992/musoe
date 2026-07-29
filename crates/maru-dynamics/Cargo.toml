@@ -9,3 +9,7 @@ description = "Maru rigid body dynamics: TGS-soft solver, islands, sleeping, joi
 maru-math = { path = "../maru-math" }
 maru-collide = { path = "../maru-collide" }
 wide = { workspace = true }
+
+[dev-dependencies]
+# FP 환경 가드가 공회전이 아님을 증명하려면 환경을 깨뜨려 봐야 한다.
+maru-math = { path = "../maru-math", features = ["test-hooks"] }

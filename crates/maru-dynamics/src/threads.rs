@@ -358,6 +358,9 @@ mod imp {
     }
 
     fn worker_loop(inner: Arc<Inner>, index: usize) {
+        // **FP 환경은 스레드마다 산다** (설계 §8) — 워커도 캐노니컬 상태로 맞춘다.
+        // 안 맞추면 어느 워커가 어느 제약을 처리했는지에 따라 해시가 갈린다.
+        let _ = maru_math::fp_canonicalize();
         let mut seen = 0u64;
         loop {
             // 새 잡(또는 종료)을 기다린다: 스핀 → park.

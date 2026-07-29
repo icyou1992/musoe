@@ -242,6 +242,13 @@ pub enum ApiError {
     /// 포화를 정상 처리로 삼키면 안 된다). 상태 자체는 안전하고 복원 가능하게 유지되므로
     /// 호스트는 계속 돌릴 수도, 되감을 수도 있다. 지원 범위 밖 입력의 신호다.
     StateOverflow,
+    /// **FP 환경이 캐노니컬 상태가 아니다** (설계 §8: RNE + FTZ/DAZ/FZ 전부 off).
+    ///
+    /// 이 레지스터는 스레드마다 산다 — 호스트나 다른 라이브러리(오디오 등)가 호출 스레드에서
+    /// 플러시 모드를 켜 두면 같은 입력이 다른 물리를 낸다. 조용히 진행하면 결정론 계약이
+    /// 거짓이 되므로 스텝을 거부한다. `World::canonicalize_fp_environment()`로 되돌린 뒤
+    /// 다시 부르면 된다. **상태는 변하지 않는다**(검증이 모든 변이보다 앞이다).
+    FpEnvironment,
 }
 
 pub struct World {
@@ -542,6 +549,10 @@ impl World {
     }
 
     fn new_unchecked(params: WorldParams) -> Self {
+        // **FP 환경을 캐노니컬 상태로 맞춘다** (설계 §8). 이 레지스터는 스레드마다 살고
+        // 호스트가 이미 플러시 모드를 켜 뒀을 수 있다 — 월드를 만드는 김에 정리한다.
+        // 이후 스텝마다 검증하므로, 다른 스레드에서 부르거나 중간에 누가 바꾸면 잡힌다.
+        let _ = maru_math::fp_canonicalize();
         Self {
             params,
             bodies: Vec::new(),
@@ -2183,12 +2194,24 @@ impl World {
     /// 탭 복귀처럼 큰 dt가 들어오면 여러 스텝으로 쪼개거나 프레임을 버려야 한다.
     /// 엔진이 조용히 클램프하면 시뮬레이션이 실시간과 어긋난 채 진행돼 더 나쁘다.
     /// 위반은 wasm trap이 아니라 `ApiError::InvalidValue`로 표현된다.
+    /// 이 스레드의 FP 환경을 엔진 캐노니컬 상태로 되돌린다 (설계 §8).
+    /// `ApiError::FpEnvironment`를 받은 호스트가 재시도 전에 부른다.
+    pub fn canonicalize_fp_environment() -> bool {
+        maru_math::fp_canonicalize()
+    }
+
     pub fn try_step(&mut self, dt: f32) -> Result<(), ApiError> {
         // 문서와 구현을 하나로(리뷰 MAJOR): 0과 음수는 **합법이 아니다**. 일시정지는
         // 호스트가 step을 부르지 않는 것으로 표현한다 — 0을 무연산으로 받아주면
         // "성공했는데 아무 일도 없음"이 오류와 구분되지 않는다.
         if !(dt.is_finite() && (MIN_DT..=MAX_DT).contains(&dt)) {
             return Err(ApiError::InvalidValue);
+        }
+        // **FP 환경 검증은 모든 변이보다 앞이다** (설계 §8). 플러시 모드가 켜진 스레드에서
+        // 돌면 같은 입력이 다른 물리를 내므로, 조용히 진행하는 대신 **상태를 건드리지 않고**
+        // 거부한다. 이 검사는 레지스터 읽기 하나라 핫패스 비용이 사실상 없다.
+        if !maru_math::fp_verify() {
+            return Err(ApiError::FpEnvironment);
         }
         self.step_inner(dt);
         if self.resource_limit {
