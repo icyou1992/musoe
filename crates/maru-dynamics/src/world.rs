@@ -1723,7 +1723,14 @@ impl World {
     /// 무관하게 비트 동일하고(그것이 L0 결정론 계약이다), 스냅샷·상태 해시에도 들어가지
     /// 않는다. 그래서 스텝 사이 아무 때나 바꿔도 궤적이 갈리지 않는다.
     ///
-    /// 워커 재생성은 스레드 생성/조인을 동반하므로 매 프레임 호출할 것은 아니다.
+    /// 워커는 **처음 병렬로 돌 때** 뜬다(지연 생성) — 병렬 문턱을 못 넘는 작은 월드는
+    /// 스레드를 아예 만들지 않는다. 그래도 이 호출은 기존 워커를 정리하고 다시 만들므로
+    /// 매 프레임 부를 것은 아니다.
+    ///
+    /// **가용 코어보다 크게 잡지 마라.** 워커는 짧게 스핀하다 눕는데, 참여자가 코어보다
+    /// 많으면 실행 중인 참여자가 대기 중인 참여자에게 밀려 dispatch·배리어 지연이
+    /// 수천 배가 된다(4코어에 5명 실측: dispatch 5ms, 배리어 4ms). 기본값
+    /// (`available_parallelism`, 상한 8)이 그 선을 넘지 않는다.
     pub fn set_threads(&mut self, n: usize) {
         let n = n.max(1);
         if n != self.pool.threads() {
@@ -2759,7 +2766,13 @@ impl World {
             self.diag.warm_hits += b.warm_hits;
         }
         self.narrow_bufs = narrow_bufs;
-        self.diag.narrow_threads = n_par;
+        // 진단은 **dispatch 뒤에** 읽는다 — 워커는 지연 생성이라 그 전에는 "요청한 수"만
+        // 알 수 있고, 스레드를 못 띄운 환경에서 실제와 갈린다(설계 §6.3 조용한 폴백 금지).
+        self.diag.narrow_threads = if n_par > 1 {
+            self.pool.threads().min(n_par)
+        } else {
+            1
+        };
 
         self.diag.sub_ns[2] = _t_nw.ns();
 

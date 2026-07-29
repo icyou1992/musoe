@@ -145,9 +145,20 @@ mod imp {
         }
     }
 
-    pub struct Pool {
+    /// 실제로 워커가 떠 있는 풀. `Pool`은 이것을 **첫 dispatch 때** 만든다.
+    struct Spawned {
         inner: Arc<Inner>,
         handles: Vec<JoinHandle<()>>,
+    }
+
+    /// 워커 풀. **스레드는 처음 병렬로 돌 때 뜬다(지연 생성).**
+    ///
+    /// 월드를 만들 때마다 OS 스레드를 띄우면, 작은 월드를 수백 개 만드는 호출자
+    /// (테스트 스위트가 그렇다)가 스레드 생성·조인 비용만 내고 병렬은 한 번도 안 쓴다 —
+    /// 실측으로 테스트 스위트가 6.7초에서 37초가 됐다. 병렬 문턱을 넘는 월드만 값을 낸다.
+    pub struct Pool {
+        want: usize,
+        imp: std::sync::OnceLock<Spawned>,
     }
 
     impl Pool {
@@ -156,9 +167,18 @@ mod imp {
         /// 영원히 안 열리기 때문이다. 강등 사실은 `threads()`로 관측된다
         /// (설계 §6.3 "조용한 폴백 금지").
         pub fn new(threads: usize) -> Self {
+            Pool {
+                want: threads.max(1),
+                imp: std::sync::OnceLock::new(),
+            }
+        }
+
+        /// 워커를 띄운다(첫 dispatch에서 1회). 못 띄우면 **띄운 만큼으로 줄여 다시**
+        /// 만든다 — `Inner.threads`가 실제 실행 주체 수와 다르면 배리어가 영원히 안 열린다.
+        fn spawn_pool(threads: usize) -> Spawned {
             let mut want = threads.max(1);
             loop {
-                match Self::try_new(want) {
+                match Self::try_spawn(want) {
                     Ok(p) => return p,
                     Err(spawned) => {
                         // 다음 시도는 이번에 실제로 띄운 수 이하로 (단조 감소 보장).
@@ -169,7 +189,7 @@ mod imp {
         }
 
         /// 정확히 `threads`명으로 시도한다. 실패하면 그때까지 띄운 워커 수를 돌려준다.
-        fn try_new(threads: usize) -> Result<Self, usize> {
+        fn try_spawn(threads: usize) -> Result<Spawned, usize> {
             let inner = Arc::new(Inner {
                 epoch: AtomicU64::new(0),
                 running: AtomicUsize::new(0),
@@ -205,12 +225,18 @@ mod imp {
                     }
                 }
             }
-            Ok(Pool { inner, handles })
+            Ok(Spawned { inner, handles })
         }
 
+        /// 참여자 수. 워커가 아직 안 떴으면 **요청한 수**를, 떴으면 **실제 수**를 돌려준다
+        /// (스레드를 못 띄운 환경에서는 첫 dispatch 뒤 값이 줄어들 수 있다 —
+        /// 설계 §6.3 "조용한 폴백 금지"에 따라 진단은 dispatch **뒤** 값을 보고한다).
         #[inline]
         pub fn threads(&self) -> usize {
-            self.inner.threads
+            match self.imp.get() {
+                Some(s) => s.inner.threads,
+                None => self.want,
+            }
         }
 
         /// 잡을 전 참여자가 나눠 돌고, 전원이 끝난 뒤 반환한다.
@@ -219,58 +245,71 @@ mod imp {
         /// 끝냈으므로 클로저가 빌린 지역 데이터는 그 뒤에 자유롭게 쓸 수 있다
         /// (`std::thread::scope`와 같은 계약).
         pub fn dispatch<F: Fn(&super::Ctx) + Sync>(&self, f: F) {
-            if self.inner.threads == 1 {
-                // 직렬 경로 — 원자 연산도 배리어도 없다. 설계 §5 "단일스레드 1급".
+            if self.want == 1 {
+                // 요청이 1명이면 워커를 **아예 띄우지 않는다** — 설계 §5 "단일스레드 1급".
+                // `inner`는 널이지만 `Ctx::barrier`가 `threads > 1`에서만 역참조하므로
+                // 이 컨텍스트에서는 절대 읽히지 않는다(참여자 1명 배리어는 no-op이다).
                 f(&super::Ctx {
                     index: 0,
                     threads: 1,
-                    inner: Arc::as_ptr(&self.inner),
+                    inner: std::ptr::null(),
                     sense: std::cell::Cell::new(false),
                 });
                 return;
             }
-            let n_workers = self.inner.threads - 1;
-            self.inner.poisoned.store(false, Ordering::Relaxed);
+            let this = self.imp.get_or_init(|| Self::spawn_pool(self.want));
+            if this.inner.threads == 1 {
+                // 직렬 경로 — 원자 연산도 배리어도 없다. 설계 §5 "단일스레드 1급".
+                f(&super::Ctx {
+                    index: 0,
+                    threads: 1,
+                    inner: Arc::as_ptr(&this.inner),
+                    sense: std::cell::Cell::new(false),
+                });
+                return;
+            }
+            let n_workers = this.inner.threads - 1;
+            this.inner.poisoned.store(false, Ordering::Relaxed);
             // 잡 슬롯 쓰기 — 직전 dispatch가 running==0을 확인하고 반환했으므로 배타적이다.
             let job = JobRef {
                 data: (&f as *const F).cast::<()>(),
                 call: call_impl::<F>,
             };
             // SAFETY: 위 배타성 + 아래 epoch Release가 워커의 Acquire와 짝을 이룬다.
-            unsafe { *self.inner.job.get() = Some(job) };
+            unsafe { *this.inner.job.get() = Some(job) };
             // **배리어 상태를 dispatch마다 초기화한다.** 참여자 로컬 sense는 매번 false로
             // 시작하므로 첫 배리어의 목표는 항상 true다 — 직전 dispatch가 남긴 sense가
             // true인 채로 들어오면 첫 배리어가 "이미 열린 문"이 되어 통과해 버린다
             // (구간 분리가 조용히 사라진다). 워커가 하나도 안 도는 지금이 유일한 안전 시점.
-            self.inner.bar_count.store(0, Ordering::Relaxed);
-            self.inner.bar_sense.store(false, Ordering::Relaxed);
-            self.inner.running.store(n_workers, Ordering::Relaxed);
+            this.inner.bar_count.store(0, Ordering::Relaxed);
+            this.inner.bar_sense.store(false, Ordering::Relaxed);
+            this.inner.running.store(n_workers, Ordering::Relaxed);
             {
                 // 잠든 워커의 wakeup 유실을 막으려면 epoch 증가가 park_lock 안이어야 한다.
-                let _g = self
+                let _g = this
                     .inner
                     .park_lock
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                self.inner.epoch.fetch_add(1, Ordering::Release);
+                this.inner.epoch.fetch_add(1, Ordering::Release);
             }
-            self.inner.park_cv.notify_all();
+            this.inner.park_cv.notify_all();
 
             // 메인도 참여자다.
             let ctx = super::Ctx {
                 index: 0,
-                threads: self.inner.threads,
-                inner: Arc::as_ptr(&self.inner),
+                threads: this.inner.threads,
+                inner: Arc::as_ptr(&this.inner),
                 sense: std::cell::Cell::new(false),
             };
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&ctx)));
             if res.is_err() {
-                self.inner.poisoned.store(true, Ordering::Release);
+                this.inner.poisoned.store(true, Ordering::Release);
             }
 
             // 전원 완료 대기 — 여기를 지나야 클로저 참조가 죽어도 안전하다.
             let mut spins = 0u32;
-            while self.inner.running.load(Ordering::Acquire) != 0 {
+            while this.inner.running.load(Ordering::Acquire) != 0 {
                 spins += 1;
                 if spins < SPIN_LIMIT {
                     std::hint::spin_loop();
@@ -281,7 +320,7 @@ mod imp {
             if let Err(p) = res {
                 std::panic::resume_unwind(p);
             }
-            if self.inner.poisoned.load(Ordering::Acquire) {
+            if this.inner.poisoned.load(Ordering::Acquire) {
                 panic!("maru: 워커 스레드가 잡 실행 중 패닉했다");
             }
         }
@@ -292,7 +331,7 @@ mod imp {
         f(ctx)
     }
 
-    impl Drop for Pool {
+    impl Drop for Spawned {
         fn drop(&mut self) {
             {
                 let _g = self

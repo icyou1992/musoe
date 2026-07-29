@@ -2076,29 +2076,37 @@ mod tests {
     /// 갈렸는지 모른다).
     ///
     /// 씬은 병렬 경로를 실제로 타야 의미가 있다 — 페어가 문턱(512)을 넘는 피라미드
-    /// 30단(465박스)을 쓰고, 실제로 참여자 >1로 돌았는지 진단으로 **증명**한다.
+    /// 20단(210박스)을 쓰고, 실제로 참여자 >1로 돌았는지 진단으로 **증명**한다.
+    /// (debug 빌드는 debug_assert가 많아 스텝이 비싸다 — 매 커밋 게이트는 짧게 잡고,
+    /// 설계 §8의 1,000스텝 판정은 아래 release 전용 테스트가 맡는다.)
     /// (이 증명이 없으면 "직렬 두 번 돌려 같았다"를 결정론이라 부르게 된다.)
-    #[test]
-    fn thread_determinism_hash_matches_across_thread_counts() {
-        fn run(threads: usize, par_solver: bool, steps: usize) -> (Vec<Vec<u8>>, usize, usize) {
+    /// 결정론 게이트의 본체 — 스레드 수·솔버 병렬 스위치를 바꿔도 **상태가 같아야** 한다.
+    fn assert_thread_determinism(tiers: usize, steps: usize, thread_counts: &[usize]) {
+        fn run(
+            tiers: usize,
+            threads: usize,
+            par_solver: bool,
+            steps: usize,
+        ) -> (Vec<Vec<u8>>, usize, usize) {
             let mut w = World::new(WorldParams::default());
             w.set_threads(threads);
             w.set_parallel_solver(par_solver);
             ground(&mut w);
-            let _ = pyramid(&mut w, 30);
+            let _ = pyramid(&mut w, tiers);
             let mut snaps = Vec::new();
             let (mut max_np, mut max_sp) = (0usize, 0usize);
+            let every = (steps / 8).max(1);
             for i in 0..steps {
                 w.step(DT);
                 max_np = max_np.max(w.diagnostics().narrow_threads);
                 max_sp = max_sp.max(w.diagnostics().solve_threads);
-                if i % 25 == 0 || i + 1 == steps {
+                if i % every == 0 || i + 1 == steps {
                     snaps.push(w.snapshot());
                 }
             }
             (snaps, max_np, max_sp)
         }
-        let (base, np1, sp1) = run(1, false, 200);
+        let (base, np1, sp1) = run(tiers, 1, false, steps);
         assert_eq!(
             np1, 1,
             "스레드 1개 실행이 병렬 경로를 탔다 — 대조군이 오염됐다"
@@ -2110,8 +2118,8 @@ mod tests {
         let can_thread = World::new(WorldParams::default()).threads() > 1;
         // 내로우만 병렬(기본) · 솔버까지 병렬(노브 on) 두 구성 모두 같은 상태를 내야 한다.
         for par_solver in [false, true] {
-            for t in [2usize, 4] {
-                let (got, np, sp) = run(t, par_solver, 200);
+            for &t in thread_counts {
+                let (got, np, sp) = run(tiers, t, par_solver, steps);
                 if can_thread {
                     // 스레드를 띄울 수 있는 환경에서만 요구한다(wasm은 항상 1).
                     assert!(
@@ -2133,6 +2141,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **L0 결정론 게이트 (설계 §8): 같은 빌드 + 같은 초기상태 + 같은 호출 순서면 결과는
+    /// 스레드 수와 무관하게 같아야 한다.** 매 커밋(`scripts/check.sh`)에서 도는 짧은 판.
+    ///
+    /// 상태 해시만 보지 않고 **스냅샷 바이트 전체**를 대조한다 — 해시는 캐노니컬 상태의
+    /// 축약이라 충돌 가능성이 남고, 이 계약은 "값이 같다"가 아니라 "상태가 같다"이다.
+    /// 중간 스텝마다 대조해야 갈림이 생긴 **시점**을 알 수 있다.
+    ///
+    /// 씬은 병렬 경로를 실제로 타야 의미가 있다 — 페어가 문턱(512)을 넘는 피라미드
+    /// 30단(465박스)을 쓰고, 실제로 참여자 >1로 돌았는지 진단으로 **증명**한다.
+    /// (이 증명이 없으면 "직렬 두 번 돌려 같았다"를 결정론이라 부르게 된다.)
+    #[test]
+    fn thread_determinism_hash_matches_across_thread_counts() {
+        assert_thread_determinism(20, 40, &[4]);
+    }
+
+    /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
+    /// `cargo test --release -p maru-dynamics -- --ignored`
+    #[test]
+    #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]
+    fn thread_determinism_1000_steps() {
+        assert_thread_determinism(30, 1000, &[2, 3, 4]);
     }
 
     /// release 전용 — debug는 수 분 걸린다. `cargo test --release -- --ignored`
