@@ -14,7 +14,7 @@ mod world;
 pub use body::{Body, BodyHandle, BodyType};
 pub use command::{Command, CommandReport};
 pub use joint::{Joint, JointKind, Motor};
-pub use snapshot::SnapshotError;
+pub use snapshot::{SnapshotError, SNAPSHOT_VERSION};
 pub use solver::SolverParams;
 pub use world::{
     ApiError, ContactEvent, ContactEventKind, Diagnostics, QueryFilter, RayHit, World, WorldParams,

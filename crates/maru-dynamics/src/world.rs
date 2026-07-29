@@ -2123,6 +2123,12 @@ impl World {
 
     /// 캐노니컬 스냅샷 (스텝 경계에서만 — 설계 §3). 트리는 제외(파생 상태).
     /// 캐노니컬 스냅샷 — **총량 정책 초과 시 명시적으로 실패한다**. M3 바인딩은 이 경로를 쓴다.
+    /// 이 빌드가 읽고 쓰는 스냅샷 포맷 버전. 호스트가 저장된 데이터의 호환성을
+    /// **미리** 판정할 수 있도록 노출한다(복원 실패로 알게 되는 것보다 낫다).
+    pub fn snapshot_version() -> u32 {
+        crate::snapshot::VERSION
+    }
+
     pub fn try_snapshot(&self) -> Result<Vec<u8>, crate::snapshot::SnapshotError> {
         let mut w = crate::snapshot::Writer(Vec::new());
         crate::snapshot::write_world(self, &mut w)?;

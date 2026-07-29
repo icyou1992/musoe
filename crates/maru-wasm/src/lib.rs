@@ -44,6 +44,29 @@ pub const ERR_STAGING_LIMIT: i32 = -7;
 /// **상태는 변하지 않았다**(검증이 모든 변이보다 앞이다).
 pub const ERR_FP_ENVIRONMENT: i32 = -8;
 
+// 스냅샷 복원 실패 — **원인별로 나눈다**. 호스트가 "저장 파일이 옛 버전이라"와 "손상됐다"를
+// 구분해야 마이그레이션할지 버릴지 정할 수 있다.
+pub const ERR_SNAPSHOT_BAD_MAGIC: i32 = -20;
+pub const ERR_SNAPSHOT_BAD_VERSION: i32 = -21;
+pub const ERR_SNAPSHOT_TRUNCATED: i32 = -22;
+pub const ERR_SNAPSHOT_TRAILING: i32 = -23;
+pub const ERR_SNAPSHOT_TOO_LARGE: i32 = -24;
+pub const ERR_SNAPSHOT_CONTENT: i32 = -25;
+
+fn snapshot_err_code(e: maru_dynamics::SnapshotError) -> i32 {
+    use maru_dynamics::SnapshotError as E;
+    match e {
+        E::BadMagic => ERR_SNAPSHOT_BAD_MAGIC,
+        E::BadVersion(_) => ERR_SNAPSHOT_BAD_VERSION,
+        E::Truncated => ERR_SNAPSHOT_TRUNCATED,
+        E::TrailingBytes => ERR_SNAPSHOT_TRAILING,
+        E::CountTooLarge => ERR_SNAPSHOT_TOO_LARGE,
+        // 값·구조가 엔진 불변식을 깨는 경우는 전부 "내용 오류"로 묶는다 — 호스트가 할 수
+        // 있는 일이 같다(버린다).
+        E::NonFinite | E::BadIndex | E::BadShape | E::InconsistentState => ERR_SNAPSHOT_CONTENT,
+    }
+}
+
 fn code(e: ApiError) -> i32 {
     match e {
         ApiError::InvalidValue => ERR_INVALID_VALUE,
@@ -89,6 +112,8 @@ pub struct WasmWorld {
     /// 월드 쪽 원본은 다음 스텝까지 살아 있으므로, 그 전에 동기화하면 복구된다
     /// (확인 검수 rev_b438e81e MAJOR: 복구 경로가 없으면 Started가 영구 유실).
     events_stale: bool,
+    /// 직전 `maru_snapshot`이 뜬 바이트 — 호스트가 `maru_snapshot_ptr`로 읽어 간다.
+    snapshot: Vec<u8>,
     /// 월드의 `contact_events`가 **이미 발행 완료된 스텝** 것이라 재스테이징 금지.
     /// `ERR_INVALID_VALUE`(스텝 미실행)가 스테이징을 비운 뒤에도 월드 원본에는 직전
     /// 성공 스텝의 이벤트가 남는다 — 이 상태에서 동기화가 원본을 재복사하면 중복
@@ -161,6 +186,8 @@ pub extern "C" fn maru_world_create(gx: f32, gy: f32, gz: f32, substeps: u32) ->
         return core::ptr::null_mut();
     }
     Box::into_raw(Box::new(WasmWorld {
+        // 스냅샷 버퍼는 **쓸 때 자란다** — 안 쓰는 호스트에게 비용을 물리지 않는다.
+        snapshot: Vec::new(),
         world,
         transforms: Vec::new(),
         sleep_flags: Vec::new(),
@@ -647,6 +674,111 @@ pub unsafe extern "C" fn maru_events_len(p: *mut WasmWorld) -> u32 {
     (w.events.len() / 5) as u32
 }
 
+// ---------- 스냅샷·복원 (설계 §8 — 롤백·리플레이·넷코드의 정본 경로) ----------
+
+/// 이 빌드가 읽고 쓰는 스냅샷 포맷 버전.
+///
+/// **정확히 일치해야 복원된다** — 호스트는 저장 시 이 값을 함께 적어 두고, 불러오기 전에
+/// 비교해 마이그레이션 여부를 스스로 정한다(복원 실패로 알게 되는 것보다 낫다).
+#[no_mangle]
+pub extern "C" fn maru_snapshot_version() -> u32 {
+    World::snapshot_version()
+}
+
+/// 스냅샷을 **엔진 내부 버퍼에 뜬다**. 성공하면 바이트 수, 실패하면 음수.
+///
+/// 두 단계로 나눈 이유는 wasm 경계 규약 그대로다: 호스트가 크기를 먼저 알아야 메모리를
+/// 잡을 수 있고, 엔진이 호스트 버퍼에 직접 쓰면 길이를 잘못 준 호출이 곧 메모리 손상이다.
+/// 여기서 뜬 바이트는 `maru_snapshot_ptr`로 읽고, **다음 스냅샷 호출까지만 유효**하다.
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_snapshot(p: *mut WasmWorld) -> i32 {
+    let w = w_or!(p, ERR_NULL);
+    match w.world.try_snapshot() {
+        Ok(bytes) => {
+            let n = bytes.len();
+            if n > i32::MAX as usize {
+                return ERR_RESOURCE_LIMIT;
+            }
+            w.snapshot = bytes;
+            n as i32
+        }
+        // 스냅샷 실패는 자원 문제뿐이다(직렬화 자체는 상태를 안 바꾼다).
+        Err(_) => ERR_RESOURCE_LIMIT,
+    }
+}
+
+/// 직전 `maru_snapshot`이 뜬 바이트의 시작 주소. 스냅샷을 뜬 적이 없으면 null.
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다. 반환 포인터는 **다음 스냅샷 호출이나 월드 소멸
+/// 전까지만** 유효하다(엔진이 버퍼를 재사용한다).
+#[no_mangle]
+pub unsafe extern "C" fn maru_snapshot_ptr(p: *mut WasmWorld) -> *const u8 {
+    let w = w_or!(p, core::ptr::null());
+    if w.snapshot.is_empty() {
+        core::ptr::null()
+    } else {
+        w.snapshot.as_ptr()
+    }
+}
+
+/// 호스트 버퍼에서 복원한다. 성공 0, 실패 음수(`ERR_SNAPSHOT_*`).
+///
+/// **실패하면 상태는 그대로다** — 리더가 전부 검증한 뒤에야 적용한다(부분 복원 없음).
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터, `data`는 `len` 바이트가 유효한 읽기 가능 영역이어야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_restore(p: *mut WasmWorld, data: *const u8, len: u32) -> i32 {
+    let w = w_or!(p, ERR_NULL);
+    if data.is_null() {
+        return ERR_NULL;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(data, len as usize) };
+    match w.world.restore(bytes) {
+        Ok(()) => {
+            // 복원은 자세·수면·이벤트를 통째로 갈아치운다 — 스테이징 버퍼는 전부 낡았다.
+            w.transforms_stale = true;
+            w.events_stale = true;
+            0
+        }
+        Err(e) => snapshot_err_code(e),
+    }
+}
+
+/// 캐노니컬 상태 해시(하위 32비트, 상위는 `maru_state_hash_hi`).
+///
+/// u64를 그대로 돌려주면 JS에서 BigInt가 되어 핫패스 호출이 비싸진다 — 32비트 두 조각으로
+/// 나눠 준다(핸들 ABI와 같은 규약).
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_state_hash_lo(p: *mut WasmWorld) -> u32 {
+    let w = w_or!(p, 0);
+    w.world.state_hash() as u32
+}
+
+/// 캐노니컬 상태 해시 상위 32비트.
+///
+/// # Safety
+/// `p`는 살아있는 월드 포인터여야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_state_hash_hi(p: *mut WasmWorld) -> u32 {
+    let w = w_or!(p, 0);
+    (w.world.state_hash() >> 32) as u32
+}
+
+/// 이 스레드의 FP 환경을 엔진 캐노니컬 상태로 되돌린다(설계 §8).
+/// `ERR_FP_ENVIRONMENT`를 받은 호스트가 재시도 전에 부른다. 성공 1, 실패 0.
+#[no_mangle]
+pub extern "C" fn maru_canonicalize_fp() -> u32 {
+    World::canonicalize_fp_environment() as u32
+}
+
 // ---------- 질의 ----------
 
 /// 가장 가까운 광선 히트. 맞으면 1, 안 맞으면 0, 실패하면 음수.
@@ -719,6 +851,85 @@ pub unsafe extern "C" fn maru_query_hit_handle(p: *mut WasmWorld) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// **스냅샷 ABI 왕복** — 호스트가 쓰는 그 경로 그대로(버전 조회 → 뜨기 → 포인터 →
+    /// 복원 → 해시 일치). ABI를 rlib으로도 빌드해 네이티브에서 도는 이유가 이것이다.
+    #[test]
+    fn snapshot_abi_round_trips_and_reports_errors() {
+        assert_eq!(maru_snapshot_version(), maru_dynamics::SNAPSHOT_VERSION);
+        unsafe {
+            let w = maru_world_create(0.0, -9.81, 0.0, 4);
+            assert!(!w.is_null());
+            // dynamic 구 (반지름 0.5) — 자세 (0,3,0), 밀도 1
+            let h = maru_add_body(
+                w,
+                1,
+                SHAPE_SPHERE,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                3.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+            );
+            assert!(h != u64::MAX);
+            for _ in 0..10 {
+                assert_eq!(maru_step(w, 1.0 / 60.0), 0);
+            }
+            let n = maru_snapshot(w);
+            assert!(n > 0, "스냅샷 실패: {n}");
+            let ptr = maru_snapshot_ptr(w);
+            assert!(!ptr.is_null());
+            let bytes = core::slice::from_raw_parts(ptr, n as usize).to_vec();
+            let (lo, hi) = (maru_state_hash_lo(w), maru_state_hash_hi(w));
+
+            // 더 굴린 뒤 되감으면 해시가 복원돼야 한다.
+            for _ in 0..10 {
+                assert_eq!(maru_step(w, 1.0 / 60.0), 0);
+            }
+            assert!(maru_state_hash_lo(w) != lo || maru_state_hash_hi(w) != hi);
+            assert_eq!(maru_restore(w, bytes.as_ptr(), bytes.len() as u32), 0);
+            assert_eq!((maru_state_hash_lo(w), maru_state_hash_hi(w)), (lo, hi));
+
+            // 오류는 **원인별로** 구분돼야 한다 — 호스트가 마이그레이션할지 버릴지 정한다.
+            let mut bad_magic = bytes.clone();
+            bad_magic[0] ^= 0xFF;
+            assert_eq!(
+                maru_restore(w, bad_magic.as_ptr(), bad_magic.len() as u32),
+                ERR_SNAPSHOT_BAD_MAGIC
+            );
+            let mut bad_version = bytes.clone();
+            bad_version[4] = bad_version[4].wrapping_add(1);
+            assert_eq!(
+                maru_restore(w, bad_version.as_ptr(), bad_version.len() as u32),
+                ERR_SNAPSHOT_BAD_VERSION
+            );
+            // 잘린 파일은 `Truncated`로도, `CountTooLarge`로도 나온다 — 선언된 개수가
+            // 남은 바이트를 넘는 순간 예산 검사가 먼저 걸리기 때문이다(입력 길이에서 유도한
+            // 예산이 그렇게 동작하도록 설계됐다). 둘 다 "이 파일은 못 쓴다"로 같다.
+            let t = maru_restore(w, bytes.as_ptr(), (bytes.len() / 2) as u32);
+            assert!(
+                t == ERR_SNAPSHOT_TRUNCATED || t == ERR_SNAPSHOT_TOO_LARGE,
+                "잘린 파일이 손상으로 보고되지 않았다: {t}"
+            );
+            assert_eq!(maru_restore(w, core::ptr::null(), 0), ERR_NULL);
+            // 실패해도 상태는 그대로다
+            assert_eq!((maru_state_hash_lo(w), maru_state_hash_hi(w)), (lo, hi));
+            maru_world_destroy(w);
+        }
+    }
+
+    /// FP 환경 되돌리기 ABI가 실제로 동작한다.
+    #[test]
+    fn fp_canonicalize_abi_works() {
+        assert_eq!(maru_canonicalize_fp(), 1);
+    }
+
     use super::*;
 
     /// **게이트가 C ABI를 네이티브로 돈다** — 바인딩만 손으로 확인하는 층이 되면 썩는다.
