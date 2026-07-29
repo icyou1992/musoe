@@ -213,7 +213,7 @@ impl Mat3 {
             // 고전 Jacobi 각: tan(2θ) = 2·apq / (app − aqq)
             // **결정적 atan2**(`det` 모듈) — 플랫폼 libm은 마지막 ulp가 갈려 L1 계약을 깬다.
             let theta = 0.5 * crate::det::atan2(2.0 * apq, app - aqq);
-            let (s, c) = theta.sin_cos();
+            let (s, c) = crate::det::sin_cos(theta);
             // G = 평면 (p,q) 회전. A ← Gᵀ A G, V ← V G
             let mut g = Mat3::IDENTITY;
             set(&mut g, p, p, c);

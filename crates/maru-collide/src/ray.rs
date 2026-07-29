@@ -60,11 +60,20 @@ pub fn cast_ray(
         // 하이트필드: 격자 DDA — 지나는 셀만 삼각형으로 시험한다.
         Shape::Heightfield { .. } => {
             let hf = shape.heightfield_ref().expect("Heightfield 변종");
+            // **표면 아래에서 시작하면 `toi=0, started_inside`** — 하이트필드는 속이 찬
+            // 것으로 정의했으므로(`contains_point`) 레이도 같은 계약을 따라야 한다.
+            // 안 그러면 "안에 있는데 안 맞았다"가 되어 다른 셰이프와 규약이 갈린다
+            // (검수 rev_1e81559e MAJOR).
+            if hf.height_at(o.x, o.z).is_some_and(|h| o.y <= h) {
+                return Some(RayCast {
+                    toi: 0.0,
+                    normal: -dir.normalize_or_zero(),
+                    started_inside: true,
+                });
+            }
             crate::heightfield::ray_heightfield(&hf, o, d, max_toi).map(|(toi, n)| Local {
                 toi,
                 normal: n,
-                // 지형은 표면이다 — "안에서 시작"은 표면 아래를 뜻하고, 그건 아래
-                // `contains_point`가 판정한다. 레이 자체는 면을 뚫는 순간을 보고한다.
                 started_inside: false,
             })
         }

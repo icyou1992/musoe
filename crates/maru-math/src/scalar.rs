@@ -130,7 +130,9 @@ impl Quat {
         if !angle.is_finite() {
             return Self::IDENTITY;
         }
-        let (s, c) = (angle * 0.5).sin_cos();
+        // **결정적 sin/cos** — 회전 CCD가 매 반복 이 함수를 부른다. 플랫폼 sin_cos의
+        // 마지막 비트가 갈리면 TOI가 갈리고 L1 계약이 깨진다(검수 rev_1e81559e BLOCKER).
+        let (s, c) = crate::det::sin_cos(angle * 0.5);
         Self {
             x: a.x * s,
             y: a.y * s,

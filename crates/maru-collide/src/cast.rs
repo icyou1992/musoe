@@ -220,6 +220,43 @@ pub fn shape_cast_dispatch_rotational(
     };
     let cast_one = |csa: &Shape, cpa: &Pose| -> Option<ShapeCastHit> {
         match sb {
+            // **하이트필드는 볼록이 아니다** — 그냥 넘기면 GJK가 `support_core`의
+            // `unreachable!`에 닿아 trap이 된다(검수 rev_1e81559e BLOCKER: 회전 CCD를 켠
+            // 블레이드를 지형 옆에 두면 선속도 0에서도 즉시 재현). 선형 경로와 같은 규칙으로
+            // 스윕 봉투가 덮는 셀만 삼각형으로 펼친다. 회전 봉투는 외접 반지름으로 넓힌다.
+            Shape::Heightfield { .. } => {
+                let hf = sb.heightfield_ref().expect("Heightfield 변종");
+                let r = csa.bounding_radius();
+                let a0 = crate::transformed_aabb(csa.local_aabb(), cpa);
+                let e = Vec3::new(r, r, r);
+                let a0 = crate::Aabb::new(a0.min - e, a0.max + e).merge(a0);
+                let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
+                let expanded = crate::Aabb::new(
+                    sweep.min - Vec3::new(skin, skin, skin),
+                    sweep.max + Vec3::new(skin, skin, skin),
+                );
+                let local = crate::heightfield::world_aabb_to_local(expanded, pb);
+                let (cx0, cz0, cx1, cz1) = hf.cell_range(local)?;
+                let mut best: Option<ShapeCastHit> = None;
+                for cz in cz0..=cz1 {
+                    for cx in cx0..=cx1 {
+                        for t in 0..2u8 {
+                            let tri = Shape::Triangle {
+                                points: hf.triangle(cx, cz, t),
+                                radius: 0.0,
+                            };
+                            if let Some(h) = shape_cast_rotational(
+                                csa, cpa, motion, axis, angle, pa.pos, &tri, pb, skin,
+                            ) {
+                                if best.as_ref().is_none_or(|b| h.toi < b.toi) {
+                                    best = Some(h);
+                                }
+                            }
+                        }
+                    }
+                }
+                best
+            }
             Shape::Compound { children } => children
                 .iter()
                 .filter_map(|(cpb, csb)| {
@@ -304,15 +341,11 @@ pub fn shape_cast_dispatch(
             );
             let local = crate::heightfield::world_aabb_to_local(expanded, pb);
             let (cx0, cz0, cx1, cz1) = hf.cell_range(local)?;
-            let mut cells = 0usize;
+            // **셀 수로 자르지 않는다.** 자르면 긴 스윕이 진짜 접촉을 조용히 넘겨
+            // 지형을 통과한다(검수 rev_1e81559e BLOCKER). 작업량은 스윕 봉투가 덮는
+            // 셀 수로 이미 유계이고, 그 범위를 줄이는 것은 호출자(속도 상한·격자 해상도)의 몫이다.
             for cz in cz0..=cz1 {
                 for cx in cx0..=cx1 {
-                    cells += 1;
-                    if cells > crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
-                        // 상한 도달 — 여기까지의 최선을 돌려준다(보수적: 더 이른 히트가
-                        // 남아 있을 수 있으나 늦은 히트를 지어내지는 않는다).
-                        return best;
-                    }
                     for t in 0..2u8 {
                         let tri = Shape::Triangle {
                             points: hf.triangle(cx, cz, t),

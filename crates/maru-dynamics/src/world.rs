@@ -555,6 +555,11 @@ impl World {
     /// 월드 생성 (오류 반환형 — **M3 바인딩의 정본 경로**). 호스트가 넘긴 파라미터로
     /// wasm 모듈을 trap시키지 않는다.
     pub fn try_new(params: WorldParams) -> Result<Self, ApiError> {
+        // **설정 불가 환경은 명시 실패**다(설계 §8) — 조용히 진행하면 결정론 계약이
+        // 처음부터 거짓인 월드가 만들어진다.
+        if !maru_math::fp_canonicalize() {
+            return Err(ApiError::FpEnvironment);
+        }
         check_params(&params)?;
         Ok(Self::new_unchecked(params))
     }
@@ -620,6 +625,7 @@ impl World {
         angular: f32,
         time_to_sleep: f32,
     ) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         let mut p = self.params.clone();
         p.sleep_linear_threshold = linear;
         p.sleep_angular_threshold = angular;
@@ -642,6 +648,7 @@ impl World {
 
     /// 파라미터 교체 (오류 반환형).
     pub fn try_set_params(&mut self, params: WorldParams) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         check_params(&params)?;
         self.invalidate_bp();
         self.params = params;
@@ -697,6 +704,7 @@ impl World {
     /// 계약 "실패는 trap이 아니라 오류"에서 이 경로만 빠져 있었다 — 브라우저 바인딩은
     /// unwind가 곧 trap이라 `expect`가 호스트에게 진단 불가능한 죽음이 된다.
     pub fn try_add_body(&mut self, body: Body) -> Result<BodyHandle, ApiError> {
+        Self::fp_guard()?;
         body.validate()?;
         Ok(self.add_body_validated(body))
     }
@@ -760,6 +768,7 @@ impl World {
         triangles: &[[u32; 3]],
         radius: f32,
     ) -> Result<Vec<BodyHandle>, ApiError> {
+        Self::fp_guard()?;
         // 전체 검증 먼저 — 부분 삽입은 실패 시 호스트가 되돌릴 수 없다.
         let mut bodies = Vec::new();
         bodies
@@ -1025,6 +1034,7 @@ impl World {
     /// 여러 번 부르면 더해진다. 한 번의 입력은 **입력 범위**로 거르고, 누적분이
     /// 파생 상한을 넘으면 포화시키고 `StateOverflow`를 올린다(다른 파생 상태와 같은 규칙).
     pub fn apply_force(&mut self, h: BodyHandle, force: Vec3) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !maru_collide::vec_in_range(force) {
             return Err(ApiError::InvalidValue);
         }
@@ -1039,6 +1049,7 @@ impl World {
 
     /// 누적 토크에 더한다 (월드 좌표, N·m).
     pub fn apply_torque(&mut self, h: BodyHandle, torque: Vec3) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !maru_collide::vec_in_range(torque) {
             return Err(ApiError::InvalidValue);
         }
@@ -1053,6 +1064,7 @@ impl World {
 
     /// 질량중심에 **즉시** 선형 충격을 준다 (N·s). 속도가 그 자리에서 바뀐다.
     pub fn apply_impulse(&mut self, h: BodyHandle, impulse: Vec3) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !maru_collide::vec_in_range(impulse) {
             return Err(ApiError::InvalidValue);
         }
@@ -1068,6 +1080,7 @@ impl World {
 
     /// **즉시** 각충격을 준다 (N·m·s).
     pub fn apply_angular_impulse(&mut self, h: BodyHandle, impulse: Vec3) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !maru_collide::vec_in_range(impulse) {
             return Err(ApiError::InvalidValue);
         }
@@ -1089,6 +1102,7 @@ impl World {
         impulse: Vec3,
         point: Vec3,
     ) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !maru_collide::vec_in_range(impulse) || !maru_collide::vec_in_range(point) {
             return Err(ApiError::InvalidValue);
         }
@@ -1109,6 +1123,7 @@ impl World {
 
     /// 누적 힘·토크를 지운다 (스텝을 돌리지 않고 취소할 때).
     pub fn clear_forces(&mut self, h: BodyHandle) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         let i = self.resolve(h)?;
         self.bodies[i].force = Vec3::ZERO;
         self.bodies[i].torque = Vec3::ZERO;
@@ -1260,6 +1275,15 @@ impl World {
             return Err(ApiError::InvalidValue);
         }
         if shape.validate().is_err() {
+            return Err(ApiError::InvalidValue);
+        }
+        // **스윕 주체는 볼록 셰이프만**. 하이트필드·복합을 넣으면 대상이 일반 convex일 때
+        // GJK로 내려가 `support_core`의 `unreachable!`에 닿는다(검수 rev_1e81559e BLOCKER).
+        // 복합을 스윕하고 싶으면 자식별로 호출하는 것이 호출자의 몫이다.
+        if matches!(
+            shape,
+            maru_collide::Shape::Heightfield { .. } | maru_collide::Shape::Compound { .. }
+        ) {
             return Err(ApiError::InvalidValue);
         }
         // 스윕 봉투로 후보를 거른다 — 전수 검사보다 싸고 결과는 같다.
@@ -1416,6 +1440,7 @@ impl World {
         linear: f32,
         angular: f32,
     ) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !(linear >= 0.0 && maru_collide::in_range(linear))
             || !(angular >= 0.0 && maru_collide::in_range(angular))
         {
@@ -1428,6 +1453,7 @@ impl World {
     }
 
     pub fn set_linear_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         // 속도는 **속도 차원 범위**다(MAX_SPEED). 일반 입력 범위를 쓰면 리더가 거부하는
         // 값을 setter가 받아들여 같은 비대칭이 되살아난다.
         if !maru_collide::vec_speed_in_range(v) {
@@ -1439,6 +1465,7 @@ impl World {
     }
 
     pub fn set_angular_velocity(&mut self, h: BodyHandle, v: Vec3) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !maru_collide::vec_angular_in_range(v) {
             return Err(ApiError::InvalidValue);
         }
@@ -1449,6 +1476,7 @@ impl World {
 
     /// 텔레포트 (설계 §9: 속도를 만들지 않는다 — kinematic 구동은 별도 API).
     pub fn set_pose(&mut self, h: BodyHandle, pose: maru_collide::Pose) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !maru_collide::vec_in_range(pose.pos) || pose.rot.try_normalize().is_none() {
             return Err(ApiError::InvalidValue);
         }
@@ -1497,6 +1525,7 @@ impl World {
         friction: f32,
         restitution: f32,
     ) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         if !maru_collide::in_range(friction)
             || friction < 0.0
             || !(0.0..=1.0).contains(&restitution)
@@ -2034,6 +2063,7 @@ impl World {
     /// 조인트 추가 (오류 반환형). 엔드포인트는 **세대까지** 검증한다 — 인덱스만 보면
     /// 제거·재사용된 슬롯의 새 바디에 붙는다(리뷰 BLOCKER: ABA).
     pub fn try_add_joint(&mut self, mut joint: Joint) -> Result<usize, ApiError> {
+        Self::fp_guard()?;
         // 생성자를 통과했더라도 **삽입 경계에서 다시** 검증한다(리뷰 BLOCKER: 공개 필드
         // 대입으로 생성 후 축을 NaN으로 바꿀 수 있었고, `length_sq() < 0.5` 비교는
         // NaN에서 false라 그대로 통과했다).
@@ -2208,6 +2238,11 @@ impl World {
     /// 스냅샷 복원. 재생은 원 실행과 같은 타깃에서 L0 비트 동일.
     /// **신뢰하지 않는 바이트를 받는다** — 검증 실패 시 월드는 그대로 두고 오류를 반환한다.
     pub fn restore(&mut self, bytes: &[u8]) -> Result<(), crate::snapshot::SnapshotError> {
+        // 복원도 산술로 상태를 만든다(정규화·검증) — 비표준 환경에서 확정되면 안 된다.
+        // 이 함수의 오류형에는 FP 항목이 없으므로 "내용 불일치"로 보고한다.
+        if !maru_math::fp_verify() {
+            return Err(crate::snapshot::SnapshotError::InconsistentState);
+        }
         crate::snapshot::read_world(self, bytes)
     }
 
@@ -2265,6 +2300,22 @@ impl World {
     /// 탭 복귀처럼 큰 dt가 들어오면 여러 스텝으로 쪼개거나 프레임을 버려야 한다.
     /// 엔진이 조용히 클램프하면 시뮬레이션이 실시간과 어긋난 채 진행돼 더 나쁘다.
     /// 위반은 wasm trap이 아니라 `ApiError::InvalidValue`로 표현된다.
+    /// **캐노니컬 상태를 만드는 모든 진입점의 FP 가드** (설계 §8).
+    ///
+    /// 스텝만 검증하면 부족하다: 월드 생성 뒤 다른 라이브러리가 플러시 모드를 켜면
+    /// `set_pose`의 쿼터니언 정규화, 질량·주축 베이킹, 복원 검증이 **비표준 환경에서
+    /// 확정된 값**을 캐노니컬 상태에 남긴다. 다음 스텝이 오류를 내도 이미 늦다
+    /// (검수 rev_1e81559e MAJOR). 그래서 산술로 상태를 만드는 진입점마다 앞세운다.
+    /// 비용은 레지스터 읽기 1회다.
+    #[inline]
+    fn fp_guard() -> Result<(), ApiError> {
+        if maru_math::fp_verify() {
+            Ok(())
+        } else {
+            Err(ApiError::FpEnvironment)
+        }
+    }
+
     /// 이 스레드의 FP 환경을 엔진 캐노니컬 상태로 되돌린다 (설계 §8).
     /// `ApiError::FpEnvironment`를 받은 호스트가 재시도 전에 부른다.
     pub fn canonicalize_fp_environment() -> bool {

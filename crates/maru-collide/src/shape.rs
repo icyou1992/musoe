@@ -187,8 +187,15 @@ impl Shape {
                     return Err("compound must have 1..=8 children");
                 }
                 for (pose, child) in children {
-                    if matches!(child, Shape::Compound { .. }) {
-                        return Err("compound nesting is not allowed");
+                    // **자식은 볼록 primitive만** — 접촉·캐스트의 compound 분기는 자식을
+                    // 그대로 GJK/support에 넣는다. 하이트필드·삼각형 자식은 거기서
+                    // `unreachable!`에 닿아 trap이 되고, 제약 회계의 `parts()`도 하이트필드
+                    // 상한을 못 센다(검수 rev_1e81559e BLOCKER).
+                    if matches!(
+                        child,
+                        Shape::Compound { .. } | Shape::Heightfield { .. } | Shape::Triangle { .. }
+                    ) {
+                        return Err("compound children must be convex primitives");
                     }
                     child.validate()?;
                     if !vec_extent_in_range(pose.pos) {

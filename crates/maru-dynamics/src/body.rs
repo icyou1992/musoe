@@ -201,6 +201,13 @@ impl Body {
     pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
         use crate::world::ApiError;
         self.shape.validate().map_err(|_| ApiError::InvalidValue)?;
+        // **하이트필드는 static 전용**이다. 복원 경계(`validate_structure`)에서만 막고
+        // 라이브 생성에서 빠뜨리면 `restore(snapshot())`가 자기 스냅샷을 거부한다 —
+        // 입력·복원 정책 비대칭은 이 저장소가 네 번 재발로 배운 계열이다
+        // (검수 rev_1e81559e BLOCKER). 질량 경로가 없어 kinematic도 성립하지 않는다.
+        if matches!(self.shape, Shape::Heightfield { .. }) && self.body_type != BodyType::Static {
+            return Err(ApiError::InvalidValue);
+        }
         // 용접 마스크: 3비트뿐이고, 비영이면 static 3점 hull(지형 삼각형)이어야 한다 —
         // 다른 셰이프에 물리면 면 법선 정의가 없어 보정이 무의미하거나 틀린다.
         if self.weld_edges >= 8 {
@@ -520,10 +527,15 @@ impl Body {
 
     /// 기구학 바디 생성 (오류 반환형).
     pub fn try_new_kinematic(shape: Shape, pose: Pose) -> Result<Self, ApiError> {
-        Ok(Self {
+        let b = Self {
             body_type: BodyType::Kinematic,
             ..Self::try_new_static(shape, pose)?
-        })
+        };
+        // **타입을 바꿨으면 다시 검증한다** — static으로는 합법인 셰이프가 kinematic으로는
+        // 아닐 수 있다(하이트필드). 이 한 줄이 빠져 있어 라이브 생성이 통과하고 복원만
+        // 거부하는 비대칭이 생겼다(검수 rev_1e81559e BLOCKER).
+        b.validate()?;
+        Ok(b)
     }
 
     #[inline]

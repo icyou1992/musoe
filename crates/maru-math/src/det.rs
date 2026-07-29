@@ -86,6 +86,58 @@ pub fn atan2(y: f32, x: f32) -> f32 {
     }
 }
 
+/// 결정적 `sin`·`cos` 동시 계산 — Cephes `sinf`/`cosf`와 같은 범위 축소 + 다항.
+///
+/// **이것도 핫패스에 있었다**(검수 rev_1e81559e BLOCKER): `Quat::from_axis_angle`이
+/// 회전 CCD의 매 반복마다 불리고, Jacobi 주축 분해도 결정적 atan2 **직후에** 다시
+/// `sin_cos`를 부른다. atan2만 갈아끼우고 "초월함수는 두 곳뿐"이라 한 내 조사가
+/// `.sin_cos()`를 놓친 것이다 — 같은 계약을 여기에도 건다.
+///
+/// 범위 축소는 π/2를 3조각으로 나눠 빼는 Cody-Waite다(한 번에 빼면 큰 각에서 상쇄로
+/// 유효숫자가 날아간다). 사분면 4개로 접고 짧은 다항 두 개로 푼다.
+pub fn sin_cos(x: f32) -> (f32, f32) {
+    if !x.is_finite() {
+        return (f32::NAN, f32::NAN);
+    }
+    const FOPI: f32 = 1.273_239_5; // 4/π
+                                   // π/4를 세 조각으로 쪼갠 상수(Cody-Waite) — 한 번에 빼면 큰 각에서 상쇄로 유효숫자가
+                                   // 날아간다. π/2가 아니라 **π/4**로 접어야 남는 각이 ±π/4 안에 들어와 짧은 다항으로 충분하다.
+    const DP1: f32 = 0.785_156_25;
+    const DP2: f32 = 2.418_756_5e-4;
+    const DP3: f32 = 3.774_895e-8;
+    let a = x.abs();
+    let mut j = (FOPI * a) as i32;
+    let mut yf = j as f32;
+    // 홀수면 하나 올려 짝수로 — 사분면 판정을 단순화한다(Cephes 규약).
+    if j & 1 == 1 {
+        j += 1;
+        yf += 1.0;
+    }
+    j &= 7;
+    let mut sin_sign = if x.is_sign_negative() { -1.0f32 } else { 1.0 };
+    let mut cos_sign = 1.0f32;
+    if j > 3 {
+        j -= 4;
+        sin_sign = -sin_sign;
+        cos_sign = -cos_sign;
+    }
+    if j > 1 {
+        cos_sign = -cos_sign;
+    }
+    let z = ((a - yf * DP1) - yf * DP2) - yf * DP3;
+    let zz = z * z;
+    let poly_sin = z + z * zz * ((-1.951_529_6e-4 * zz + 8.332_161e-3) * zz - 1.666_665_5e-1);
+    let poly_cos =
+        1.0 - 0.5 * zz + zz * zz * ((2.443_315_7e-5 * zz - 1.388_731_6e-3) * zz + 4.166_664_6e-2);
+    // 사분면 1·2에서는 sin과 cos의 다항이 뒤바뀐다.
+    let (s_base, c_base) = if j == 1 || j == 2 {
+        (poly_cos, poly_sin)
+    } else {
+        (poly_sin, poly_cos)
+    };
+    (sin_sign * s_base, cos_sign * c_base)
+}
+
 /// 결정적 `asin` — `|x| ≤ 1` 밖은 클램프한다(물리 입력은 반올림으로 1을 살짝 넘길 수 있다).
 pub fn asin(x: f32) -> f32 {
     let x = x.clamp(-1.0, 1.0);
@@ -172,6 +224,28 @@ mod tests {
         // 범위 밖은 클램프 — NaN이 아니라 경계값
         assert_eq!(asin(1.5), asin(1.0));
         assert_eq!(acos(-2.0), acos(-1.0));
+    }
+
+    /// sin/cos도 계약 안(오차 + 항등식).
+    #[test]
+    fn sin_cos_matches_std_and_keeps_identity() {
+        let mut worst = 0.0f32;
+        let mut worst_at = 0.0f32;
+        // 작은 각부터 여러 바퀴까지 — 범위 축소가 큰 각에서 무너지는지 본다.
+        for i in -20_000..=20_000 {
+            let x = i as f32 * 0.001; // ±20 rad ≈ ±3바퀴
+            let (s, c) = sin_cos(x);
+            let e = (s - x.sin()).abs().max((c - x.cos()).abs());
+            if e > worst {
+                worst = e;
+                worst_at = x;
+            }
+            // 항등식은 근사와 무관하게 성립해야 한다
+            let unit = (s * s + c * c - 1.0).abs();
+            assert!(unit < 1e-5, "sin²+cos²−1 = {unit} at x={x}");
+        }
+        assert!(worst < 5e-6, "sin/cos 최대 오차 {worst} at {worst_at}");
+        assert!(sin_cos(f32::NAN).0.is_nan());
     }
 
     /// **결정론의 핵심**: 같은 입력이면 항상 같은 비트. (플랫폼 간 비교는 CI가 한다 —

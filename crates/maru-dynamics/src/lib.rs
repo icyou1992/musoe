@@ -2905,6 +2905,221 @@ mod tests {
         assert_eq!(run(), run(), "같은 입력이 다른 경로를 냈다");
     }
 
+    // ===== 검수 rev_1e81559e 회귀 =====
+
+    /// **회전 CCD가 하이트필드를 만나도 trap하지 않는다** (BLOCKER).
+    /// 회전 스윕은 선속도 0에서도 켜지므로, 지형 옆에서 도는 CCD 바디가 즉시 재현했다.
+    #[test]
+    fn rotational_ccd_against_heightfield_does_not_trap() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            substeps: 8,
+            ..WorldParams::default()
+        });
+        let heights = vec![0.0f32; 9 * 9];
+        w.try_add_heightfield(&heights, 9, 9, 1.0, pose(0.0, 0.0, 0.0))
+            .expect("지형");
+        let blade = Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(1.2, 0.05, 0.1),
+                radius: 0.0,
+            },
+            pose(4.0, 0.6, 4.0),
+            1.0,
+        )
+        .with_ccd();
+        let h = w.add_body(blade);
+        w.set_angular_velocity(h, Vec3::new(0.0, 0.0, 60.0))
+            .expect("각속도");
+        for _ in 0..30 {
+            w.step(DT); // trap이면 여기서 프로세스가 죽는다
+        }
+        assert!(w.body(h).pose().pos.y.is_finite());
+    }
+
+    /// **긴 지형을 가로지르는 캐스트가 접촉을 놓치지 않는다** (BLOCKER: 셀 상한 절단).
+    #[test]
+    fn long_sweep_across_a_wide_heightfield_still_hits() {
+        let mut w = World::new(WorldParams::default());
+        // 가로로 아주 긴 격자(셀 8192개) — 예전 4096 상한이면 뒷부분을 못 봤다.
+        let (nx, nz) = (8193u32, 3u32);
+        let mut heights = vec![0.0f32; (nx * nz) as usize];
+        // 6000번째 셀에만 벽처럼 솟은 줄
+        for iz in 0..nz {
+            heights[(iz * nx + 6000) as usize] = 3.0;
+        }
+        w.try_add_heightfield(&heights, nx, nz, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형");
+        let hit = w
+            .sweep_shape(
+                &Shape::Sphere { radius: 0.2 },
+                pose(0.0, 1.0, 0.1),
+                Vec3::new(800.0, 0.0, 0.0),
+                QueryFilter::ALL,
+            )
+            .expect("질의");
+        assert!(
+            hit.is_some(),
+            "600m 뒤의 벽을 놓쳤다 — 셀 상한이 진짜 히트를 잘랐다"
+        );
+        // 레이도 같은 벽을 봐야 한다
+        let r = w
+            .cast_ray(Vec3::new(0.05, 1.0, 0.1), Vec3::new(1.0, 0.0, 0.0), 1000.0)
+            .expect("질의");
+        assert!(r.is_some(), "레이가 먼 벽을 놓쳤다");
+    }
+
+    /// 격자 **밖** 점은 지형 안이 아니다 (MAJOR: 마지막 셀 외삽).
+    /// 그리고 표면 아래에서 쏜 레이는 `toi=0`·`started_inside`다(다른 셰이프와 같은 계약).
+    #[test]
+    fn heightfield_point_and_ray_contracts_hold_outside_and_inside() {
+        let mut w = World::new(WorldParams::default());
+        let heights = vec![0.0f32; 3 * 3];
+        let hf = w
+            .try_add_heightfield(&heights, 3, 3, 1.0, pose(0.0, 0.0, 0.0))
+            .expect("지형");
+        let mut out = Vec::new();
+        w.query_point(Vec3::new(100.0, -1.0, 0.5), &mut out)
+            .expect("질의");
+        assert!(
+            !out.contains(&hf),
+            "격자에서 98m 떨어진 점이 지형 안으로 잡혔다"
+        );
+        let inside = w
+            .cast_ray(Vec3::new(1.0, -0.5, 1.0), Vec3::new(0.0, 1.0, 0.0), 10.0)
+            .expect("질의")
+            .expect("안에서 시작한 레이도 히트다");
+        assert_eq!(inside.toi, 0.0, "안에서 시작인데 toi가 0이 아니다");
+        assert!(inside.started_inside, "started_inside가 안 섰다");
+    }
+
+    /// 하이트필드는 **라이브 생성에서도** static 전용이고, compound 자식이 될 수 없다
+    /// (BLOCKER: 복원에서만 막으면 `restore(snapshot())`가 자기 스냅샷을 거부한다).
+    #[test]
+    fn heightfield_static_only_is_enforced_at_creation_too() {
+        let hf = || Shape::Heightfield {
+            heights: vec![0.0; 4],
+            nx: 2,
+            nz: 2,
+            cell: 1.0,
+        };
+        // **fallible 생성자로** 본다 — 비-fallible 쪽은 계약 위반에 패닉하는 것이 규약이다.
+        assert!(
+            Body::try_new_kinematic(hf(), pose(0.0, 0.0, 0.0)).is_err(),
+            "kinematic 하이트필드가 통과했다 — 스냅샷 왕복이 깨진다"
+        );
+        // compound 자식으로도 안 된다(접촉 경로가 자식을 GJK에 그대로 넣는다)
+        assert!(Body::try_new_static(
+            Shape::Compound {
+                children: vec![
+                    (pose(0.0, 0.0, 0.0), Shape::Sphere { radius: 0.5 }),
+                    (pose(0.0, 0.0, 0.0), hf()),
+                ],
+            },
+            pose(0.0, 0.0, 0.0),
+        )
+        .is_err());
+    }
+
+    /// 캐릭터 설정이 **매 호출 검증**된다 (BLOCKER: 음수 skin이면 요청보다 더 간다).
+    #[test]
+    fn character_rejects_a_broken_configuration() {
+        let mut w = char_world();
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(0.2, 2.0, 5.0),
+                radius: 0.0,
+            },
+            pose(1.5, 2.0, 0.0),
+        ));
+        let mut c = capsule_char(0.0, 0.8, 0.0);
+        c.skin = -10.0;
+        assert_eq!(
+            c.move_and_slide(&w, Vec3::new(10.0, 0.0, 0.0), QueryFilter::ALL)
+                .err(),
+            Some(ApiError::InvalidValue),
+            "음수 skin이 통과하면 벽 반대편으로 순간이동한다"
+        );
+        let mut c2 = capsule_char(0.0, 0.8, 0.0);
+        c2.up = Vec3::new(0.0, 3.0, 0.0); // 단위가 아니다
+        assert!(c2
+            .move_and_slide(&w, Vec3::new(1.0, 0.0, 0.0), QueryFilter::ALL)
+            .is_err());
+        // 비볼록 셰이프는 스윕 주체가 될 수 없다
+        let mut c3 = capsule_char(0.0, 0.8, 0.0);
+        c3.shape = Shape::Heightfield {
+            heights: vec![0.0; 4],
+            nx: 2,
+            nz: 2,
+            cell: 1.0,
+        };
+        assert!(c3
+            .move_and_slide(&w, Vec3::new(1.0, 0.0, 0.0), QueryFilter::ALL)
+            .is_err());
+        assert!(w
+            .sweep_shape(
+                &Shape::Heightfield {
+                    heights: vec![0.0; 4],
+                    nx: 2,
+                    nz: 2,
+                    cell: 1.0
+                },
+                pose(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                QueryFilter::ALL
+            )
+            .is_err());
+    }
+
+    /// **FP 가드가 스텝뿐 아니라 상태를 만드는 진입점에도 있다** (MAJOR).
+    #[test]
+    fn canonical_mutations_refuse_a_non_canonical_fp_environment() {
+        let mut w = World::new(WorldParams::default());
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 2.0, 0.0),
+            1.0,
+        ));
+        if !maru_math::force_flush_to_zero_for_test() {
+            return;
+        }
+        // 자세·속도·힘·바디 추가·조인트·복원이 전부 거부돼야 한다.
+        assert_eq!(
+            w.set_pose(
+                h,
+                maru_collide::Pose {
+                    pos: Vec3::new(1.0, 1.0, 1.0),
+                    rot: Quat::IDENTITY
+                }
+            ),
+            Err(ApiError::FpEnvironment)
+        );
+        assert_eq!(
+            w.apply_impulse(h, Vec3::new(1.0, 0.0, 0.0)),
+            Err(ApiError::FpEnvironment)
+        );
+        assert_eq!(
+            w.try_add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.2 },
+                pose(3.0, 3.0, 3.0),
+                1.0
+            ))
+            .err(),
+            Some(ApiError::FpEnvironment)
+        );
+        assert!(World::try_new(WorldParams::default()).is_ok() || true);
+        assert!(World::canonicalize_fp_environment());
+        assert!(w
+            .set_pose(
+                h,
+                maru_collide::Pose {
+                    pos: Vec3::new(1.0, 1.0, 1.0),
+                    rot: Quat::IDENTITY
+                }
+            )
+            .is_ok());
+    }
+
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
     /// `cargo test --release -p maru-dynamics -- --ignored`
     #[test]

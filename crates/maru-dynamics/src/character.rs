@@ -119,7 +119,24 @@ impl CharacterVirtual {
         displacement: Vec3,
         filter: QueryFilter,
     ) -> Result<MoveResult, ApiError> {
-        if !maru_collide::vec_in_range(displacement) {
+        // **설정 필드가 전부 public이므로 매 호출 검증한다** (검수 rev_1e81559e BLOCKER).
+        // 예: `skin`이 음수면 접촉에서 물러나는 대신 **더 나아가** 벽 반대편으로 순간이동한다
+        // (`travel = t·len − skin`). 한 번 잘못 설정하면 조용히 물리를 깨는 종류의 값이라,
+        // 생성자에서만 막아서는 부족하다(호스트가 나중에 대입할 수 있다).
+        let up2 = self.up.length_sq();
+        if !maru_collide::vec_in_range(displacement)
+            || !maru_collide::vec_in_range(self.position)
+            || self.shape.validate().is_err()
+            // 스윕 주체는 볼록이어야 한다 — 비볼록을 넣으면 GJK가 trap이다.
+            || matches!(
+                self.shape,
+                Shape::Heightfield { .. } | Shape::Compound { .. }
+            )
+            || !(0.0..=1.0).contains(&self.max_slope_cos)
+            || !(self.skin.is_finite() && self.skin >= 0.0)
+            || !(self.step_height.is_finite() && self.step_height >= 0.0)
+            || !(0.99..=1.01).contains(&up2)
+        {
             return Err(ApiError::InvalidValue);
         }
         let mut pos = self.position;

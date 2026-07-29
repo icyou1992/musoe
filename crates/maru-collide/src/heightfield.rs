@@ -28,7 +28,12 @@ pub const MAX_HEIGHTFIELD_MANIFOLDS: usize = 64;
 /// 격자 샘플 수 상한 (nx·nz). 스냅샷·검증 예산의 근거.
 pub const MAX_HEIGHTFIELD_SAMPLES: usize = 1 << 20;
 
-/// 캐스트·레이가 훑을 수 있는 셀 수 상한 — 무한 루프 방지.
+/// (구) 질의 셀 상한 — **더는 절단에 쓰지 않는다**.
+///
+/// 인위적 상한은 긴 지형에서 진짜 히트를 조용히 미스로 만들었다(검수 rev_1e81559e BLOCKER:
+/// 8194×2 격자를 가로지르는 캐스트가 5,000번째 셀의 접촉을 놓쳤다). 지금은 작업량을
+/// **격자 자체**가 묶는다 — 레이 DDA는 한 방향 전진이라 ncx+ncz+2를 못 넘고, 선형 캐스트는
+/// 스윕 봉투가 덮는 셀만 본다. 상수는 호스트가 격자 크기를 정할 때 쓰라고 남겨 둔다.
 pub const MAX_HEIGHTFIELD_CELLS_PER_QUERY: usize = 4096;
 
 /// 공면 판정 임계 — 지형 등록부(`World::try_add_terrain`)와 **같은 값**이어야 한다.
@@ -195,7 +200,10 @@ impl<'a> HeightfieldRef<'a> {
         let inv = 1.0 / self.cell;
         let fx = x * inv;
         let fz = z * inv;
-        if !(fx >= 0.0 && fz >= 0.0) {
+        // **상한도 검사한다.** clamp만 하고 넘기면 격자에서 수십 미터 떨어진 점이
+        // 마지막 셀의 외삽으로 "지형 안"이 된다(검수 rev_1e81559e MAJOR:
+        // `query_point`가 98m 밖 점을 지형 내부로 보고했다).
+        if !(fx >= 0.0 && fz >= 0.0 && fx <= ncx as f32 && fz <= ncz as f32) {
             return None;
         }
         let cx = (fx.floor() as u32).min(ncx.saturating_sub(1));
@@ -315,7 +323,11 @@ pub fn ray_heightfield(
     };
     let (step_x, mut t_next_x, dt_x) = setup(o.x, d.x, cx);
     let (step_z, mut t_next_z, dt_z) = setup(o.z, d.z, cz);
+    // 상한을 두지 않는다: DDA는 격자를 **한 방향으로** 지나므로 방문 셀이
+    // ncx+ncz+2를 넘을 수 없다(경계에 닿으면 루프가 끝난다). 인위적 상한은 긴 지형에서
+    // 진짜 히트를 조용히 미스로 만들었다(검수 rev_1e81559e BLOCKER).
     let mut visited = 0usize;
+    let visit_bound = (ncx as usize + ncz as usize).saturating_add(2);
     loop {
         for t in 0..2u8 {
             if let Some(hit) = ray_triangle(o, d, hf.triangle(cx, cz, t), max_toi) {
@@ -328,8 +340,12 @@ pub fn ray_heightfield(
             }
         }
         visited += 1;
-        if visited >= MAX_HEIGHTFIELD_CELLS_PER_QUERY {
-            return None; // 상한 도달 — 조용한 무한 루프 대신 미탐지
+        debug_assert!(
+            visited <= visit_bound,
+            "DDA가 격자 경계를 못 벗어났다 — 전진 규칙이 깨졌다"
+        );
+        if visited > visit_bound {
+            return None; // 도달 불가(방어) — 무한 루프 대신 종료
         }
         // 다음 셀로
         if t_next_x < t_next_z {
