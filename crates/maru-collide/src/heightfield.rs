@@ -573,6 +573,58 @@ mod tests {
         assert_eq!(r, (0, 0, 3, 3));
     }
 
+    /// **타일 범위는 그 타일 셀들의 모든 정점을 덮어야 한다.**
+    ///
+    /// 이게 깨지면 가지치기가 진짜 접촉을 건너뛴다 — 성능 최적화가 조용한 관통이 된다.
+    /// 타일 경계 셀은 **옆 타일의 정점**도 쓰므로(셀 (7,z)는 정점 x=8을 쓴다) 한 줄만
+    /// 빠뜨려도 깨진다. 전수로 확인한다.
+    #[test]
+    fn tile_ranges_cover_every_cell_vertex() {
+        // 타일 경계를 넘나드는 크기 + 불규칙한 높이
+        let (nx, nz) = (19u32, 13u32);
+        let mut h = vec![0.0f32; (nx * nz) as usize];
+        for iz in 0..nz {
+            for ix in 0..nx {
+                // 결정적 의사난수 — 인접 정점이 크게 다르게
+                let v = ((ix * 7 + iz * 13) % 11) as f32 * 0.37 - 2.0;
+                h[(iz * nx + ix) as usize] = v;
+            }
+        }
+        let tiles = build_tiles(&h, nx, nz);
+        let f = HeightfieldRef {
+            heights: &h,
+            tiles: &tiles,
+            nx,
+            nz,
+            cell: 1.0,
+            radius: 0.0,
+        };
+        let (ncx, ncz) = f.cells();
+        for cz in 0..ncz {
+            for cx in 0..ncx {
+                let (lo, hi) = f.tile_range(cx / HEIGHTFIELD_TILE, cz / HEIGHTFIELD_TILE);
+                for t in 0..2u8 {
+                    for v in f.triangle(cx, cz, t) {
+                        assert!(
+                            v.y >= lo && v.y <= hi,
+                            "셀({cx},{cz}) 삼각형{t} 정점 y={} 이 타일 범위 [{lo},{hi}] 밖이다\
+                             — 가지치기가 이 접촉을 건너뛴다",
+                            v.y
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 잘못된 격자에는 빈 타일 — 생성 경계에서 패닉하지 않는다(검증이 거부한다).
+    #[test]
+    fn build_tiles_is_defensive_about_bad_input() {
+        assert!(build_tiles(&[0.0; 8], 3, 3).is_empty(), "샘플 부족");
+        assert!(build_tiles(&[0.0; 1], 1, 1).is_empty(), "격자 미달");
+        assert!(!build_tiles(&[0.0; 9], 3, 3).is_empty());
+    }
+
     /// 레이가 격자를 맞히고, 빗나가고, 아래에서 위로도 맞힌다.
     #[test]
     fn ray_hits_the_grid_surface() {
