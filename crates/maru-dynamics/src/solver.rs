@@ -421,11 +421,103 @@ pub fn prepare(
 /// 반대 방향(서브스텝 `inv_i` 갱신 제거)도 재봤는데 그건 회전 장면을 크게 바꾼다
 /// (E1/E0 0.20 → 0.30, angmax 57 → 88) — 그러니 `inv_i` 갱신은 유지한다.
 /// 결론: 이론상 불일치는 실재하지만 관측되는 대가가 없고, 10%는 관측된다.
-pub fn refresh_anchors(st: &SolverState, c: &mut ContactConstraint) {
-    let (qa, qb) = (st.rot[c.a], st.rot[c.b]);
+pub fn refresh_anchors(v: &SolveView, c: &mut ContactConstraint) {
+    let (qa, qb) = (v.rot(c.a), v.rot(c.b));
     for p in &mut c.points {
         p.ra = qa.rotate(p.anchor_a);
         p.rb = qb.rotate(p.anchor_b);
+    }
+}
+
+/// 솔브 패스가 보는 상태 — **속도만 쓰고 나머지는 읽는다**.
+///
+/// 병렬 색 구간에서 참여자들이 공유하는 유일한 상태이고, 그래서 이 타입이 병렬 솔버의
+/// 안전 계약이 사는 곳이다.
+///
+/// - `lin`/`ang`: **원소별 raw 접근**. 참여자들이 같은 배열의 서로 다른 원소를 쓰므로
+///   슬라이스 참조를 만들면(공유든 가변이든) 그 자체로 규칙 위반이다 — 원소 하나짜리
+///   접근만 한다. 서로 다른 원소만 만진다는 보장은 **그래프 컬러링**에서 온다:
+///   같은 색의 두 제약은 dynamic 바디를 공유하지 않고(`color_constraints`), 솔브가
+///   write하는 집합(`dynamic`)은 컬러링이 conflict로 본 집합과 같은 술어다.
+/// - 나머지(`pos`/`rot`/`inv_m`/`inv_i`/`dynamic`): 패스 **동안 불변**이라 평범한
+///   공유 슬라이스다. 서브스텝 사이의 위치 적분·`inv_i` 갱신은 직렬 구간에서 일어난다.
+///
+/// `SolverState`를 통째로 넘기지 않는 이유가 이것이다: 넘기면 병렬 커널이 실수로
+/// `st.lin[i]`를 읽을 수 있고, 그 순간 동시 변이 중인 배열에 공유 참조가 생긴다.
+/// 뷰는 그 경로를 **타입에서** 없앤다.
+#[derive(Clone, Copy)]
+pub struct SolveView<'a> {
+    lin: *mut Vec3,
+    ang: *mut Vec3,
+    pos: &'a [Vec3],
+    rot: &'a [Quat],
+    inv_m: &'a [f32],
+    inv_i: &'a [Mat3],
+    dynamic: &'a [bool],
+}
+
+/// SAFETY: 원소 비겹침은 호출자(컬러링) 계약이고, 뷰 자체는 `&mut SolverState`에서만
+/// 만들어지므로 뷰가 사는 동안 다른 접근 경로가 없다.
+unsafe impl Send for SolveView<'_> {}
+unsafe impl Sync for SolveView<'_> {}
+
+impl<'a> SolveView<'a> {
+    pub fn new(st: &'a mut SolverState) -> Self {
+        Self {
+            lin: st.lin.as_mut_ptr(),
+            ang: st.ang.as_mut_ptr(),
+            pos: &st.pos,
+            rot: &st.rot,
+            inv_m: &st.inv_m,
+            inv_i: &st.inv_i,
+            dynamic: &st.dynamic,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.pos.len()
+    }
+    #[inline]
+    pub fn lin(&self, i: usize) -> Vec3 {
+        debug_assert!(i < self.len());
+        // SAFETY: 인덱스 유효 + 이 원소를 쓰는 참여자는 자기 하나(컬러링 계약).
+        unsafe { *self.lin.add(i) }
+    }
+    #[inline]
+    pub fn ang(&self, i: usize) -> Vec3 {
+        debug_assert!(i < self.len());
+        unsafe { *self.ang.add(i) }
+    }
+    #[inline]
+    pub fn set_lin(&self, i: usize, v: Vec3) {
+        debug_assert!(i < self.len());
+        unsafe { *self.lin.add(i) = v }
+    }
+    #[inline]
+    pub fn set_ang(&self, i: usize, v: Vec3) {
+        debug_assert!(i < self.len());
+        unsafe { *self.ang.add(i) = v }
+    }
+    #[inline]
+    pub fn pos(&self, i: usize) -> Vec3 {
+        self.pos[i]
+    }
+    #[inline]
+    pub fn rot(&self, i: usize) -> Quat {
+        self.rot[i]
+    }
+    #[inline]
+    pub fn inv_m(&self, i: usize) -> f32 {
+        self.inv_m[i]
+    }
+    #[inline]
+    pub fn inv_i(&self, i: usize) -> Mat3 {
+        self.inv_i[i]
+    }
+    #[inline]
+    pub fn dynamic(&self, i: usize) -> bool {
+        self.dynamic[i]
     }
 }
 
@@ -446,20 +538,20 @@ struct BodyReg {
 
 impl BodyReg {
     #[inline]
-    fn load(st: &SolverState, i: usize) -> Self {
+    fn load(v: &SolveView, i: usize) -> Self {
         Self {
-            lin: st.lin[i],
-            ang: st.ang[i],
-            inv_m: st.inv_m[i],
-            inv_i: st.inv_i[i],
-            dynamic: st.dynamic[i],
+            lin: v.lin(i),
+            ang: v.ang(i),
+            inv_m: v.inv_m(i),
+            inv_i: v.inv_i(i),
+            dynamic: v.dynamic(i),
         }
     }
     #[inline]
-    fn store(&self, st: &mut SolverState, i: usize) {
+    fn store(&self, v: &SolveView, i: usize) {
         if self.dynamic {
-            st.lin[i] = self.lin;
-            st.ang[i] = self.ang;
+            v.set_lin(i, self.lin);
+            v.set_ang(i, self.ang);
         }
     }
     #[inline]
@@ -476,8 +568,8 @@ impl BodyReg {
 }
 
 /// warm start: 누적 임펄스를 서브스텝 시작 추정으로 재적용 (Box2D v3 동형).
-pub fn warm_start(st: &mut SolverState, c: &ContactConstraint) {
-    let (mut ba, mut bb) = (BodyReg::load(st, c.a), BodyReg::load(st, c.b));
+pub fn warm_start(v: &SolveView, c: &ContactConstraint) {
+    let (mut ba, mut bb) = (BodyReg::load(v, c.a), BodyReg::load(v, c.b));
     for p in &c.points {
         let (ra, rb) = (p.ra, p.rb);
         let imp = c.normal * p.normal_impulse
@@ -486,8 +578,8 @@ pub fn warm_start(st: &mut SolverState, c: &ContactConstraint) {
         ba.apply(imp, ra);
         bb.apply(-imp, rb);
     }
-    ba.store(st, c.a);
-    bb.store(st, c.b);
+    ba.store(v, c.a);
+    bb.store(v, c.b);
 }
 
 // ===== SIMD 배치 (Unit 3 — 설계 §5) — 지금은 **참조 구현**이다 =====
@@ -711,8 +803,9 @@ pub fn warm_start_batched(
         let (start, end) = (start as usize, end as usize);
         // 색 63은 오버플로 버킷일 수 있어(공유 바디) 항상 스칼라 — 정상 색 63의 손실은 무시 가능.
         if color as u32 == COLOR_OVERFLOW {
+            let v = SolveView::new(st);
             for c in &constraints[start..end] {
-                warm_start(st, c);
+                warm_start(&v, c);
             }
             continue;
         }
@@ -729,8 +822,11 @@ pub fn warm_start_batched(
             );
             i += 4;
         }
-        for c in &constraints[i..end] {
-            warm_start(st, c);
+        {
+            let v = SolveView::new(st);
+            for c in &constraints[i..end] {
+                warm_start(&v, c);
+            }
         }
     }
 }
@@ -967,7 +1063,8 @@ pub fn solve_batched(
                 } else {
                     Some((&p.static_soft, p.max_bias))
                 };
-                solve(st, c, p.inv_h, soft);
+                let v = SolveView::new(st);
+                solve(&v, c, p.inv_h, soft);
             }
         }
     }
@@ -975,13 +1072,13 @@ pub fn solve_batched(
 
 /// 속도 임펄스 해석. `soft`=bias 페이즈, `relax`(soft=None)=bias 제거 페이즈.
 pub fn solve(
-    st: &mut SolverState,
+    v: &SolveView,
     c: &mut ContactConstraint,
     inv_h: f32,
     soft: Option<(&Softness, f32)>, // (계수, max_bias_speed)
 ) {
-    let (mut ba, mut bb) = (BodyReg::load(st, c.a), BodyReg::load(st, c.b));
-    let (pos_a, pos_b) = (st.pos[c.a], st.pos[c.b]);
+    let (mut ba, mut bb) = (BodyReg::load(v, c.a), BodyReg::load(v, c.b));
+    let (pos_a, pos_b) = (v.pos(c.a), v.pos(c.b));
     for p in &mut c.points {
         let (ra, rb) = (p.ra, p.rb);
         // TGS: 현재 자세로 separation 추적. A가 +n로 이동하면 s 증가해야 하므로
@@ -1051,8 +1148,8 @@ pub fn solve(
             bb.apply(-imp, rb);
         }
     }
-    ba.store(st, c.a);
-    bb.store(st, c.b);
+    ba.store(v, c.a);
+    bb.store(v, c.b);
     let _ = inv_h;
 }
 
@@ -1409,8 +1506,11 @@ mod tests {
             mk_constraint(6, 7, 4),
         ];
         let mut st_s = st.clone();
-        for c in &cs {
-            warm_start(&mut st_s, c);
+        {
+            let v = SolveView::new(&mut st_s);
+            for c in &cs {
+                warm_start(&v, c);
+            }
         }
         let mut st_v = st.clone();
         warm_start_x4(&mut st_v, [&cs[0], &cs[1], &cs[2], &cs[3]]);
@@ -1432,8 +1532,11 @@ mod tests {
             mk_constraint(3, 8, 2),
         ];
         let mut st_s = st.clone();
-        for c in &cs {
-            warm_start(&mut st_s, c);
+        {
+            let v = SolveView::new(&mut st_s);
+            for c in &cs {
+                warm_start(&v, c);
+            }
         }
         let mut st_v = st.clone();
         warm_start_x4(&mut st_v, [&cs[0], &cs[1], &cs[2], &cs[3]]);
@@ -1491,7 +1594,8 @@ mod tests {
                 } else {
                     Some((&static_soft, max_bias))
                 };
-                solve(&mut st_s, c, inv_h, opt);
+                let v = SolveView::new(&mut st_s);
+                solve(&v, c, inv_h, opt);
             }
             // SIMD
             let mut st_v = st.clone();

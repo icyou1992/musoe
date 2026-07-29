@@ -20,8 +20,9 @@
 
 use crate::solver::{
     solve as solve_scalar, warm_start as warm_start_scalar, BatchSolveParams, ContactConstraint,
-    SolverState, COLOR_OVERFLOW,
+    SolveView, COLOR_OVERFLOW,
 };
+use crate::threads::{DisjointSlice, Pool};
 use maru_math::{Quatx4, Vec3, Vec3x4};
 use wide::{f32x4, CmpGt};
 
@@ -213,49 +214,39 @@ struct BodyRegs {
 
 impl BodyRegs {
     #[inline]
-    fn load(st: &SolverState, idx: [usize; 4]) -> Self {
+    fn load(v: &SolveView, idx: [usize; 4]) -> Self {
         Self {
-            lin: Vec3x4::from_array([
-                st.lin[idx[0]],
-                st.lin[idx[1]],
-                st.lin[idx[2]],
-                st.lin[idx[3]],
-            ]),
-            ang: Vec3x4::from_array([
-                st.ang[idx[0]],
-                st.ang[idx[1]],
-                st.ang[idx[2]],
-                st.ang[idx[3]],
-            ]),
+            lin: Vec3x4::from_array([v.lin(idx[0]), v.lin(idx[1]), v.lin(idx[2]), v.lin(idx[3])]),
+            ang: Vec3x4::from_array([v.ang(idx[0]), v.ang(idx[1]), v.ang(idx[2]), v.ang(idx[3])]),
             inv_m: f32x4::from([
-                st.inv_m[idx[0]],
-                st.inv_m[idx[1]],
-                st.inv_m[idx[2]],
-                st.inv_m[idx[3]],
+                v.inv_m(idx[0]),
+                v.inv_m(idx[1]),
+                v.inv_m(idx[2]),
+                v.inv_m(idx[3]),
             ]),
             inv_i: maru_math::Mat3x4::from_array([
-                st.inv_i[idx[0]],
-                st.inv_i[idx[1]],
-                st.inv_i[idx[2]],
-                st.inv_i[idx[3]],
+                v.inv_i(idx[0]),
+                v.inv_i(idx[1]),
+                v.inv_i(idx[2]),
+                v.inv_i(idx[3]),
             ]),
             dyn_mask: f32x4::from([
-                st.dynamic[idx[0]] as u32 as f32,
-                st.dynamic[idx[1]] as u32 as f32,
-                st.dynamic[idx[2]] as u32 as f32,
-                st.dynamic[idx[3]] as u32 as f32,
+                v.dynamic(idx[0]) as u32 as f32,
+                v.dynamic(idx[1]) as u32 as f32,
+                v.dynamic(idx[2]) as u32 as f32,
+                v.dynamic(idx[3]) as u32 as f32,
             ])
             .cmp_gt(f32x4::splat(0.5)),
         }
     }
 
     #[inline]
-    fn store(&self, st: &mut SolverState, idx: [usize; 4]) {
+    fn store(&self, v: &SolveView, idx: [usize; 4]) {
         let (lin, ang) = (lanes(self.lin), lanes(self.ang));
         for k in 0..4 {
-            if st.dynamic[idx[k]] {
-                st.lin[idx[k]] = lin[k];
-                st.ang[idx[k]] = ang[k];
+            if v.dynamic(idx[k]) {
+                v.set_lin(idx[k], lin[k]);
+                v.set_ang(idx[k], ang[k]);
             }
         }
     }
@@ -305,18 +296,18 @@ fn blend(gate: f32x4, t: Vec3x4, f: Vec3x4) -> Vec3x4 {
 }
 
 /// 앵커 재회전 — 4-wide. 레인당 자세가 달라도 회전식은 레인별이라 셔플이 없다.
-pub fn refresh_anchors_block(st: &SolverState, blk: &mut ContactBlock) {
+pub fn refresh_anchors_block(v: &SolveView, blk: &mut ContactBlock) {
     let qa = Quatx4::from_array([
-        st.rot[blk.a[0]],
-        st.rot[blk.a[1]],
-        st.rot[blk.a[2]],
-        st.rot[blk.a[3]],
+        v.rot(blk.a[0]),
+        v.rot(blk.a[1]),
+        v.rot(blk.a[2]),
+        v.rot(blk.a[3]),
     ]);
     let qb = Quatx4::from_array([
-        st.rot[blk.b[0]],
-        st.rot[blk.b[1]],
-        st.rot[blk.b[2]],
-        st.rot[blk.b[3]],
+        v.rot(blk.b[0]),
+        v.rot(blk.b[1]),
+        v.rot(blk.b[2]),
+        v.rot(blk.b[3]),
     ]);
     for p in blk.points.iter_mut().take(blk.n_points) {
         p.ra = qa.rotate(p.anchor_a);
@@ -325,9 +316,9 @@ pub fn refresh_anchors_block(st: &SolverState, blk: &mut ContactBlock) {
 }
 
 /// warm start — 블록판. 레인당 스칼라 `warm_start`와 비트 동일.
-pub fn warm_start_block(st: &mut SolverState, blk: &ContactBlock) {
-    let mut ba = BodyRegs::load(st, blk.a);
-    let mut bb = BodyRegs::load(st, blk.b);
+pub fn warm_start_block(v: &SolveView, blk: &ContactBlock) {
+    let mut ba = BodyRegs::load(v, blk.a);
+    let mut bb = BodyRegs::load(v, blk.b);
     for p in blk.points.iter().take(blk.n_points) {
         let imp = blk.normal.scale(p.normal_impulse)
             + blk.tangents[0].scale(p.tangent_impulse[0])
@@ -335,25 +326,25 @@ pub fn warm_start_block(st: &mut SolverState, blk: &ContactBlock) {
         ba.apply(imp, p.ra, p.has);
         bb.apply(neg(imp), p.rb, p.has);
     }
-    ba.store(st, blk.a);
-    bb.store(st, blk.b);
+    ba.store(v, blk.a);
+    bb.store(v, blk.b);
 }
 
 /// solve — 블록판. `solver::solve_x4`와 **같은 산술·같은 순서**이고 게더만 없다.
-pub fn solve_block(st: &mut SolverState, blk: &mut ContactBlock, p: &BatchSolveParams) {
-    let mut ba = BodyRegs::load(st, blk.a);
-    let mut bb = BodyRegs::load(st, blk.b);
+pub fn solve_block(v: &SolveView, blk: &mut ContactBlock, p: &BatchSolveParams) {
+    let mut ba = BodyRegs::load(v, blk.a);
+    let mut bb = BodyRegs::load(v, blk.b);
     let pos_a = Vec3x4::from_array([
-        st.pos[blk.a[0]],
-        st.pos[blk.a[1]],
-        st.pos[blk.a[2]],
-        st.pos[blk.a[3]],
+        v.pos(blk.a[0]),
+        v.pos(blk.a[1]),
+        v.pos(blk.a[2]),
+        v.pos(blk.a[3]),
     ]);
     let pos_b = Vec3x4::from_array([
-        st.pos[blk.b[0]],
-        st.pos[blk.b[1]],
-        st.pos[blk.b[2]],
-        st.pos[blk.b[3]],
+        v.pos(blk.b[0]),
+        v.pos(blk.b[1]),
+        v.pos(blk.b[2]),
+        v.pos(blk.b[3]),
     ]);
     let (zero, one) = (f32x4::splat(0.0), f32x4::splat(1.0));
     let both_dyn = ba.dyn_mask & bb.dyn_mask;
@@ -420,8 +411,8 @@ pub fn solve_block(st: &mut SolverState, blk: &mut ContactBlock, p: &BatchSolveP
         ba.apply(imp, ra, has & cond);
         bb.apply(neg(imp), rb, has & cond);
     }
-    ba.store(st, blk.a);
-    bb.store(st, blk.b);
+    ba.store(v, blk.a);
+    bb.store(v, blk.b);
 }
 
 /// 서브스텝 루프가 훑는 **작업 순서** 한 칸.
@@ -449,14 +440,22 @@ pub fn plan(
     color_ranges: &[(u32, u32)],
     work: &mut Vec<Work>,
     starts: &mut Vec<usize>,
+    color_work: &mut Vec<(u32, u32)>,
 ) {
     let _ = constraints;
     for (color, &(start, end)) in color_ranges.iter().enumerate() {
         let (start, end) = (start as usize, end as usize);
+        // 색마다 **자기 work 구간**을 남긴다 — 병렬 솔브가 색 경계에서 배리어를 치려면
+        // "이 색의 일" 목록이 필요하다. 색 안은 순서 무관(공유 dynamic 바디 없음),
+        // 색 사이는 순서 필수(Gauss-Seidel)라는 비대칭이 이 자료구조의 존재 이유다.
+        let w0 = work.len() as u32;
         if color as u32 == COLOR_OVERFLOW {
             if start < end {
+                // 오버플로 색은 바디를 공유할 수 있으므로 **쪼개지 않는다** — 항목 1개로
+                // 남겨 한 참여자가 통째로 순서대로 푼다.
                 work.push(Work::Scalar(start as u32, end as u32));
             }
+            color_work.push((w0, work.len() as u32));
             continue;
         }
         let mut i = start;
@@ -468,71 +467,161 @@ pub fn plan(
         if i < end {
             work.push(Work::Scalar(i as u32, end as u32));
         }
+        color_work.push((w0, work.len() as u32));
     }
+}
+
+/// 병렬로 돌릴 만한 일감인가. 문턱 아래면 dispatch 비용이 이득보다 크다 —
+/// 어느 쪽이든 **결과는 같다**(문턱도 스위치도 성능 노브일 뿐 시맨틱이 아니다.
+/// 그 사실을 `parallel_color_solve_matches_serial_bit_for_bit`가 잠근다).
+#[inline]
+fn parallel_worth_it(pool: &Pool, work: &[Work], enabled: bool) -> bool {
+    enabled && pool.threads() > 1 && work.len() >= SOLVE_PARALLEL_MIN_WORK
+}
+
+/// 색 병렬을 켜는 work 항목 수 문턱.
+pub const SOLVE_PARALLEL_MIN_WORK: usize = 64;
+
+/// 이번 스텝 솔브 패스를 실제로 나눠 돌 참여자 수 (1 = 직렬). 진단 보고용 —
+/// **판정식은 실행 경로와 같은 정본**을 쓴다(따로 적으면 보고와 실제가 갈린다).
+pub fn solve_participants(pool: &Pool, parallel: bool, work: &[Work]) -> usize {
+    if parallel_worth_it(pool, work, parallel) {
+        pool.threads()
+    } else {
+        1
+    }
+}
+
+/// 색 단위 병렬 실행 — 이 모듈의 병렬 구조 **단일 정본**이다 (설계 §5).
+///
+/// 각 참여자가 색 안의 work 항목을 스트라이드로 나눠 갖고, 색이 끝날 때마다 배리어에서
+/// 만난다. 색 안이 순서 무관인 근거는 컬러링 계약(같은 색 = dynamic 바디 비공유)이고,
+/// 색 사이 순서가 지켜지는 근거는 배리어다. 그래서 결과는 참여자 수와 무관하다.
+///
+/// 배리어는 **모든 참여자가 같은 횟수** 쳐야 한다 — 자기 몫이 0개인 색에서도 루프를
+/// 돌기 때문에 자연히 지켜진다.
+#[inline]
+fn run_colors<F: Fn(usize) + Sync>(pool: &Pool, work_len: usize, color_work: &[(u32, u32)], f: F) {
+    debug_assert_eq!(
+        color_work
+            .iter()
+            .map(|&(s, e)| (e - s) as usize)
+            .sum::<usize>(),
+        work_len,
+        "색별 work 구간이 work 전체를 분할하지 않는다"
+    );
+    let _ = work_len;
+    pool.dispatch(|ctx| {
+        for &(ws, we) in color_work {
+            let mut i = ws as usize + ctx.index();
+            while i < we as usize {
+                f(i);
+                i += ctx.threads();
+            }
+            ctx.barrier();
+        }
+    });
 }
 
 /// 앵커 갱신 — 블록은 4-wide, 스칼라 잔여는 기존 경로. 순서는 무관하다(읽기만 한다).
 pub fn refresh_anchors_all(
-    st: &SolverState,
+    pool: &Pool,
+    parallel: bool,
+    v: &SolveView,
     blocks: &mut [ContactBlock],
     constraints: &mut [ContactConstraint],
     work: &[Work],
+    color_work: &[(u32, u32)],
 ) {
-    for w in work {
-        match *w {
-            Work::Block(i) => refresh_anchors_block(st, &mut blocks[i as usize]),
-            Work::Scalar(s, e) => {
-                for c in &mut constraints[s as usize..e as usize] {
-                    crate::solver::refresh_anchors(st, c);
-                }
+    let blocks = DisjointSlice::new(blocks);
+    let constraints = DisjointSlice::new(constraints);
+    // work 항목 하나가 만지는 블록/제약 구간은 다른 항목과 겹치지 않는다(plan의 분할).
+    let one = |i: usize| match work[i] {
+        // SAFETY: 블록 인덱스는 work 항목마다 유일하다(plan이 조립 순서대로 부여).
+        Work::Block(b) => refresh_anchors_block(v, unsafe { blocks.get(b as usize) }),
+        // SAFETY: 스칼라 구간은 색 안에서 서로 겹치지 않는 [s,e)다.
+        Work::Scalar(s, e) => {
+            for c in unsafe { constraints.range(s as usize, e as usize) } {
+                crate::solver::refresh_anchors(v, c);
             }
+        }
+    };
+    if parallel_worth_it(pool, work, parallel) {
+        run_colors(pool, work.len(), color_work, one);
+    } else {
+        for i in 0..work.len() {
+            one(i);
         }
     }
 }
 
 /// warm start — `solve_batched`와 같은 순서로 블록/스칼라를 훑는다.
 pub fn warm_start_all(
-    st: &mut SolverState,
+    pool: &Pool,
+    parallel: bool,
+    v: &SolveView,
     blocks: &[ContactBlock],
     constraints: &[ContactConstraint],
     work: &[Work],
+    color_work: &[(u32, u32)],
 ) {
-    for w in work {
-        match *w {
-            Work::Block(i) => warm_start_block(st, &blocks[i as usize]),
-            Work::Scalar(s, e) => {
-                for c in &constraints[s as usize..e as usize] {
-                    warm_start_scalar(st, c);
-                }
+    // 여기서 쓰이는 것은 속도(`v`)뿐이고 블록·제약은 읽기만 한다 — 공유 참조로 충분하다.
+    let one = |i: usize| match work[i] {
+        Work::Block(b) => warm_start_block(v, &blocks[b as usize]),
+        Work::Scalar(s, e) => {
+            for c in &constraints[s as usize..e as usize] {
+                warm_start_scalar(v, c);
             }
+        }
+    };
+    if parallel_worth_it(pool, work, parallel) {
+        run_colors(pool, work.len(), color_work, one);
+    } else {
+        for i in 0..work.len() {
+            one(i);
         }
     }
 }
 
 /// solve — 같은 순서 보존.
+#[allow(clippy::too_many_arguments)] // 패스 하나가 받는 것: 실행 자원(pool·스위치) +
+                                     // 상태 뷰 + 데이터 3종(blocks·constraints·work) + 색 경계 + 솔브 파라미터. 묶을 만한
+                                     // 응집 단위가 없어(수명·가변성이 제각각) 구조체화는 이름만 늘린다.
 pub fn solve_all(
-    st: &mut SolverState,
+    pool: &Pool,
+    parallel: bool,
+    v: &SolveView,
     blocks: &mut [ContactBlock],
     constraints: &mut [ContactConstraint],
     work: &[Work],
+    color_work: &[(u32, u32)],
     p: &BatchSolveParams,
 ) {
-    for w in work {
-        match *w {
-            Work::Block(i) => solve_block(st, &mut blocks[i as usize], p),
-            Work::Scalar(s, e) => {
-                for c in &mut constraints[s as usize..e as usize] {
-                    // softness 선택은 `solve_batched`의 스칼라 분기와 동일하다.
-                    let soft = if p.relax {
-                        None
-                    } else if st.dynamic[c.a] && st.dynamic[c.b] {
-                        Some((&p.soft, p.max_bias))
-                    } else {
-                        Some((&p.static_soft, p.max_bias))
-                    };
-                    solve_scalar(st, c, p.inv_h, soft);
-                }
+    let blocks = DisjointSlice::new(blocks);
+    let constraints = DisjointSlice::new(constraints);
+    let one = |i: usize| match work[i] {
+        // SAFETY: 블록 인덱스는 work 항목마다 유일하다.
+        Work::Block(b) => solve_block(v, unsafe { blocks.get(b as usize) }, p),
+        // SAFETY: 스칼라 구간은 서로 겹치지 않는다.
+        Work::Scalar(s, e) => {
+            for c in unsafe { constraints.range(s as usize, e as usize) } {
+                // softness 선택은 `solve_batched`의 스칼라 분기와 동일하다.
+                let soft = if p.relax {
+                    None
+                } else if v.dynamic(c.a) && v.dynamic(c.b) {
+                    Some((&p.soft, p.max_bias))
+                } else {
+                    Some((&p.static_soft, p.max_bias))
+                };
+                solve_scalar(v, c, p.inv_h, soft);
             }
+        }
+    };
+    if parallel_worth_it(pool, work, parallel) {
+        run_colors(pool, work.len(), color_work, one);
+    } else {
+        for i in 0..work.len() {
+            one(i);
         }
     }
 }
@@ -541,7 +630,8 @@ pub fn solve_all(
 mod tests {
     use super::*;
     use crate::solver::{
-        solve_batched, warm_start_batched, ContactPointConstraint, Softness, COLOR_OVERFLOW,
+        solve_batched, warm_start_batched, ContactPointConstraint, Softness, SolverState,
+        COLOR_OVERFLOW,
     };
     use maru_collide::{FeatureId, FEATURE_GENERIC};
     use maru_math::{Mat3, Quat};
@@ -643,6 +733,173 @@ mod tests {
         }
     }
 
+    /// **병렬 색 솔브가 직렬과 비트 동일한지** — 유닛 수준 게이트.
+    ///
+    /// 월드 수준 결정론 테스트(`thread_determinism_*`)는 파이프라인 전체를 보므로 갈림의
+    /// 원인을 못 좁힌다. 여기서는 솔버 패스만 떼어 같은 입력에 참여자 수만 바꿔 돌린다.
+    /// 씬은 병렬 문턱(work 64개)을 **넘도록** 만든다 — 안 넘기면 두 번 다 직렬로 돌아
+    /// 통과가 아무 의미 없다(그래서 아래에서 work 길이를 assert한다).
+    fn colored_scene(colors: usize, per_color: usize) -> (Vec<ContactConstraint>, Vec<(u32, u32)>) {
+        let nb = 2 * per_color;
+        let mut cs = Vec::new();
+        let mut ranges = Vec::new();
+        for c in 0..colors {
+            let start = cs.len() as u32;
+            for k in 0..per_color {
+                // 같은 색 안에서는 바디가 겹치지 않고(2k+c, 2k+1+c), 색이 다르면 겹친다 —
+                // 색 사이 순서가 결과를 바꾸는 진짜 Gauss-Seidel 커플링을 만든다.
+                let a = (2 * k + c) % nb;
+                let b = (2 * k + 1 + c) % nb;
+                let npts = 1 + (k % 4);
+                cs.push(ContactConstraint {
+                    a,
+                    b,
+                    normal: Vec3::new(0.0, 1.0, 0.0),
+                    tangents: [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)],
+                    friction: 0.4,
+                    restitution: 0.0,
+                    points: (0..npts)
+                        .map(|q| mk_point((k + q + c) as f32 * 0.37))
+                        .collect(),
+                    warm_matched: 0,
+                });
+            }
+            ranges.push((start, cs.len() as u32));
+        }
+        (cs, ranges)
+    }
+
+    /// 계측용(무시 기본): 색 병렬 솔브가 **패스 자체로는** 스케일하는지.
+    ///
+    /// 파이프라인 안에서는 dispatch 지연·직렬 구간 경합이 섞여 있어 "안 빨라진다"의
+    /// 원인을 못 가른다. 여기서는 워커가 계속 뜨거운 상태로 같은 패스만 반복해
+    /// **커널의 병렬 효율 상한**을 잰다.
+    /// 실행: cargo test --release -p maru-dynamics bench_parallel_solve -- --ignored --nocapture
+    #[test]
+    #[ignore = "계측용"]
+    fn bench_parallel_solve_scaling() {
+        let (colors, per_color) = (7usize, 300usize);
+        let (cs0, ranges) = colored_scene(colors, per_color);
+        let st0 = mk_state(2 * per_color);
+        for threads in [1usize, 2, 3, 4] {
+            let pool = Pool::new(threads);
+            let mut st = st0.clone();
+            let mut cs = cs0.clone();
+            let mut work = Vec::new();
+            let mut starts = Vec::new();
+            let mut color_work = Vec::new();
+            plan(&cs, &ranges, &mut work, &mut starts, &mut color_work);
+            let mut blocks = vec![ContactBlock::default(); starts.len()];
+            for (bi, &s) in starts.iter().enumerate() {
+                blocks[bi].assemble_into([&cs[s], &cs[s + 1], &cs[s + 2], &cs[s + 3]]);
+            }
+            let reps = 200;
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    solve_all(
+                        &pool,
+                        true,
+                        &SolveView::new(&mut st),
+                        &mut blocks,
+                        &mut cs,
+                        &work,
+                        &color_work,
+                        &params(false),
+                    );
+                }
+                best = best.min(t.elapsed().as_secs_f64() * 1e6 / reps as f64);
+            }
+            println!(
+                "threads={} (actual {}): solve pass {:.1} us  (work {} items, {} colors)",
+                threads,
+                pool.threads(),
+                best,
+                work.len(),
+                color_work.len()
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_color_solve_matches_serial_bit_for_bit() {
+        let (colors, per_color) = (4usize, 64usize);
+        let (cs0, ranges) = colored_scene(colors, per_color);
+        let st0 = mk_state(2 * per_color);
+
+        let run = |threads: usize| {
+            let pool = Pool::new(threads);
+            let mut st = st0.clone();
+            let mut cs = cs0.clone();
+            let mut work = Vec::new();
+            let mut starts = Vec::new();
+            let mut color_work = Vec::new();
+            plan(&cs, &ranges, &mut work, &mut starts, &mut color_work);
+            let mut blocks = vec![ContactBlock::default(); starts.len()];
+            for (bi, &s) in starts.iter().enumerate() {
+                blocks[bi].assemble_into([&cs[s], &cs[s + 1], &cs[s + 2], &cs[s + 3]]);
+            }
+            for _ in 0..3 {
+                refresh_anchors_all(
+                    &pool,
+                    true,
+                    &SolveView::new(&mut st),
+                    &mut blocks,
+                    &mut cs,
+                    &work,
+                    &color_work,
+                );
+                warm_start_all(
+                    &pool,
+                    true,
+                    &SolveView::new(&mut st),
+                    &blocks,
+                    &cs,
+                    &work,
+                    &color_work,
+                );
+                for relax in [false, true] {
+                    solve_all(
+                        &pool,
+                        true,
+                        &SolveView::new(&mut st),
+                        &mut blocks,
+                        &mut cs,
+                        &work,
+                        &color_work,
+                        &params(relax),
+                    );
+                }
+            }
+            (st, work.len(), pool.threads())
+        };
+
+        let (st_serial, nwork, _) = run(1);
+        assert!(
+            nwork >= SOLVE_PARALLEL_MIN_WORK,
+            "work {nwork}개는 병렬 문턱({SOLVE_PARALLEL_MIN_WORK}) 아래다 — 게이트가 공회전한다"
+        );
+        for threads in [2usize, 4, 8] {
+            let (st_par, _, actual) = run(threads);
+            if actual == 1 {
+                continue; // 스레드를 못 띄우는 환경
+            }
+            for i in 0..st_serial.lin.len() {
+                assert_eq!(
+                    st_serial.lin[i].to_bits_triple(),
+                    st_par.lin[i].to_bits_triple(),
+                    "threads={threads}: 바디 {i} 선속도가 갈렸다"
+                );
+                assert_eq!(
+                    st_serial.ang[i].to_bits_triple(),
+                    st_par.ang[i].to_bits_triple(),
+                    "threads={threads}: 바디 {i} 각속도가 갈렸다"
+                );
+            }
+        }
+    }
+
     #[test]
     fn block_path_matches_x4_path_bit_for_bit() {
         let (mut cs_ref, ranges) = mk_constraints();
@@ -652,8 +909,11 @@ mod tests {
 
         // 기준: 기존 x4 배치 경로 (색 순서대로 4청크 → 꼬리)
         for _ in 0..3 {
-            for c in cs_ref.iter_mut() {
-                crate::solver::refresh_anchors(&st_ref, c);
+            {
+                let v = SolveView::new(&mut st_ref);
+                for c in cs_ref.iter_mut() {
+                    crate::solver::refresh_anchors(&v, c);
+                }
             }
             warm_start_batched(&mut st_ref, &cs_ref, &ranges);
             solve_batched(&mut st_ref, &mut cs_ref, &ranges, &params(false));
@@ -663,7 +923,8 @@ mod tests {
         // 대상: SoA 블록 경로
         let mut work = Vec::new();
         let mut starts = Vec::new();
-        plan(&cs_blk, &ranges, &mut work, &mut starts);
+        let mut color_work = Vec::new();
+        plan(&cs_blk, &ranges, &mut work, &mut starts, &mut color_work);
         let mut blocks = vec![ContactBlock::default(); starts.len()];
         for (bi, &s) in starts.iter().enumerate() {
             blocks[bi].assemble_into([&cs_blk[s], &cs_blk[s + 1], &cs_blk[s + 2], &cs_blk[s + 3]]);
@@ -676,11 +937,38 @@ mod tests {
             work.iter().any(|w| matches!(w, Work::Scalar(..))),
             "스칼라 꼬리가 없으면 혼합 순서를 검증하지 못한다"
         );
+        let pool = Pool::new(1);
         for _ in 0..3 {
-            refresh_anchors_all(&st_blk, &mut blocks, &mut cs_blk, &work);
-            warm_start_all(&mut st_blk, &blocks, &cs_blk, &work);
-            solve_all(&mut st_blk, &mut blocks, &mut cs_blk, &work, &params(false));
-            solve_all(&mut st_blk, &mut blocks, &mut cs_blk, &work, &params(true));
+            refresh_anchors_all(
+                &pool,
+                true,
+                &SolveView::new(&mut st_blk),
+                &mut blocks,
+                &mut cs_blk,
+                &work,
+                &color_work,
+            );
+            warm_start_all(
+                &pool,
+                true,
+                &SolveView::new(&mut st_blk),
+                &blocks,
+                &cs_blk,
+                &work,
+                &color_work,
+            );
+            for relax in [false, true] {
+                solve_all(
+                    &pool,
+                    true,
+                    &SolveView::new(&mut st_blk),
+                    &mut blocks,
+                    &mut cs_blk,
+                    &work,
+                    &color_work,
+                    &params(relax),
+                );
+            }
         }
         for (bi, &s) in starts.iter().enumerate() {
             let (l, r) = cs_blk.split_at_mut(s + 1);

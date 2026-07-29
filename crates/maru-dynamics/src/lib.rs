@@ -8,6 +8,7 @@ mod joint;
 mod snapshot;
 mod solver;
 mod solver_block;
+mod threads;
 mod world;
 
 pub use body::{Body, BodyHandle, BodyType};
@@ -2066,6 +2067,74 @@ mod tests {
     /// 아일랜드가 얼어 영구 안정이 되고, 떨어지지 않으면 지터가 수십 초에 걸쳐 자라 붕괴한다.
     /// 그래서 속도·형상뿐 아니라 **수면**을 함께 요구한다.
     ///
+    /// **L0 결정론 게이트 (설계 §8): 같은 빌드·같은 초기상태·같은 호출 순서면 결과는
+    /// 스레드 수와 무관하게 같아야 한다.**
+    ///
+    /// 상태 해시만 보지 않고 **스냅샷 바이트 전체**를 대조한다 — 해시는 캐노니컬 상태의
+    /// 축약이라 충돌 가능성이 남고, 이 계약은 "값이 같다"가 아니라 "상태가 같다"이다.
+    /// 중간 스텝마다 대조해야 갈림이 생긴 **시점**을 알 수 있다(끝에서만 보면 어디서
+    /// 갈렸는지 모른다).
+    ///
+    /// 씬은 병렬 경로를 실제로 타야 의미가 있다 — 페어가 문턱(512)을 넘는 피라미드
+    /// 30단(465박스)을 쓰고, 실제로 참여자 >1로 돌았는지 진단으로 **증명**한다.
+    /// (이 증명이 없으면 "직렬 두 번 돌려 같았다"를 결정론이라 부르게 된다.)
+    #[test]
+    fn thread_determinism_hash_matches_across_thread_counts() {
+        fn run(threads: usize, par_solver: bool, steps: usize) -> (Vec<Vec<u8>>, usize, usize) {
+            let mut w = World::new(WorldParams::default());
+            w.set_threads(threads);
+            w.set_parallel_solver(par_solver);
+            ground(&mut w);
+            let _ = pyramid(&mut w, 30);
+            let mut snaps = Vec::new();
+            let (mut max_np, mut max_sp) = (0usize, 0usize);
+            for i in 0..steps {
+                w.step(DT);
+                max_np = max_np.max(w.diagnostics().narrow_threads);
+                max_sp = max_sp.max(w.diagnostics().solve_threads);
+                if i % 25 == 0 || i + 1 == steps {
+                    snaps.push(w.snapshot());
+                }
+            }
+            (snaps, max_np, max_sp)
+        }
+        let (base, np1, sp1) = run(1, false, 200);
+        assert_eq!(
+            np1, 1,
+            "스레드 1개 실행이 병렬 경로를 탔다 — 대조군이 오염됐다"
+        );
+        assert_eq!(
+            sp1, 1,
+            "스레드 1개 실행에서 솔버가 병렬로 돌았다 — 대조군 오염"
+        );
+        let can_thread = World::new(WorldParams::default()).threads() > 1;
+        // 내로우만 병렬(기본) · 솔버까지 병렬(노브 on) 두 구성 모두 같은 상태를 내야 한다.
+        for par_solver in [false, true] {
+            for t in [2usize, 4] {
+                let (got, np, sp) = run(t, par_solver, 200);
+                if can_thread {
+                    // 스레드를 띄울 수 있는 환경에서만 요구한다(wasm은 항상 1).
+                    assert!(
+                        np > 1,
+                        "threads={t}인데 내로우페이즈가 병렬로 안 돌았다 — 게이트가 공회전이다"
+                    );
+                    assert_eq!(
+                        sp > 1,
+                        par_solver,
+                        "threads={t} par_solver={par_solver}: 솔버 병렬 여부가 스위치와 다르다"
+                    );
+                }
+                assert_eq!(got.len(), base.len());
+                for (i, (a, b)) in base.iter().zip(got.iter()).enumerate() {
+                    assert!(
+                        a == b,
+                        "threads={t} par_solver={par_solver}: 스냅샷 #{i}에서 상태가 갈렸다 (L0 결정론 위반)"
+                    );
+                }
+            }
+        }
+    }
+
     /// release 전용 — debug는 수 분 걸린다. `cargo test --release -- --ignored`
     #[test]
     #[ignore = "release 전용: cargo test --release -p maru-dynamics -- --ignored"]

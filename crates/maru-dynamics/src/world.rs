@@ -320,6 +320,13 @@ pub struct World {
     /// SoA 솔버 블록 풀 (비캐노니컬 스크래치). 블록 1개가 ~1.5KB라 스텝마다 새로 할당하면
     /// 조립 이득이 할당·이동 비용으로 되돌아간다 — 월드가 버퍼를 들고 제자리에서 덮어쓴다.
     contact_blocks: Vec<solver_block::ContactBlock>,
+    /// 워커 풀 (설계 §5). **캐노니컬 상태가 아니다** — 스레드 수는 결과를 바꾸지 않으므로
+    /// 스냅샷·상태 해시에 들어가지 않는다. 그것이 이 트랙의 계약 자체다.
+    pool: crate::threads::Pool,
+    /// 내로우페이즈 참여자별 출력 버퍼 (스텝 사이 재사용 — 할당 0).
+    narrow_bufs: Vec<NarrowOut>,
+    /// 접촉 솔버 색 병렬 스위치 — **기본 off**. 근거는 `set_parallel_solver` 문서.
+    parallel_solver: bool,
 }
 
 /// 진단 계측용 시계 — **wasm32-unknown-unknown에는 시계가 없다.**
@@ -373,6 +380,15 @@ pub struct Diagnostics {
     pub bp_incremental: bool,
     /// 이번 스텝이 제한 순회(활성⊆R 증명 → wake/narrow/이벤트를 fresh로 한정)를 탔는가.
     pub narrow_limited: bool,
+    /// 이번 스텝 내로우페이즈를 나눠 돈 참여자 수 (1 = 직렬. 설계 §6.3 "티어 강등은
+    /// 리포트에 노출" — 스레드가 실제로 쓰였는지를 호스트가 관측할 수 있어야 한다).
+    pub narrow_threads: usize,
+    /// 접촉 제약 그래프 컬러링이 쓴 색 수 = 솔브 패스당 배리어 수.
+    pub colors: usize,
+    /// 이번 스텝 솔브 패스를 나눠 돈 참여자 수 (1 = 직렬).
+    pub solve_threads: usize,
+    /// 솔버 work 항목 수 (블록 + 스칼라 잔여) — 색 병렬의 분배 단위.
+    pub solve_work: usize,
     /// 이번 스텝 CCD linear cast가 이동을 절단한 횟수 (서브스텝×바디 누적).
     pub ccd_clamps: usize,
     /// 이번 스텝 frozen(평면 5개째 = 구석에 낌) 상태로 돈 서브스텝×바디 누적.
@@ -555,6 +571,11 @@ impl World {
             integrate_gate: Vec::new(),
             gravity_gate: Vec::new(),
             island_parent: Vec::new(),
+            // 기본 = 가용 코어(상한 8). 결과는 스레드 수와 무관하게 같으므로 기본 활성이
+            // 안전하고, 원하면 `set_threads`로 1(완전 직렬)까지 내릴 수 있다.
+            pool: crate::threads::Pool::new(crate::threads::default_threads()),
+            narrow_bufs: Vec::new(),
+            parallel_solver: false,
         }
     }
 
@@ -1663,6 +1684,53 @@ impl World {
         self.diag
     }
 
+    /// 지금 쓰는 참여자 수 (메인 스레드 포함, 1 = 완전 직렬).
+    ///
+    /// 요청한 수보다 작을 수 있다 — 스레드를 못 띄운 환경(wasm·제한된 호스트)에서는
+    /// 실제로 확보한 수를 돌려준다(설계 §6.3 "조용한 폴백 금지").
+    pub fn threads(&self) -> usize {
+        self.pool.threads()
+    }
+
+    /// 접촉 솔버의 **색 병렬**을 켠다 (기본 off). 결과는 켜든 끄든 비트 동일하다 —
+    /// 이건 성능 스위치일 뿐이다(`parallel_color_solve_matches_serial_bit_for_bit`가 잠금).
+    ///
+    /// **왜 기본이 off인가 — 측정 결과다.** 4코어(가용 ~2, 부하 2.4) 리눅스 박스에서
+    /// 피라미드 40단·60단·80단을 교차 실행 min-of-4로 재보니 솔브 단계가 참여자 수에
+    /// 따라 **단조 악화**했다(40단: 3975 → 4451(2) → 4626(3) → 5014us(4)). 원인은 둘이다:
+    /// ① 패스 자체의 병렬 효율이 낮다 — 워커가 뜨거운 상태의 격리 계측에서도 3참여자
+    ///    1.48배가 상한이고 4에서는 되레 느려진다(색 7개면 배리어 7회에 색당 일감이
+    ///    참여자당 수십 us뿐이라 동기화가 이득을 먹는다).
+    /// ② 파이프라인 안에서는 패스마다 dispatch를 하는데(서브스텝 4 × 패스 5 = 20회),
+    ///    직렬 구간이 스핀 창보다 길면 워커가 잠들어 깨우는 값이 붙는다.
+    /// 반면 내로우페이즈는 스텝당 dispatch 1회에 청크가 커서 확실히 이긴다 — 그래서
+    /// 그쪽만 기본으로 켠다.
+    ///
+    /// 코어가 많은 기계(8~16)나 접촉이 훨씬 많은 장면에서는 판단이 달라질 수 있다.
+    /// 그 판정은 추측이 아니라 계측으로 한다:
+    /// `MARU_THREADS=n cargo run --release -p maru-bench --bin pyramid100 -- 4 150 60 nosleep`이
+    /// 단계별 귀속(narrow/solve/refresh/warm/bias/relax)을 찍는다.
+    pub fn set_parallel_solver(&mut self, on: bool) {
+        self.parallel_solver = on;
+    }
+
+    /// 접촉 솔버 색 병렬이 켜져 있는가.
+    pub fn parallel_solver(&self) -> bool {
+        self.parallel_solver
+    }
+
+    /// 참여자 수 변경 (설계 §5). **성능 노브일 뿐 시맨틱이 아니다** — 결과는 스레드 수와
+    /// 무관하게 비트 동일하고(그것이 L0 결정론 계약이다), 스냅샷·상태 해시에도 들어가지
+    /// 않는다. 그래서 스텝 사이 아무 때나 바꿔도 궤적이 갈리지 않는다.
+    ///
+    /// 워커 재생성은 스레드 생성/조인을 동반하므로 매 프레임 호출할 것은 아니다.
+    pub fn set_threads(&mut self, n: usize) {
+        let n = n.max(1);
+        if n != self.pool.threads() {
+            self.pool = crate::threads::Pool::new(n);
+        }
+    }
+
     /// 잠들었는지. **stale 핸들은 false**(살아있지 않은 것은 잠든 것이 아니다).
     /// raw 인덱스 접근은 재사용된 슬롯의 남의 상태를 읽으므로 쓰지 않는다(리뷰 MAJOR).
     /// 월드 범위를 벗어나 시뮬레이션에서 제외됐는가. `set_pose`로만 해제된다.
@@ -2149,6 +2217,12 @@ impl World {
             + core::mem::size_of::<solver_block::ContactBlock>().div_ceil(4)
             + core::mem::size_of::<usize>().div_ceil(4)                  // block_starts
             + core::mem::size_of::<solver_block::Work>()                 // work
+            // 내로우페이즈 참여자 버퍼 — 청크 용량의 **합**이 페어 수를 넘지 않으므로
+            // (⌈ncap/n_par⌉ × n_par은 ncap + n_par 미만) 페어당 한 벌로 회계한다.
+            // 접점 힙(`ContactConstraint.points`)은 병합 때 **이동**하므로 중복 계상하지
+            // 않는다 — 복제되는 것은 헤더와 키뿐이다.
+            + core::mem::size_of::<ContactConstraint>()                  // NarrowOut.constraints
+            + 2 * core::mem::size_of::<(u32, u32)>()                     // NarrowOut.keys/live
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
                   // per-body(슬롯당) 스크래치 전부: SolverState 7배열 + inv_inertia_local + ext_force +
                   // damping + 게이트 2 + island_parent + 컬러 body_color/conflict. 총상한에서 먼저 뺀다.
@@ -2290,7 +2364,17 @@ impl World {
         // 블록은 제약 4개당 1개라 상한은 ncap/4 + 색 수(색마다 꼬리가 생길 수 있다).
         let mut block_starts: Vec<usize> = Vec::new();
         let mut work: Vec<solver_block::Work> = Vec::new();
+        // 색별 work 구간 — 병렬 솔브의 배리어 경계. 색은 최대 64개라 고정 상한이다.
+        let mut color_work: Vec<(u32, u32)> = Vec::new();
         let _t_res = Stopwatch::start();
+        // 내로우페이즈 참여자 수와 참여자별 버퍼 용량은 **wake 폐쇄 전에** 확정해야 한다
+        // (아래 통합 fallible 블록의 존재 이유와 같다: wake 뒤의 예약 실패는 깨워 둔 채
+        // ResourceLimit을 돌려줘 "Err면 상태 불변" 계약을 깬다).
+        // 그래서 판정 입력은 이 시점에 이미 확정된 **전체 페어 수**다 — 제한 순회로 실제
+        // 청크가 더 작아지는 것은 상관없다(예약이 과할 뿐, 모자라지 않는다).
+        let n_par = narrow_participants(&self.pool, ncap);
+        let chunk_cap = ncap.div_ceil(n_par.max(1));
+        let mut narrow_bufs = std::mem::take(&mut self.narrow_bufs);
         if (ccd_any
             && self
                 .ccd_hits
@@ -2308,6 +2392,9 @@ impl World {
             || block_starts.try_reserve(ncap / 4).is_err()
             || work.try_reserve(ncap).is_err()
             || color_ranges
+                .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
+                .is_err()
+            || color_work
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
                 .is_err()
             || constraint_keys.try_reserve(ncap).is_err()
@@ -2331,8 +2418,10 @@ impl World {
             || self.ext_force.try_reserve(nbody).is_err()
             || self.damping.try_reserve(nbody).is_err()
             || self.island_parent.try_reserve(nbody).is_err()
+            || reserve_narrow_bufs(&mut narrow_bufs, n_par, chunk_cap).is_err()
         {
             self.bp_pairs = pairs;
+            self.narrow_bufs = narrow_bufs;
             self.resource_limit = true;
             return;
         }
@@ -2528,7 +2617,6 @@ impl World {
         // 제약 컨테이너도 페어 수 기준으로 **미리 fallible 예약**한다 — 접촉 페어마다
         // 암묵 성장이 일어나면 그 재할당이 abort가 된다.
         // constraints·constraint_keys·live_keys는 wake 이전에 선점됨 (위) — 여기선 채워 쓴다.
-        let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
         let _t_nw = Stopwatch::start();
         // 직전 기준선을 페어와 **같은 전순서**로 정렬해 둔다(둘 다 (a, b_raw) 오름차순).
         // 아래 루프가 단조 포인터 하나로 훑으므로 페어당 비용은 비교 1회다.
@@ -2583,174 +2671,95 @@ impl World {
         } else {
             &pairs
         };
-        let mut ti = 0usize;
-        for &(a_id, b_raw) in narrow_pairs {
-            let key = (a_id, b_raw);
-            let is_static_pair = b_raw & STATIC_BIT != 0;
-            let b_plain = b_raw & !STATIC_BIT;
-            // 기준선 병합 포인터를 이 페어까지 전진시킨다(전 페어 공통, 총 전진 = |touching|).
-            // 제한 모드는 fresh만 걸으므로 병합 대신 아래 dormant 분기에서 해시 1회를 쓴다.
-            while ti < touch_sorted.len() && touch_sorted[ti] < key {
-                ti += 1;
-            }
-            // **양쪽 다 비활성인 페어는 여기서 끝난다** (wake 폐쇄는 이미 위에서 닫혔다).
-            // 움직이지 않은 페어는 새 접촉을 만들 수 없고, 브로드페이즈 AABB 겹침은 매니폴드의
-            // 충분조건이 아니므로 **직전 기준선에 실제 접촉으로 있던 키만** 살린다 — 아니면
-            // 잠들면서 거짓 Started가 난다. 원래는 페어마다 `touching`을 해시했는데(전원 수면
-            // pile-3k에서 24810회/스텝), 두 정렬 배열의 병합이면 페어당 비교 1회로 같은 교집합이
-            // 나온다. 술어는 wake 루프와 동일한 초집합이다.
-            if !maybe_active(a_id as usize, self)
-                && (is_static_pair || !maybe_active(b_plain as usize, self))
-            {
-                let in_baseline = if narrow_restricted {
-                    self.touching.contains(&key)
+        // === 내로우페이즈 실행 — 페어 청크를 참여자들이 나눠 돈다 (설계 §5) ===
+        //
+        // 페어 하나의 처리는 **순수**하다: 읽기는 `NarrowCtx`(전부 불변 참조), 쓰기는
+        // 자기 `NarrowOut` 하나뿐이다. 그래서 청크를 나눠 돌리고 청크 순서대로 이어 붙이면
+        // 직렬 결과와 **비트 동일**하다 — 각 제약은 자기 페어만의 함수이고 부동소수점
+        // 누산이 페어 사이를 넘지 않는다.
+        //
+        // 청크는 **연속 구간**으로 나눈다(스트라이드 인터리브가 아니라). 이어 붙인 순서가
+        // 곧 페어 순서여야 하고, 그 순서가 아래 정렬·컬러링·Gauss-Seidel 순서의 입력이기
+        // 때문이다. 참여자 수는 위(wake 폐쇄 전)에서 확정했다.
+        let n_np = narrow_pairs.len();
+        let n_par = n_par.min(n_np.max(1));
+        {
+            let cx = NarrowCtx {
+                bodies: &self.bodies,
+                asleep: &self.asleep,
+                oob: &self.oob,
+                cache: &self.contact_cache,
+                touching: &self.touching,
+                touch_sorted: &touch_sorted,
+                excluded: &excluded,
+                restricted: narrow_restricted,
+                margin: self.params.speculative_margin,
+                dt,
+            };
+            // 청크 경계 — 참여자 w는 [n_np·w/n_par, n_np·(w+1)/n_par)를 맡는다.
+            let bounds = |w: usize| (n_np * w / n_par, n_np * (w + 1) / n_par);
+            // 기준선 병합 포인터의 시작값. 직렬 루프는 단조 포인터 하나로 훑지만 청크는
+            // 중간에서 시작하므로, 자기 첫 키까지 **이분 탐색**으로 전진시킨 값이 필요하다
+            // (둘 다 오름차순이라 결과가 같다). 제한 모드는 이 포인터를 안 쓴다.
+            let ti_of = |lo: usize| {
+                if narrow_restricted || lo >= n_np {
+                    0
                 } else {
-                    ti < touch_sorted.len() && touch_sorted[ti] == key
-                };
-                if in_baseline {
-                    // 필터 순서는 활성 경로와 같다(제외 → 그룹 → 비활성). 특히 **그룹 판정이
-                    // 수면보다 먼저**여야 잠든 사이 그룹이 바뀐 페어가 접촉을 승계하지 않고
-                    // Stopped를 낸다(검수 rev_7f7bb07c MAJOR). 여기 도달하는 키는 ≤ 접촉 수라
-                    // 뚱뚱한 `Body` 접근도 그만큼만 일어난다.
-                    let excluded_pair = !excluded.is_empty()
-                        && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain)));
-                    if !excluded_pair
-                        && groups_collide(
-                            &self.bodies[a_id as usize],
-                            &self.bodies[b_plain as usize],
-                        )
-                    {
-                        live_keys.insert(key);
-                    }
+                    touch_sorted.partition_point(|k| *k < narrow_pairs[lo])
                 }
-                continue;
-            }
-            // 조인트가 없으면 집합이 비어 있다 — 빈 집합에도 해시는 도는다.
-            if !excluded.is_empty() && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))) {
-                continue;
-            }
-            let (a_id, b_id) = (a_id as usize, b_plain as usize);
-            // 양쪽 모두 비활성이면 제약 없음. wake는 위 1.5에서 이미 끝났다.
-            let a_asleep = !self.bodies[a_id].is_dynamic() || self.asleep[a_id];
-            let b_asleep = is_static_pair || !self.bodies[b_id].is_dynamic() || self.asleep[b_id];
-            let a_inactive = self.oob[a_id]
-                || match self.bodies[a_id].body_type {
-                    BodyType::Kinematic => false,
-                    BodyType::Dynamic => self.asleep[a_id],
-                    BodyType::Static => true,
-                };
-            let b_inactive = self.oob[b_id]
-                || match self.bodies[b_id].body_type {
-                    BodyType::Kinematic => false,
-                    BodyType::Dynamic => is_static_pair || self.asleep[b_id],
-                    BodyType::Static => true,
-                };
-            // **그룹 판정이 수면 분기보다 먼저다.** 반대면 그룹이 명시적으로 충돌을
-            // 거부한 페어도 잠든 동안 접촉으로 승격된다(검수 rev_7f7bb07c MAJOR).
-            if !groups_collide(&self.bodies[a_id], &self.bodies[b_id]) {
-                continue;
-            }
-            // 양쪽 비활성 페어는 위 조기 탈출에서 이미 걸러졌다. 두 술어는 **동치**다:
-            // a는 항상 동적 트리 원소(Dynamic|Kinematic)라 `a_inactive == !maybe_active(a)`이고,
-            // b는 static이면 `b_inactive == true == is_static_pair` 아니면 마찬가지다.
-            // 동치가 깨지면 접촉 기준선 보존이 두 경로로 갈라지므로 여기서 잠근다.
-            debug_assert!(
-                !(a_inactive && b_inactive),
-                "dormant 페어는 조기 탈출이 이미 걸렀어야 한다 — 술어 동치 붕괴"
-            );
-            let _ = (a_asleep, b_asleep);
-            let sensor_pair = self.bodies[a_id].sensor || self.bodies[b_id].sensor;
-            // **복합 디스패치**: 자식쌍마다 독립 매니폴드 → 페어당 제약 여러 개(법선이 달라
-            // 병합 불가). 같은 pair 키를 constraint_keys에 반복 push하는 것이 규약이고,
-            // PCM 갱신(post 5절)이 같은 키의 엔트리를 append 병합한다. feature는 자식쌍 키
-            // (1..=64, 비복합=0 미변형)를 bits 9..15에 접어 자식 간 warm start 혼선을 막는다.
-            let is_compound = matches!(
-                self.bodies[a_id].shape,
-                maru_collide::Shape::Compound { .. }
-            ) || matches!(
-                self.bodies[b_id].shape,
-                maru_collide::Shape::Compound { .. }
-            );
-            let mut touched = false;
-            let mut bail = false;
-            {
-                let bodies = &self.bodies;
-                let diag = &mut self.diag;
-                let cache = &self.contact_cache;
-                let constraints = &mut constraints;
-                let constraint_keys = &mut constraint_keys;
-                let live_keys = &mut live_keys;
-                // 지형 삼각형(내부 에지 마스크 보유)이면 월드 좌표 삼각형을 미리 풀어 둔다 —
-                // 접점 법선 용접(§4.2 ghost edge)은 매니폴드 생성 직후, 소비(prepare) 전이다.
-                // 지형은 항상 static = B 쪽이다(validate가 static 3점 hull에만 마스크 허용).
-                let weld = match &bodies[b_id].shape {
-                    maru_collide::Shape::Hull { points, radius }
-                        if bodies[b_id].weld_edges != 0 && points.len() == 3 =>
-                    {
-                        let pb = &bodies[b_id].pose;
-                        let t = |p: Vec3| pb.pos + pb.rot.rotate(p);
-                        Some((
-                            [t(points[0]), t(points[1]), t(points[2])],
-                            *radius,
-                            bodies[b_id].weld_edges,
-                        ))
+            };
+            if n_par > 1 {
+                let view = crate::threads::DisjointSlice::new(&mut narrow_bufs[..n_par]);
+                self.pool.dispatch(|ctx| {
+                    let mut w = ctx.index();
+                    while w < n_par {
+                        // SAFETY: 참여자 w가 만지는 버퍼는 인덱스 w 하나뿐이고, w는
+                        // 참여자마다 서로 다르다(`w = index + k·threads`).
+                        let out = unsafe { view.get(w) };
+                        out.reset();
+                        let (lo, hi) = bounds(w);
+                        narrow_chunk(&cx, &narrow_pairs[lo..hi], ti_of(lo), out);
+                        w += ctx.threads();
                     }
-                    _ => None,
-                };
-                for_each_contact(
-                    &bodies[a_id].shape,
-                    &bodies[a_id].pose,
-                    &bodies[b_id].shape,
-                    &bodies[b_id].pose,
-                    self.params.speculative_margin,
-                    &mut |ca, cb, mut m| {
-                        if bail || m.is_empty() {
-                            return;
-                        }
-                        if let Some((tri, r, mask)) = weld {
-                            maru_collide::weld_internal_edges(&mut m, tri, r, mask);
-                        }
-                        touched = true;
-                        if sensor_pair {
-                            return; // 센서: 이벤트만 — 아래 touched 처리에서 live_keys로
-                        }
-                        if is_compound {
-                            m.namespace_features(ca as u32 * 8 + cb as u32 + 1);
-                        }
-                        let cached = cache.get(&key).unwrap_or(&empty);
-                        for p in m.points() {
-                            diag.max_penetration = diag.max_penetration.max(-p.separation);
-                        }
-                        // narrowphase는 wake 이후이고 pairs를 대여 중이라 bp_pairs를 되돌릴 수
-                        // 없다. 접점 Vec 할당(≤4점) 실패는 극단 OOM — bail로 모아 아래서 처리.
-                        // 페어당 계측은 두지 않는다 — `Instant::now()` 두 번이 페어당
-                        // 실제 작업의 몇 %가 되어 계측기가 대상을 왜곡한다(2026-07-29 실측:
-                        // 40단에서 스텝당 ~0.2ms). 내역이 필요하면 `maru-bench --bin boxsplit`
-                        // (매니폴드 생성)과 아래 `narrow` 총계의 차로 귀속한다.
-                        let Ok(c) = solver::prepare(bodies, a_id, b_id, &m, cached, dt) else {
-                            bail = true;
-                            return;
-                        };
-                        // 진단은 **실제 warm load**를 센다(feature ID 일치만 세면 generic 접점의
-                        // 위치·법선 게이트가 매칭을 끊어도 100%로 보인다 — 거짓 지표).
-                        diag.warm_total += c.points.len();
-                        diag.warm_hits += c.warm_matched as usize;
-                        constraints.push(c);
-                        constraint_keys.push(key);
-                        live_keys.insert(key);
-                    },
-                );
-            }
-            if bail {
-                self.invalidate_bp();
-                self.resource_limit = true;
-                return;
-            }
-            // 센서 페어(또는 접촉만 있고 제약이 없는 경우의 이벤트 기준선).
-            if touched && sensor_pair {
-                live_keys.insert(key);
+                });
+            } else {
+                let out = &mut narrow_bufs[0];
+                out.reset();
+                narrow_chunk(&cx, narrow_pairs, 0, out);
             }
         }
+        // 병합 — 청크(=페어) 순서 그대로. 실패(bail)는 어느 청크에서 났든 같은 결말이다.
+        if narrow_bufs[..n_par].iter().any(|b| b.bail) {
+            // 접점 힙 할당 실패(극단 OOM). narrowphase는 wake 이후이고 pairs를 대여 중이라
+            // bp_pairs를 되돌릴 수 없다 — 구조를 버려 다음 스텝이 재빌드하게 한다.
+            self.narrow_bufs = narrow_bufs;
+            self.invalidate_bp();
+            self.resource_limit = true;
+            return;
+        }
+        if n_par == 1 {
+            // 참여자가 하나면 **옮기지 않고 스왑**한다(제약 하나가 ~100B라 이동도 공짜가
+            // 아니다). 결과는 append와 같고, 버퍼는 다음 스텝을 위해 용량째 되돌아온다.
+            core::mem::swap(&mut constraints, &mut narrow_bufs[0].constraints);
+            core::mem::swap(&mut constraint_keys, &mut narrow_bufs[0].keys);
+        } else {
+            for b in narrow_bufs[..n_par].iter_mut() {
+                constraints.append(&mut b.constraints);
+                constraint_keys.append(&mut b.keys);
+            }
+        }
+        for b in narrow_bufs[..n_par].iter() {
+            for &k in &b.live {
+                live_keys.insert(k);
+            }
+            // max는 결합·교환법칙이 성립하고(NaN이 있어도 f32::max는 비-NaN을 고른다)
+            // 정수 합도 순서 무관이라, 진단 누적은 청크 순서에 의존하지 않는다.
+            self.diag.max_penetration = self.diag.max_penetration.max(b.max_penetration);
+            self.diag.warm_total += b.warm_total;
+            self.diag.warm_hits += b.warm_hits;
+        }
+        self.narrow_bufs = narrow_bufs;
+        self.diag.narrow_threads = n_par;
 
         self.diag.sub_ns[2] = _t_nw.ns();
 
@@ -2845,7 +2854,13 @@ impl World {
         // 분할 규칙은 `solve_batched`의 chunk(4)와 동일하므로 두 경로의 처리 순서가 같다.
         // 블록 풀을 꺼내 온다 — 여기까지 오면 이 스텝의 조기 반환은 없다(bail은 위에서 끝났다).
         let mut blocks = std::mem::take(&mut self.contact_blocks);
-        solver_block::plan(&constraints, &color_ranges, &mut work, &mut block_starts);
+        solver_block::plan(
+            &constraints,
+            &color_ranges,
+            &mut work,
+            &mut block_starts,
+            &mut color_work,
+        );
         // 풀을 필요한 길이까지만 늘리고(용량은 위에서 확보), 기존 원소는 제자리에서 덮어쓴다.
         if blocks.len() < block_starts.len() {
             blocks.resize_with(block_starts.len(), Default::default);
@@ -2859,6 +2874,10 @@ impl World {
             ]);
         }
 
+        self.diag.colors = color_work.len();
+        self.diag.solve_work = work.len();
+        self.diag.solve_threads =
+            solver_block::solve_participants(&self.pool, self.parallel_solver, &work);
         self.diag.phase_ns[2] = _t_np.ns();
         let _t_sv = Stopwatch::start();
         // 3) TGS-soft 서브스텝 루프
@@ -3028,7 +3047,15 @@ impl World {
             }
 
             let _t_ra = Stopwatch::start();
-            solver_block::refresh_anchors_all(&st, &mut blocks, &mut constraints, &work);
+            solver_block::refresh_anchors_all(
+                &self.pool,
+                self.parallel_solver,
+                &solver::SolveView::new(&mut st),
+                &mut blocks,
+                &mut constraints,
+                &work,
+                &color_work,
+            );
             self.diag.solve_ns[1] += _t_ra.ns();
             // warm start + bias 솔브 (조인트 먼저 — Box2D 순서)
             let _t_jw = Stopwatch::start();
@@ -3039,7 +3066,15 @@ impl World {
             // 접촉 warm_start — 색 배치 SIMD 디스패치(Unit 3b). 색 내 4제약은 4-wide, 나머지는
             // 스칼라. 콜러드-스칼라와 비트 동일이라 L0 해시 불변(아래 state_hash 테스트가 잠금).
             let _t_ws = Stopwatch::start();
-            solver_block::warm_start_all(&mut st, &blocks, &constraints, &work);
+            solver_block::warm_start_all(
+                &self.pool,
+                self.parallel_solver,
+                &solver::SolveView::new(&mut st),
+                &blocks,
+                &constraints,
+                &work,
+                &color_work,
+            );
             self.diag.solve_ns[2] += _t_ws.ns();
             let _t_js = Stopwatch::start();
             for &ji in &active_joints {
@@ -3057,7 +3092,16 @@ impl World {
             self.diag.solve_ns[6] += _t_js.ns();
             // bias 솔브 — 색 배치 SIMD 디스패치(Unit 3c). 콜러드-스칼라와 비트 동일.
             let _t_bs = Stopwatch::start();
-            solver_block::solve_all(&mut st, &mut blocks, &mut constraints, &work, &bias_params);
+            solver_block::solve_all(
+                &self.pool,
+                self.parallel_solver,
+                &solver::SolveView::new(&mut st),
+                &mut blocks,
+                &mut constraints,
+                &work,
+                &color_work,
+                &bias_params,
+            );
             self.diag.solve_ns[3] += _t_bs.ns();
             // 속도 상한 — 위치 적분 **전에** 걸어야 변위도 유계가 된다
             let _t_int = Stopwatch::start();
@@ -3260,7 +3304,15 @@ impl World {
             st.refresh_inv_i_active(inv_i_local, &active);
             self.diag.solve_ns[0] += _t_ii2.ns();
             let _t_ra2 = Stopwatch::start();
-            solver_block::refresh_anchors_all(&st, &mut blocks, &mut constraints, &work);
+            solver_block::refresh_anchors_all(
+                &self.pool,
+                self.parallel_solver,
+                &solver::SolveView::new(&mut st),
+                &mut blocks,
+                &mut constraints,
+                &work,
+                &color_work,
+            );
             self.diag.solve_ns[1] += _t_ra2.ns();
             let _t_js2 = Stopwatch::start();
             for &ji in &active_joints {
@@ -3269,7 +3321,16 @@ impl World {
             self.diag.solve_ns[6] += _t_js2.ns();
             // relax 솔브 — 색 배치 SIMD 디스패치(Unit 3c).
             let _t_rs = Stopwatch::start();
-            solver_block::solve_all(&mut st, &mut blocks, &mut constraints, &work, &relax_params);
+            solver_block::solve_all(
+                &self.pool,
+                self.parallel_solver,
+                &solver::SolveView::new(&mut st),
+                &mut blocks,
+                &mut constraints,
+                &work,
+                &color_work,
+                &relax_params,
+            );
             self.diag.solve_ns[4] += _t_rs.ns();
         }
 
@@ -3603,4 +3664,268 @@ fn shape_world_aabb(shape: &maru_collide::Shape, pose: &maru_collide::Pose) -> A
 #[inline]
 fn groups_collide(a: &Body, b: &Body) -> bool {
     (a.membership & b.filter) != 0 && (b.membership & a.filter) != 0
+}
+
+/// 내로우페이즈를 병렬로 돌리기 시작하는 페어 수.
+///
+/// dispatch 한 번은 워커를 깨우는 비용(뮤텍스+condvar broadcast, ~us)이 있고 페어 하나는
+/// ~0.1-1us다. 페어가 적으면 깨우는 값이 일보다 비싸므로 그냥 직렬로 돈다 — 어느 쪽이든
+/// 결과는 같으므로 이 문턱은 **성능 노브일 뿐 시맨틱이 아니다**.
+const NARROW_PARALLEL_MIN: usize = 512;
+
+/// 이번 스텝 내로우페이즈에 쓸 참여자 수.
+fn narrow_participants(pool: &crate::threads::Pool, pairs: usize) -> usize {
+    if pairs >= NARROW_PARALLEL_MIN {
+        pool.threads().max(1)
+    } else {
+        1
+    }
+}
+
+/// 참여자별 버퍼를 **wake 폐쇄 전에** 확보한다(실패는 상태 변경 없이 ResourceLimit).
+fn reserve_narrow_bufs(
+    bufs: &mut Vec<NarrowOut>,
+    n_par: usize,
+    chunk_cap: usize,
+) -> Result<(), ApiError> {
+    if bufs.len() < n_par {
+        bufs.try_reserve(n_par - bufs.len())
+            .map_err(|_| ApiError::ResourceLimit)?;
+        bufs.resize_with(n_par, NarrowOut::default);
+    }
+    for b in bufs[..n_par].iter_mut() {
+        b.reserve(chunk_cap)?;
+    }
+    Ok(())
+}
+
+/// 내로우페이즈 한 청크가 읽는 것 전부 — 전부 **불변 참조**다.
+///
+/// 페어 하나의 처리가 순수하다는 사실(읽기는 이 구조체, 쓰기는 자기 `NarrowOut`)이
+/// 병렬화의 근거이자 결정론의 근거다. 새 필드를 추가할 때 **가변 상태를 끼워 넣으면
+/// 그 근거가 무너진다** — 누적이 필요하면 `NarrowOut`으로 간다.
+struct NarrowCtx<'a> {
+    bodies: &'a [Body],
+    asleep: &'a [bool],
+    oob: &'a [bool],
+    cache: &'a IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+    touching: &'a IntSet<(u32, u32)>,
+    touch_sorted: &'a [(u32, u32)],
+    excluded: &'a IntSet<(u32, u32)>,
+    restricted: bool,
+    margin: f32,
+    dt: f32,
+}
+
+/// 내로우페이즈 참여자 하나의 출력 버퍼. 스텝 사이에 **재사용**한다(할당 0).
+#[derive(Default)]
+pub(crate) struct NarrowOut {
+    constraints: Vec<ContactConstraint>,
+    keys: Vec<(u32, u32)>,
+    /// 이번 청크에서 살아있는 접촉 키. 집합 삽입은 병합 때 직렬로 한다
+    /// (해시 집합을 병렬로 만들면 순회 순서가 스레드 수에 의존한다).
+    live: Vec<(u32, u32)>,
+    max_penetration: f32,
+    warm_total: usize,
+    warm_hits: usize,
+    /// 접점 힙 할당 실패(극단 OOM) — 직렬 경로의 `bail`과 같은 뜻이다.
+    bail: bool,
+}
+
+impl NarrowOut {
+    fn reset(&mut self) {
+        self.constraints.clear();
+        self.keys.clear();
+        self.live.clear();
+        self.max_penetration = 0.0;
+        self.warm_total = 0;
+        self.warm_hits = 0;
+        self.bail = false;
+    }
+
+    fn reserve(&mut self, pairs: usize) -> Result<(), ApiError> {
+        self.constraints
+            .try_reserve(pairs.saturating_sub(self.constraints.capacity()))
+            .map_err(|_| ApiError::ResourceLimit)?;
+        self.keys
+            .try_reserve(pairs.saturating_sub(self.keys.capacity()))
+            .map_err(|_| ApiError::ResourceLimit)?;
+        self.live
+            .try_reserve(pairs.saturating_sub(self.live.capacity()))
+            .map_err(|_| ApiError::ResourceLimit)?;
+        Ok(())
+    }
+}
+
+/// 페어 청크 하나를 처리한다 — **직렬 경로와 병렬 경로가 공유하는 단일 정본**이다.
+///
+/// 두 경로가 각자 루프를 갖고 있으면 "스레드 1개면 예전과 같다"가 검증이 아니라 희망이
+/// 된다. 하나만 두고, 병렬은 이 함수를 청크마다 부르는 것으로 정의한다.
+///
+/// `ti`는 기준선(`touch_sorted`) 병합 포인터의 **시작 위치**다. 청크의 첫 키까지
+/// 미리 전진시켜 넣어야 직렬과 같은 판정이 나온다(둘 다 오름차순이라 이분 탐색으로 구한다).
+fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut NarrowOut) {
+    let empty: Vec<(FeatureId, CachedImpulse)> = Vec::new();
+    // `active`의 초집합 술어 — 뚱뚱한 `Body`를 안 건드리고 Vec<bool> 두 개만 읽는다.
+    let maybe_active = |i: usize| !cx.asleep[i] && !cx.oob[i];
+    for &(a_id, b_raw) in pairs {
+        if out.bail {
+            return;
+        }
+        let key = (a_id, b_raw);
+        let is_static_pair = b_raw & STATIC_BIT != 0;
+        let b_plain = b_raw & !STATIC_BIT;
+        // 기준선 병합 포인터를 이 페어까지 전진시킨다(전 페어 공통, 총 전진 = |touching|).
+        // 제한 모드는 fresh만 걸으므로 병합 대신 아래 dormant 분기에서 해시 1회를 쓴다
+        // (그 모드의 `touch_sorted`는 정렬돼 있지도 않다 — 전진시키면 안 된다).
+        if !cx.restricted {
+            while ti < cx.touch_sorted.len() && cx.touch_sorted[ti] < key {
+                ti += 1;
+            }
+        }
+        // **양쪽 다 비활성인 페어는 여기서 끝난다** (wake 폐쇄는 이미 위에서 닫혔다).
+        // 움직이지 않은 페어는 새 접촉을 만들 수 없고, 브로드페이즈 AABB 겹침은 매니폴드의
+        // 충분조건이 아니므로 **직전 기준선에 실제 접촉으로 있던 키만** 살린다 — 아니면
+        // 잠들면서 거짓 Started가 난다. 원래는 페어마다 `touching`을 해시했는데(전원 수면
+        // pile-3k에서 24810회/스텝), 두 정렬 배열의 병합이면 페어당 비교 1회로 같은 교집합이
+        // 나온다. 술어는 wake 루프와 동일한 초집합이다.
+        if !maybe_active(a_id as usize) && (is_static_pair || !maybe_active(b_plain as usize)) {
+            let in_baseline = if cx.restricted {
+                cx.touching.contains(&key)
+            } else {
+                ti < cx.touch_sorted.len() && cx.touch_sorted[ti] == key
+            };
+            if in_baseline {
+                // 필터 순서는 활성 경로와 같다(제외 → 그룹 → 비활성). 특히 **그룹 판정이
+                // 수면보다 먼저**여야 잠든 사이 그룹이 바뀐 페어가 접촉을 승계하지 않고
+                // Stopped를 낸다(검수 rev_7f7bb07c MAJOR). 여기 도달하는 키는 ≤ 접촉 수라
+                // 뚱뚱한 `Body` 접근도 그만큼만 일어난다.
+                let excluded_pair = !cx.excluded.is_empty()
+                    && cx
+                        .excluded
+                        .contains(&(a_id.min(b_plain), a_id.max(b_plain)));
+                if !excluded_pair
+                    && groups_collide(&cx.bodies[a_id as usize], &cx.bodies[b_plain as usize])
+                {
+                    push_live(out, key);
+                }
+            }
+            continue;
+        }
+        // 조인트가 없으면 집합이 비어 있다 — 빈 집합에도 해시는 도는다.
+        if !cx.excluded.is_empty()
+            && cx
+                .excluded
+                .contains(&(a_id.min(b_plain), a_id.max(b_plain)))
+        {
+            continue;
+        }
+        let (a_id, b_id) = (a_id as usize, b_plain as usize);
+        let a_inactive = cx.oob[a_id]
+            || match cx.bodies[a_id].body_type {
+                BodyType::Kinematic => false,
+                BodyType::Dynamic => cx.asleep[a_id],
+                BodyType::Static => true,
+            };
+        let b_inactive = cx.oob[b_id]
+            || match cx.bodies[b_id].body_type {
+                BodyType::Kinematic => false,
+                BodyType::Dynamic => is_static_pair || cx.asleep[b_id],
+                BodyType::Static => true,
+            };
+        // **그룹 판정이 수면 분기보다 먼저다.** 반대면 그룹이 명시적으로 충돌을
+        // 거부한 페어도 잠든 동안 접촉으로 승격된다(검수 rev_7f7bb07c MAJOR).
+        if !groups_collide(&cx.bodies[a_id], &cx.bodies[b_id]) {
+            continue;
+        }
+        // 양쪽 비활성 페어는 위 조기 탈출에서 이미 걸러졌다. 두 술어는 **동치**다:
+        // a는 항상 동적 트리 원소(Dynamic|Kinematic)라 `a_inactive == !maybe_active(a)`이고,
+        // b는 static이면 `b_inactive == true == is_static_pair` 아니면 마찬가지다.
+        // 동치가 깨지면 접촉 기준선 보존이 두 경로로 갈라지므로 여기서 잠근다.
+        debug_assert!(
+            !(a_inactive && b_inactive),
+            "dormant 페어는 조기 탈출이 이미 걸렀어야 한다 — 술어 동치 붕괴"
+        );
+        let sensor_pair = cx.bodies[a_id].sensor || cx.bodies[b_id].sensor;
+        // **복합 디스패치**: 자식쌍마다 독립 매니폴드 → 페어당 제약 여러 개(법선이 달라
+        // 병합 불가). 같은 pair 키를 keys에 반복 push하는 것이 규약이고,
+        // PCM 갱신(post 5절)이 같은 키의 엔트리를 append 병합한다. feature는 자식쌍 키
+        // (1..=64, 비복합=0 미변형)를 bits 9..15에 접어 자식 간 warm start 혼선을 막는다.
+        let is_compound = matches!(cx.bodies[a_id].shape, maru_collide::Shape::Compound { .. })
+            || matches!(cx.bodies[b_id].shape, maru_collide::Shape::Compound { .. });
+        let mut touched = false;
+        // 지형 삼각형(내부 에지 마스크 보유)이면 월드 좌표 삼각형을 미리 풀어 둔다 —
+        // 접점 법선 용접(§4.2 ghost edge)은 매니폴드 생성 직후, 소비(prepare) 전이다.
+        // 지형은 항상 static = B 쪽이다(validate가 static 3점 hull에만 마스크 허용).
+        let weld = match &cx.bodies[b_id].shape {
+            maru_collide::Shape::Hull { points, radius }
+                if cx.bodies[b_id].weld_edges != 0 && points.len() == 3 =>
+            {
+                let pb = &cx.bodies[b_id].pose;
+                let t = |p: Vec3| pb.pos + pb.rot.rotate(p);
+                Some((
+                    [t(points[0]), t(points[1]), t(points[2])],
+                    *radius,
+                    cx.bodies[b_id].weld_edges,
+                ))
+            }
+            _ => None,
+        };
+        for_each_contact(
+            &cx.bodies[a_id].shape,
+            &cx.bodies[a_id].pose,
+            &cx.bodies[b_id].shape,
+            &cx.bodies[b_id].pose,
+            cx.margin,
+            &mut |ca, cb, mut m| {
+                if out.bail || m.is_empty() {
+                    return;
+                }
+                if let Some((tri, r, mask)) = weld {
+                    maru_collide::weld_internal_edges(&mut m, tri, r, mask);
+                }
+                touched = true;
+                if sensor_pair {
+                    return; // 센서: 이벤트만 — 아래 touched 처리에서 live로
+                }
+                if is_compound {
+                    m.namespace_features(ca as u32 * 8 + cb as u32 + 1);
+                }
+                let cached = cx.cache.get(&key).unwrap_or(&empty);
+                for p in m.points() {
+                    out.max_penetration = out.max_penetration.max(-p.separation);
+                }
+                // 접점 Vec 할당(≤4점) 실패는 극단 OOM — bail로 모아 호출부에서 처리.
+                // 페어당 계측은 두지 않는다 — `Instant::now()` 두 번이 페어당
+                // 실제 작업의 몇 %가 되어 계측기가 대상을 왜곡한다(2026-07-29 실측:
+                // 40단에서 스텝당 ~0.2ms). 내역이 필요하면 `maru-bench --bin boxsplit`
+                // (매니폴드 생성)과 `narrow` 총계의 차로 귀속한다.
+                let Ok(c) = solver::prepare(cx.bodies, a_id, b_id, &m, cached, cx.dt) else {
+                    out.bail = true;
+                    return;
+                };
+                // 진단은 **실제 warm load**를 센다(feature ID 일치만 세면 generic 접점의
+                // 위치·법선 게이트가 매칭을 끊어도 100%로 보인다 — 거짓 지표).
+                out.warm_total += c.points.len();
+                out.warm_hits += c.warm_matched as usize;
+                out.constraints.push(c);
+                out.keys.push(key);
+                push_live(out, key);
+            },
+        );
+        // 센서 페어(또는 접촉만 있고 제약이 없는 경우의 이벤트 기준선).
+        if touched && sensor_pair {
+            push_live(out, key);
+        }
+    }
+}
+
+/// live 키는 **연속 중복만 접어** 넣는다 — 복합 페어가 제약을 여러 개 밀어도 키는 같으므로
+/// 그대로 쌓으면 버퍼가 페어 수를 넘어 선점 용량을 깬다. 집합 삽입은 병합 때 하므로
+/// 중복이 남아도 결과는 같지만, **용량 상한**이 근거를 잃는다.
+#[inline]
+fn push_live(out: &mut NarrowOut, key: (u32, u32)) {
+    if out.live.last() != Some(&key) {
+        out.live.push(key);
+    }
 }
