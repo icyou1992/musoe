@@ -2330,6 +2330,52 @@ mod tests {
         );
     }
 
+    /// **줄어든 월드의 영속 스크래치는 반납된다** (확인검수 rev_21c1a97f MAJOR).
+    ///
+    /// 회계는 "이번 스텝에 필요한 양"으로 세는데 `Vec` 용량은 저절로 줄지 않는다.
+    /// 큰 월드를 돌린 뒤 작아지면 그 차이가 회계 밖에 남아 128 MiB 주장이 거짓이 된다.
+    /// 반대로 "넘쳤으니 거절"만 하면 용량이 안 줄어 그 월드는 영원히 못 돈다 —
+    /// 그래서 **반납하고 다시 잰다**. 이 테스트는 반납이 실제로 일어나는지 본다.
+    #[test]
+    fn shrunken_world_releases_persistent_scratch() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let mut hs = Vec::new();
+        for i in 0..400 {
+            hs.push(w.add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.2 },
+                pose(i as f32 * 0.5, 3.0, 0.0),
+                1.0,
+            )));
+        }
+        w.step(DT);
+        let big = w.body_scratch_capacities();
+        assert!(big[0] >= 400, "큰 월드에서 스크래치가 안 자랐다: {big:?}");
+        // 대부분을 지운다 — 슬롯은 줄지 않지만(free-list) 용량 회계의 목표는 줄어든다.
+        for h in hs.iter().skip(8) {
+            w.remove_body(*h).expect("제거");
+        }
+        // 슬롯 수를 실제로 줄이려면 새 월드가 필요하다 — 여기서는 **반납 경로 자체**를
+        // 직접 부른다(스텝 경로는 초과분이 상한을 넘을 때만 부른다).
+        w.release_scratch_for_test(8);
+        let small = w.body_scratch_capacities();
+        for (i, (b, s)) in big.iter().zip(small.iter()).enumerate() {
+            // #1·#2는 적분/중력 게이트다 — 이 시점 뒤에도 **직전 스텝 값으로 읽히므로**
+            // (증분 브로드페이즈의 R 집합) 비우지 않는다. 1바이트짜리라 회계상 무시할 만하고,
+            // 다음 스텝이 현재 크기로 다시 채운 뒤에 줄어든다.
+            if i == 1 || i == 2 {
+                assert!(s <= b, "게이트 #{i} 용량이 늘었다: {b} → {s}");
+                continue;
+            }
+            assert!(
+                s <= b && *s <= 64,
+                "스크래치 #{i}가 반납되지 않았다: {b} → {s}"
+            );
+        }
+        // 반납 뒤에도 정상 동작해야 한다(예약이 다시 목표까지 올라간다).
+        assert!(w.try_step(DT).is_ok(), "반납 뒤 스텝이 실패했다");
+    }
+
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
     /// `cargo test --release -p maru-dynamics -- --ignored`
     #[test]

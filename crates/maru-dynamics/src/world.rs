@@ -1684,6 +1684,91 @@ impl World {
         self.diag
     }
 
+    /// 영속 스크래치가 **목표를 넘겨 쥐고만 있는** 바이트.
+    ///
+    /// 회계는 "이번 스텝에 필요한 양"으로 세는데 `Vec` 용량은 저절로 줄지 않는다. 큰
+    /// 월드를 한 번 돌린 뒤 작은 월드로 복원하면 그 차이가 회계 밖에 남고, 128 MiB
+    /// 총상한 주장이 거짓이 된다(확인검수 rev_21c1a97f MAJOR — 참여자 버퍼만 정확히
+    /// 세고 나머지를 빠뜨렸다).
+    fn persistent_excess_bytes(&self, nbody: usize, ncap: usize, constraint_cap: usize) -> usize {
+        let ex = |cap: usize, target: usize, elem: usize| cap.saturating_sub(target) * elem;
+        self.solver_state
+            .excess_capacity_bytes(nbody)
+            .saturating_add(ex(
+                self.inv_inertia_local.capacity(),
+                nbody,
+                core::mem::size_of::<Vec3>(),
+            ))
+            .saturating_add(ex(
+                self.ext_force.capacity(),
+                nbody,
+                core::mem::size_of::<(Vec3, Vec3)>(),
+            ))
+            .saturating_add(ex(
+                self.damping.capacity(),
+                nbody,
+                core::mem::size_of::<(f32, f32)>(),
+            ))
+            .saturating_add(ex(self.integrate_gate.capacity(), nbody, 1))
+            .saturating_add(ex(self.gravity_gate.capacity(), nbody, 1))
+            .saturating_add(ex(
+                self.island_parent.capacity(),
+                nbody,
+                core::mem::size_of::<usize>(),
+            ))
+            .saturating_add(ex(
+                self.contact_blocks.capacity(),
+                constraint_cap / 4,
+                core::mem::size_of::<solver_block::ContactBlock>(),
+            ))
+            .saturating_add(ex(
+                self.bp_pairs_scratch.capacity(),
+                ncap,
+                core::mem::size_of::<(u32, u32)>(),
+            ))
+    }
+
+    /// 목표를 넘겨 쥐고 있는 영속 스크래치를 **반납**한다.
+    ///
+    /// 상한을 넘었다고 스텝을 거절하는 것은 답이 아니다 — 용량은 저절로 줄지 않으므로
+    /// 그 월드는 **영원히** 거절된다. 안 쓰는 만큼을 실제로 돌려주고 다시 잰다.
+    /// 평소 경로에서는 초과분이 0이라 이 함수가 불리지 않는다.
+    fn release_oversized_scratch(&mut self, nbody: usize, ncap: usize, constraint_cap: usize) {
+        // **내용을 버려야 용량이 준다** — `Vec::shrink_to`는 `len` 아래로 못 내려가고,
+        // 이 버퍼들은 직전 스텝의 값을 그대로 들고 있다. 아래 버퍼들은 이번 스텝 안에서
+        // `clear` 후 다시 채워지므로(솔버 상태·per-body 압축 배열·블록 풀·페어 핑퐁)
+        // 지금 비워도 읽는 쪽이 없다.
+        self.solver_state.shrink_to(nbody);
+        for (v, n) in [
+            (
+                &mut self.inv_inertia_local as &mut dyn ShrinkableScratch,
+                nbody,
+            ),
+            (&mut self.ext_force, nbody),
+            (&mut self.damping, nbody),
+            (&mut self.island_parent, nbody),
+            (&mut self.contact_blocks, constraint_cap / 4),
+            (&mut self.bp_pairs_scratch, ncap),
+        ] {
+            v.clear_and_shrink_to(n);
+        }
+        // **게이트 두 개는 비우지 않는다.** `integrate_gate`는 이 시점 뒤에도 직전 스텝
+        // 값으로 읽힌다(증분 브로드페이즈의 R 집합·제한 순회 판정). 용량만 깎는다.
+        self.integrate_gate
+            .shrink_to(nbody.max(self.integrate_gate.len()));
+        self.gravity_gate
+            .shrink_to(nbody.max(self.gravity_gate.len()));
+        for b in self.narrow_bufs.iter_mut() {
+            b.shrink_to(constraint_cap, ncap);
+        }
+    }
+
+    /// 테스트 전용 — 반납 경로 직접 호출.
+    #[cfg(test)]
+    pub(crate) fn release_scratch_for_test(&mut self, nbody: usize) {
+        self.release_oversized_scratch(nbody, 0, 0);
+    }
+
     /// 테스트 전용 — per-body 영속 스크래치의 용량(회계가 미는 값과 대조하기 위해).
     #[cfg(test)]
     pub(crate) fn body_scratch_capacities(&self) -> [usize; 7] {
@@ -2398,6 +2483,7 @@ impl World {
         // 내로우페이즈 참여자 수와 참여자별 버퍼 용량은 **wake 폐쇄 전에** 확정해야 한다
         // (아래 통합 fallible 블록의 존재 이유와 같다: wake 뒤의 예약 실패는 깨워둔 채
         // ResourceLimit을 돌려줘 "Err면 상태 불변" 계약을 깬다).
+        let nbody = self.bodies.len();
         let n_par = narrow_participants(&self.pool, ncap);
         // 참여자별 상한은 **자기 청크의 정확한 제약 합**이다(복합 페어는 1개가 아니다).
         // 이 스텝이 전체 목록을 걸을지 fresh만 걸을지는 wake 뒤에 정해지므로, 두 목록의
@@ -2442,19 +2528,36 @@ impl World {
             .skip(self.narrow_bufs.len())
             .map(|&(c, p)| NarrowOut::bytes_for(c, p))
             .sum();
-        if fixed_bytes
-            .saturating_add(ncap.saturating_mul(per_pair_bytes))
-            .saturating_add(constraint_cap.saturating_mul(per_constraint_bytes))
-            .saturating_add(narrow_held)
-            .saturating_add(narrow_new)
-            > MAX_STEP_SCRATCH_BYTES
-        {
-            // 참여자 버퍼는 아직 self가 들고 있다(아래에서 take한다) — 되돌릴 것이 없다.
-            self.bp_pairs = pairs;
-            self.resource_limit = true;
-            return;
+        let step_bytes = |this: &Self, narrow_held: usize| {
+            fixed_bytes
+                .saturating_add(ncap.saturating_mul(per_pair_bytes))
+                .saturating_add(constraint_cap.saturating_mul(per_constraint_bytes))
+                .saturating_add(narrow_held)
+                .saturating_add(narrow_new)
+                .saturating_add(this.persistent_excess_bytes(nbody, ncap, constraint_cap))
+        };
+        if step_bytes(self, narrow_held) > MAX_STEP_SCRATCH_BYTES {
+            // 먼저 **반납**하고 다시 잰다(위 `release_oversized_scratch` 주석 — 거절만 하면
+            // 줄어든 월드가 영원히 못 돈다). 여기는 wake 폐쇄 이전이고 용량만 건드리므로
+            // 캐노니컬 상태는 그대로다.
+            self.release_oversized_scratch(nbody, ncap, constraint_cap);
+            let narrow_held: usize = self
+                .narrow_bufs
+                .iter()
+                .enumerate()
+                .map(|(w, b)| {
+                    let (c_cap, p_cap) = chunk_caps.get(w).copied().unwrap_or((0, 0));
+                    let (c, p) = if w < n_par { (c_cap, p_cap) } else { (0, 0) };
+                    b.projected_bytes(c, p)
+                })
+                .sum();
+            if step_bytes(self, narrow_held) > MAX_STEP_SCRATCH_BYTES {
+                // 참여자 버퍼는 아직 self가 들고 있다(아래에서 take한다) — 되돌릴 것이 없다.
+                self.bp_pairs = pairs;
+                self.resource_limit = true;
+                return;
+            }
         }
-        let nbody = self.bodies.len();
         let njoint = self.joints.len();
         let mut constraints: Vec<ContactConstraint> = Vec::new();
         let mut constraint_keys: Vec<(u32, u32)> = Vec::new();
@@ -3792,6 +3895,18 @@ fn shape_world_aabb(shape: &maru_collide::Shape, pose: &maru_collide::Pose) -> A
 ///
 /// **양방향 조건**이다: 한 방향만 보면 "A는 B를 무시하는데 B는 A를 민다"가 되어
 /// 운동량이 새고, 호스트가 설정한 적 없는 비대칭이 생긴다.
+/// `Vec<T>`를 원소 타입과 무관하게 "비우고 용량 반납"만 시키기 위한 최소 트레이트.
+trait ShrinkableScratch {
+    fn clear_and_shrink_to(&mut self, n: usize);
+}
+
+impl<T> ShrinkableScratch for Vec<T> {
+    fn clear_and_shrink_to(&mut self, n: usize) {
+        self.clear();
+        self.shrink_to(n);
+    }
+}
+
 #[inline]
 fn groups_collide(a: &Body, b: &Body) -> bool {
     (a.membership & b.filter) != 0 && (b.membership & a.filter) != 0
@@ -3892,6 +4007,16 @@ impl NarrowOut {
             self.keys.capacity(),
             self.live.capacity(),
         )
+    }
+
+    fn shrink_to(&mut self, constraints: usize, pairs: usize) {
+        // 내용은 매 청크 시작에 `reset`되므로 지금 버려도 된다.
+        self.constraints.clear();
+        self.keys.clear();
+        self.live.clear();
+        self.constraints.shrink_to(constraints);
+        self.keys.shrink_to(constraints);
+        self.live.shrink_to(pairs);
     }
 
     fn reset(&mut self) {
