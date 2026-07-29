@@ -175,9 +175,13 @@ impl SolverState {
     /// 솔버 이득을 먹는다(실측: SoA 전환이 되레 1.3ms 느려졌다) — 버퍼는 월드가 보관한다.
     /// 용량만 미리 확보한다 — **캐노니컬 변이 전에** 호출해 실패를 여기서 끝낸다.
     pub fn reserve_for(&mut self, n: usize) -> Result<(), crate::world::ApiError> {
+        // **`try_reserve`의 인자는 `len`에 더할 여분이다.** 목표에서 `capacity`를 빼면
+        // `len < capacity < 목표`일 때 모자란 예약이 통과하고(예: len=100·cap=128·목표=1000
+        // → 보장 972), 그 뒤 `fill_from`의 `resize`가 **wake 폐쇄 뒤에** 재할당한다
+        // (확인검수 rev_071f1cd9 MAJOR — `NarrowOut::reserve`와 같은 계열의 잔존).
         macro_rules! res {
             ($v:expr) => {
-                $v.try_reserve(n.saturating_sub($v.capacity()))
+                $v.try_reserve(n.saturating_sub($v.len()))
                     .map_err(|_| crate::world::ApiError::ResourceLimit)?;
             };
         }
@@ -189,6 +193,12 @@ impl SolverState {
         res!(self.inv_i);
         res!(self.dynamic);
         Ok(())
+    }
+
+    /// 테스트 전용 — 예약이 목표에 닿았는지 보기 위한 창.
+    #[cfg(test)]
+    pub fn lin_capacity(&self) -> usize {
+        self.lin.capacity()
     }
 
     /// 용량이 확보된 상태에서 값을 채운다 (실패하지 않는다).

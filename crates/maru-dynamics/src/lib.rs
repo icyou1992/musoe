@@ -2260,6 +2260,76 @@ mod tests {
         );
     }
 
+    /// 영속 스크래치 예약이 **목표 용량**을 요구하는지 (확인검수 rev_071f1cd9 MAJOR).
+    ///
+    /// `try_reserve(nbody)`는 "지금 len에 nbody를 **더**"라는 뜻이라, 매 스텝 len이
+    /// 바디 수인 버퍼에 그대로 넘기면 두 번째 스텝부터 용량이 2배로 부푼다 —
+    /// 회계는 한 벌만 세므로 128 MiB 상한이 조용히 깨진다. 되돌리면 이 테스트가 실패한다.
+    #[test]
+    fn per_body_scratch_does_not_double_each_step() {
+        const N: usize = 120;
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        for i in 0..N {
+            w.add_body(Body::new_dynamic(
+                Shape::Sphere { radius: 0.2 },
+                pose(i as f32 * 0.5, 3.0, 0.0),
+                1.0,
+            ));
+        }
+        let n = w.slot_count();
+        for _ in 0..3 {
+            w.step(DT);
+        }
+        for (i, cap) in w.body_scratch_capacities().iter().enumerate() {
+            // 고친 경로는 정확히 슬롯 수만큼 잡는다. 버그는 `len + nbody`를 요구해
+            // 두 번째 스텝에서 **정확히 2배**가 되므로, 여유를 조금만 두면 갈린다.
+            assert!(
+                *cap <= n + n / 4 + 16,
+                "per-body 스크래치 #{i} 용량 {cap}이 슬롯 수 {n}보다 크게 부풀었다 — 매 스텝 재예약이 쌓인다"
+            );
+        }
+    }
+
+    /// `SolverState::reserve_for`가 `len < capacity < 목표`에서도 목표에 닿는지
+    /// (확인검수 rev_071f1cd9 MAJOR — `NarrowOut::reserve`와 같은 계열의 잔존).
+    #[test]
+    fn solver_state_reserve_reaches_target_when_capacity_exceeds_len() {
+        let mut st = crate::solver::SolverState::default();
+        // 큰 용량을 먼저 잡고(=capacity 128) 작은 수로 채운다(=len 100).
+        st.reserve_for(128).expect("첫 예약");
+        let bodies: Vec<Body> = (0..100)
+            .map(|_| Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(0.0, 0.0, 0.0), 1.0))
+            .collect();
+        let alive = vec![true; 100];
+        let oob = vec![false; 100];
+        st.fill_from(&bodies, &alive, &oob);
+        assert!(st.lin_capacity() >= 128 && st.lin_capacity() > 100);
+        // 이제 목표 1000 — `목표 - capacity`로 계산하면 보장이 972에 그친다.
+        st.reserve_for(1000).expect("두 번째 예약");
+        assert!(
+            st.lin_capacity() >= 1000,
+            "예약이 목표에 못 닿았다: {} (목표 1000)",
+            st.lin_capacity()
+        );
+    }
+
+    /// 참여자 버퍼 회계가 **실제 보유 용량**을 세는지 (확인검수 rev_071f1cd9 MAJOR).
+    /// 영속 버퍼는 줄지 않으므로, 이번 청크 목표가 작아도 이미 쥔 만큼을 세야 한다.
+    #[test]
+    fn narrow_buffer_accounting_counts_held_capacity() {
+        let mut b = crate::world::NarrowOut::default();
+        // 용량은 판정에 필요한 만큼만 — wasm 테스트는 한 인스턴스에서 전 테스트가 돌고
+        // 선형 메모리는 줄지 않으므로, 테스트 하나의 발자국이 전체 상한을 밀어 올린다.
+        b.reserve(1024, 1024).expect("큰 예약");
+        let small_target = crate::world::NarrowOut::bytes_for(8, 8);
+        let projected = b.projected_bytes(8, 8);
+        assert!(
+            projected > small_target * 50,
+            "보유 용량(4096)을 안 세고 목표(8)만 셌다: {projected} vs {small_target}"
+        );
+    }
+
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
     /// `cargo test --release -p maru-dynamics -- --ignored`
     #[test]

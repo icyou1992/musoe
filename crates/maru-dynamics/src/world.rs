@@ -1684,6 +1684,20 @@ impl World {
         self.diag
     }
 
+    /// 테스트 전용 — per-body 영속 스크래치의 용량(회계가 미는 값과 대조하기 위해).
+    #[cfg(test)]
+    pub(crate) fn body_scratch_capacities(&self) -> [usize; 7] {
+        [
+            self.inv_inertia_local.capacity(),
+            self.integrate_gate.capacity(),
+            self.gravity_gate.capacity(),
+            self.ext_force.capacity(),
+            self.damping.capacity(),
+            self.island_parent.capacity(),
+            self.solver_state.lin_capacity(),
+        ]
+    }
+
     /// 지금 쓰는 참여자 수 (메인 스레드 포함, 1 = 완전 직렬).
     ///
     /// 요청한 수보다 작을 수 있다 — 스레드를 못 띄운 환경(wasm·제한된 호스트)에서는
@@ -1737,6 +1751,11 @@ impl World {
         // 입력 크기와 무관하게 늘어난다(교차검수 rev_518b072b MAJOR).
         let n = n.clamp(1, crate::threads::MAX_THREADS);
         if n != self.pool.threads() {
+            // 참여자 버퍼는 분할 수에 맞춰 커진 채 영속한다 — 분할이 바뀌면 과거 용량을
+            // 새 분할에 얹지 않도록 버린다(확인검수 rev_071f1cd9 MAJOR). 회계는 보유
+            // 용량을 세므로 안 버려도 상한은 지켜지지만, 안 쓸 메모리를 계속 쥐고 있으면
+            // 그만큼 이번 스텝의 페어·제약 여유가 줄어든다.
+            self.narrow_bufs.clear();
             self.pool = crate::threads::Pool::new(n);
         }
     }
@@ -2233,10 +2252,15 @@ impl World {
             + core::mem::size_of::<solver_block::ContactBlock>().div_ceil(4)
             + core::mem::size_of::<usize>().div_ceil(4)                  // block_starts
             + core::mem::size_of::<solver_block::Work>()                 // work
-            // 내로우페이즈 참여자 버퍼 — 청크별 상한의 **합**이 전체 상한을 넘지 않으므로
-            // 제약당 한 벌로 회계한다. 접점 힙(`ContactConstraint.points`)은 병합 때
-            // **이동**하므로 중복 계상하지 않는다 — 복제되는 것은 헤더와 키뿐이다.
-            + core::mem::size_of::<ContactConstraint>()                  // NarrowOut.constraints
+            ;
+        // 내로우페이즈 참여자 버퍼는 **두 번 센다** — 목적이 다르다.
+        // ① 아래 페어 예산(byte_cap)에는 "논리 한 벌"을 얹는다: 예산이 이 변경 전보다
+        //    관대해지면 안 된다(관대해진 순간 바이트 상한을 재던 스트레스 테스트가
+        //    32비트 wasm에서 메모리 한계에 닿았다 — 예산은 조이는 쪽으로만 바꾼다).
+        // ② 페어를 받은 뒤의 총상한 검사에는 **실제 보유 용량**을 쓴다(rev_071f1cd9 MAJOR).
+        // 접점 힙(`ContactConstraint.points`)은 병합 때 **이동**하므로 중복 계상하지 않는다.
+        let per_constraint_budget_bytes = per_constraint_bytes
+            + core::mem::size_of::<ContactConstraint>()  // NarrowOut.constraints
             + core::mem::size_of::<(u32, u32)>(); // NarrowOut.keys
                                                   // per-body(슬롯당) 스크래치 전부: SolverState 7배열 + inv_inertia_local + ext_force +
                                                   // damping + 게이트 2 + island_parent + 컬러 body_color/conflict. 총상한에서 먼저 뺀다.
@@ -2288,8 +2312,8 @@ impl World {
         // 이 예산은 **페어 개수**의 상한이다 — 제약 수는 페어 목록이 나와야 알 수 있으므로
         // 여기서는 "페어당 제약 1개"로 역산하고, 실제 제약 상한 검사는 페어를 받은 뒤
         // (wake 폐쇄 전에) 아래에서 한다.
-        let byte_cap =
-            (MAX_STEP_SCRATCH_BYTES - fixed_bytes) / (per_pair_bytes + per_constraint_bytes).max(1);
+        let byte_cap = (MAX_STEP_SCRATCH_BYTES - fixed_bytes)
+            / (per_pair_bytes + per_constraint_budget_bytes).max(1);
         let budget = (self.params.max_pairs_per_body as usize)
             .saturating_mul(live)
             .saturating_add(1024)
@@ -2371,11 +2395,58 @@ impl World {
         for &(a, b) in pairs.iter() {
             constraint_cap = constraint_cap.saturating_add(parts(a).saturating_mul(parts(b)));
         }
+        // 내로우페이즈 참여자 수와 참여자별 버퍼 용량은 **wake 폐쇄 전에** 확정해야 한다
+        // (아래 통합 fallible 블록의 존재 이유와 같다: wake 뒤의 예약 실패는 깨워둔 채
+        // ResourceLimit을 돌려줘 "Err면 상태 불변" 계약을 깬다).
+        let n_par = narrow_participants(&self.pool, ncap);
+        // 참여자별 상한은 **자기 청크의 정확한 제약 합**이다(복합 페어는 1개가 아니다).
+        // 이 스텝이 전체 목록을 걸을지 fresh만 걸을지는 wake 뒤에 정해지므로, 두 목록의
+        // 같은 번호 청크 중 **큰 쪽**을 잡는다 — 어느 쪽으로 가도 모자라지 않는다.
+        let mut chunk_caps = [(0usize, 0usize); crate::threads::MAX_THREADS];
+        for (w, slot) in chunk_caps.iter_mut().enumerate().take(n_par) {
+            let mut worst = (0usize, 0usize);
+            for list in [Some(&pairs), fresh_pairs.as_ref()].into_iter().flatten() {
+                let n = list.len();
+                let (lo, hi) = (n * w / n_par, n * (w + 1) / n_par);
+                let mut c = 0usize;
+                for &(a, b) in &list[lo..hi] {
+                    c = c.saturating_add(parts(a).saturating_mul(parts(b)));
+                }
+                worst = (worst.0.max(c), worst.1.max(hi - lo));
+            }
+            *slot = worst;
+        }
         // 바이트 총상한 재검사 — 페어는 예산 안이어도 **제약**이 넘칠 수 있다.
         // 여기는 wake 폐쇄 **이전**이라 실패해도 상태는 그대로다("Err면 상태 불변").
+        //
+        // 참여자 버퍼는 **논리적 상한이 아니라 실제로 들고 있게 될 용량**으로 센다
+        // (확인검수 rev_071f1cd9 MAJOR): 버퍼는 영속이라 줄지 않으므로, 1참여자로 큰
+        // 장면을 한 번 돌린 뒤 8참여자로 바꾸면 0번 버퍼가 **전체 한 벌**을 쥔 채 나머지
+        // 7개가 청크만큼 더 잡는다. 청크 합 한 벌만 세면 그 초과분이 회계 밖으로 샌다.
+        let narrow_held: usize = self
+            .narrow_bufs
+            .iter()
+            .enumerate()
+            .map(|(w, b)| {
+                let (c_cap, p_cap) = chunk_caps.get(w).copied().unwrap_or((0, 0));
+                b.projected_bytes(
+                    if w < n_par { c_cap } else { 0 },
+                    if w < n_par { p_cap } else { 0 },
+                )
+            })
+            .sum();
+        // 아직 안 만들어진 참여자 버퍼(첫 병렬 스텝)도 예약될 것이므로 함께 센다.
+        let narrow_new: usize = chunk_caps
+            .iter()
+            .take(n_par)
+            .skip(self.narrow_bufs.len())
+            .map(|&(c, p)| NarrowOut::bytes_for(c, p))
+            .sum();
         if fixed_bytes
             .saturating_add(ncap.saturating_mul(per_pair_bytes))
             .saturating_add(constraint_cap.saturating_mul(per_constraint_bytes))
+            .saturating_add(narrow_held)
+            .saturating_add(narrow_new)
             > MAX_STEP_SCRATCH_BYTES
         {
             // 참여자 버퍼는 아직 self가 들고 있다(아래에서 take한다) — 되돌릴 것이 없다.
@@ -2411,29 +2482,6 @@ impl World {
         // 색별 work 구간 — 병렬 솔브의 배리어 경계. 색은 최대 64개라 고정 상한이다.
         let mut color_work: Vec<(u32, u32)> = Vec::new();
         let _t_res = Stopwatch::start();
-        // 내로우페이즈 참여자 수와 참여자별 버퍼 용량은 **wake 폐쇄 전에** 확정해야 한다
-        // (아래 통합 fallible 블록의 존재 이유와 같다: wake 뒤의 예약 실패는 깨워 둔 채
-        // ResourceLimit을 돌려줘 "Err면 상태 불변" 계약을 깬다).
-        // 그래서 판정 입력은 이 시점에 이미 확정된 **전체 페어 수**다 — 제한 순회로 실제
-        // 청크가 더 작아지는 것은 상관없다(예약이 과할 뿐, 모자라지 않는다).
-        let n_par = narrow_participants(&self.pool, ncap);
-        // 참여자별 상한은 **자기 청크의 정확한 제약 합**이다(복합 페어는 1개가 아니다).
-        // 이 스텝이 전체 목록을 걷을지 fresh만 걸을지는 wake 뒤에 정해지므로, 두 목록의
-        // 같은 번호 청크 중 **큰 쪽**을 잡는다 — 어느 쪽으로 가도 모자라지 않는다.
-        let mut chunk_caps = [(0usize, 0usize); crate::threads::MAX_THREADS];
-        for (w, slot) in chunk_caps.iter_mut().enumerate().take(n_par) {
-            let mut worst = (0usize, 0usize);
-            for list in [Some(&pairs), fresh_pairs.as_ref()].into_iter().flatten() {
-                let n = list.len();
-                let (lo, hi) = (n * w / n_par, n * (w + 1) / n_par);
-                let mut c = 0usize;
-                for &(a, b) in &list[lo..hi] {
-                    c = c.saturating_add(parts(a).saturating_mul(parts(b)));
-                }
-                worst = (worst.0.max(c), worst.1.max(hi - lo));
-            }
-            *slot = worst;
-        }
         let mut narrow_bufs = std::mem::take(&mut self.narrow_bufs);
         if (ccd_any
             && self
@@ -2472,12 +2520,24 @@ impl World {
             || new_keys.try_reserve(constraint_cap).is_err()
             || touch_sorted.try_reserve(self.touching.len()).is_err()
             || self.solver_state.reserve_for(nbody).is_err()
-            || self.inv_inertia_local.try_reserve(nbody).is_err()
-            || self.integrate_gate.try_reserve(nbody).is_err()
-            || self.gravity_gate.try_reserve(nbody).is_err()
-            || self.ext_force.try_reserve(nbody).is_err()
-            || self.damping.try_reserve(nbody).is_err()
-            || self.island_parent.try_reserve(nbody).is_err()
+            || self.inv_inertia_local
+                .try_reserve(nbody.saturating_sub(self.inv_inertia_local.len()))
+                .is_err()
+            || self.integrate_gate
+                .try_reserve(nbody.saturating_sub(self.integrate_gate.len()))
+                .is_err()
+            || self.gravity_gate
+                .try_reserve(nbody.saturating_sub(self.gravity_gate.len()))
+                .is_err()
+            || self.ext_force
+                .try_reserve(nbody.saturating_sub(self.ext_force.len()))
+                .is_err()
+            || self.damping
+                .try_reserve(nbody.saturating_sub(self.damping.len()))
+                .is_err()
+            || self.island_parent
+                .try_reserve(nbody.saturating_sub(self.island_parent.len()))
+                .is_err()
             || reserve_narrow_bufs(&mut narrow_bufs, n_par, &chunk_caps).is_err()
         {
             self.bp_pairs = pairs;
@@ -3800,6 +3860,25 @@ pub(crate) struct NarrowOut {
 }
 
 impl NarrowOut {
+    /// 용량 `c`(제약)·`p`(페어)를 가진 버퍼가 잡는 바이트.
+    pub(crate) fn bytes_for(c: usize, p: usize) -> usize {
+        c.saturating_mul(core::mem::size_of::<ContactConstraint>())
+            .saturating_add(c.saturating_mul(core::mem::size_of::<(u32, u32)>()))
+            .saturating_add(p.saturating_mul(core::mem::size_of::<(u32, u32)>()))
+    }
+
+    /// 이 버퍼가 예약 뒤에 **실제로 들고 있게 될** 바이트 — 영속 버퍼는 줄지 않으므로
+    /// 현재 용량과 이번 목표 중 큰 쪽이다.
+    pub(crate) fn projected_bytes(&self, c_cap: usize, p_cap: usize) -> usize {
+        Self::bytes_for(
+            self.constraints
+                .capacity()
+                .max(c_cap)
+                .max(self.keys.capacity()),
+            self.live.capacity().max(p_cap),
+        )
+    }
+
     /// 테스트 전용 — 예약이 실제로 목표 용량에 닿았는지 본다.
     #[cfg(test)]
     pub(crate) fn capacities(&self) -> (usize, usize, usize) {
