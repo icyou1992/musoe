@@ -22,8 +22,9 @@ pub use cast::{shape_cast, shape_cast_dispatch, shape_cast_dispatch_rotational, 
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
 pub use heightfield::{
-    world_aabb_to_local, HeightfieldRef, COS_COPLANAR, MAX_HEIGHTFIELD_CELLS_PER_QUERY,
-    MAX_HEIGHTFIELD_MANIFOLDS, MAX_HEIGHTFIELD_SAMPLES,
+    build_tiles as build_heightfield_tiles, world_aabb_to_local, HeightfieldRef, COS_COPLANAR,
+    HEIGHTFIELD_TILE, MAX_HEIGHTFIELD_CELLS_PER_QUERY, MAX_HEIGHTFIELD_MANIFOLDS,
+    MAX_HEIGHTFIELD_SAMPLES,
 };
 pub use limits::{
     anchor_in_range, angular_in_range, extent_in_range, in_range, in_state_range,

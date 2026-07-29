@@ -241,8 +241,17 @@ pub fn shape_cast_dispatch_rotational(
                 let local = crate::heightfield::world_aabb_to_local(expanded, pb);
                 let (cx0, cz0, cx1, cz1) = hf.cell_range(local)?;
                 let mut best: Option<ShapeCastHit> = None;
+                // 선형 경로와 **같은 가지치기**: 타일 높이 범위가 스윕 Y 밴드와 안 겹치면
+                // 그 타일의 셀은 보지 않는다. 궤도 봉투는 넓으므로 이게 없으면 최악이
+                // 격자 전체다(확인검수 rev_d390e73d BLOCKER — 회전 분기만 예산 밖이었다).
+                let (y_lo, y_hi) = (local.min.y, local.max.y);
                 for cz in cz0..=cz1 {
                     for cx in cx0..=cx1 {
+                        let (t_lo, t_hi) = hf
+                            .tile_range(cx / crate::HEIGHTFIELD_TILE, cz / crate::HEIGHTFIELD_TILE);
+                        if t_hi < y_lo || t_lo > y_hi {
+                            continue;
+                        }
                         for t in 0..2u8 {
                             let tri = Shape::Triangle {
                                 points: hf.triangle(cx, cz, t),
@@ -349,21 +358,19 @@ pub fn shape_cast_dispatch(
             // 스윕 한 번이 200만 회 캐스트가 된다(확인검수 rev_7efe4e35 MAJOR).
             // 그래서 **보수적으로 정지**시킨다: 이동을 toi=0에서 막는 히트를 만들어
             // 관통 대신 멈춤을 고른다. 질의 API는 이 경우를 오류로 따로 보고한다.
-            let cells = (cx1 - cx0 + 1) as usize * (cz1 - cz0 + 1) as usize;
-            if cells > crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
-                let n = if motion.length_sq() > 0.0 {
-                    motion * (-1.0 / motion.length())
-                } else {
-                    Vec3::new(0.0, 1.0, 0.0)
-                };
-                return Some(ShapeCastHit {
-                    toi: 0.0,
-                    point: pa.pos,
-                    normal: n,
-                });
-            }
+            // **타일 높이 범위로 먼저 쳐낸다.** 스윕의 Y 밴드와 안 겹치는 타일은 셀을
+            // 하나도 볼 필요가 없다 — 이게 없으면 총알이 평평한 통로를 지나가는 것만으로
+            // 수천 셀을 검사하고, 그 비용을 피하려던 "예산 초과 = 가짜 히트"가 정상 장면을
+            // 영구 동결시켰다(확인검수 rev_d390e73d BLOCKER). 가지치기는 근사가 아니라
+            // 정확하다: 타일 밖 높이는 그 범위 안에 있다는 것이 build_tiles의 계약이다.
+            let (y_lo, y_hi) = (local.min.y, local.max.y);
             for cz in cz0..=cz1 {
                 for cx in cx0..=cx1 {
+                    let (t_lo, t_hi) =
+                        hf.tile_range(cx / crate::HEIGHTFIELD_TILE, cz / crate::HEIGHTFIELD_TILE);
+                    if t_hi < y_lo || t_lo > y_hi {
+                        continue;
+                    }
                     for t in 0..2u8 {
                         let tri = Shape::Triangle {
                             points: hf.triangle(cx, cz, t),

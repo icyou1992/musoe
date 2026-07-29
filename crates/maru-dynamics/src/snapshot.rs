@@ -313,6 +313,9 @@ fn write_shape(w: &mut Writer, s: &Shape) {
             nx,
             nz,
             cell,
+            // 타일은 높이의 파생물이라 **직렬화하지 않는다** — 복원에서 다시 만든다.
+            // 파생을 저장하면 "바이트는 같은데 파생이 다른" 상태가 생길 수 있다.
+            tiles: _,
         } => {
             w.u8(5);
             w.u32(*nx);
@@ -384,8 +387,10 @@ fn read_shape(r: &mut Reader, allow_compound: bool) -> Result<Shape, SnapshotErr
             for _ in 0..n {
                 heights.push(r.f32()?);
             }
+            let tiles = maru_collide::build_heightfield_tiles(&heights, nx, nz);
             Shape::Heightfield {
                 heights,
+                tiles,
                 nx,
                 nz,
                 cell,

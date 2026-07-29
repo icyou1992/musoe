@@ -676,6 +676,14 @@ impl World {
     /// `AddBody`를 큐에 쌓고 **핸들을 즉시 반환**한다(리뷰 BLOCKER: 커맨드 경로에서
     /// 새 바디를 가리킬 방법이 없었다). 슬롯을 예약하고 세대를 올려 ABA를 차단한다.
     /// 반환된 핸들은 flush 이후에 유효해지며, 그 전에도 같은 배치의 후속 커맨드에 쓸 수 있다.
+    /// 슬롯 예약 + 추가 커맨드 (오류 반환형).
+    pub fn try_enqueue_add_body(&mut self, body: Body) -> Result<BodyHandle, ApiError> {
+        // **가드는 큐·슬롯을 건드리기 전에** — 실패가 상태를 남기면 안 된다.
+        Self::fp_guard()?;
+        body.validate()?;
+        Ok(self.enqueue_add_body(body))
+    }
+
     pub fn enqueue_add_body(&mut self, body: Body) -> BodyHandle {
         body.validate().expect("invalid body");
         let index = if let Some(index) = self.free_slot() {
@@ -750,8 +758,10 @@ impl World {
             .try_reserve_exact(heights.len())
             .map_err(|_| ApiError::ResourceLimit)?;
         owned.extend_from_slice(heights);
+        let tiles = maru_collide::build_heightfield_tiles(&owned, nx, nz);
         let shape = maru_collide::Shape::Heightfield {
             heights: owned,
+            tiles,
             nx,
             nz,
             cell,
@@ -1300,8 +1310,13 @@ impl World {
             // 하이트필드는 셀 예산을 **미리** 본다 — 공개 질의는 보수적 정지(가짜 히트)가
             // 아니라 **오류**로 알려야 호스트가 질의를 좁힐 수 있다(확인검수 rev_7efe4e35).
             if let Some(hf) = self.bodies[i].shape.heightfield_ref() {
+                // **디스패치와 정확히 같은 봉투**를 재야 한다 — margin을 빼면 경계에서
+                // "질의는 예산 안, 내부는 예산 밖"이 되어 계약이 갈린다(확인검수 rev_d390e73d).
                 let a0 = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
                 let sw = a0.merge(Aabb::new(a0.min + motion, a0.max + motion));
+                let m = self.params.speculative_margin;
+                let pad = Vec3::new(m, m, m);
+                let sw = Aabb::new(sw.min - pad, sw.max + pad);
                 let local = maru_collide::world_aabb_to_local(sw, &self.bodies[i].pose);
                 if let Some((cx0, cz0, cx1, cz1)) = hf.cell_range(local) {
                     let cells = (cx1 - cx0 + 1) as usize * (cz1 - cz0 + 1) as usize;
@@ -1359,6 +1374,17 @@ impl World {
             }
             if !self.passes(i, filter) || !aabb.overlaps(self.body_aabb(i)) {
                 continue;
+            }
+            // 하이트필드는 셀 예산을 본다 — 이 질의는 캐릭터가 **매 이동마다** 부르므로
+            // 공개 스윕의 예산을 우회하는 새 작업량 경로가 된다(확인검수 rev_d390e73d MAJOR).
+            if let Some(hf) = self.bodies[i].shape.heightfield_ref() {
+                let local = maru_collide::world_aabb_to_local(aabb, &self.bodies[i].pose);
+                if let Some((x0, z0, x1, z1)) = hf.cell_range(local) {
+                    let cells = (x1 - x0 + 1) as usize * (z1 - z0 + 1) as usize;
+                    if cells > maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
+                        return Err(ApiError::ResourceLimit);
+                    }
+                }
             }
             maru_collide::for_each_contact(
                 shape,
@@ -1615,6 +1641,7 @@ impl World {
     /// 유효성은 **enqueue 시점** 기준이다: 앞선 커맨드가 대상을 지우면 flush에서 거부되어
     /// 리포트에 잡힌다(스텝을 중단시키지 않는다 — 설계 §3 스텝 원자성).
     pub fn enqueue(&mut self, cmd: Command) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         self.validate_command(&cmd)?;
         self.commands.push(PendingCommand::Public(cmd));
         Ok(())

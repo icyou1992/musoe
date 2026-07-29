@@ -2621,6 +2621,7 @@ mod tests {
     fn dynamic_heightfield_is_rejected_at_construction() {
         let _ = Body::new_dynamic(
             Shape::Heightfield {
+                tiles: maru_collide::build_heightfield_tiles(&[0.0; 4], 2, 2),
                 heights: vec![0.0; 4],
                 nx: 2,
                 nz: 2,
@@ -3014,6 +3015,7 @@ mod tests {
     #[test]
     fn heightfield_static_only_is_enforced_at_creation_too() {
         let hf = || Shape::Heightfield {
+            tiles: maru_collide::build_heightfield_tiles(&[0.0; 4], 2, 2),
             heights: vec![0.0; 4],
             nx: 2,
             nz: 2,
@@ -3064,6 +3066,7 @@ mod tests {
         // 비볼록 셰이프는 스윕 주체가 될 수 없다
         let mut c3 = capsule_char(0.0, 0.8, 0.0);
         c3.shape = Shape::Heightfield {
+            tiles: maru_collide::build_heightfield_tiles(&[0.0; 4], 2, 2),
             heights: vec![0.0; 4],
             nx: 2,
             nz: 2,
@@ -3075,6 +3078,7 @@ mod tests {
         assert!(w
             .sweep_shape(
                 &Shape::Heightfield {
+                    tiles: maru_collide::build_heightfield_tiles(&[0.0; 4], 2, 2),
                     heights: vec![0.0; 4],
                     nx: 2,
                     nz: 2,
@@ -3114,13 +3118,9 @@ mod tests {
             w.apply_impulse(h, Vec3::new(1.0, 0.0, 0.0)),
             Err(ApiError::FpEnvironment)
         );
+        // 생성자 자체가 가드에 걸린다 — 비-fallible 판은 패닉이므로 fallible 판으로 본다.
         assert_eq!(
-            w.try_add_body(Body::new_dynamic(
-                Shape::Sphere { radius: 0.2 },
-                pose(3.0, 3.0, 3.0),
-                1.0
-            ))
-            .err(),
+            Body::try_new_dynamic(Shape::Sphere { radius: 0.2 }, pose(3.0, 3.0, 3.0), 1.0).err(),
             Some(ApiError::FpEnvironment)
         );
         assert!(World::try_new(WorldParams::default()).is_ok() || true);

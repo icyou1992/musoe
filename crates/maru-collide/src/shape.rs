@@ -34,6 +34,11 @@ pub enum Shape {
     /// 로컬 좌표는 `x = ix·cell`, `z = iz·cell`, 높이는 `heights[iz·nx + ix]`.
     Heightfield {
         heights: Vec<f32>,
+        /// 타일별 (최소, 최대) 높이 — **높이 배열의 파생물**이다(캐노니컬 상태 아님).
+        /// 생성·복원에서 `heightfield::build_tiles`로 만들고 스냅샷에는 넣지 않는다.
+        /// 질의가 이걸로 타일 단위 가지치기를 해서, 총알이 평평한 통로를 지나갈 때
+        /// 셀을 하나도 안 보게 된다.
+        tiles: Vec<(f32, f32)>,
         nx: u32,
         nz: u32,
         cell: f32,
@@ -210,6 +215,7 @@ impl Shape {
             }
             Shape::Heightfield {
                 heights,
+                tiles,
                 nx,
                 nz,
                 cell,
@@ -235,6 +241,15 @@ impl Shape {
                 }
                 if !heights.iter().all(|h| extent_in_range(*h)) {
                     return Err("heightfield heights must be finite and within extent range");
+                }
+                // 타일은 파생물이지만 **모양이 맞아야** 한다 — 엉뚱한 타일을 들고 오면
+                // 가지치기가 진짜 접촉을 건너뛴다(정확성 문제다). 개수·범위 검사 뒤에 본다.
+                let (ntx, ntz) = (
+                    (nx - 1).div_ceil(crate::heightfield::HEIGHTFIELD_TILE),
+                    (nz - 1).div_ceil(crate::heightfield::HEIGHTFIELD_TILE),
+                );
+                if tiles.len() != (ntx as usize) * (ntz as usize) {
+                    return Err("heightfield tile pyramid does not match the grid");
                 }
             }
             Shape::Triangle { .. } => {
@@ -413,11 +428,13 @@ impl Shape {
         match self {
             Shape::Heightfield {
                 heights,
+                tiles,
                 nx,
                 nz,
                 cell,
             } => Some(crate::HeightfieldRef {
                 heights,
+                tiles,
                 nx: *nx,
                 nz: *nz,
                 cell: *cell,

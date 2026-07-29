@@ -46,12 +46,25 @@ pub const MAX_HEIGHTFIELD_CELLS_PER_QUERY: usize = 4096;
 /// Jolt ActiveEdges 기본과 동급(~5.7°).
 pub const COS_COPLANAR: f32 = 0.995;
 
+/// 타일 한 변의 셀 수 — 높이 범위 계층의 해상도.
+///
+/// 8×8이면 1024×1024 격자의 타일이 128×128 = 16k개다(최소/최대 f32 두 개 = 128KB).
+/// 이 정도면 캐시에 들어가고, 스윕 하나가 훑을 타일 수는 셀 수의 1/64이다.
+pub const HEIGHTFIELD_TILE: u32 = 8;
+
 /// 격자 하이트필드의 기하 — `Shape::Heightfield`의 계산을 모아 둔 뷰.
 ///
 /// 셰이프가 소유한 데이터를 빌려 쓰기만 한다(복사 없음).
 #[derive(Clone, Copy)]
 pub struct HeightfieldRef<'a> {
     pub heights: &'a [f32],
+    /// 타일별 (최소, 최대) 높이 — **질의가 셀을 안 보고 통째로 건너뛰는 근거**.
+    ///
+    /// 이게 없으면 총알이 평평한 통로를 50m 지나가는 것만으로 5,000셀을 검사해야 한다
+    /// (확인검수 rev_d390e73d BLOCKER: 그 비용을 피하려고 넣은 "예산 초과 = 가짜 히트"가
+    /// 정상 장면을 영구 동결시켰다). 타일의 높이 범위가 질의의 Y 밴드와 안 겹치면
+    /// 그 타일의 셀 64개는 볼 필요가 **없다** — 근사가 아니라 정확한 가지치기다.
+    pub tiles: &'a [(f32, f32)],
     pub nx: u32,
     pub nz: u32,
     pub cell: f32,
@@ -62,6 +75,30 @@ impl<'a> HeightfieldRef<'a> {
     #[inline]
     pub fn height(&self, ix: u32, iz: u32) -> f32 {
         self.heights[(iz * self.nx + ix) as usize]
+    }
+
+    /// 타일 격자 크기 (x, z).
+    #[inline]
+    pub fn tile_dims(&self) -> (u32, u32) {
+        let (ncx, ncz) = self.cells();
+        (
+            ncx.div_ceil(HEIGHTFIELD_TILE),
+            ncz.div_ceil(HEIGHTFIELD_TILE),
+        )
+    }
+
+    /// 타일 `(tx, tz)`의 (최소, 최대) 높이. 범위 밖이면 빈 구간.
+    #[inline]
+    pub fn tile_range(&self, tx: u32, tz: u32) -> (f32, f32) {
+        let (ntx, ntz) = self.tile_dims();
+        if tx >= ntx || tz >= ntz {
+            return (f32::INFINITY, f32::NEG_INFINITY);
+        }
+        let i = (tz * ntx + tx) as usize;
+        self.tiles
+            .get(i)
+            .copied()
+            .unwrap_or((f32::NEG_INFINITY, f32::INFINITY))
     }
 
     /// 셀 개수 (x, z) — 정점 수보다 하나씩 적다.
@@ -378,6 +415,42 @@ pub fn ray_heightfield(
     }
 }
 
+/// 높이 배열에서 타일별 (최소, 최대)를 만든다.
+///
+/// 셰이프 생성·복원에서 **한 번** 계산해 두는 파생 데이터다(캐노니컬 상태가 아니다 —
+/// 높이 배열의 함수이므로 스냅샷에 넣지 않고 복원 때 다시 만든다).
+pub fn build_tiles(heights: &[f32], nx: u32, nz: u32) -> Vec<(f32, f32)> {
+    // **잘못된 입력에는 빈 목록**을 돌려준다 — 검증 전에 불릴 수 있고(생성 경계),
+    // 여기서 패닉하면 "실패는 오류지 trap이 아니다" 계약이 깨진다.
+    // 빈 목록은 `validate`가 타일 길이 불일치로 거부한다.
+    if nx < 2 || nz < 2 || heights.len() < (nx as usize) * (nz as usize) {
+        return Vec::new();
+    }
+    let (ncx, ncz) = (nx - 1, nz - 1);
+    let (ntx, ntz) = (
+        ncx.div_ceil(HEIGHTFIELD_TILE),
+        ncz.div_ceil(HEIGHTFIELD_TILE),
+    );
+    let mut tiles = vec![(f32::INFINITY, f32::NEG_INFINITY); (ntx * ntz) as usize];
+    for tz in 0..ntz {
+        for tx in 0..ntx {
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            // 셀의 네 꼭짓점을 다 봐야 한다 — 타일 경계 셀은 옆 타일의 정점도 쓴다.
+            let x1 = ((tx + 1) * HEIGHTFIELD_TILE).min(ncx);
+            let z1 = ((tz + 1) * HEIGHTFIELD_TILE).min(ncz);
+            for iz in (tz * HEIGHTFIELD_TILE)..=z1 {
+                for ix in (tx * HEIGHTFIELD_TILE)..=x1 {
+                    let h = heights[(iz * nx + ix) as usize];
+                    lo = lo.min(h);
+                    hi = hi.max(h);
+                }
+            }
+            tiles[(tz * ntx + tx) as usize] = (lo, hi);
+        }
+    }
+    tiles
+}
+
 /// 로컬 공간 AABB를 포즈로 되돌린 것 — 월드 AABB를 하이트필드 로컬로 옮긴다.
 pub fn world_aabb_to_local(aabb: Aabb, pose: &Pose) -> Aabb {
     // 회전의 역변환은 켤레. 축 정렬 상자를 회전시키면 다시 축 정렬 상자로 감싸야 한다.
@@ -398,13 +471,26 @@ pub fn world_aabb_to_local(aabb: Aabb, pose: &Pose) -> Aabb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static TILES: RefCell<Vec<(f32, f32)>> = const { RefCell::new(Vec::new()) };
+    }
 
     fn flat(nx: u32, nz: u32, _cell: f32) -> Vec<f32> {
         vec![0.0; (nx * nz) as usize]
     }
 
     fn hf(heights: &[f32], nx: u32, nz: u32, cell: f32) -> HeightfieldRef<'_> {
+        // 테스트는 타일을 매번 새로 만든다 — 누수 없이 'static으로 두려고 Box::leak을
+        // 쓰지 않고, 호출자가 소유하도록 별도 헬퍼를 둔다.
         HeightfieldRef {
+            tiles: TILES.with(|t| {
+                let v = build_tiles(heights, nx, nz);
+                *t.borrow_mut() = v;
+                // SAFETY 대신: 테스트 전용으로 thread_local 버퍼를 빌려 준다.
+                unsafe { core::slice::from_raw_parts(t.borrow().as_ptr(), t.borrow().len()) }
+            }),
             heights,
             nx,
             nz,

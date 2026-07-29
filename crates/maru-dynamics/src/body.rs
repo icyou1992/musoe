@@ -304,6 +304,9 @@ impl Body {
         if !maru_math::fp_verify() {
             return Err(ApiError::FpEnvironment);
         }
+        if !maru_math::fp_verify() {
+            return Err(ApiError::FpEnvironment);
+        }
         if !(in_range(density) && density > 0.0) {
             return Err(ApiError::InvalidValue);
         }
@@ -421,6 +424,14 @@ impl Body {
     }
 
     pub fn new_dynamic(shape: Shape, pose: Pose, density: f32) -> Self {
+        // **비-fallible 판에도 가드가 필요하다.** 본문이 fallible 판과 복제돼 있어서
+        // 가드가 한쪽에만 붙어 있었다 — 비표준 FP 환경에서 만든 Body를 들고 있다가
+        // 환경을 되돌린 뒤 월드에 넣는 우회가 열려 있었다(확인검수 rev_d390e73d BLOCKER).
+        // 여기서는 오류형이 없으므로 관례대로 패닉이다(기존 메시지 계약은 아래가 유지).
+        assert!(
+            maru_math::fp_verify(),
+            "non-canonical FP environment (see World::canonicalize_fp_environment)"
+        );
         assert!(
             density.is_finite() && density > 0.0,
             "density must be finite and positive, got {density}"
@@ -502,6 +513,14 @@ impl Body {
     }
 
     pub fn new_static(shape: Shape, pose: Pose) -> Self {
+        // **비-fallible 판에도 가드가 필요하다.** 본문이 fallible 판과 복제돼 있어서
+        // 가드가 한쪽에만 붙어 있었다 — 비표준 FP 환경에서 만든 Body를 들고 있다가
+        // 환경을 되돌린 뒤 월드에 넣는 우회가 열려 있었다(확인검수 rev_d390e73d BLOCKER).
+        // 여기서는 오류형이 없으므로 관례대로 패닉이다(기존 메시지 계약은 아래가 유지).
+        assert!(
+            maru_math::fp_verify(),
+            "non-canonical FP environment (see World::canonicalize_fp_environment)"
+        );
         shape.validate().expect("invalid shape");
         let pose = normalized_pose(pose);
         let b = Self {

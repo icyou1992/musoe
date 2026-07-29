@@ -1240,6 +1240,7 @@ mod heightfield_contact_tests {
             }
         }
         let hf_shape = Shape::Heightfield {
+            tiles: crate::heightfield::build_tiles(&heights, nx, nz),
             heights,
             nx,
             nz,
