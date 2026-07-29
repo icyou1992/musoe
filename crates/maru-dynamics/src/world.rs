@@ -2488,7 +2488,12 @@ impl World {
                 .ccd_hits
                 .try_reserve(MAX_CCD_HITS.saturating_sub(self.ccd_hits.capacity()))
                 .is_err())
-            || constraints.try_reserve(constraint_cap).is_err()
+            // **참여자가 1명이면 이 지역 버퍼는 예약하지 않는다.** 병합이 없으므로 아래에서
+            // 참여자 버퍼와 **스왑**만 하고, 스왑 뒤 이 지역 변수가 그 용량을 물려받는다.
+            // 예약하면 같은 크기 배열을 두 벌 쥐게 되어 스텝 최대 메모리가 두 배가 된다
+            // (32비트 wasm 테스트 인스턴스가 이것 때문에 메모리 한계에 닿았다 —
+            // 선형 메모리는 줄지 않아 한 스텝의 최대치가 그대로 상한을 민다).
+            || (n_par > 1 && constraints.try_reserve(constraint_cap).is_err())
             // 여유 상수(`+1`·`+64`)를 붙이지 않는다: 페어가 0이면 이 버퍼들도 0이어야
             // 총 바이트 회계(위 `per_pair_bytes`)가 실제 선점과 일치한다.
             // 예산이 0페어로 잘린 월드에서 상수만큼 더 잡으면 128 MiB 계약을 넘긴다
@@ -2505,7 +2510,7 @@ impl World {
             || color_work
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
                 .is_err()
-            || constraint_keys.try_reserve(constraint_cap).is_err()
+            || (n_par > 1 && constraint_keys.try_reserve(constraint_cap).is_err())
             || live_keys.try_reserve(ncap).is_err()
             || joint_pairs.try_reserve(njoint).is_err()
             || active_joints.try_reserve(njoint).is_err()
