@@ -2158,6 +2158,108 @@ mod tests {
         assert_thread_determinism(20, 40, &[4]);
     }
 
+    /// 참여자 버퍼 예약이 **목표 용량에 실제로 닿는지** (교차검수 rev_518b072b MAJOR).
+    ///
+    /// `Vec::try_reserve`의 인자는 목표 용량이 아니라 `len`에 더할 여분이다. 목표에서
+    /// `capacity`를 빼서 넘기면 비워진 버퍼(len=0)가 목표보다 작은 용량으로도 요청을
+    /// 통과시키고, 그 뒤 push가 **wake 폐쇄 뒤에** 재할당한다("스텝 중 할당 0"·
+    /// "Err면 상태 불변" 계약이 동시에 깨진다). 되돌리면 이 테스트가 실패한다.
+    #[test]
+    fn narrow_buffer_reserve_reaches_target_capacity_after_reuse() {
+        let mut b = crate::world::NarrowOut::default();
+        b.reserve(150, 150).expect("첫 예약");
+        let before = b.capacities();
+        assert!(before.0 >= 150);
+        // 사용 후 비워진 상태(len=0, capacity≥150)에서 더 큰 목표를 요구하는 상황.
+        b.reserve(200, 200).expect("두 번째 예약");
+        let after = b.capacities();
+        assert!(
+            after.0 >= 200 && after.1 >= 200 && after.2 >= 200,
+            "예약이 목표에 못 닿았다: {after:?} (목표 200)"
+        );
+    }
+
+    /// 참여자 수는 설계 상한(`MAX_THREADS`)을 넘지 않는다 — 넘기면 스핀 설계가 무너지고
+    /// 참여자별 스크래치가 입력과 무관하게 커진다(교차검수 rev_518b072b MAJOR).
+    #[test]
+    fn thread_count_is_clamped_to_design_limit() {
+        let mut w = World::new(WorldParams::default());
+        w.set_threads(4096);
+        assert!(
+            w.threads() <= crate::threads::MAX_THREADS,
+            "참여자 {}명 — 상한 {}을 넘었다",
+            w.threads(),
+            crate::threads::MAX_THREADS
+        );
+        w.set_threads(1);
+        assert_eq!(w.threads(), 1, "1은 그대로여야 한다(완전 직렬)");
+    }
+
+    /// **복합 바디는 페어 하나가 제약 여러 개다** — 스크래치 회계가 그것을 세는지
+    /// (교차검수 rev_518b072b BLOCKER).
+    ///
+    /// 8자식 복합 64개가 전부 겹치면 페어는 2,016개뿐이지만 제약은 최대 64배(≈129k)라
+    /// 128 MiB 예산을 넘는다. 페어 수로만 세던 회계는 이 스텝을 통과시킨 뒤 wake 폐쇄
+    /// **뒤에** 재할당했다. 지금은 페어 목록에서 정확한 제약 상한을 구해 미리 거절한다.
+    ///
+    /// 판정이 **페어 예산이 아니라 제약 회계**에서 났음을 함께 확인한다:
+    /// 브로드페이즈는 성공해 `diag.pairs`가 차 있고 예산 안이다.
+    #[test]
+    fn compound_pairs_are_budgeted_by_constraints_not_pair_count() {
+        fn scene(compound: bool) -> (World, Result<(), ApiError>) {
+            let mut w = World::new(WorldParams::default());
+            for i in 0..64 {
+                let shape = if compound {
+                    Shape::Compound {
+                        children: (0..8)
+                            .map(|c| {
+                                (
+                                    pose(0.02 * c as f32, 0.0, 0.0),
+                                    Shape::Sphere { radius: 0.2 },
+                                )
+                            })
+                            .collect(),
+                    }
+                } else {
+                    Shape::Sphere { radius: 0.2 }
+                };
+                // 전부 겹치게 촘촘히 둔다 — 페어 수는 같고 제약 수만 64배가 된다.
+                w.add_body(Body::new_dynamic(
+                    shape,
+                    pose(0.01 * i as f32, 5.0, 0.0),
+                    1.0,
+                ));
+            }
+            let r = w.try_step(DT);
+            (w, r)
+        }
+        let (w_plain, r_plain) = scene(false);
+        assert!(
+            r_plain.is_ok(),
+            "비복합 대조군이 실패하면 이 테스트는 예산이 아니라 씬을 재는 것이다: {r_plain:?}"
+        );
+        let pairs = w_plain.diagnostics().pairs;
+        assert!(pairs > 1000, "겹침이 부족하다 — 페어 {pairs}개");
+
+        let (w_comp, r_comp) = scene(true);
+        assert!(
+            matches!(r_comp, Err(ApiError::ResourceLimit)),
+            "복합 씬이 제약 회계에 걸리지 않았다: {r_comp:?}"
+        );
+        let d = w_comp.diagnostics();
+        // 복합은 자식이 퍼져 AABB가 커서 페어가 조금 더 많다 — 같은 수를 요구하지 않는다.
+        assert!(
+            d.pairs >= pairs,
+            "브로드페이즈 자체는 통과했어야 한다: {}",
+            d.pairs
+        );
+        assert!(
+            d.pairs <= d.pair_budget,
+            "페어 예산({})이 먼저 걸렸다 — 제약 회계를 재는 테스트가 아니게 된다",
+            d.pair_budget
+        );
+    }
+
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
     /// `cargo test --release -p maru-dynamics -- --ignored`
     #[test]

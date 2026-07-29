@@ -1732,7 +1732,10 @@ impl World {
     /// 수천 배가 된다(4코어에 5명 실측: dispatch 5ms, 배리어 4ms). 기본값
     /// (`available_parallelism`, 상한 8)이 그 선을 넘지 않는다.
     pub fn set_threads(&mut self, n: usize) {
-        let n = n.max(1);
+        // 상한을 넘기는 요청은 **자른다** — 참여자가 코어보다 많으면 스핀 대기가 실행 중인
+        // 참여자를 밀어내 dispatch·배리어 지연이 수천 배가 되고, 참여자별 스크래치도
+        // 입력 크기와 무관하게 늘어난다(교차검수 rev_518b072b MAJOR).
+        let n = n.clamp(1, crate::threads::MAX_THREADS);
         if n != self.pool.threads() {
             self.pool = crate::threads::Pool::new(n);
         }
@@ -2206,8 +2209,14 @@ impl World {
         // per-pair 스크래치. **매니폴드 접점 힙까지** 센다 — `ContactConstraint.points`는 페어당
         // 최대 MAX_MANIFOLD_POINTS 원소를 따로 할당하므로 Vec 헤더만 세면 총상한이 깨진다
         // (교차검수 rev_2ade4bf3 MAJOR).
+        // **페어 비례**와 **제약 비례**를 나눠 센다. 둘은 같은 수가 아니다 — 복합 바디는
+        // 자식쌍마다 독립 제약을 만들어 페어 하나가 최대 (자식 수)² 개의 제약이 된다
+        // (교차검수 rev_518b072b BLOCKER: 페어당 1개로 세면 8자식×8자식 페어에서 회계가
+        // 64배 틀린다). 아래에서 실제 페어 목록으로 **정확한** 제약 상한을 구해 다시 잰다.
         let per_pair_bytes = core::mem::size_of::<(u32, u32)>()          // pairs
-            + core::mem::size_of::<ContactConstraint>()                  // constraints (Vec 헤더)
+            + core::mem::size_of::<(u32, u32)>()                         // NarrowOut.live
+            + 48; // live_keys(HashSet) + PCM 엔트리 여유
+        let per_constraint_bytes = core::mem::size_of::<ContactConstraint>() // constraints
             + maru_collide::MAX_MANIFOLD_POINTS
                 * core::mem::size_of::<solver::ContactPointConstraint>() // 접점 힙 원소
             + core::mem::size_of::<(u32, u32)>()                         // constraint_keys
@@ -2217,22 +2226,20 @@ impl World {
             + core::mem::size_of::<u32>()                                // grouped
             + core::mem::size_of::<Option<ContactConstraint>>()          // c_tmp (거의 한 벌 더)
             + core::mem::size_of::<(u32, u32)>()                         // new_keys
-            // SoA 솔버 블록 3종. **개수 상한을 페어 수로 되돌려 계산한다**:
+            // SoA 솔버 블록 3종. **개수 상한을 제약 수로 되돌려 계산한다**:
             // 블록·block_starts는 제약 4개를 소비하므로 ≤ ⌊n/4⌋, `work` 항목은 하나가
             // 최소 제약 1개를 소비하므로 ≤ n (색마다 4청크 + 꼬리 1개인데, 꼬리도 제약을
             // 최소 1개 쓴다). 나눗셈은 **올림**이다 — 내림으로 깎으면 상한이 상한이 아니다.
             + core::mem::size_of::<solver_block::ContactBlock>().div_ceil(4)
             + core::mem::size_of::<usize>().div_ceil(4)                  // block_starts
             + core::mem::size_of::<solver_block::Work>()                 // work
-            // 내로우페이즈 참여자 버퍼 — 청크 용량의 **합**이 페어 수를 넘지 않으므로
-            // (⌈ncap/n_par⌉ × n_par은 ncap + n_par 미만) 페어당 한 벌로 회계한다.
-            // 접점 힙(`ContactConstraint.points`)은 병합 때 **이동**하므로 중복 계상하지
-            // 않는다 — 복제되는 것은 헤더와 키뿐이다.
+            // 내로우페이즈 참여자 버퍼 — 청크별 상한의 **합**이 전체 상한을 넘지 않으므로
+            // 제약당 한 벌로 회계한다. 접점 힙(`ContactConstraint.points`)은 병합 때
+            // **이동**하므로 중복 계상하지 않는다 — 복제되는 것은 헤더와 키뿐이다.
             + core::mem::size_of::<ContactConstraint>()                  // NarrowOut.constraints
-            + 2 * core::mem::size_of::<(u32, u32)>()                     // NarrowOut.keys/live
-            + 48; // live_keys(HashSet) + PCM 엔트리 여유
-                  // per-body(슬롯당) 스크래치 전부: SolverState 7배열 + inv_inertia_local + ext_force +
-                  // damping + 게이트 2 + island_parent + 컬러 body_color/conflict. 총상한에서 먼저 뺀다.
+            + core::mem::size_of::<(u32, u32)>(); // NarrowOut.keys
+                                                  // per-body(슬롯당) 스크래치 전부: SolverState 7배열 + inv_inertia_local + ext_force +
+                                                  // damping + 게이트 2 + island_parent + 컬러 body_color/conflict. 총상한에서 먼저 뺀다.
         let per_body_bytes = 3 * core::mem::size_of::<Vec3>()            // lin/ang/pos
             + core::mem::size_of::<maru_math::Quat>()                    // rot
             + core::mem::size_of::<f32>()                                // inv_m
@@ -2278,7 +2285,11 @@ impl World {
             self.resource_limit = true;
             return;
         }
-        let byte_cap = (MAX_STEP_SCRATCH_BYTES - fixed_bytes) / per_pair_bytes.max(1);
+        // 이 예산은 **페어 개수**의 상한이다 — 제약 수는 페어 목록이 나와야 알 수 있으므로
+        // 여기서는 "페어당 제약 1개"로 역산하고, 실제 제약 상한 검사는 페어를 받은 뒤
+        // (wake 폐쇄 전에) 아래에서 한다.
+        let byte_cap =
+            (MAX_STEP_SCRATCH_BYTES - fixed_bytes) / (per_pair_bytes + per_constraint_bytes).max(1);
         let budget = (self.params.max_pairs_per_body as usize)
             .saturating_mul(live)
             .saturating_add(1024)
@@ -2346,6 +2357,32 @@ impl World {
         // 지적). 여기서 용량만 잡고(실패=wake 전 종료), 내용은 원래 자리에서 채운다(무재할당).
         // 상한: 페어당=pairs.len(), 바디당=bodies.len(), 조인트당=joints.len(). 전부 위 byte 예산에 포함.
         let ncap = pairs.len();
+        // **제약 상한을 실제 페어 목록에서 정확히 구한다.** 복합 바디는 자식쌍마다 독립
+        // 제약을 만들므로(narrow의 `for_each_contact` 디스패치) 페어 하나의 상한은
+        // parts(a)×parts(b)이고, 비복합끼리면 1이라 기존 장면의 회계는 변하지 않는다.
+        // 이 합이 곧 constraints·키·컬러링·블록 버퍼의 상한이다.
+        let parts = |id: u32| -> usize {
+            match &self.bodies[(id & !STATIC_BIT) as usize].shape {
+                maru_collide::Shape::Compound { children } => children.len(),
+                _ => 1,
+            }
+        };
+        let mut constraint_cap = 0usize;
+        for &(a, b) in pairs.iter() {
+            constraint_cap = constraint_cap.saturating_add(parts(a).saturating_mul(parts(b)));
+        }
+        // 바이트 총상한 재검사 — 페어는 예산 안이어도 **제약**이 넘칠 수 있다.
+        // 여기는 wake 폐쇄 **이전**이라 실패해도 상태는 그대로다("Err면 상태 불변").
+        if fixed_bytes
+            .saturating_add(ncap.saturating_mul(per_pair_bytes))
+            .saturating_add(constraint_cap.saturating_mul(per_constraint_bytes))
+            > MAX_STEP_SCRATCH_BYTES
+        {
+            // 참여자 버퍼는 아직 self가 들고 있다(아래에서 take한다) — 되돌릴 것이 없다.
+            self.bp_pairs = pairs;
+            self.resource_limit = true;
+            return;
+        }
         let nbody = self.bodies.len();
         let njoint = self.joints.len();
         let mut constraints: Vec<ContactConstraint> = Vec::new();
@@ -2380,43 +2417,59 @@ impl World {
         // 그래서 판정 입력은 이 시점에 이미 확정된 **전체 페어 수**다 — 제한 순회로 실제
         // 청크가 더 작아지는 것은 상관없다(예약이 과할 뿐, 모자라지 않는다).
         let n_par = narrow_participants(&self.pool, ncap);
-        let chunk_cap = ncap.div_ceil(n_par.max(1));
+        // 참여자별 상한은 **자기 청크의 정확한 제약 합**이다(복합 페어는 1개가 아니다).
+        // 이 스텝이 전체 목록을 걷을지 fresh만 걸을지는 wake 뒤에 정해지므로, 두 목록의
+        // 같은 번호 청크 중 **큰 쪽**을 잡는다 — 어느 쪽으로 가도 모자라지 않는다.
+        let mut chunk_caps = [(0usize, 0usize); crate::threads::MAX_THREADS];
+        for (w, slot) in chunk_caps.iter_mut().enumerate().take(n_par) {
+            let mut worst = (0usize, 0usize);
+            for list in [Some(&pairs), fresh_pairs.as_ref()].into_iter().flatten() {
+                let n = list.len();
+                let (lo, hi) = (n * w / n_par, n * (w + 1) / n_par);
+                let mut c = 0usize;
+                for &(a, b) in &list[lo..hi] {
+                    c = c.saturating_add(parts(a).saturating_mul(parts(b)));
+                }
+                worst = (worst.0.max(c), worst.1.max(hi - lo));
+            }
+            *slot = worst;
+        }
         let mut narrow_bufs = std::mem::take(&mut self.narrow_bufs);
         if (ccd_any
             && self
                 .ccd_hits
                 .try_reserve(MAX_CCD_HITS.saturating_sub(self.ccd_hits.capacity()))
                 .is_err())
-            || constraints.try_reserve(ncap).is_err()
+            || constraints.try_reserve(constraint_cap).is_err()
             // 여유 상수(`+1`·`+64`)를 붙이지 않는다: 페어가 0이면 이 버퍼들도 0이어야
             // 총 바이트 회계(위 `per_pair_bytes`)가 실제 선점과 일치한다.
             // 예산이 0페어로 잘린 월드에서 상수만큼 더 잡으면 128 MiB 계약을 넘긴다
             // (교차검수 rev_d4f505e6 MAJOR).
             || self
                 .contact_blocks
-                .try_reserve((ncap / 4).saturating_sub(self.contact_blocks.len()))
+                .try_reserve((constraint_cap / 4).saturating_sub(self.contact_blocks.len()))
                 .is_err()
-            || block_starts.try_reserve(ncap / 4).is_err()
-            || work.try_reserve(ncap).is_err()
+            || block_starts.try_reserve(constraint_cap / 4).is_err()
+            || work.try_reserve(constraint_cap).is_err()
             || color_ranges
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
                 .is_err()
             || color_work
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
                 .is_err()
-            || constraint_keys.try_reserve(ncap).is_err()
+            || constraint_keys.try_reserve(constraint_cap).is_err()
             || live_keys.try_reserve(ncap).is_err()
             || joint_pairs.try_reserve(njoint).is_err()
             || active_joints.try_reserve(njoint).is_err()
             || excluded.try_reserve(njoint).is_err()
-            || order.try_reserve(ncap).is_err()
+            || order.try_reserve(constraint_cap).is_err()
             || conflict.try_reserve(nbody).is_err()
-            || endpoints.try_reserve(ncap).is_err()
+            || endpoints.try_reserve(constraint_cap).is_err()
             || body_color.try_reserve(nbody).is_err()
-            || color_of.try_reserve(ncap).is_err()
-            || grouped.try_reserve(ncap).is_err()
-            || c_tmp.try_reserve(ncap).is_err()
-            || new_keys.try_reserve(ncap).is_err()
+            || color_of.try_reserve(constraint_cap).is_err()
+            || grouped.try_reserve(constraint_cap).is_err()
+            || c_tmp.try_reserve(constraint_cap).is_err()
+            || new_keys.try_reserve(constraint_cap).is_err()
             || touch_sorted.try_reserve(self.touching.len()).is_err()
             || self.solver_state.reserve_for(nbody).is_err()
             || self.inv_inertia_local.try_reserve(nbody).is_err()
@@ -2425,7 +2478,7 @@ impl World {
             || self.ext_force.try_reserve(nbody).is_err()
             || self.damping.try_reserve(nbody).is_err()
             || self.island_parent.try_reserve(nbody).is_err()
-            || reserve_narrow_bufs(&mut narrow_bufs, n_par, chunk_cap).is_err()
+            || reserve_narrow_bufs(&mut narrow_bufs, n_par, &chunk_caps).is_err()
         {
             self.bp_pairs = pairs;
             self.narrow_bufs = narrow_bufs;
@@ -3696,18 +3749,19 @@ fn narrow_participants(pool: &crate::threads::Pool, pairs: usize) -> usize {
 }
 
 /// 참여자별 버퍼를 **wake 폐쇄 전에** 확보한다(실패는 상태 변경 없이 ResourceLimit).
+/// `caps[w] = (제약 상한, 페어 상한)`.
 fn reserve_narrow_bufs(
     bufs: &mut Vec<NarrowOut>,
     n_par: usize,
-    chunk_cap: usize,
+    caps: &[(usize, usize)],
 ) -> Result<(), ApiError> {
     if bufs.len() < n_par {
         bufs.try_reserve(n_par - bufs.len())
             .map_err(|_| ApiError::ResourceLimit)?;
         bufs.resize_with(n_par, NarrowOut::default);
     }
-    for b in bufs[..n_par].iter_mut() {
-        b.reserve(chunk_cap)?;
+    for (b, &(c_cap, p_cap)) in bufs[..n_par].iter_mut().zip(caps) {
+        b.reserve(c_cap, p_cap)?;
     }
     Ok(())
 }
@@ -3746,6 +3800,16 @@ pub(crate) struct NarrowOut {
 }
 
 impl NarrowOut {
+    /// 테스트 전용 — 예약이 실제로 목표 용량에 닿았는지 본다.
+    #[cfg(test)]
+    pub(crate) fn capacities(&self) -> (usize, usize, usize) {
+        (
+            self.constraints.capacity(),
+            self.keys.capacity(),
+            self.live.capacity(),
+        )
+    }
+
     fn reset(&mut self) {
         self.constraints.clear();
         self.keys.clear();
@@ -3756,15 +3820,22 @@ impl NarrowOut {
         self.bail = false;
     }
 
-    fn reserve(&mut self, pairs: usize) -> Result<(), ApiError> {
+    /// `constraints`/`keys`는 제약 수, `live`는 페어 수 상한으로 잡는다.
+    ///
+    /// **`try_reserve`의 인자는 목표 용량이 아니라 `len`에 더할 여분이다** — 목표에서
+    /// `capacity`를 빼서 넘기면, 비워진(len=0) 버퍼가 목표보다 작은 용량으로도 요청을
+    /// "이미 충분"으로 통과시킨다(교차검수 rev_518b072b MAJOR: len=0·cap=150에 목표 200이면
+    /// `try_reserve(50)`이 그냥 성공하고 151번째 push에서 wake 뒤 재할당이 난다).
+    /// 그래서 **`len`을 뺀다**.
+    pub(crate) fn reserve(&mut self, constraints: usize, pairs: usize) -> Result<(), ApiError> {
         self.constraints
-            .try_reserve(pairs.saturating_sub(self.constraints.capacity()))
+            .try_reserve(constraints.saturating_sub(self.constraints.len()))
             .map_err(|_| ApiError::ResourceLimit)?;
         self.keys
-            .try_reserve(pairs.saturating_sub(self.keys.capacity()))
+            .try_reserve(constraints.saturating_sub(self.keys.len()))
             .map_err(|_| ApiError::ResourceLimit)?;
         self.live
-            .try_reserve(pairs.saturating_sub(self.live.capacity()))
+            .try_reserve(pairs.saturating_sub(self.live.len()))
             .map_err(|_| ApiError::ResourceLimit)?;
         Ok(())
     }

@@ -22,6 +22,15 @@
 //! 컴파일 타임에 참여자 1명짜리 직렬 경로로 강등한다. 설계 §5의 "단일스레드 완전 동작"이
 //! 폴백이 아니라 1급 경로라는 계약이 여기서 지켜진다.
 
+/// 설계·스크래치 회계가 지원하는 **최대 참여자 수**(메인 포함).
+///
+/// 설계 §5가 "4–8워커가 최적점"(Jolt 실측: 네이티브도 16코어+에서 정체·역행)이라 상한이
+/// 있고, 그보다 중요한 이유는 **가용 코어를 넘기면 스핀 설계가 무너진다**는 것이다
+/// (4코어에 5참여자 실측: dispatch 5ms·배리어 4ms — 정상의 수백 배). 호스트가
+/// `set_threads`로 더 큰 값을 줘도 여기서 자른다. 자른 사실은 `World::threads()`로
+/// 관측된다(설계 §6.3 조용한 폴백 금지 — 값을 숨기지 않고 보고한다).
+pub const MAX_THREADS: usize = 8;
+
 /// 잡 안에서 참여자 하나가 보는 컨텍스트.
 pub struct Ctx {
     index: usize,
@@ -168,7 +177,7 @@ mod imp {
         /// (설계 §6.3 "조용한 폴백 금지").
         pub fn new(threads: usize) -> Self {
             Pool {
-                want: threads.max(1),
+                want: threads.clamp(1, super::MAX_THREADS),
                 imp: std::sync::OnceLock::new(),
             }
         }
@@ -497,7 +506,7 @@ pub fn default_threads() -> usize {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .clamp(1, 8)
+            .clamp(1, MAX_THREADS)
     }
 }
 
