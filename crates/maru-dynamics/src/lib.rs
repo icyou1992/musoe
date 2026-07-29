@@ -2414,6 +2414,237 @@ mod tests {
         }
     }
 
+    // ===== M4: 하이트필드 (설계 §4.2) =====
+
+    fn hf_pose() -> maru_collide::Pose {
+        pose(0.0, 0.0, 0.0)
+    }
+
+    /// 평평한 하이트필드 위에 떨어뜨린 구는 **표면에 정착한다** — 지형 접촉의 기본.
+    #[test]
+    fn sphere_settles_on_a_flat_heightfield() {
+        let mut w = World::new(WorldParams::default());
+        let heights = vec![0.0f32; 9 * 9];
+        w.try_add_heightfield(&heights, 9, 9, 1.0, hf_pose())
+            .expect("지형 추가");
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(4.0, 3.0, 4.0),
+            1.0,
+        ));
+        for _ in 0..300 {
+            w.step(DT);
+        }
+        let b = w.body(h);
+        assert!(
+            (b.pose().pos.y - 0.5).abs() < 0.02,
+            "표면(0)+반지름(0.5)에 정착해야 한다: y={}",
+            b.pose().pos.y
+        );
+        assert!(b.linvel().length() < 0.05, "정착 속도 {:?}", b.linvel());
+    }
+
+    /// 격자 위를 굴러가는 구가 셀 경계를 지나도 **뚫거나 튀지 않는다** (거동 회귀).
+    ///
+    /// 내부 에지 억제 자체의 증거는 여기가 아니라
+    /// `maru_collide::manifold::heightfield_contact_tests::welding_snaps_seam_contact_normal_to_the_face`
+    /// 에 있다 — 평평한 격자(두께 0)에서는 에지 법선이 이미 면 법선과 같아서 용접을 꺼도
+    /// 이 테스트가 통과한다(확인함). 여기서 재는 것은 "이음매를 지나도 정상"이다.
+    #[test]
+    fn sphere_slides_across_heightfield_seams_without_kick() {
+        let mut w = World::new(WorldParams::default());
+        let heights = vec![0.0f32; 13 * 5];
+        w.try_add_heightfield(&heights, 13, 5, 1.0, hf_pose())
+            .expect("지형");
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(1.0, 0.5, 2.0),
+            1.0,
+        ));
+        w.set_linear_velocity(h, Vec3::new(4.0, 0.0, 0.0))
+            .expect("속도");
+        let mut max_y = f32::NEG_INFINITY;
+        let mut min_y = f32::INFINITY;
+        for _ in 0..120 {
+            w.step(DT);
+            let y = w.body(h).pose().pos.y;
+            max_y = max_y.max(y);
+            min_y = min_y.min(y);
+            // 굴러가는 동안 계속 지형 위에 있어야 한다
+            assert!(y > 0.3, "지형을 뚫었다: y={y}");
+        }
+        assert!(
+            max_y - min_y < 0.05,
+            "이음매에서 튀었다: y 범위 {min_y}..{max_y} (내부 에지 억제 실패)"
+        );
+        assert!(
+            w.body(h).pose().pos.x > 4.0,
+            "굴러가지 못했다: x={}",
+            w.body(h).pose().pos.x
+        );
+    }
+
+    /// 경사면에서는 미끄러져 내려가고, 능선(절벽)은 **용접하지 않아** 벽으로 작동한다.
+    #[test]
+    fn heightfield_slope_and_cliff_behave_differently() {
+        let mut w = World::new(WorldParams::default());
+        // z가 커질수록 높아지는 완만한 경사 + 마지막 줄은 절벽
+        let (nx, nz) = (9u32, 9u32);
+        let mut heights = vec![0.0f32; (nx * nz) as usize];
+        for iz in 0..nz {
+            for ix in 0..nx {
+                heights[(iz * nx + ix) as usize] = if iz >= 7 { 4.0 } else { iz as f32 * 0.1 };
+            }
+        }
+        w.try_add_heightfield(&heights, nx, nz, 1.0, hf_pose())
+            .expect("지형");
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.4 },
+            pose(4.0, 2.0, 5.5),
+            1.0,
+        ));
+        w.set_linear_velocity(h, Vec3::new(0.0, 0.0, 6.0))
+            .expect("속도");
+        let mut max_z = f32::NEG_INFINITY;
+        for _ in 0..240 {
+            w.step(DT);
+            let p = w.body(h).pose().pos;
+            assert!(p.y.is_finite(), "발산했다: {p:?}");
+            max_z = max_z.max(p.z);
+            // 격자 안에 있는 동안에는 표면 위에 있어야 한다(뚫리지 않는다).
+            let inside = (0.4..7.6).contains(&p.x) && (0.4..6.6).contains(&p.z);
+            if inside {
+                let surf = if p.z >= 7.0 {
+                    4.0
+                } else {
+                    (p.z * 0.1).max(0.0)
+                };
+                assert!(p.y > surf - 0.15, "지형을 뚫었다: p={p:?} surface≈{surf}");
+            }
+        }
+        // 절벽(z≥7 줄, 높이 4m)을 그냥 통과하면 안 된다 — 격자 밖으로 나가 떨어지는 것은
+        // 유한 지형의 정상 거동이므로 최종 위치가 아니라 **최대 z**로 판정한다.
+        assert!(max_z < 7.3, "절벽을 뚫고 지나갔다: max_z={max_z}");
+    }
+
+    /// 레이가 지형 표면을 맞히고, 지형에 묻힌 점은 `query_point`가 찾는다.
+    #[test]
+    fn heightfield_supports_ray_and_point_queries() {
+        let mut w = World::new(WorldParams::default());
+        let mut heights = vec![0.0f32; 5 * 5];
+        heights[12] = 2.0; // 가운데 정점
+        let hf = w
+            .try_add_heightfield(&heights, 5, 5, 1.0, hf_pose())
+            .expect("지형");
+        let hit = w
+            .cast_ray(Vec3::new(2.0, 5.0, 2.0), Vec3::new(0.0, -1.0, 0.0), 100.0)
+            .expect("질의 성공")
+            .expect("표면을 맞혀야 한다");
+        assert_eq!(hit.body, hf);
+        assert!((hit.toi - 3.0).abs() < 1e-2, "toi={}", hit.toi);
+        // 봉우리 정점을 정통으로 맞히면 법선은 이웃 삼각형의 **기울어진** 법선이다.
+        // 위를 향하기만 하면 된다 — 평평한 곳의 법선은 아래에서 따로 본다.
+        assert!(hit.normal.y > 0.3, "법선이 위를 안 본다: {:?}", hit.normal);
+        let flat = w
+            .cast_ray(Vec3::new(0.5, 5.0, 0.5), Vec3::new(0.0, -1.0, 0.0), 100.0)
+            .expect("질의 성공")
+            .expect("평평한 곳도 맞아야 한다");
+        assert!(flat.normal.y > 0.99, "평면 법선 {:?}", flat.normal);
+        // 표면 아래 점은 지형 안이다(속이 찬 것으로 본다)
+        let mut out = Vec::new();
+        w.query_point(Vec3::new(1.0, -1.0, 1.0), &mut out)
+            .expect("질의");
+        assert!(out.contains(&hf), "표면 아래 점이 지형 안으로 안 잡혔다");
+        out.clear();
+        w.query_point(Vec3::new(1.0, 5.0, 1.0), &mut out)
+            .expect("질의");
+        assert!(!out.contains(&hf), "표면 위 점이 지형 안으로 잡혔다");
+    }
+
+    /// **CCD가 지형을 뚫지 않는다** — 총알 속도로 쏜 구가 격자에서 멈춘다.
+    #[test]
+    fn ccd_bullet_does_not_tunnel_through_heightfield() {
+        let mut w = World::new(WorldParams::default());
+        let heights = vec![0.0f32; 9 * 9];
+        w.try_add_heightfield(&heights, 9, 9, 1.0, hf_pose())
+            .expect("지형");
+        let b =
+            Body::new_dynamic(Shape::Sphere { radius: 0.1 }, pose(4.0, 6.0, 4.0), 1.0).with_ccd();
+        let h = w.add_body(b);
+        w.set_linear_velocity(h, Vec3::new(0.0, -400.0, 0.0))
+            .expect("속도");
+        for _ in 0..20 {
+            w.step(DT);
+        }
+        let y = w.body(h).pose().pos.y;
+        assert!(y > -0.5, "지형을 관통했다: y={y}");
+    }
+
+    /// 하이트필드는 **static 전용**이고 스냅샷 왕복에서 살아남는다.
+    #[test]
+    fn heightfield_is_static_only_and_survives_snapshot() {
+        let mut w = World::new(WorldParams::default());
+        let mut heights = vec![0.0f32; 6 * 6];
+        heights[7] = 1.5;
+        let hf = w
+            .try_add_heightfield(&heights, 6, 6, 1.0, hf_pose())
+            .expect("지형");
+        let ball = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(2.5, 2.0, 2.5),
+            1.0,
+        ));
+        for _ in 0..60 {
+            w.step(DT);
+        }
+        let snap = w.snapshot();
+        let hash = w.state_hash();
+        let mut w2 = World::new(WorldParams::default());
+        w2.restore(&snap).expect("복원");
+        assert_eq!(w2.state_hash(), hash, "복원 해시 불일치");
+        // 복원된 월드가 같은 궤적을 낸다
+        for _ in 0..60 {
+            w.step(DT);
+            w2.step(DT);
+        }
+        assert_eq!(w.state_hash(), w2.state_hash(), "복원 후 궤적이 갈렸다");
+        assert!(w.is_alive(hf) && w.is_alive(ball));
+    }
+
+    /// dynamic 하이트필드는 **만들 수조차 없다** — 질량 경로가 없어 생성이 거부한다.
+    /// (복원 경계도 같은 정책이다: `validate_structure`가 static이 아닌 하이트필드를 거부.)
+    #[test]
+    #[should_panic(expected = "dynamic shape must have finite positive mass")]
+    fn dynamic_heightfield_is_rejected_at_construction() {
+        let _ = Body::new_dynamic(
+            Shape::Heightfield {
+                heights: vec![0.0; 4],
+                nx: 2,
+                nz: 2,
+                cell: 1.0,
+            },
+            hf_pose(),
+            1.0,
+        );
+    }
+
+    /// 잘못된 격자는 **오류로** 거부된다(패닉이 아니라).
+    #[test]
+    fn malformed_heightfields_are_rejected_as_errors() {
+        let mut w = World::new(WorldParams::default());
+        let cases: Vec<(&str, Vec<f32>, u32, u32, f32)> = vec![
+            ("샘플 수 불일치", vec![0.0; 8], 3, 3, 1.0),
+            ("너무 작은 격자", vec![0.0; 1], 1, 1, 1.0),
+            ("셀 크기 0", vec![0.0; 4], 2, 2, 0.0),
+            ("NaN 높이", vec![f32::NAN; 4], 2, 2, 1.0),
+            ("무한 높이", vec![f32::INFINITY; 4], 2, 2, 1.0),
+        ];
+        for (name, heights, nx, nz, cell) in cases {
+            let r = w.try_add_heightfield(&heights, nx, nz, cell, hf_pose());
+            assert!(r.is_err(), "{name}가 통과했다");
+        }
+    }
+
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
     /// `cargo test --release -p maru-dynamics -- --ignored`
     #[test]

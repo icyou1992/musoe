@@ -292,6 +292,39 @@ pub fn shape_cast_dispatch(
                 }
             }
         }
+        // 하이트필드가 대상이면 스윕 봉투가 덮는 셀만 삼각형으로 펼친다.
+        // CCD의 유일한 대상이 static이므로(설계 §4 linear cast) 이 경로가 지형 관통을 막는다.
+        (_, Shape::Heightfield { .. }) => {
+            let hf = sb.heightfield_ref().expect("Heightfield 변종");
+            let a0 = crate::transformed_aabb(sa.local_aabb(), pa);
+            let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
+            let expanded = crate::Aabb::new(
+                sweep.min - Vec3::new(skin, skin, skin),
+                sweep.max + Vec3::new(skin, skin, skin),
+            );
+            let local = crate::heightfield::world_aabb_to_local(expanded, pb);
+            let (cx0, cz0, cx1, cz1) = hf.cell_range(local)?;
+            let mut cells = 0usize;
+            for cz in cz0..=cz1 {
+                for cx in cx0..=cx1 {
+                    cells += 1;
+                    if cells > crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
+                        // 상한 도달 — 여기까지의 최선을 돌려준다(보수적: 더 이른 히트가
+                        // 남아 있을 수 있으나 늦은 히트를 지어내지는 않는다).
+                        return best;
+                    }
+                    for t in 0..2u8 {
+                        let tri = Shape::Triangle {
+                            points: hf.triangle(cx, cz, t),
+                            radius: 0.0,
+                        };
+                        if let Some(h) = shape_cast(sa, pa, motion, &tri, pb, skin) {
+                            consider(h);
+                        }
+                    }
+                }
+            }
+        }
         _ => return shape_cast(sa, pa, motion, sb, pb, skin),
     }
     best

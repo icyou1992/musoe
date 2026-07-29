@@ -51,6 +51,23 @@ pub fn cast_ray(
             }
         }
         Shape::Hull { .. } => ray_convex_ca(shape, o, d, max_toi),
+        Shape::Triangle { points, .. } => crate::heightfield::ray_triangle(o, d, points, max_toi)
+            .map(|(toi, n)| Local {
+                toi,
+                normal: n,
+                started_inside: false,
+            }),
+        // 하이트필드: 격자 DDA — 지나는 셀만 삼각형으로 시험한다.
+        Shape::Heightfield { .. } => {
+            let hf = shape.heightfield_ref().expect("Heightfield 변종");
+            crate::heightfield::ray_heightfield(&hf, o, d, max_toi).map(|(toi, n)| Local {
+                toi,
+                normal: n,
+                // 지형은 표면이다 — "안에서 시작"은 표면 아래를 뜻하고, 그건 아래
+                // `contains_point`가 판정한다. 레이 자체는 면을 뚫는 순간을 보고한다.
+                started_inside: false,
+            })
+        }
         // 복합: 자식별 최소 TOI. 동률은 앞선 자식(낮은 인덱스) — 결정론.
         Shape::Compound { ref children } => {
             let mut best: Option<Local> = None;
@@ -103,6 +120,17 @@ pub fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
         Shape::Hull { .. } => {
             // 코어까지의 거리가 radius 이하인가 — support 기반 최근접점으로 판정한다.
             closest_core_dist(shape, local).0 <= r
+        }
+        // 삼각형은 부피가 없다 — radius가 있을 때만 코어까지 거리로 판정(hull과 같은 경로).
+        Shape::Triangle { .. } => r > 0.0 && closest_core_dist(shape, local).0 <= r,
+        // 하이트필드는 **표면 아래를 속이 찬 것으로** 본다(Jolt 동형): 격자 범위 안이고
+        // 보간 높이 아래면 포함이다. 그래야 `query_point`가 지형에 묻힌 물체를 찾는다.
+        Shape::Heightfield { .. } => {
+            let hf = shape.heightfield_ref().expect("Heightfield 변종");
+            match hf.height_at(local.x, local.z) {
+                Some(h) => local.y <= h,
+                None => false,
+            }
         }
         // 복합: 어느 자식이든 포함하면 포함.
         Shape::Compound { ref children } => children.iter().any(|(cp, child)| {

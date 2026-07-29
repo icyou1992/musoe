@@ -28,6 +28,22 @@ pub enum Shape {
     /// 디스패치한다(`support_core`가 unreachable로 잠근다). 중첩 금지·자식 1..=8은
     /// validate가 강제한다. 질량 생성 시 COM 재중심화+주축 베이킹은 body 계층 소관.
     Compound { children: Vec<(Pose, Shape)> },
+    /// **격자 하이트필드** (설계 §4.2). 볼록이 아니다 — compound와 같은 계약으로
+    /// 모든 진입점이 삼각형으로 디스패치하고 `support_core`는 unreachable이다.
+    /// static 전용(월드가 강제): 질량·관성 계산 경로가 없다.
+    /// 로컬 좌표는 `x = ix·cell`, `z = iz·cell`, 높이는 `heights[iz·nx + ix]`.
+    Heightfield {
+        heights: Vec<f32>,
+        nx: u32,
+        nz: u32,
+        cell: f32,
+    },
+    /// **내부 전용 삼각형** — 하이트필드/메시가 접촉 순간에 펼치는 임시 셰이프다.
+    ///
+    /// 호스트가 만들 수 없다(`validate`가 거부하고 스냅샷도 쓰지 않는다): 스텝마다
+    /// 수십 개가 생기는데 `Hull`로 만들면 삼각형마다 `Vec` 하나를 힙에 잡아
+    /// "스텝 중 할당 0" 규율이 깨지기 때문이다. 배열이라 스택에 산다.
+    Triangle { points: [Vec3; 3], radius: f32 },
 }
 
 /// 점 집합의 **회전 불변** 최소 폭 **하한 추정**.
@@ -185,6 +201,39 @@ impl Shape {
                     }
                 }
             }
+            Shape::Heightfield {
+                heights,
+                nx,
+                nz,
+                cell,
+            } => {
+                if *nx < 2 || *nz < 2 {
+                    return Err("heightfield must be at least 2x2 samples");
+                }
+                let n = (*nx as usize).saturating_mul(*nz as usize);
+                if n != heights.len() {
+                    return Err("heightfield sample count must equal nx*nz");
+                }
+                if n > crate::heightfield::MAX_HEIGHTFIELD_SAMPLES {
+                    return Err("heightfield sample count exceeds MAX_HEIGHTFIELD_SAMPLES");
+                }
+                if !extent_in_range(*cell) || *cell < MIN_SHAPE_EXTENT {
+                    return Err("heightfield cell size must be within extent range");
+                }
+                // 격자 전체 폭도 범위 안이어야 한다 — 셀은 작아도 개수가 크면 넘는다.
+                if !extent_in_range((*nx - 1) as f32 * *cell)
+                    || !extent_in_range((*nz - 1) as f32 * *cell)
+                {
+                    return Err("heightfield extent exceeds MAX_SHAPE_EXTENT");
+                }
+                if !heights.iter().all(|h| extent_in_range(*h)) {
+                    return Err("heightfield heights must be finite and within extent range");
+                }
+            }
+            Shape::Triangle { .. } => {
+                // 내부 전용 — 호스트 입력 경계에서는 언제나 거부한다.
+                return Err("triangle is an internal shape and cannot be added to a world");
+            }
             Shape::Hull { points, .. } => {
                 if points.is_empty() {
                     return Err("hull must contain at least one point");
@@ -217,9 +266,12 @@ impl Shape {
             Shape::Sphere { radius }
             | Shape::Capsule { radius, .. }
             | Shape::Box { radius, .. }
-            | Shape::Hull { radius, .. } => radius,
-            // 복합은 볼록 질의 대상이 아니다 — radius는 convex 경로 전용 개념.
-            Shape::Compound { .. } => 0.0,
+            | Shape::Hull { radius, .. }
+            | Shape::Triangle { radius, .. } => radius,
+            // 복합·하이트필드는 볼록 질의 대상이 아니다 — radius는 convex 경로 전용 개념.
+            // 하이트필드 삼각형은 두께 0으로 펼친다(Jolt 동형): 둥근 삼각형은 레이·캐스트
+            // 해가 근사가 되는데, 지형에서 그 근사를 감수할 이유가 없다.
+            Shape::Compound { .. } | Shape::Heightfield { .. } => 0.0,
         }
     }
 
@@ -239,6 +291,14 @@ impl Shape {
             Shape::Compound { children } => children.iter().fold(0.0f32, |m, (cp, cs)| {
                 m.max(cp.pos.length() + cs.bounding_radius())
             }),
+            Shape::Triangle { points, radius } => {
+                points.iter().fold(0.0f32, |m, p| m.max(p.length())) + radius
+            }
+            Shape::Heightfield { .. } => {
+                // 원점(격자 모서리)에서 가장 먼 표면점 — 로컬 AABB 코너로 상한을 잡는다.
+                let a = self.local_aabb();
+                a.min.length().max(a.max.length())
+            }
         }
     }
 
@@ -251,6 +311,12 @@ impl Shape {
     pub fn angular_sweep_radius(&self, axis: Vec3) -> f32 {
         let perp = |p: Vec3| (p - axis * p.dot(axis)).length();
         match self {
+            // 하이트필드는 캐스트의 **대상**이지 주체가 아니다(static 전용) — 그래도
+            // 계약을 만족시키려 외접 반지름으로 상한을 준다(보수적).
+            Shape::Heightfield { .. } => self.bounding_radius(),
+            Shape::Triangle { points, radius } => {
+                points.iter().fold(0.0f32, |m, p| m.max(perp(*p))) + radius
+            }
             Shape::Sphere { .. } => 0.0,
             Shape::Capsule { half_height, .. } => perp(Vec3::new(0.0, *half_height, 0.0)),
             Shape::Box { half, radius } => {
@@ -302,8 +368,22 @@ impl Shape {
                     if d.z >= 0.0 { c.z } else { -c.z },
                 )
             }
-            Shape::Compound { .. } => {
-                unreachable!("compound is not convex — dispatch to children before GJK/support")
+            Shape::Compound { .. } | Shape::Heightfield { .. } => {
+                unreachable!("non-convex shape — dispatch to children/triangles before GJK/support")
+            }
+            Shape::Triangle { points, radius } => {
+                // 코어 = 삼각형 자체(이미 radius만큼 얇아진 것으로 본다). 동률은 낮은 인덱스.
+                let _ = radius;
+                let mut best = points[0];
+                let mut best_d = best.dot(d);
+                for p in &points[1..] {
+                    let pd = p.dot(d);
+                    if pd > best_d {
+                        best_d = pd;
+                        best = *p;
+                    }
+                }
+                best
             }
             Shape::Hull { points, .. } => {
                 // 선형 스캔 (v1 — hill climbing은 벤치 증명 시 도입). 동률은 낮은 인덱스 우선(결정론).
@@ -321,6 +401,25 @@ impl Shape {
         }
     }
 
+    /// 하이트필드 뷰 — 격자 계산의 단일 진입점(다른 변종이면 `None`).
+    pub fn heightfield_ref(&self) -> Option<crate::HeightfieldRef<'_>> {
+        match self {
+            Shape::Heightfield {
+                heights,
+                nx,
+                nz,
+                cell,
+            } => Some(crate::HeightfieldRef {
+                heights,
+                nx: *nx,
+                nz: *nz,
+                cell: *cell,
+                radius: 0.0,
+            }),
+            _ => None,
+        }
+    }
+
     /// 겉면 기준 로컬 AABB (코어 + radius 재팽창 포함).
     pub fn local_aabb(&self) -> Aabb {
         let r = self.radius();
@@ -330,6 +429,20 @@ impl Shape {
                 Aabb::from_center(Vec3::ZERO, Vec3::new(r, half_height + r, r))
             }
             Shape::Box { half, .. } => Aabb::from_center(Vec3::ZERO, *half),
+            Shape::Heightfield { .. } => self
+                .heightfield_ref()
+                .expect("Heightfield 변종")
+                .local_aabb(),
+            Shape::Triangle { points, .. } => {
+                let e = Vec3::new(r, r, r);
+                let mut lo = points[0];
+                let mut hi = points[0];
+                for p in &points[1..] {
+                    lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                    hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+                }
+                Aabb::new(lo - e, hi + e)
+            }
             Shape::Compound { children } => {
                 let mut acc: Option<Aabb> = None;
                 for (pose, child) in children {

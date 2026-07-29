@@ -115,6 +115,12 @@ pub const FEATURE_CHILD_MASK: u32 = 0x7F << FEATURE_CHILD_SHIFT;
 
 impl Manifold {
     /// 자식쌍 키를 전 접점 feature에 접는다. 비복합 경로는 호출하지 않는다(key 0 예약).
+    /// A/B 역할을 뒤집는다 — 법선 방향 계약(“A를 +normal로 밀면 분리”)을 지키려면
+    /// 법선을 뒤집는 것으로 충분하다(접점 위치·침투는 대칭이다).
+    pub fn flip(&mut self) {
+        self.normal = -self.normal;
+    }
+
     pub fn namespace_features(&mut self, key: u32) {
         debug_assert!((1..=64).contains(&key), "자식쌍 키는 1..=64");
         for i in 0..self.count as usize {
@@ -138,6 +144,117 @@ pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) ->
     found
 }
 
+/// 하이트필드 접촉 — 겹치는 셀만 삼각형으로 펼친다.
+///
+/// `flip`이면 A/B 역할이 원래와 반대라 매니폴드 법선·접점 소유를 되돌린다.
+/// 반환 = 상한(`MAX_HEIGHTFIELD_MANIFOLDS`)에서 끊었는가.
+///
+/// **feature ID는 전부 generic으로 덮는다.** 클리핑이 삼각형마다 부여하는 ID는 삼각형이
+/// 다르면 같은 값이 나올 수 있어(같은 페어 안에서 충돌) warm start가 남의 임펄스를
+/// 물려받는다. generic은 위치 근접으로 매칭되므로 삼각형이 달라도 옳게 갈린다 —
+/// 계보 대신 위치를 쓰는 대가는 슬라이딩 시 계승률 하락뿐이다.
+fn heightfield_contacts(
+    sa: &Shape,
+    pa: &Pose,
+    hf_shape: &Shape,
+    hf_pose: &Pose,
+    margin: f32,
+    flip: bool,
+    f: &mut dyn FnMut(u8, u8, Manifold),
+) -> bool {
+    let hf = hf_shape.heightfield_ref().expect("Heightfield 변종");
+    // 볼록 쪽 월드 AABB를 격자 로컬로 옮겨 셀 범위를 얻는다(margin만큼 넓힌다).
+    let mut world = crate::transformed_aabb(sa.local_aabb(), pa);
+    #[allow(unused_assignments)]
+    let pad = Vec3::new(margin, margin, margin);
+    world = crate::Aabb::new(world.min - pad, world.max + pad);
+    let local = crate::heightfield::world_aabb_to_local(world, hf_pose);
+    let Some((cx0, cz0, cx1, cz1)) = hf.cell_range(local) else {
+        return false;
+    };
+    let mut emitted = 0usize;
+    // 복합 자식도 함께 펼친다 — 자식 키는 그대로 콜백에 넘겨 네임스페이싱을 유지한다.
+    let children: &[(Pose, Shape)] = match sa {
+        Shape::Compound { children } => children,
+        _ => &[],
+    };
+    for cz in cz0..=cz1 {
+        for cx in cx0..=cx1 {
+            for t in 0..2u8 {
+                let tri_local = hf.triangle(cx, cz, t);
+                let tri_shape = Shape::Triangle {
+                    points: tri_local,
+                    radius: 0.0,
+                };
+                let mask = hf.weld_mask(cx, cz, t);
+                let mut emit = |ci: u8, cs: &Shape, cp: &Pose| -> bool {
+                    let Some(mut m) = contact(cs, cp, &tri_shape, hf_pose, margin) else {
+                        return false;
+                    };
+                    if m.is_empty() {
+                        return false;
+                    }
+                    // 내부 에지 억제 — 월드 좌표 삼각형이 필요하다.
+                    if mask != 0 {
+                        let tw = [
+                            hf_pose.pos + hf_pose.rot.rotate(tri_local[0]),
+                            hf_pose.pos + hf_pose.rot.rotate(tri_local[1]),
+                            hf_pose.pos + hf_pose.rot.rotate(tri_local[2]),
+                        ];
+                        // 밴드 폭 = **접촉 허용오차 + 침투 깊이**.
+                        //
+                        // 하이트필드 삼각형은 두께가 0이라 radius를 밴드로 쓸 수 없다(지형
+                        // 등록부는 삼각형 radius가 그 역할을 했다). 그리고 접점은 에지에서
+                        // 정확히 0만큼 떨어져 있지 않다 — 깊이 파고들수록 최근접점이 에지에서
+                        // 멀어진다(실측: 18cm 침투에서 5cm). 침투를 밴드에 넣지 않으면
+                        // **정작 유령 에지가 세게 차는 깊은 침투에서만 용접이 꺼진다**.
+                        let pen = m.points().iter().fold(0.0f32, |a, p| a.max(-p.separation));
+                        crate::weld_internal_edges(&mut m, tw, margin + pen.max(0.0), mask);
+                    }
+                    for i in 0..m.count as usize {
+                        m.points[i].feature = FeatureId(FEATURE_GENERIC);
+                    }
+                    if flip {
+                        m.flip();
+                    }
+                    if flip {
+                        f(0, ci, m);
+                    } else {
+                        f(ci, 0, m);
+                    }
+                    true
+                };
+                let hit = if children.is_empty() {
+                    emit(0, sa, pa)
+                } else {
+                    let mut any = false;
+                    for (i, (cp, cs)) in children.iter().enumerate() {
+                        let wp = Pose {
+                            pos: pa.pos + pa.rot.rotate(cp.pos),
+                            rot: pa.rot * cp.rot,
+                        };
+                        if emit(i as u8, cs, &wp) {
+                            any = true;
+                            emitted += 1;
+                            if emitted >= crate::MAX_HEIGHTFIELD_MANIFOLDS {
+                                return true;
+                            }
+                        }
+                    }
+                    any
+                };
+                if children.is_empty() && hit {
+                    emitted += 1;
+                    if emitted >= crate::MAX_HEIGHTFIELD_MANIFOLDS {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// 접촉 디스패처 — compound를 자식으로 펼쳐 자식쌍마다 매니폴드를 콜백에 준다.
 /// 비복합 쌍은 (0,0) 키로 1회. 자식 순서는 목록 순 — 결정적. 콜백이 받은 매니폴드의
 /// feature 네임스페이싱(자식쌍 키 접기)은 **호출자 책임**이다(키 조립 규약이 호출자에 있다).
@@ -148,11 +265,20 @@ pub fn for_each_contact(
     pb: &Pose,
     margin: f32,
     f: &mut dyn FnMut(u8, u8, Manifold),
-) {
+) -> bool {
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
         rot: parent.rot * child.rot,
     };
+    // 하이트필드는 바디 하나가 삼각형 수천 개다 — 겹치는 셀만 펼치고 **상한에서 끊는다**.
+    // 끊었다는 사실은 반환값으로 나간다(조용한 누락 금지 — 호출자가 진단에 싣는다).
+    if matches!(sb, Shape::Heightfield { .. }) {
+        return heightfield_contacts(sa, pa, sb, pb, margin, false, f);
+    }
+    if matches!(sa, Shape::Heightfield { .. }) {
+        // 하이트필드가 A쪽인 경우(질의 경로) — 역할을 바꿔 풀고 매니폴드를 뒤집는다.
+        return heightfield_contacts(sb, pb, sa, pa, margin, true, f);
+    }
     match (sa, sb) {
         (Shape::Compound { children: ca }, Shape::Compound { children: cb }) => {
             for (i, (cpa, csa)) in ca.iter().enumerate() {
@@ -184,6 +310,7 @@ pub fn for_each_contact(
             }
         }
     }
+    false
 }
 
 pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<Manifold> {
@@ -1081,6 +1208,82 @@ mod weld_tests {
             "용접 후 면 법선이어야 한다 (n={:?})",
             m.normal
         );
+    }
+}
+
+#[cfg(test)]
+mod heightfield_contact_tests {
+    use super::*;
+    use maru_math::Quat;
+
+    fn pose(x: f32, y: f32, z: f32) -> Pose {
+        Pose {
+            pos: Vec3::new(x, y, z),
+            rot: Quat::IDENTITY,
+        }
+    }
+
+    /// **내부 에지 억제의 직접 증거**: 셀 경계 바로 위에 놓인 구의 접촉 법선이
+    /// 에지 법선이 아니라 **면 법선**이어야 한다.
+    ///
+    /// 완만한 경사(≈4°, 용접 원뿔 안)를 주면 에지에서의 최근접 방향이 두 면 법선 어느
+    /// 쪽과도 다르다 — 용접이 없으면 구가 이음매를 지날 때마다 그 방향으로 차인다.
+    /// 용접을 끄면(mask=0) 이 테스트가 실패하는 것으로 기제를 잠근다.
+    #[test]
+    fn welding_snaps_seam_contact_normal_to_the_face() {
+        // z 방향으로 셀마다 7cm 오르는 격자(1m 셀 → ≈4°)
+        let (nx, nz) = (4u32, 4u32);
+        let mut heights = vec![0.0f32; (nx * nz) as usize];
+        for iz in 0..nz {
+            for ix in 0..nx {
+                heights[(iz * nx + ix) as usize] = iz as f32 * 0.07;
+            }
+        }
+        let hf_shape = Shape::Heightfield {
+            heights,
+            nx,
+            nz,
+            cell: 1.0,
+        };
+        let hf = hf_shape.heightfield_ref().unwrap();
+        // 이음매(z=2)를 **넘어선 쪽**에 중심을 두고 살짝 파고들게 놓는다.
+        // 이러면 뒤 셀(1,1) 삼각형에서 최근접 특징이 **공유 에지**가 되고, 에지에서
+        // 중심으로 향하는 법선은 면 법선과 크게 어긋난다 — 용접이 잡아야 하는 바로 그 경우다.
+        // (구를 에지 바로 위에 얹으면 에지 법선이 이미 면 법선의 5° 원뿔 안이라 아무 일도
+        //  일어나지 않는다 — 그건 용접이 필요 없는 상황이다.)
+        let surf = hf.height_at(1.5, 2.15).unwrap();
+        let sphere = Shape::Sphere { radius: 0.3 };
+        let sp = pose(1.5, surf + 0.12, 2.15);
+
+        let mut normals = Vec::new();
+        for_each_contact(
+            &sphere,
+            &sp,
+            &hf_shape,
+            &pose(0.0, 0.0, 0.0),
+            0.02,
+            &mut |_, _, m| {
+                if !m.is_empty() {
+                    normals.push(m.normal);
+                }
+            },
+        );
+        assert!(
+            !normals.is_empty(),
+            "이음매에서 접촉이 없다 — 테스트가 공회전"
+        );
+        // 면 법선(두 이웃 삼각형 중 하나) 과 거의 같아야 한다.
+        let faces: Vec<Vec3> = [(1u32, 1u32, 1u8), (1, 2, 0)]
+            .iter()
+            .map(|&(cx, cz, t)| hf.triangle_normal(cx, cz, t).unwrap())
+            .collect();
+        for n in &normals {
+            let best = faces.iter().map(|f| f.dot(*n).abs()).fold(0.0f32, f32::max);
+            assert!(
+                best > 0.999,
+                "이음매 법선이 면 법선과 다르다(용접 실패): n={n:?} faces={faces:?}"
+            );
+        }
     }
 }
 

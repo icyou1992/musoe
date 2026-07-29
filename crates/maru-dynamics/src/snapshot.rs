@@ -45,7 +45,7 @@ const MAGIC: u32 = 0x4d41_5255; // "MARU"
 ///      바이트 형식은 그대로지만 **같은 바이트가 다른 값으로 복원된다**: 구 빌드가 저장한
 ///      주기-2 쿼터니언을 구 리더는 한 번 더 정규화하고 새 리더는 비트 그대로 둔다.
 ///      같은 버전 번호가 두 계약을 뜻하면 안 되므로 올린다(위 정책 그대로).
-const VERSION: u32 = 14;
+const VERSION: u32 = 15;
 
 /// 입력 자체의 상한. 정상 월드(3k 바디 ≈ 300KB)의 200배 이상 여유가 있으면서,
 /// 디코딩 증폭이 선형 메모리를 삼키지 못하게 한다.
@@ -77,6 +77,8 @@ mod min_bytes {
     pub const CACHE_ENTRY: usize = 4 + 4 + 8 + 12 + 12 + 12;
     /// hull 점 12 + (뒤따르는 반지름 4는 개수와 무관하므로 제외)
     pub const HULL_POINT: usize = 12;
+    /// 하이트필드 샘플: f32 하나.
+    pub const HEIGHT: usize = 4;
 }
 
 /// 디코딩 후 원소가 힙에서 차지하는 크기 — count 과금용.
@@ -99,6 +101,11 @@ mod decoded_size {
     pub fn cache_entry() -> usize {
         core::mem::size_of::<(maru_collide::FeatureId, crate::solver::CachedImpulse)>()
     }
+    /// 디코딩된 높이 한 칸(f32).
+    pub fn height() -> usize {
+        core::mem::size_of::<f32>()
+    }
+
     pub fn hull_point() -> usize {
         core::mem::size_of::<Vec3>()
     }
@@ -286,6 +293,27 @@ fn write_shape(w: &mut Writer, s: &Shape) {
             w.vec3(*half);
             w.f32(*radius);
         }
+        Shape::Heightfield {
+            heights,
+            nx,
+            nz,
+            cell,
+        } => {
+            w.u8(5);
+            w.u32(*nx);
+            w.u32(*nz);
+            w.f32(*cell);
+            // 개수는 nx·nz로 유도되지만 **명시로 쓴다** — 리더가 곱셈 오버플로를 만나기
+            // 전에 남은 바이트로 예산을 걸 수 있어야 한다(count 계약).
+            w.u32(heights.len() as u32);
+            for h in heights {
+                w.f32(*h);
+            }
+        }
+        Shape::Triangle { .. } => {
+            // 내부 전용 셰이프는 바디가 될 수 없다(validate가 거부) — 여기 오면 계약 위반.
+            unreachable!("triangle is an internal shape and is never serialized")
+        }
         Shape::Hull { points, radius } => {
             w.u8(3);
             w.u32(points.len() as u32);
@@ -328,6 +356,24 @@ fn read_shape(r: &mut Reader, allow_compound: bool) -> Result<Shape, SnapshotErr
             Shape::Hull {
                 points,
                 radius: r.f32()?,
+            }
+        }
+        5 => {
+            let nx = r.u32()?;
+            let nz = r.u32()?;
+            let cell = r.f32()?;
+            // 개수는 **입력 길이에서 유도된 예산**으로 묶는다 — nx·nz를 믿고 곱하면
+            // 12바이트 파일이 40억 칸을 주장할 수 있다(스냅샷 계약의 상시 규칙).
+            let n = r.count(min_bytes::HEIGHT, decoded_size::height())?;
+            let mut heights = try_vec(n)?;
+            for _ in 0..n {
+                heights.push(r.f32()?);
+            }
+            Shape::Heightfield {
+                heights,
+                nx,
+                nz,
+                cell,
             }
         }
         4 => {
@@ -703,6 +749,9 @@ fn shape_size(s: &Shape) -> usize {
         Shape::Capsule { .. } => 8,
         Shape::Box { .. } => 16,
         Shape::Hull { points, .. } => 4 + points.len() * 12 + 4,
+        // nx4 + nz4 + cell4 + count4 + 높이 4바이트씩
+        Shape::Heightfield { heights, .. } => 4 + 4 + 4 + 4 + heights.len() * 4,
+        Shape::Triangle { .. } => unreachable!("triangle is never serialized"),
         Shape::Compound { children } => {
             1 + children
                 .iter()
@@ -1120,6 +1169,14 @@ fn validate_structure(
         if asleep[i]
             && (bodies[i].linvel != maru_math::Vec3::ZERO
                 || bodies[i].angvel != maru_math::Vec3::ZERO)
+        {
+            return Err(SnapshotError::InconsistentState);
+        }
+        // **하이트필드는 static 전용**이다 — 질량·관성 경로가 없고(0을 돌려준다) 솔버가
+        // 임펄스를 주면 무한 가속이 된다. 라이브 생성이 이미 거부하므로 복원도 거부한다
+        // (입력 경계와 복원 경계의 정책 대칭 — 이 저장소가 네 번 재발로 배운 것).
+        if matches!(bodies[i].shape, maru_collide::Shape::Heightfield { .. })
+            && bodies[i].body_type != BodyType::Static
         {
             return Err(SnapshotError::InconsistentState);
         }

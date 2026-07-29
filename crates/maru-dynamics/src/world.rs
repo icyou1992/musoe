@@ -383,6 +383,10 @@ pub struct Diagnostics {
     /// 이번 스텝 내로우페이즈를 나눠 돈 참여자 수 (1 = 직렬. 설계 §6.3 "티어 강등은
     /// 리포트에 노출" — 스레드가 실제로 쓰였는지를 호스트가 관측할 수 있어야 한다).
     pub narrow_threads: usize,
+    /// 하이트필드 페어가 매니폴드 상한(`MAX_HEIGHTFIELD_MANIFOLDS`)에서 끊긴 횟수.
+    /// 0이 아니면 그 페어의 접촉 일부가 이번 스텝에서 빠졌다는 뜻이다 — 격자를 성기게
+    /// 하거나 바디를 작게 하라는 신호다(조용한 누락이 아니라 관측 가능한 포화).
+    pub heightfield_saturated: usize,
     /// 접촉 제약 그래프 컬러링이 쓴 색 수 = 솔브 패스당 배리어 수.
     pub colors: usize,
     /// 이번 스텝 솔브 패스를 나눠 돈 참여자 수 (1 = 직렬).
@@ -688,6 +692,46 @@ impl World {
     /// (에지 법선이 물리적으로 옳은 곳이다).
     ///
     /// 반환: 삼각형별 핸들. 퇴화 삼각형(validate 실패)은 `Err`로 전체 거부(부분 삽입 없음).
+    /// **격자 하이트필드 지형**을 static 바디 하나로 추가한다 (설계 §4.2, M4).
+    ///
+    /// `try_add_terrain`(삼각형마다 바디)과 달리 격자는 **바디 하나**다: 256×256이면
+    /// 13만 개 대신 1개고, 브로드페이즈 리프도 1개다. 어떤 삼각형이 겹치는지는
+    /// 내로우페이즈가 셀 좌표로 바로 구한다.
+    ///
+    /// 내부 에지 억제는 **격자 구조에서 유도**된다 — 이웃 삼각형이 좌표로 나오므로
+    /// 에지 사전이 필요 없고, 공면 판정 임계는 `try_add_terrain`과 같은 값이다
+    /// (같은 지형을 두 방식으로 만들어도 물리가 갈리지 않아야 한다).
+    ///
+    /// 로컬 좌표: `x = ix·cell`, `z = iz·cell`, 높이는 `heights[iz·nx + ix]`.
+    /// 원점은 격자의 (0,0) 모서리이므로 타일을 이어 붙일 때 오프셋이 곧 pose다.
+    ///
+    /// 한 페어가 만드는 접촉은 `MAX_HEIGHTFIELD_MANIFOLDS`에서 끊기고, 끊긴 사실은
+    /// `Diagnostics::heightfield_saturated`로 보고된다(조용한 누락 금지).
+    pub fn try_add_heightfield(
+        &mut self,
+        heights: &[f32],
+        nx: u32,
+        nz: u32,
+        cell: f32,
+        pose: maru_collide::Pose,
+    ) -> Result<BodyHandle, ApiError> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(heights.len())
+            .map_err(|_| ApiError::ResourceLimit)?;
+        owned.extend_from_slice(heights);
+        let shape = maru_collide::Shape::Heightfield {
+            heights: owned,
+            nx,
+            nz,
+            cell,
+        };
+        // 검증은 라이브·복원 공통 정본(`Shape::validate`)이 한다 — 여기서 따로 적으면
+        // 두 경계의 정책이 갈린다.
+        shape.validate().map_err(|_| ApiError::InvalidValue)?;
+        self.try_add_body(Body::new_static(shape, pose))
+    }
+
     pub fn try_add_terrain(
         &mut self,
         vertices: &[Vec3],
@@ -2509,6 +2553,9 @@ impl World {
         let parts = |id: u32| -> usize {
             match &self.bodies[(id & !STATIC_BIT) as usize].shape {
                 maru_collide::Shape::Compound { children } => children.len(),
+                // 하이트필드는 겹치는 셀마다 매니폴드를 낸다 — 상한이 곧 페어당 제약 상한이다
+                // (그 상한을 내로우페이즈가 실제로 강제하고 포화를 진단으로 보고한다).
+                maru_collide::Shape::Heightfield { .. } => maru_collide::MAX_HEIGHTFIELD_MANIFOLDS,
                 _ => 1,
             }
         };
@@ -3043,6 +3090,7 @@ impl World {
             self.diag.max_penetration = self.diag.max_penetration.max(b.max_penetration);
             self.diag.warm_total += b.warm_total;
             self.diag.warm_hits += b.warm_hits;
+            self.diag.heightfield_saturated += b.heightfield_saturated;
         }
         self.narrow_bufs = narrow_bufs;
         // 진단은 **dispatch 뒤에** 읽는다 — 워커는 지연 생성이라 그 전에는 "요청한 수"만
@@ -4021,6 +4069,8 @@ pub(crate) struct NarrowOut {
     max_penetration: f32,
     warm_total: usize,
     warm_hits: usize,
+    /// 하이트필드 페어가 매니폴드 상한에서 끊긴 횟수 (진단 — 조용한 누락 금지).
+    heightfield_saturated: usize,
     /// 접점 힙 할당 실패(극단 OOM) — 직렬 경로의 `bail`과 같은 뜻이다.
     bail: bool,
 }
@@ -4083,6 +4133,7 @@ impl NarrowOut {
         self.max_penetration = 0.0;
         self.warm_total = 0;
         self.warm_hits = 0;
+        self.heightfield_saturated = 0;
         self.bail = false;
     }
 
@@ -4221,7 +4272,7 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
             }
             _ => None,
         };
-        for_each_contact(
+        let saturated = for_each_contact(
             &cx.bodies[a_id].shape,
             &cx.bodies[a_id].pose,
             &cx.bodies[b_id].shape,
@@ -4263,6 +4314,9 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
                 push_live(out, key);
             },
         );
+        if saturated {
+            out.heightfield_saturated += 1;
+        }
         // 센서 페어(또는 접촉만 있고 제약이 없는 경우의 이벤트 기준선).
         if touched && sensor_pair {
             push_live(out, key);
