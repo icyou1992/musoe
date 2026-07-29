@@ -219,26 +219,22 @@ impl SolverState {
         bytes
     }
 
-    /// 목표 길이보다 크게 부푼 용량을 **실제로 반납**한다.
+    /// 부푼 용량을 **해제**한다 — 축소가 아니라 통째로 버린다.
     ///
-    /// 내용은 버린다 — 이 배열들은 매 스텝 `fill_from`이 `clear` 후 다시 채우므로
-    /// 반납 시점의 값은 쓰이지 않는다. 비우지 않으면 `Vec::shrink_to`가 `len` 아래로
-    /// 못 내려가서, 큰 월드가 남긴 용량을 영원히 못 돌려준다.
-    pub fn shrink_to(&mut self, n: usize) {
-        self.lin.clear();
-        self.ang.clear();
-        self.pos.clear();
-        self.rot.clear();
-        self.inv_m.clear();
-        self.inv_i.clear();
-        self.dynamic.clear();
-        self.lin.shrink_to(n);
-        self.ang.shrink_to(n);
-        self.pos.shrink_to(n);
-        self.rot.shrink_to(n);
-        self.inv_m.shrink_to(n);
-        self.inv_i.shrink_to(n);
-        self.dynamic.shrink_to(n);
+    /// `Vec::shrink_to`는 더 작은 할당으로 **복사**하느라 재할당을 시도할 수 있고,
+    /// 실패하면 fallible이 아니라 abort다. 이 함수가 불리는 시점은 스크래치가 상한을
+    /// 넘어 자원이 빠듯한 바로 그 순간이라, 거기서 abort하면 `ResourceLimit`을 돌려주려던
+    /// 보호 경로가 프로세스를 죽인다(확인검수 rev_de34bbb5 MAJOR).
+    /// `Vec::new()` 대입은 **할당 없이** 옛 버퍼를 반납한다. 용량은 뒤따르는 통합
+    /// fallible 블록(`reserve_for`)이 wake 폐쇄 이전에 다시 잡는다.
+    pub fn release(&mut self) {
+        self.lin = Vec::new();
+        self.ang = Vec::new();
+        self.pos = Vec::new();
+        self.rot = Vec::new();
+        self.inv_m = Vec::new();
+        self.inv_i = Vec::new();
+        self.dynamic = Vec::new();
     }
 
     /// 테스트 전용 — 예약이 목표에 닿았는지 보기 위한 창.

@@ -1690,7 +1690,7 @@ impl World {
     /// 월드를 한 번 돌린 뒤 작은 월드로 복원하면 그 차이가 회계 밖에 남고, 128 MiB
     /// 총상한 주장이 거짓이 된다(확인검수 rev_21c1a97f MAJOR — 참여자 버퍼만 정확히
     /// 세고 나머지를 빠뜨렸다).
-    fn persistent_excess_bytes(&self, nbody: usize, ncap: usize, constraint_cap: usize) -> usize {
+    fn persistent_excess_bytes(&self, nbody: usize, constraint_cap: usize) -> usize {
         let ex = |cap: usize, target: usize, elem: usize| cap.saturating_sub(target) * elem;
         self.solver_state
             .excess_capacity_bytes(nbody)
@@ -1721,52 +1721,48 @@ impl World {
                 constraint_cap / 4,
                 core::mem::size_of::<solver_block::ContactBlock>(),
             ))
-            .saturating_add(ex(
-                self.bp_pairs_scratch.capacity(),
-                ncap,
-                core::mem::size_of::<(u32, u32)>(),
-            ))
     }
 
     /// 목표를 넘겨 쥐고 있는 영속 스크래치를 **반납**한다.
     ///
     /// 상한을 넘었다고 스텝을 거절하는 것은 답이 아니다 — 용량은 저절로 줄지 않으므로
-    /// 그 월드는 **영원히** 거절된다. 안 쓰는 만큼을 실제로 돌려주고 다시 잰다.
+    /// 그 월드는 **영원히** 거절된다. 안 쓰는 것을 실제로 돌려주고 다시 잰다.
     /// 평소 경로에서는 초과분이 0이라 이 함수가 불리지 않는다.
-    fn release_oversized_scratch(&mut self, nbody: usize, ncap: usize, constraint_cap: usize) {
-        // **내용을 버려야 용량이 준다** — `Vec::shrink_to`는 `len` 아래로 못 내려가고,
-        // 이 버퍼들은 직전 스텝의 값을 그대로 들고 있다. 아래 버퍼들은 이번 스텝 안에서
-        // `clear` 후 다시 채워지므로(솔버 상태·per-body 압축 배열·블록 풀·페어 핑퐁)
-        // 지금 비워도 읽는 쪽이 없다.
-        self.solver_state.shrink_to(nbody);
-        for (v, n) in [
-            (
-                &mut self.inv_inertia_local as &mut dyn ShrinkableScratch,
-                nbody,
-            ),
-            (&mut self.ext_force, nbody),
-            (&mut self.damping, nbody),
-            (&mut self.island_parent, nbody),
-            (&mut self.contact_blocks, constraint_cap / 4),
-            (&mut self.bp_pairs_scratch, ncap),
-        ] {
-            v.clear_and_shrink_to(n);
+    ///
+    /// **축소가 아니라 해제다.** `Vec::shrink_to`는 재할당을 시도할 수 있고 실패하면
+    /// abort인데, 이 함수는 자원이 빠듯한 순간에만 불린다 — 거기서 abort하면
+    /// `ResourceLimit`을 돌려주려던 보호 경로가 프로세스를 죽인다(확인검수 rev_de34bbb5).
+    /// `Vec::new()` 대입은 할당 없이 옛 버퍼를 반납하고, 용량은 뒤따르는 통합 fallible
+    /// 블록이 wake 폐쇄 이전에 다시 잡는다. 목표치를 남길 이유도 없다 —
+    /// 남기면 참여자 버퍼가 과거 청크 용량을 계속 쥔 채 회복하지 못한다(같은 검수 MAJOR).
+    ///
+    /// 비워도 되는 근거는 전부 "이번 스텝 안에서 clear 후 다시 채운다"이다.
+    /// 유일한 예외가 `integrate_gate`인데, 증분 브로드페이즈 경로(`fresh_pairs.is_some()`)
+    /// 에서만 이 시점 뒤에 직전 값으로 읽힌다 — 그리고 그 경로는 성립 조건이
+    /// `len == bodies.len()`이라 애초에 초과분이 없다. 그래서 그때만 보존한다.
+    fn release_oversized_scratch(&mut self, preserve_integrate_gate: bool) {
+        self.solver_state.release();
+        self.inv_inertia_local = Vec::new();
+        self.ext_force = Vec::new();
+        self.damping = Vec::new();
+        self.island_parent = Vec::new();
+        self.contact_blocks = Vec::new();
+        // 페어 핑퐁 두 벌 — 살아있는 목록은 지역 `pairs`가 들고 있다.
+        self.bp_pairs = Vec::new();
+        self.bp_pairs_scratch = Vec::new();
+        self.gravity_gate = Vec::new();
+        if !preserve_integrate_gate {
+            self.integrate_gate = Vec::new();
         }
-        // **게이트 두 개는 비우지 않는다.** `integrate_gate`는 이 시점 뒤에도 직전 스텝
-        // 값으로 읽힌다(증분 브로드페이즈의 R 집합·제한 순회 판정). 용량만 깎는다.
-        self.integrate_gate
-            .shrink_to(nbody.max(self.integrate_gate.len()));
-        self.gravity_gate
-            .shrink_to(nbody.max(self.gravity_gate.len()));
         for b in self.narrow_bufs.iter_mut() {
-            b.shrink_to(constraint_cap, ncap);
+            b.release();
         }
     }
 
     /// 테스트 전용 — 반납 경로 직접 호출.
     #[cfg(test)]
-    pub(crate) fn release_scratch_for_test(&mut self, nbody: usize) {
-        self.release_oversized_scratch(nbody, 0, 0);
+    pub(crate) fn release_scratch_for_test(&mut self, _nbody: usize) {
+        self.release_oversized_scratch(false);
     }
 
     /// 테스트 전용 — per-body 영속 스크래치의 용량(회계가 미는 값과 대조하기 위해).
@@ -2528,19 +2524,32 @@ impl World {
             .skip(self.narrow_bufs.len())
             .map(|&(c, p)| NarrowOut::bytes_for(c, p))
             .sum();
+        // **페어 배열은 한 벌이 아니다.** 논리식은 `ncap` 한 벌만 세는데, 증분 경로는
+        // 지역 `pairs`(=병합 출력)와 `bp_pairs_scratch`(=직전 목록)를 동시에 들고 있고,
+        // 전체 재빌드 경로는 거기에 옛 `bp_pairs`까지 남는다 — 최대 세 벌이다
+        // (확인검수 rev_de34bbb5 BLOCKER). 지역 배열의 **초과분**과 self가 쥔 두 벌을
+        // 실제 용량으로 센다(지역의 첫 ncap은 논리식이 이미 셌다).
+        let pair_bytes = core::mem::size_of::<(u32, u32)>();
+        let pair_held_extra = pairs
+            .capacity()
+            .saturating_sub(ncap)
+            .saturating_mul(pair_bytes)
+            .saturating_add(self.bp_pairs.capacity().saturating_mul(pair_bytes))
+            .saturating_add(self.bp_pairs_scratch.capacity().saturating_mul(pair_bytes));
         let step_bytes = |this: &Self, narrow_held: usize| {
             fixed_bytes
                 .saturating_add(ncap.saturating_mul(per_pair_bytes))
                 .saturating_add(constraint_cap.saturating_mul(per_constraint_bytes))
                 .saturating_add(narrow_held)
                 .saturating_add(narrow_new)
-                .saturating_add(this.persistent_excess_bytes(nbody, ncap, constraint_cap))
+                .saturating_add(pair_held_extra)
+                .saturating_add(this.persistent_excess_bytes(nbody, constraint_cap))
         };
         if step_bytes(self, narrow_held) > MAX_STEP_SCRATCH_BYTES {
             // 먼저 **반납**하고 다시 잰다(위 `release_oversized_scratch` 주석 — 거절만 하면
             // 줄어든 월드가 영원히 못 돈다). 여기는 wake 폐쇄 이전이고 용량만 건드리므로
             // 캐노니컬 상태는 그대로다.
-            self.release_oversized_scratch(nbody, ncap, constraint_cap);
+            self.release_oversized_scratch(fresh_pairs.is_some());
             let narrow_held: usize = self
                 .narrow_bufs
                 .iter()
@@ -2551,7 +2560,16 @@ impl World {
                     b.projected_bytes(c, p)
                 })
                 .sum();
-            if step_bytes(self, narrow_held) > MAX_STEP_SCRATCH_BYTES {
+            // 반납 뒤에는 self 쪽 페어 두 벌도 사라졌다 — 지역 배열의 초과분만 남는다.
+            let pair_held_extra = pairs.capacity().saturating_sub(ncap) * pair_bytes;
+            let after = fixed_bytes
+                .saturating_add(ncap.saturating_mul(per_pair_bytes))
+                .saturating_add(constraint_cap.saturating_mul(per_constraint_bytes))
+                .saturating_add(narrow_held)
+                .saturating_add(narrow_new)
+                .saturating_add(pair_held_extra)
+                .saturating_add(self.persistent_excess_bytes(nbody, constraint_cap));
+            if after > MAX_STEP_SCRATCH_BYTES {
                 // 참여자 버퍼는 아직 self가 들고 있다(아래에서 take한다) — 되돌릴 것이 없다.
                 self.bp_pairs = pairs;
                 self.resource_limit = true;
@@ -3895,18 +3913,6 @@ fn shape_world_aabb(shape: &maru_collide::Shape, pose: &maru_collide::Pose) -> A
 ///
 /// **양방향 조건**이다: 한 방향만 보면 "A는 B를 무시하는데 B는 A를 민다"가 되어
 /// 운동량이 새고, 호스트가 설정한 적 없는 비대칭이 생긴다.
-/// `Vec<T>`를 원소 타입과 무관하게 "비우고 용량 반납"만 시키기 위한 최소 트레이트.
-trait ShrinkableScratch {
-    fn clear_and_shrink_to(&mut self, n: usize);
-}
-
-impl<T> ShrinkableScratch for Vec<T> {
-    fn clear_and_shrink_to(&mut self, n: usize) {
-        self.clear();
-        self.shrink_to(n);
-    }
-}
-
 #[inline]
 fn groups_collide(a: &Body, b: &Body) -> bool {
     (a.membership & b.filter) != 0 && (b.membership & a.filter) != 0
@@ -4009,14 +4015,14 @@ impl NarrowOut {
         )
     }
 
-    fn shrink_to(&mut self, constraints: usize, pairs: usize) {
-        // 내용은 매 청크 시작에 `reset`되므로 지금 버려도 된다.
-        self.constraints.clear();
-        self.keys.clear();
-        self.live.clear();
-        self.constraints.shrink_to(constraints);
-        self.keys.shrink_to(constraints);
-        self.live.shrink_to(pairs);
+    /// 버퍼를 **해제**한다(축소가 아니라). 내용은 매 청크 시작에 `reset`되므로 버려도 되고,
+    /// 용량은 `reserve_narrow_bufs`가 wake 이전에 fallible하게 다시 잡는다.
+    /// 목표치를 남기지 않는 이유: 남기면 과거에 큰 청크를 맡았던 버퍼들이 각자 한 벌씩
+    /// 쥔 채 회복하지 못한다(확인검수 rev_de34bbb5 MAJOR).
+    fn release(&mut self) {
+        self.constraints = Vec::new();
+        self.keys = Vec::new();
+        self.live = Vec::new();
     }
 
     fn reset(&mut self) {
