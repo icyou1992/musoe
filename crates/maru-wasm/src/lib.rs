@@ -52,6 +52,8 @@ pub const ERR_SNAPSHOT_TRUNCATED: i32 = -22;
 pub const ERR_SNAPSHOT_TRAILING: i32 = -23;
 pub const ERR_SNAPSHOT_TOO_LARGE: i32 = -24;
 pub const ERR_SNAPSHOT_CONTENT: i32 = -25;
+/// 파일은 멀쩡하지만 FP 환경이 비표준이라 복원을 거부했다 — `maru_canonicalize_fp()` 후 재시도.
+pub const ERR_SNAPSHOT_FP_ENVIRONMENT: i32 = -26;
 
 fn snapshot_err_code(e: maru_dynamics::SnapshotError) -> i32 {
     use maru_dynamics::SnapshotError as E;
@@ -63,6 +65,7 @@ fn snapshot_err_code(e: maru_dynamics::SnapshotError) -> i32 {
         E::CountTooLarge => ERR_SNAPSHOT_TOO_LARGE,
         // 값·구조가 엔진 불변식을 깨는 경우는 전부 "내용 오류"로 묶는다 — 호스트가 할 수
         // 있는 일이 같다(버린다).
+        E::FpEnvironment => ERR_SNAPSHOT_FP_ENVIRONMENT,
         E::NonFinite | E::BadIndex | E::BadShape | E::InconsistentState => ERR_SNAPSHOT_CONTENT,
     }
 }

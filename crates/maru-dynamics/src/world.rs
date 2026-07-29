@@ -1297,6 +1297,19 @@ impl World {
             if !sweep.overlaps(self.body_aabb(i)) {
                 continue;
             }
+            // 하이트필드는 셀 예산을 **미리** 본다 — 공개 질의는 보수적 정지(가짜 히트)가
+            // 아니라 **오류**로 알려야 호스트가 질의를 좁힐 수 있다(확인검수 rev_7efe4e35).
+            if let Some(hf) = self.bodies[i].shape.heightfield_ref() {
+                let a0 = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
+                let sw = a0.merge(Aabb::new(a0.min + motion, a0.max + motion));
+                let local = maru_collide::world_aabb_to_local(sw, &self.bodies[i].pose);
+                if let Some((cx0, cz0, cx1, cz1)) = hf.cell_range(local) {
+                    let cells = (cx1 - cx0 + 1) as usize * (cz1 - cz0 + 1) as usize;
+                    if cells > maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
+                        return Err(ApiError::ResourceLimit);
+                    }
+                }
+            }
             let hit = maru_collide::shape_cast_dispatch(
                 shape,
                 &pose,
@@ -1318,6 +1331,49 @@ impl World {
             }
         }
         Ok(best)
+    }
+
+    /// **형상이 지금 무언가에 파고들어 있는가** — 캐릭터가 이동 전에 묻는 질문.
+    ///
+    /// 스윕(`shape_cast`)은 CCD 계약상 "이미 겹친 상태"를 `None`으로 돌려준다(그게 옳다:
+    /// 이동 시작점이 이미 접촉이면 TOI가 없다). 그런데 캐릭터가 그 `None`을 "장애물 없음"으로
+    /// 읽으면 벽에 살짝 묻힌 채로 **전체 이동을 적용해 벽을 통과한다**(확인검수 rev_7efe4e35
+    /// BLOCKER). 그래서 겹침은 스윕이 아니라 이 질의로 따로 본다.
+    ///
+    /// 판정은 **코어 침투**다 — speculative margin 안의 근접(분리 ≥ 0)은 겹침이 아니다.
+    /// 바닥에 서 있는 캐릭터가 매 프레임 "끼었다"가 되면 쓸 수 없다.
+    pub fn shape_penetrates(
+        &self,
+        shape: &maru_collide::Shape,
+        pose: maru_collide::Pose,
+        filter: QueryFilter,
+    ) -> Result<bool, ApiError> {
+        if !maru_collide::vec_in_range(pose.pos) || shape.validate().is_err() {
+            return Err(ApiError::InvalidValue);
+        }
+        let aabb = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
+        let mut found = false;
+        for i in 0..self.bodies.len() {
+            if found {
+                break;
+            }
+            if !self.passes(i, filter) || !aabb.overlaps(self.body_aabb(i)) {
+                continue;
+            }
+            maru_collide::for_each_contact(
+                shape,
+                &pose,
+                &self.bodies[i].shape,
+                &self.bodies[i].pose,
+                0.0,
+                &mut |_, _, m| {
+                    if m.points().iter().any(|p| p.separation < -1e-4) {
+                        found = true;
+                    }
+                },
+            );
+        }
+        Ok(found)
     }
 
     /// 점을 품은 물체들 (슬롯 오름차순). 겉면 기준 — convex radius를 포함한다.
@@ -1626,7 +1682,24 @@ impl World {
 
     /// pending 커맨드를 **enqueue 순서대로** 즉시 적용한다.
     /// 각 커맨드는 자신의 pre-mutation 그래프를 기준으로 3단 원자 절차를 수행한다.
+    /// 커맨드 적용 (오류 반환형).
+    ///
+    /// **큐를 비우기 전에 FP 환경을 본다** — 가드 없이 drain하면 비표준 환경에서 호출 한 번에
+    /// 큐가 사라지고 각 커맨드가 `rejected`로 소비된다(확인검수 rev_7efe4e35 BLOCKER:
+    /// 재시도할 커맨드가 없어진다). 실패 시 큐는 **그대로**다.
+    pub fn try_flush_commands(&mut self) -> Result<CommandReport, ApiError> {
+        Self::fp_guard()?;
+        Ok(self.flush_commands_inner())
+    }
+
+    /// 커맨드 적용 (관례상 비-fallible 판 — 계약 위반이면 패닉).
+    /// 엔진 내부(스텝)는 이미 진입에서 검증했으므로 `flush_commands_inner`를 직접 부른다.
     pub fn flush_commands(&mut self) -> CommandReport {
+        self.try_flush_commands()
+            .expect("non-canonical FP environment (see World::canonicalize_fp_environment)")
+    }
+
+    fn flush_commands_inner(&mut self) -> CommandReport {
         let cmds = std::mem::take(&mut self.commands);
         let mut report = CommandReport::default();
         for cmd in cmds {
@@ -2241,7 +2314,7 @@ impl World {
         // 복원도 산술로 상태를 만든다(정규화·검증) — 비표준 환경에서 확정되면 안 된다.
         // 이 함수의 오류형에는 FP 항목이 없으므로 "내용 불일치"로 보고한다.
         if !maru_math::fp_verify() {
-            return Err(crate::snapshot::SnapshotError::InconsistentState);
+            return Err(crate::snapshot::SnapshotError::FpEnvironment);
         }
         crate::snapshot::read_world(self, bytes)
     }
@@ -2377,7 +2450,8 @@ impl World {
         //    **빈 월드 판정보다 먼저** 해야 한다: 빈 월드에 AddBody만 큐잉하면 영원히
         //    적용되지 않아 '다음 step에서 적용' 계약이 깨진다(리뷰 NOT_RESOLVED).
         if !self.commands.is_empty() {
-            self.flush_commands();
+            // 스텝 진입에서 이미 검증했다 — 여기서 다시 보면 같은 값을 두 번 읽을 뿐이다.
+            self.flush_commands_inner();
         }
         // 속도 클램프는 **flush 뒤·브로드페이즈 앞**이어야 한다(리뷰 BLOCKER): 스텝 시작에만
         // 걸면 pending `SetLinearVelocity`가 그 뒤에 적용돼 sweep AABB를 부풀린 채

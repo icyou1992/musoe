@@ -133,6 +133,12 @@ pub enum SnapshotError {
     BadShape,
     /// 유한·범위는 맞지만 엔진 불변식을 깨는 조합.
     InconsistentState,
+    /// **FP 환경이 캐노니컬 상태가 아니다** — 파일은 멀쩡하다.
+    ///
+    /// 복원도 산술로 상태를 만들므로(정규화·검증) 비표준 환경에서 확정되면 안 된다.
+    /// 이걸 `InconsistentState`로 보고하면 호스트가 **멀쩡한 저장본을 손상 파일로 폐기**한다
+    /// (확인검수 rev_7efe4e35 MAJOR). 원인을 따로 두어 "환경을 되돌리고 재시도"를 알린다.
+    FpEnvironment,
 }
 
 pub struct Writer(pub Vec<u8>);

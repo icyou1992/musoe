@@ -301,6 +301,9 @@ impl Body {
     /// `inv_mass ≈ 2.39e9`가 입력 상한을 넘어 뒤따르는 `add_body`가 패닉했다.
     /// **최종 Body에 `validate()`를 걸어** 생성 경계에서 끝낸다.
     pub fn try_new_dynamic(shape: Shape, pose: Pose, density: f32) -> Result<Self, ApiError> {
+        if !maru_math::fp_verify() {
+            return Err(ApiError::FpEnvironment);
+        }
         if !(in_range(density) && density > 0.0) {
             return Err(ApiError::InvalidValue);
         }
@@ -379,6 +382,12 @@ impl Body {
 
     /// 정적 바디 생성 (오류 반환형).
     pub fn try_new_static(shape: Shape, pose: Pose) -> Result<Self, ApiError> {
+        // **생성도 산술이다** — 자세 정규화·질량·주축 베이킹이 여기서 확정된다.
+        // 월드 진입점에만 가드를 두면, 비표준 환경에서 만든 Body를 들고 있다가 환경을
+        // 되돌린 뒤 넣는 우회가 남는다(확인검수 rev_7efe4e35 BLOCKER).
+        if !maru_math::fp_verify() {
+            return Err(ApiError::FpEnvironment);
+        }
         shape.validate().map_err(|_| ApiError::InvalidValue)?;
         if !vec_in_range(pose.pos) || pose.rot.try_normalize().is_none() {
             return Err(ApiError::InvalidValue);

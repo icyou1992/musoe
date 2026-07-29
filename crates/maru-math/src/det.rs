@@ -99,38 +99,46 @@ pub fn sin_cos(x: f32) -> (f32, f32) {
     if !x.is_finite() {
         return (f32::NAN, f32::NAN);
     }
-    const FOPI: f32 = 1.273_239_5; // 4/π
-                                   // π/4를 세 조각으로 쪼갠 상수(Cody-Waite) — 한 번에 빼면 큰 각에서 상쇄로 유효숫자가
-                                   // 날아간다. π/2가 아니라 **π/4**로 접어야 남는 각이 ±π/4 안에 들어와 짧은 다항으로 충분하다.
-    const DP1: f32 = 0.785_156_25;
-    const DP2: f32 = 2.418_756_5e-4;
-    const DP3: f32 = 3.774_895e-8;
-    let a = x.abs();
-    let mut j = (FOPI * a) as i32;
-    let mut yf = j as f32;
+    // **범위 축소는 f64로 한다.** f32로 접으면 큰 각에서 유효 비트가 남지 않는다 —
+    // 1e6 rad에서 f32 한 칸(ulp)이 이미 0.06 rad라 f32 Cody-Waite는 수 %씩 틀리고,
+    // 1e9 rad에서는 다항이 폭주해 ±Inf를 낸다(확인검수 rev_7efe4e35 MAJOR:
+    // `Quat::from_axis_angle`이 비유한 쿼터니언을 돌려줬다). f64 연산도 IEEE라 결정적이고,
+    // 이 경로는 회전당 한 번뿐이라 비용도 무시할 만하다.
+    const FOPI_D: f64 = 4.0 / core::f64::consts::PI;
+    const PI_4_D: f64 = core::f64::consts::FRAC_PI_4;
+    let xd = x as f64;
+    let a = xd.abs();
+    // **각이 f64 정수 격자를 넘어서면 각도 정보가 남아 있지 않다**(2^52 rad ≈ 7e14 바퀴).
+    // 어떤 구현도 의미 있는 답을 못 내므로 항등 회전으로 정한다 — 임의값이지만
+    // 결정적이고 유한하며 단위원 위다(공개 계약을 지킨다).
+    if a >= 4.5e15 {
+        return (0.0, 1.0);
+    }
+    let mut j = (a * FOPI_D) as i64;
+    let mut yf = j as f64;
     // 홀수면 하나 올려 짝수로 — 사분면 판정을 단순화한다(Cephes 규약).
     if j & 1 == 1 {
         j += 1;
         yf += 1.0;
     }
-    j &= 7;
+    let mut q = (j & 7) as i32;
     let mut sin_sign = if x.is_sign_negative() { -1.0f32 } else { 1.0 };
     let mut cos_sign = 1.0f32;
-    if j > 3 {
-        j -= 4;
+    if q > 3 {
+        q -= 4;
         sin_sign = -sin_sign;
         cos_sign = -cos_sign;
     }
-    if j > 1 {
+    if q > 1 {
         cos_sign = -cos_sign;
     }
-    let z = ((a - yf * DP1) - yf * DP2) - yf * DP3;
+    // 남은 각은 ±π/4 안이라 f32로 내려도 유효 비트가 충분하다.
+    let z = (a - yf * PI_4_D) as f32;
     let zz = z * z;
     let poly_sin = z + z * zz * ((-1.951_529_6e-4 * zz + 8.332_161e-3) * zz - 1.666_665_5e-1);
     let poly_cos =
         1.0 - 0.5 * zz + zz * zz * ((2.443_315_7e-5 * zz - 1.388_731_6e-3) * zz + 4.166_664_6e-2);
-    // 사분면 1·2에서는 sin과 cos의 다항이 뒤바뀐다.
-    let (s_base, c_base) = if j == 1 || j == 2 {
+    let (s_base, c_base) = if q == 1 || q == 2 {
         (poly_cos, poly_sin)
     } else {
         (poly_sin, poly_cos)
@@ -246,6 +254,18 @@ mod tests {
         }
         assert!(worst < 5e-6, "sin/cos 최대 오차 {worst} at {worst_at}");
         assert!(sin_cos(f32::NAN).0.is_nan());
+        // **큰 각에서도 계약을 지킨다** — f32 축소는 여기서 무너졌다(1e9에서 ±Inf).
+        // 이 영역에서 std와의 절대 오차를 요구하는 것은 무의미하지만(f32 한 칸이 이미
+        // 수십 rad다), **유한·단위원 위**라는 것은 언제나 참이어야 한다.
+        for x in [1e5f32, 1e6, 1e7, 1e9, 1e12, -1e9, f32::MAX] {
+            let (s, c) = sin_cos(x);
+            assert!(s.is_finite() && c.is_finite(), "sin_cos({x}) = ({s}, {c})");
+            assert!(
+                (s * s + c * c - 1.0).abs() < 1e-4,
+                "sin²+cos²−1이 큰 각에서 깨졌다: x={x} → {}",
+                s * s + c * c
+            );
+        }
     }
 
     /// **결정론의 핵심**: 같은 입력이면 항상 같은 비트. (플랫폼 간 비교는 CI가 한다 —

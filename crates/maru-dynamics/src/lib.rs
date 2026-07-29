@@ -2937,32 +2937,48 @@ mod tests {
         assert!(w.body(h).pose().pos.y.is_finite());
     }
 
-    /// **긴 지형을 가로지르는 캐스트가 접촉을 놓치지 않는다** (BLOCKER: 셀 상한 절단).
+    /// **긴 지형에서 접촉을 조용히 놓치지 않는다** — 예산 안이면 찾고, 넘으면 **오류**다.
+    ///
+    /// 처음엔 4,096셀에서 잘라 `None`을 냈다(진짜 접촉이 사라져 관통). 지금은 두 갈래다:
+    /// 공개 질의는 `ResourceLimit`으로 거절하고(호스트가 질의를 좁힐 수 있다),
+    /// 스텝 CCD는 보수적으로 이동을 막는다(관통 대신 멈춤).
     #[test]
-    fn long_sweep_across_a_wide_heightfield_still_hits() {
+    fn long_heightfield_queries_either_hit_or_report_a_budget_error() {
         let mut w = World::new(WorldParams::default());
-        // 가로로 아주 긴 격자(셀 8192개) — 예전 4096 상한이면 뒷부분을 못 봤다.
         let (nx, nz) = (8193u32, 3u32);
         let mut heights = vec![0.0f32; (nx * nz) as usize];
-        // 6000번째 셀에만 벽처럼 솟은 줄
         for iz in 0..nz {
-            heights[(iz * nx + 6000) as usize] = 3.0;
+            heights[(iz * nx + 6000) as usize] = 3.0; // 600m 지점의 벽
         }
         w.try_add_heightfield(&heights, nx, nz, 0.1, pose(0.0, 0.0, 0.0))
             .expect("지형");
-        let hit = w
+
+        // ① 예산을 넘는 질의는 **오류**다(조용한 미탐지가 아니라).
+        let huge = w.sweep_shape(
+            &Shape::Sphere { radius: 0.2 },
+            pose(0.0, 1.0, 0.1),
+            Vec3::new(800.0, 0.0, 0.0),
+            QueryFilter::ALL,
+        );
+        assert_eq!(
+            huge.err(),
+            Some(ApiError::ResourceLimit),
+            "예산 초과가 조용한 미탐지로 처리됐다"
+        );
+
+        // ② 예산 안(≈20m = 200셀)에서는 벽을 실제로 찾는다 — 4,096셀 상한 시절에도
+        //    통과했겠지만, 여기서 재는 것은 "짧은 질의는 정상"이라는 대조군이다.
+        let near = w
             .sweep_shape(
                 &Shape::Sphere { radius: 0.2 },
-                pose(0.0, 1.0, 0.1),
-                Vec3::new(800.0, 0.0, 0.0),
+                pose(599.0, 1.0, 0.1),
+                Vec3::new(20.0, 0.0, 0.0),
                 QueryFilter::ALL,
             )
             .expect("질의");
-        assert!(
-            hit.is_some(),
-            "600m 뒤의 벽을 놓쳤다 — 셀 상한이 진짜 히트를 잘랐다"
-        );
-        // 레이도 같은 벽을 봐야 한다
+        assert!(near.is_some(), "20m 앞의 벽을 놓쳤다");
+
+        // ③ 레이는 DDA라 예산과 무관하게 격자를 끝까지 걷는다 — 600m 앞 벽을 본다.
         let r = w
             .cast_ray(Vec3::new(0.05, 1.0, 0.1), Vec3::new(1.0, 0.0, 0.0), 1000.0)
             .expect("질의");
@@ -3118,6 +3134,141 @@ mod tests {
                 }
             )
             .is_ok());
+    }
+
+    // ===== 확인검수 rev_7efe4e35 회귀 =====
+
+    /// **시작부터 벽에 묻혀 있으면 이동하지 않는다** (BLOCKER: 스윕이 None을 내 통과했다).
+    #[test]
+    fn character_that_starts_overlapped_does_not_pass_through() {
+        let mut w = char_world();
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(1.0, 2.0, 5.0),
+                radius: 0.0,
+            },
+            pose(0.0, 2.0, 0.0),
+        ));
+        // 벽 한가운데에서 시작(스폰·텔레포트·움직이는 지형이 만드는 상황)
+        let mut c = capsule_char(0.0, 1.0, 0.0);
+        let r = c
+            .move_and_slide(&w, Vec3::new(5.0, 0.0, 0.0), QueryFilter::ALL)
+            .expect("오류가 아니라 결과로 알린다");
+        assert!(r.started_overlapped, "겹침을 감지하지 못했다");
+        assert_eq!(r.position, Vec3::new(0.0, 1.0, 0.0), "겹친 채로 이동했다");
+        assert_eq!(r.remaining, Vec3::new(5.0, 0.0, 0.0));
+        // 정상 위치에서는 그대로 동작한다(대조군)
+        let mut ok = capsule_char(3.0, 0.8, 0.0);
+        let r2 = ok
+            .move_and_slide(&w, Vec3::new(0.5, 0.0, 0.0), QueryFilter::ALL)
+            .expect("이동");
+        assert!(!r2.started_overlapped);
+    }
+
+    /// **회전 CCD의 봉투가 자식 궤도를 덮는다** (BLOCKER: 먼 자식이 지형을 관통했다).
+    #[test]
+    fn rotating_compound_child_far_from_pivot_still_sees_terrain() {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            substeps: 8,
+            ..WorldParams::default()
+        });
+        // 넓은 평지
+        let heights = vec![0.0f32; 33 * 33];
+        w.try_add_heightfield(&heights, 33, 33, 1.0, pose(0.0, 0.0, 0.0))
+            .expect("지형");
+        // 피벗에서 멀리 떨어진 자식을 가진 복합 바디 — 회전만으로 지형을 쓸고 지나간다.
+        let body = Body::new_dynamic(
+            Shape::Compound {
+                children: vec![
+                    (pose(0.0, 0.0, 0.0), Shape::Sphere { radius: 0.2 }),
+                    (pose(8.0, -0.55, 0.0), Shape::Sphere { radius: 0.2 }),
+                ],
+            },
+            pose(16.0, 0.6, 16.0),
+            1.0,
+        )
+        .with_ccd();
+        let h = w.add_body(body);
+        w.set_angular_velocity(h, Vec3::new(0.0, 12.0, 0.0))
+            .expect("각속도");
+        for _ in 0..40 {
+            w.step(DT);
+        }
+        // trap 없이 끝나고, 바디가 지형 아래로 꺼지지 않았다.
+        let p = w.body(h).pose().pos;
+        assert!(p.y.is_finite() && p.y > -0.5, "지형 아래로 빠졌다: {p:?}");
+    }
+
+    /// **커맨드 큐는 비표준 FP 환경에서 소비되지 않는다** (BLOCKER).
+    #[test]
+    fn command_queue_survives_a_non_canonical_fp_environment() {
+        let mut w = World::new(WorldParams::default());
+        let h = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 2.0, 0.0),
+            1.0,
+        ));
+        let pending = w.pending_commands();
+        assert!(pending > 0);
+        if !maru_math::force_flush_to_zero_for_test() {
+            return;
+        }
+        assert_eq!(
+            w.try_flush_commands().err(),
+            Some(ApiError::FpEnvironment),
+            "비표준 환경에서 커맨드가 소비됐다"
+        );
+        assert_eq!(
+            w.pending_commands(),
+            pending,
+            "실패했는데 큐가 줄었다 — 재시도할 커맨드가 사라진다"
+        );
+        assert!(World::canonicalize_fp_environment());
+        let report = w.try_flush_commands().expect("환경 복구 후에는 성공");
+        assert!(report.applied > 0, "복구 후에도 적용되지 않았다");
+        assert!(w.is_alive(h));
+    }
+
+    /// 비표준 환경에서 만든 **Body 자체**가 거부된다 (BLOCKER: 우회 경로).
+    #[test]
+    fn body_construction_is_guarded_too() {
+        if !maru_math::force_flush_to_zero_for_test() {
+            return;
+        }
+        let r = Body::try_new_dynamic(Shape::Sphere { radius: 0.3 }, pose(0.0, 0.0, 0.0), 1.0);
+        let r2 = Body::try_new_static(Shape::Sphere { radius: 0.3 }, pose(0.0, 0.0, 0.0));
+        assert!(World::canonicalize_fp_environment());
+        assert_eq!(r.err(), Some(ApiError::FpEnvironment));
+        assert_eq!(r2.err(), Some(ApiError::FpEnvironment));
+        assert!(
+            Body::try_new_dynamic(Shape::Sphere { radius: 0.3 }, pose(0.0, 0.0, 0.0), 1.0).is_ok()
+        );
+    }
+
+    /// 복원 실패 원인이 **환경**과 **파일 손상**으로 갈린다 (MAJOR: 멀쩡한 저장본 폐기 방지).
+    #[test]
+    fn restore_reports_fp_environment_separately_from_corruption() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 2.0, 0.0),
+            1.0,
+        ));
+        w.step(DT);
+        let snap = w.snapshot();
+        if !maru_math::force_flush_to_zero_for_test() {
+            return;
+        }
+        let e = w.restore(&snap).err();
+        assert!(World::canonicalize_fp_environment());
+        assert_eq!(
+            e,
+            Some(crate::SnapshotError::FpEnvironment),
+            "멀쩡한 저장본이 손상으로 보고됐다 — 호스트가 버린다"
+        );
+        assert!(w.restore(&snap).is_ok(), "환경 복구 후에는 복원돼야 한다");
     }
 
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).

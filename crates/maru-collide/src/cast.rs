@@ -226,10 +226,13 @@ pub fn shape_cast_dispatch_rotational(
             // 스윕 봉투가 덮는 셀만 삼각형으로 펼친다. 회전 봉투는 외접 반지름으로 넓힌다.
             Shape::Heightfield { .. } => {
                 let hf = sb.heightfield_ref().expect("Heightfield 변종");
-                let r = csa.bounding_radius();
-                let a0 = crate::transformed_aabb(csa.local_aabb(), cpa);
-                let e = Vec3::new(r, r, r);
-                let a0 = crate::Aabb::new(a0.min - e, a0.max + e).merge(a0);
+                // **자식은 자기 원점이 아니라 부모 피벗 주위를 돈다.** 자식 반경만 넓히면
+                // COM에서 10m 떨어진 자식이 90° 도는 궤도를 못 덮어, 캐스트가 `None`을
+                // 내면서 자식이 지형을 관통한다(확인검수 rev_7efe4e35 BLOCKER).
+                // 봉투는 피벗 중심의 궤도 반경(|자식-피벗| + 자식 반경)으로 잡는다.
+                let orbit_r = (cpa.pos - pa.pos).length() + csa.bounding_radius();
+                let e = Vec3::new(orbit_r, orbit_r, orbit_r);
+                let a0 = crate::Aabb::new(pa.pos - e, pa.pos + e);
                 let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
                 let expanded = crate::Aabb::new(
                     sweep.min - Vec3::new(skin, skin, skin),
@@ -341,9 +344,24 @@ pub fn shape_cast_dispatch(
             );
             let local = crate::heightfield::world_aabb_to_local(expanded, pb);
             let (cx0, cz0, cx1, cz1) = hf.cell_range(local)?;
-            // **셀 수로 자르지 않는다.** 자르면 긴 스윕이 진짜 접촉을 조용히 넘겨
-            // 지형을 통과한다(검수 rev_1e81559e BLOCKER). 작업량은 스윕 봉투가 덮는
-            // 셀 수로 이미 유계이고, 그 범위를 줄이는 것은 호출자(속도 상한·격자 해상도)의 몫이다.
+            // **예산을 넘으면 자르지 않고 막는다.** 셀 수로 잘라 `None`을 내면 진짜 접촉을
+            // 넘겨 지형을 통과하고(검수 rev_1e81559e), 자르지 않으면 1024×1024 격자를 덮는
+            // 스윕 한 번이 200만 회 캐스트가 된다(확인검수 rev_7efe4e35 MAJOR).
+            // 그래서 **보수적으로 정지**시킨다: 이동을 toi=0에서 막는 히트를 만들어
+            // 관통 대신 멈춤을 고른다. 질의 API는 이 경우를 오류로 따로 보고한다.
+            let cells = (cx1 - cx0 + 1) as usize * (cz1 - cz0 + 1) as usize;
+            if cells > crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
+                let n = if motion.length_sq() > 0.0 {
+                    motion * (-1.0 / motion.length())
+                } else {
+                    Vec3::new(0.0, 1.0, 0.0)
+                };
+                return Some(ShapeCastHit {
+                    toi: 0.0,
+                    point: pa.pos,
+                    normal: n,
+                });
+            }
             for cz in cz0..=cz1 {
                 for cx in cx0..=cx1 {
                     for t in 0..2u8 {

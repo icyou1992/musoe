@@ -59,6 +59,12 @@ pub struct MoveResult {
     pub slides: u32,
     /// 계단을 올라갔는가.
     pub stepped_up: bool,
+    /// **이동 전에 이미 무언가에 파고들어 있었다** — 이동을 적용하지 않았다.
+    ///
+    /// 스폰·텔레포트·움직이는 지형 때문에 생긴다. 이 상태에서 스윕은 "장애물 없음"(`None`)을
+    /// 돌려주므로 그대로 이동하면 벽을 통과한다 — 그래서 **멈추고 알린다**. 호스트는 밀어내기
+    /// (depenetration)를 하거나 위치를 되돌린 뒤 다시 부른다.
+    pub started_overlapped: bool,
 }
 
 impl CharacterVirtual {
@@ -139,6 +145,18 @@ impl CharacterVirtual {
         {
             return Err(ApiError::InvalidValue);
         }
+        // **시작 침투를 먼저 본다** (확인검수 rev_7efe4e35 BLOCKER).
+        if world.shape_penetrates(&self.shape, self.pose_at(self.position), filter)? {
+            return Ok(MoveResult {
+                position: self.position,
+                remaining: displacement,
+                on_ground: false,
+                ground_normal: self.up,
+                slides: 0,
+                stepped_up: false,
+                started_overlapped: true,
+            });
+        }
         let mut pos = self.position;
         let mut remaining = displacement;
         let mut slides = 0u32;
@@ -195,6 +213,7 @@ impl CharacterVirtual {
             ground_normal,
             slides,
             stepped_up,
+            started_overlapped: false,
         })
     }
 
