@@ -4820,6 +4820,58 @@ mod tests {
         );
     }
 
+    /// **경계를 넘는 서브스텝도 회전을 빼먹지 않는다** (BLOCKER 지적의 실제 하위 결함).
+    ///
+    /// 내 첫 OOB 가드는 감지 서브스텝에서 `continue`로 회전 적분까지 건너뛰었다. 그러면 그
+    /// 서브스텝만 회전이 빠지고 이후 서브스텝(`ccd_frozen && !rot_sweep`)은 전체 회전을
+    /// 적분하는 **비대칭**이 생긴다 — `ccd_frozen`의 규약은 "이동만 얼린다"이므로 회전은
+    /// 일관되게 돌아야 한다(확인검수 rev_59dcb940).
+    #[test]
+    fn boundary_crossing_substep_still_integrates_rotation() {
+        let spin = Vec3::new(0.0, 3.0, 0.0);
+        let mk = |x: f32| {
+            let mut w = World::new(WorldParams::default());
+            let h = w.add_body(
+                Body::new_dynamic(
+                    Shape::Box {
+                        half: Vec3::new(0.4, 0.1, 0.1),
+                        radius: 0.0,
+                    },
+                    pose(x, 0.0, 0.0),
+                    1.0,
+                )
+                .with_ccd(),
+            );
+            w.set_angular_velocity(h, spin).expect("각속도");
+            w.set_linear_velocity(h, Vec3::new(w.params().max_linear_velocity, 0.0, 0.0))
+                .expect("속도");
+            (w, h)
+        };
+        // ① 경계를 넘는 바디 ② 월드 한복판의 같은 바디 — 회전량이 같아야 한다.
+        let (mut w_edge, h_edge) = mk(maru_collide::MAX_INPUT - 4.0);
+        let (mut w_mid, h_mid) = mk(0.0);
+        assert_eq!(w_edge.try_step(1.0 / 60.0), Ok(()));
+        assert_eq!(w_mid.try_step(1.0 / 60.0), Ok(()));
+        assert!(
+            w_edge.diagnostics().out_of_bounds > 0,
+            "테스트 전제(경계 이탈)가 성립하지 않았다"
+        );
+        let ang = |q: maru_math::Quat| 2.0 * q.y.atan2(q.w);
+        let (a_edge, a_mid) = (
+            ang(w_edge.body(h_edge).pose().rot),
+            ang(w_mid.body(h_mid).pose().rot),
+        );
+        assert!(
+            (a_edge - a_mid).abs() < 1.0e-5,
+            "경계를 넘은 바디의 회전이 {a_edge}, 안쪽 바디는 {a_mid} — 서브스텝 하나의 회전이 빠졌다"
+        );
+        // **음성 대조** — 회전이 실제로 일어났어야 비교가 의미 있다(둘 다 0이면 무의미).
+        assert!(
+            a_mid.abs() > 1.0e-3,
+            "회전이 아예 없었다 — 테스트 배치가 무의미하다"
+        );
+    }
+
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.
     ///
     /// 검수가 두 번 같은 계열을 지적했다(생성자 → enqueue). 한 곳만 빠지면 "비표준 환경

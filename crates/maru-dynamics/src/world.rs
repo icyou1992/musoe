@@ -1955,6 +1955,25 @@ impl World {
         }
     }
 
+    /// **경계 이탈의 배제는 다음 스텝부터다** — 넘는 스텝은 끝까지 돈다.
+    ///
+    /// 검수(rev_59dcb940)가 "넘은 바디를 같은 스텝의 relax·조인트 솔버에서도 빼야 한다"며
+    /// 남은 서브스텝을 전역 중단(`break 'substeps`)하라고 제안했다. **채택하지 않았다** —
+    /// 근거는 정밀도 실측이다:
+    ///
+    /// - 한 스텝 최대 이동 = `max_linear_velocity × dt` (기본 500 m/s → 8.3m, 호스트 상한
+    ///   1e4 m/s → 167m). 즉 이탈은 10km + 167m 이내다.
+    /// - f32 간격: 9999m에서 9.766e-4 m, **10167m에서도 9.766e-4 m**(같은 binade). 다음 계단은
+    ///   16384m부터다. 즉 넘은 자세의 수치 품질은 경계 안쪽과 **동일**하고, 그 상태로 계산한
+    ///   조인트 임펄스는 9995m에서 계산한 것과 같은 정도로 유효하다.
+    /// - 반면 전역 중단은 **다른 모든 바디의 남은 서브스텝을 빼먹는다** — 한 바디의 경계 이탈이
+    ///   월드 전체의 그 프레임을 under-integrate하는 관측 가능한 인공물이다.
+    ///
+    /// 없는 인공물을 막으려고 있는 인공물을 만들지 않는다. 대신 이탈은 이 함수가 관측 가능하게
+    /// 보고하고(`Diagnostics::out_of_bounds`), CCD는 범위 밖 자세로 캐스트만 하지 않는다
+    /// (원인 오보 방지 — 그 자리 주석 참조). `is_out_of_bounds` 계약("시뮬레이션에서 제외")은
+    /// **플래그가 선 뒤**, 즉 다음 스텝부터 성립한다.
+    ///
     /// 월드 범위를 벗어난 바디를 **경계에 고정하고 재운다**(리뷰 BLOCKER: 위치 정밀도
     /// 계약이 step에 대해 닫혀 있지 않았다). 10km 밖에서는 f32 간격이 최소 특징 크기를
     /// 넘어 충돌 판정이 의미를 잃으므로, 조용히 계속 계산하는 것이 가장 나쁘다.
@@ -3977,35 +3996,31 @@ impl World {
                         d = Vec3::ZERO;
                         self.diag.ccd_frozen += 1;
                     }
-                    if (!ccd_frozen[ci] && (d != Vec3::ZERO || rot_sweep))
-                        || (ccd_frozen[ci] && rot_sweep)
+                    // **월드 범위를 벗어난 자세로는 캐스트하지 않는다** (자기 검수 2026-07-30).
+                    // 경계 고정(`enforce_world_bounds`)은 스텝 **말**에 도는데, 빠른 바디는 스텝
+                    // 중간에 10km를 넘을 수 있다. 그 자세를 디스패처에 넘기면 이제
+                    // `InvalidInput`이 되고(범위 검사) 그것이 `cast_incomplete`로 접혀
+                    // **원인이 잘못 보고된다**(`ccd_incomplete` 문서는 "지형 해상도·바디 크기를
+                    // 보라"고 말한다). 범위 이탈은 스텝 말 OOB 패스가 `out_of_bounds`로 센다.
+                    //
+                    // 이동만 얼리고 **회전은 `ccd_frozen` 규약 그대로** 둔다. 처음에는 여기서
+                    // `continue`로 회전 적분까지 건너뛰었는데, 그러면 감지 서브스텝만 회전이
+                    // 빠지고 이후 서브스텝(`ccd_frozen && !rot_sweep`)은 전체 회전을 적분하는
+                    // **비대칭**이 생긴다(확인검수 rev_59dcb940가 지적).
+                    let pos_in_range = maru_collide::vec_in_range(st.pos[i]);
+                    if !pos_in_range {
+                        d = Vec3::ZERO;
+                        ccd_frozen[ci] = true;
+                    }
+                    if pos_in_range
+                        && ((!ccd_frozen[ci] && (d != Vec3::ZERO || rot_sweep))
+                            || (ccd_frozen[ci] && rot_sweep))
                     {
                         let body = &self.bodies[i];
                         let pose_now = maru_collide::Pose {
                             pos: st.pos[i],
                             rot: st.rot[i],
                         };
-                        // **월드 범위를 이미 벗어났으면 캐스트하지 않고 얼린다** (자기 검수
-                        // 2026-07-30). 경계 고정(`enforce_world_bounds`)은 스텝 **말**에 도는데,
-                        // 빠른 바디는 스텝 중간에 10km를 넘을 수 있다. 그 자세로 캐스트를 부르면
-                        // 이제 디스패처가 `InvalidInput`을 내고(직전 라운드에 범위 검사를 넣었다)
-                        // 그것이 `cast_incomplete`로 접혀 **원인이 잘못 보고된다**
-                        // (`ccd_incomplete`의 문서는 "지형 해상도·바디 크기를 보라"고 말한다).
-                        // 여기서 끊으면 동작은 같고(보수적 정지) 보고는 정직하다 —
-                        // 범위 이탈은 스텝 말 OOB 패스가 `out_of_bounds`로 센다.
-                        //
-                        // **defense-in-depth이며 테스트가 없다.** 이 가드가 실제로 도는 조건은
-                        // "정적 후보가 스윕 AABB와 겹치는데 캐스트는 빗나간다 + 그 스텝에 경계를
-                        // 넘는다"인데, 그 배치는 취약하다(벽을 두면 CCD가 먼저 막아 경계를 못
-                        // 넘고, 안 두면 후보가 없어 캐스트가 안 돈다 — 둘 다 실측했다).
-                        // 관련 계약의 단위 고정은 `out_of_range_arithmetic_input_is_rejected_…`,
-                        // 씬 계약은 `ccd_body_crossing_the_world_bound_…`가 맡는다.
-                        if !maru_collide::vec_in_range(pose_now.pos) {
-                            // `continue`가 아래 회전 적분까지 건너뛴다 = 이 서브스텝은 이동도
-                            // 회전도 없다(그래서 `rot_toi`를 세울 필요가 없다).
-                            ccd_frozen[ci] = true;
-                            continue;
-                        }
                         let a0 = shape_world_aabb(&body.shape, &pose_now);
                         // 회전 스윕이면 외접 반지름 상자로 봉투를 넓힌다 — 스윕 AABB가
                         // 후보를 놓치면 캐스트는 옳아도 관통이 조용히 지나간다.
