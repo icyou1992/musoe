@@ -126,6 +126,44 @@ impl Mat3 {
 
 #[cfg(test)]
 mod tests {
+
+    /// 회전행렬의 **열 = 회전된 단위축**이고 순서가 x,y,z다 — 비트 단위로.
+    ///
+    /// `maru-collide`의 박스-박스 경로가 `axes_a = Mat3::from_quat(rot).c`로 쿼터니언 회전
+    /// 3회를 대체한다. 그 대체가 성립하는 근거가 이 성질이고, **열 순서가 뒤바뀌어도 대칭적인
+    /// 씬에서는 상위 테스트가 통과할 수 있다** — 그래서 여기서 직접 잠근다(가장 조용한 실패 모드).
+    #[test]
+    fn from_quat_columns_are_rotated_unit_axes_bit_for_bit() {
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u64 << 23) as f32) * 2.0 - 1.0
+        };
+        let mut quats = vec![Quat::IDENTITY];
+        for _ in 0..200 {
+            quats.push(Quat::from_axis_angle(
+                Vec3::new(next(), next(), next()).normalize_or_zero() + Vec3::new(0.0, 1e-9, 0.0),
+                next() * 3.2,
+            ));
+        }
+        for q in quats {
+            let m = Mat3::from_quat(q);
+            let axes = [
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ];
+            for (i, e) in axes.into_iter().enumerate() {
+                let r = q.rotate(e);
+                assert_eq!(m.c[i].x.to_bits(), r.x.to_bits(), "열 {i}.x (q={q:?})");
+                assert_eq!(m.c[i].y.to_bits(), r.y.to_bits(), "열 {i}.y (q={q:?})");
+                assert_eq!(m.c[i].z.to_bits(), r.z.to_bits(), "열 {i}.z (q={q:?})");
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
