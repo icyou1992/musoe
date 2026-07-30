@@ -22,7 +22,8 @@ pub use cast::{shape_cast, shape_cast_dispatch, shape_cast_dispatch_rotational, 
 pub use epa::{epa, Penetration};
 pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
 pub use heightfield::{
-    build_tiles as build_heightfield_tiles, world_aabb_to_local, HeightfieldRef, COS_COPLANAR,
+    build_tiles as build_heightfield_tiles, for_each_overlapping_cell, overlapping_cell_count,
+    tiles_match as heightfield_tiles_match, world_aabb_to_local, HeightfieldRef, COS_COPLANAR,
     HEIGHTFIELD_TILE, MAX_HEIGHTFIELD_CELLS_PER_QUERY, MAX_HEIGHTFIELD_MANIFOLDS,
     MAX_HEIGHTFIELD_SAMPLES,
 };
@@ -34,9 +35,9 @@ pub use limits::{
     MAX_INPUT, MAX_SHAPE_EXTENT, MAX_SPEED, MAX_STATE, MIN_DT, MIN_INV_MASS, MIN_SHAPE_EXTENT,
 };
 pub use manifold::{
-    any_contact, contact, for_each_contact, weld_internal_edges, ContactPoint, FeatureId, Manifold,
-    FEATURE_ANALYTIC, FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT, FEATURE_GENERIC,
-    MAX_MANIFOLD_POINTS,
+    any_contact, contact, for_each_contact, weld_internal_edges, ContactPoint, ContactWalk,
+    FeatureId, Manifold, FEATURE_ANALYTIC, FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT,
+    FEATURE_GENERIC, MAX_MANIFOLD_POINTS,
 };
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};

@@ -19,6 +19,12 @@ pub struct ShapeCastHit {
     pub point: Vec3,
 }
 
+/// 볼록 전용 경로 판정 (`manifold`의 것과 같은 규칙).
+#[inline]
+fn is_non_convex(s: &Shape) -> bool {
+    matches!(s, Shape::Compound { .. } | Shape::Heightfield { .. })
+}
+
 /// 선형 셰이프 캐스트. `skin` = 이 거리 안이면 "닿았다"로 판정하는 피부 두께 —
 /// 호출자는 보통 speculative margin을 넘겨, 정지 위치가 다음 스텝의 일반 접촉
 /// 파이프라인(speculative 봉투)에 자연히 잡히게 한다.
@@ -38,6 +44,12 @@ pub fn shape_cast(
     pb: &Pose,
     skin: f32,
 ) -> Option<ShapeCastHit> {
+    // **비볼록은 여기서 끝낸다** — 볼록 전용 경로다(디스패치는 `shape_cast_dispatch`).
+    // 넘기면 GJK가 `support_core`의 `unreachable!`에 닿아 프로세스가 죽는다
+    // (확인검수 rev_e50670ad BLOCKER: 공개 저수준 API가 trap 경로였다).
+    if is_non_convex(sa) || is_non_convex(sb) {
+        return None;
+    }
     let (ra, rb) = (sa.radius(), sb.radius());
     let mut t = 0.0f32;
     let mut pose_a = *pa;
@@ -129,6 +141,10 @@ pub fn shape_cast_rotational(
     pb: &Pose,
     skin: f32,
 ) -> Option<ShapeCastHit> {
+    // 볼록 전용 — 비볼록은 `shape_cast_dispatch_rotational`이 펼친다.
+    if is_non_convex(sa) || is_non_convex(sb) {
+        return None;
+    }
     let (ra, rb) = (sa.radius(), sb.radius());
     let offset = pa.pos - pivot;
     // 각 기여 상한 = 축 수직 오프셋 + **각 스윕 반지름**(코어의 축 수직 거리 —

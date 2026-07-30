@@ -685,6 +685,13 @@ impl World {
     }
 
     pub fn enqueue_add_body(&mut self, body: Body) -> BodyHandle {
+        // **여기도 가드가 필요하다** — 이 경로만 검증 없이 예약 슬롯·세대·큐를 바꿨다.
+        // 다른 변이는 전부 거부되는데 이것만 통과하면 "비표준 환경 진입은 상태를 바꾸지
+        // 않는다"가 API 선택에 따라 갈린다(확인검수 rev_e50670ad MAJOR).
+        assert!(
+            maru_math::fp_verify(),
+            "non-canonical FP environment (see World::canonicalize_fp_environment)"
+        );
         body.validate().expect("invalid body");
         let index = if let Some(index) = self.free_slot() {
             self.reserved[index] = true;
@@ -1318,8 +1325,11 @@ impl World {
                 let pad = Vec3::new(m, m, m);
                 let sw = Aabb::new(sw.min - pad, sw.max + pad);
                 let local = maru_collide::world_aabb_to_local(sw, &self.bodies[i].pose);
-                if let Some((cx0, cz0, cx1, cz1)) = hf.cell_range(local) {
-                    let cells = (cx1 - cx0 + 1) as usize * (cz1 - cz0 + 1) as usize;
+                if let Some(range) = hf.cell_range(local) {
+                    // **실제로 볼 셀만 센다.** raw 셀 수를 세면 멀리 있는 봉우리 하나가
+                    // 지형 AABB를 높여 후보가 0개인 질의까지 거절한다(확인검수 rev_e50670ad).
+                    let cells =
+                        maru_collide::overlapping_cell_count(&hf, range, local.min.y, local.max.y);
                     if cells > maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
                         return Err(ApiError::ResourceLimit);
                     }
@@ -1379,8 +1389,9 @@ impl World {
             // 공개 스윕의 예산을 우회하는 새 작업량 경로가 된다(확인검수 rev_d390e73d MAJOR).
             if let Some(hf) = self.bodies[i].shape.heightfield_ref() {
                 let local = maru_collide::world_aabb_to_local(aabb, &self.bodies[i].pose);
-                if let Some((x0, z0, x1, z1)) = hf.cell_range(local) {
-                    let cells = (x1 - x0 + 1) as usize * (z1 - z0 + 1) as usize;
+                if let Some(range) = hf.cell_range(local) {
+                    let cells =
+                        maru_collide::overlapping_cell_count(&hf, range, local.min.y, local.max.y);
                     if cells > maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
                         return Err(ApiError::ResourceLimit);
                     }
@@ -3337,6 +3348,10 @@ impl World {
             self.diag.warm_total += b.warm_total;
             self.diag.warm_hits += b.warm_hits;
             self.diag.heightfield_saturated += b.heightfield_saturated;
+            if b.budget_exceeded {
+                // 접촉 판정이 불완전한 스텝은 **자원 오류**로 끝난다(조용한 누락 금지).
+                self.resource_limit = true;
+            }
         }
         self.narrow_bufs = narrow_bufs;
         // 진단은 **dispatch 뒤에** 읽는다 — 워커는 지연 생성이라 그 전에는 "요청한 수"만
@@ -4317,6 +4332,8 @@ pub(crate) struct NarrowOut {
     warm_hits: usize,
     /// 하이트필드 페어가 매니폴드 상한에서 끊긴 횟수 (진단 — 조용한 누락 금지).
     heightfield_saturated: usize,
+    /// 셀 예산을 넘어 접촉 순회를 포기했다 — 이 스텝은 자원 오류다.
+    budget_exceeded: bool,
     /// 접점 힙 할당 실패(극단 OOM) — 직렬 경로의 `bail`과 같은 뜻이다.
     bail: bool,
 }
@@ -4380,6 +4397,7 @@ impl NarrowOut {
         self.warm_total = 0;
         self.warm_hits = 0;
         self.heightfield_saturated = 0;
+        self.budget_exceeded = false;
         self.bail = false;
     }
 
@@ -4560,8 +4578,13 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
                 push_live(out, key);
             },
         );
-        if saturated {
-            out.heightfield_saturated += 1;
+        match saturated {
+            maru_collide::ContactWalk::Complete => {}
+            maru_collide::ContactWalk::Saturated => out.heightfield_saturated += 1,
+            // **예산 초과는 포화와 다르다** — 판정 자체를 못 했으므로 이 스텝의 접촉 집합이
+            // 불완전하다. 포화로 뭉개면 "접촉 없음"으로 계속 진행해 뒤쪽 접촉이 사라진다.
+            // 자원 오류로 올려 호스트가 장면을 줄이거나 격자를 성기게 하도록 한다.
+            maru_collide::ContactWalk::BudgetExceeded => out.budget_exceeded = true,
         }
         // 센서 페어(또는 접촉만 있고 제약이 없는 경우의 이벤트 기준선).
         if touched && sensor_pair {

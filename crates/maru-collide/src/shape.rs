@@ -248,7 +248,9 @@ impl Shape {
                     (nx - 1).div_ceil(crate::heightfield::HEIGHTFIELD_TILE),
                     (nz - 1).div_ceil(crate::heightfield::HEIGHTFIELD_TILE),
                 );
-                if tiles.len() != (ntx as usize) * (ntz as usize) {
+                if tiles.len() != (ntx as usize) * (ntz as usize)
+                    || !crate::heightfield::tiles_match(heights, *nx, *nz, tiles)
+                {
                     return Err("heightfield tile pyramid does not match the grid");
                 }
             }

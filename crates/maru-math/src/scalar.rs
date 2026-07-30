@@ -124,21 +124,36 @@ impl Quat {
     /// (0 축에 대해 비단위 쿼터니언을 만들면 이후 회전이 조용히 붕괴한다).
     #[inline]
     pub fn from_axis_angle(axis: Vec3, angle: f32) -> Self {
-        let Some(a) = axis.try_normalize() else {
-            return Self::IDENTITY;
-        };
-        if !angle.is_finite() {
-            return Self::IDENTITY;
+        Self::try_from_axis_angle(axis, angle).unwrap_or(Self::IDENTITY)
+    }
+
+    /// 결정적으로 표현 가능한 최대 각(rad) — 이보다 큰 각은 `try_from_axis_angle`이 거부한다.
+    ///
+    /// 회전은 2π 주기이므로 큰 각도 **의미가 있다**. 다만 그 각을 f32/f64 산술로 정확히
+    /// 접으려면 Payne–Hanek 비트 테이블이 필요하고(우리는 안 넣었다), 그 없이 접으면
+    /// 결과가 조용히 틀린다 — 그래서 **거부**한다. 물리는 각속도 상한(100 rad/s) 때문에
+    /// 스텝당 2 rad을 넘지 않아 이 경계에 닿지 않는다.
+    pub const MAX_AXIS_ANGLE: f32 = 1.0e10;
+
+    /// 축·각에서 쿼터니언 (오류 반환형).
+    ///
+    /// `None`인 경우: 축을 정규화할 수 없음 · 각이 비유한 · **각이 `MAX_AXIS_ANGLE` 초과**.
+    /// 마지막 항목이 이 함수가 존재하는 이유다: 예전에는 거대한 유한 각을 조용히 항등
+    /// 회전으로 뭉갰다(확인검수 rev_e50670ad MAJOR — 문서는 "비유한만 항등"이라 적혀 있었다).
+    pub fn try_from_axis_angle(axis: Vec3, angle: f32) -> Option<Self> {
+        let a = axis.try_normalize()?;
+        if !angle.is_finite() || angle.abs() > Self::MAX_AXIS_ANGLE {
+            return None;
         }
         // **결정적 sin/cos** — 회전 CCD가 매 반복 이 함수를 부른다. 플랫폼 sin_cos의
         // 마지막 비트가 갈리면 TOI가 갈리고 L1 계약이 깨진다(검수 rev_1e81559e BLOCKER).
         let (s, c) = crate::det::sin_cos(angle * 0.5);
-        Self {
+        Some(Self {
             x: a.x * s,
             y: a.y * s,
             z: a.z * s,
             w: c,
-        }
+        })
     }
 
     /// v' = q v q⁻¹ — 2×cross 전개(표준 최적화, FMA 비의존).

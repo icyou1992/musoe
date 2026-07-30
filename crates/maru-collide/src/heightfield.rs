@@ -423,7 +423,14 @@ pub fn build_tiles(heights: &[f32], nx: u32, nz: u32) -> Vec<(f32, f32)> {
     // **잘못된 입력에는 빈 목록**을 돌려준다 — 검증 전에 불릴 수 있고(생성 경계),
     // 여기서 패닉하면 "실패는 오류지 trap이 아니다" 계약이 깨진다.
     // 빈 목록은 `validate`가 타일 길이 불일치로 거부한다.
-    if nx < 2 || nz < 2 || heights.len() < (nx as usize) * (nz as usize) {
+    //
+    // **곱셈은 checked로** — wasm32의 usize는 32비트라 `nx*nz`가 래핑한다. nx=nz=65537,
+    // 높이 131073개인 악성 스냅샷(0.5MiB)이 길이 검사를 통과한 뒤 타일 6,700만 개(512MiB)를
+    // 잡으려 해서 `validate`에 닿기 전에 OOM trap이 났다(확인검수 rev_e50670ad BLOCKER).
+    let Some(samples) = (nx as usize).checked_mul(nz as usize) else {
+        return Vec::new();
+    };
+    if nx < 2 || nz < 2 || samples != heights.len() || samples > MAX_HEIGHTFIELD_SAMPLES {
         return Vec::new();
     }
     let (ncx, ncz) = (nx - 1, nz - 1);
@@ -431,7 +438,14 @@ pub fn build_tiles(heights: &[f32], nx: u32, nz: u32) -> Vec<(f32, f32)> {
         ncx.div_ceil(HEIGHTFIELD_TILE),
         ncz.div_ceil(HEIGHTFIELD_TILE),
     );
-    let mut tiles = vec![(f32::INFINITY, f32::NEG_INFINITY); (ntx * ntz) as usize];
+    let Some(tile_count) = (ntx as usize).checked_mul(ntz as usize) else {
+        return Vec::new();
+    };
+    let mut tiles = Vec::new();
+    if tiles.try_reserve_exact(tile_count).is_err() {
+        return Vec::new();
+    }
+    tiles.resize(tile_count, (f32::INFINITY, f32::NEG_INFINITY));
     for tz in 0..ntz {
         for tx in 0..ntx {
             let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -449,6 +463,111 @@ pub fn build_tiles(heights: &[f32], nx: u32, nz: u32) -> Vec<(f32, f32)> {
         }
     }
     tiles
+}
+
+/// 셀 범위 안에서 **Y 밴드와 겹치는 타일의 셀만** 훑는 반복자 헬퍼.
+///
+/// 셀을 다 돌면서 타일 범위를 매번 조회하면 가지치기가 **일은 줄여도 반복은 그대로**다 —
+/// 1024×1024 격자에서 후보가 0개여도 100만 번 돈다(확인검수 rev_e50670ad MAJOR).
+/// 타일을 바깥 루프로 두면 겹치지 않는 타일의 셀 64개는 **아예 방문하지 않는다**.
+///
+/// `f`가 `false`를 돌려주면 즉시 중단하고 `false`를 반환한다(예산 초과·조기 종료).
+pub fn for_each_overlapping_cell(
+    hf: &HeightfieldRef<'_>,
+    range: (u32, u32, u32, u32),
+    y_lo: f32,
+    y_hi: f32,
+    mut f: impl FnMut(u32, u32) -> bool,
+) -> bool {
+    let (cx0, cz0, cx1, cz1) = range;
+    for tz in (cz0 / HEIGHTFIELD_TILE)..=(cz1 / HEIGHTFIELD_TILE) {
+        for tx in (cx0 / HEIGHTFIELD_TILE)..=(cx1 / HEIGHTFIELD_TILE) {
+            let (lo, hi) = hf.tile_range(tx, tz);
+            if hi < y_lo || lo > y_hi {
+                continue;
+            }
+            let x0 = cx0.max(tx * HEIGHTFIELD_TILE);
+            let z0 = cz0.max(tz * HEIGHTFIELD_TILE);
+            let x1 = cx1.min((tx + 1) * HEIGHTFIELD_TILE - 1);
+            let z1 = cz1.min((tz + 1) * HEIGHTFIELD_TILE - 1);
+            for cz in z0..=z1 {
+                for cx in x0..=x1 {
+                    if !f(cx, cz) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Y 밴드와 겹치는 타일이 덮는 **셀 수** — 공개 질의의 사전 예산 판정용.
+///
+/// raw 셀 수를 세면 "멀리 있는 봉우리 하나가 지형 AABB를 높여" 실제 후보가 0개인 질의도
+/// 거절한다(확인검수 rev_e50670ad MAJOR). 실제로 볼 셀만 센다.
+pub fn overlapping_cell_count(
+    hf: &HeightfieldRef<'_>,
+    range: (u32, u32, u32, u32),
+    y_lo: f32,
+    y_hi: f32,
+) -> usize {
+    let mut n = 0usize;
+    for_each_overlapping_cell(hf, range, y_lo, y_hi, |_, _| {
+        n += 1;
+        true
+    });
+    n
+}
+
+/// 타일 배열이 **정말 이 높이 배열에서 유도된 것인가** — 값까지 확인한다.
+///
+/// 길이만 보면 안 된다: `Shape::Heightfield`는 공개 필드라 호스트가 직접 만들 수 있고,
+/// 길이만 맞는 엉뚱한 타일(예: 평지에 `[(100,100)]`)을 넣으면 가지치기가 **모든 실제 지형을
+/// 건너뛴다** — 스윕이 `None`을 돌려주고 물체가 지형을 통과한다.
+/// 더 나쁜 것은 스냅샷이다: 타일은 직렬화하지 않으므로 복원 월드는 **올바른** 타일을 갖는다.
+/// 즉 같은 바이트·같은 상태 해시인데 다음 CCD 결과가 달라진다 — L0 결정론과
+/// 입력/복원 대칭이 동시에 깨진다(확인검수 rev_e50670ad BLOCKER).
+///
+/// 할당 없이(재계산해 비교) 검사한다 — `Body::validate`가 커맨드 flush에서도 불린다.
+/// 비교는 **비트 단위**다: 파생값이 조금이라도 다르면 그건 다른 파생이다.
+pub fn tiles_match(heights: &[f32], nx: u32, nz: u32, tiles: &[(f32, f32)]) -> bool {
+    let Some(samples) = (nx as usize).checked_mul(nz as usize) else {
+        return false;
+    };
+    if nx < 2 || nz < 2 || samples != heights.len() {
+        return false;
+    }
+    let (ncx, ncz) = (nx - 1, nz - 1);
+    let (ntx, ntz) = (
+        ncx.div_ceil(HEIGHTFIELD_TILE),
+        ncz.div_ceil(HEIGHTFIELD_TILE),
+    );
+    let Some(tile_count) = (ntx as usize).checked_mul(ntz as usize) else {
+        return false;
+    };
+    if tiles.len() != tile_count {
+        return false;
+    }
+    for tz in 0..ntz {
+        for tx in 0..ntx {
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            let x1 = ((tx + 1) * HEIGHTFIELD_TILE).min(ncx);
+            let z1 = ((tz + 1) * HEIGHTFIELD_TILE).min(ncz);
+            for iz in (tz * HEIGHTFIELD_TILE)..=z1 {
+                for ix in (tx * HEIGHTFIELD_TILE)..=x1 {
+                    let h = heights[(iz * nx + ix) as usize];
+                    lo = lo.min(h);
+                    hi = hi.max(h);
+                }
+            }
+            let got = tiles[(tz * ntx + tx) as usize];
+            if got.0.to_bits() != lo.to_bits() || got.1.to_bits() != hi.to_bits() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// 로컬 공간 AABB를 포즈로 되돌린 것 — 월드 AABB를 하이트필드 로컬로 옮긴다.

@@ -2938,52 +2938,62 @@ mod tests {
         assert!(w.body(h).pose().pos.y.is_finite());
     }
 
-    /// **긴 지형에서 접촉을 조용히 놓치지 않는다** — 예산 안이면 찾고, 넘으면 **오류**다.
+    /// **타일 가지치기가 긴 질의를 살린다** — 그리고 진짜로 볼 셀이 많으면 오류다.
     ///
-    /// 처음엔 4,096셀에서 잘라 `None`을 냈다(진짜 접촉이 사라져 관통). 지금은 두 갈래다:
-    /// 공개 질의는 `ResourceLimit`으로 거절하고(호스트가 질의를 좁힐 수 있다),
-    /// 스텝 CCD는 보수적으로 이동을 막는다(관통 대신 멈춤).
+    /// 예산 이력: 잘라서 `None`(관통) → 무제한(폭주) → 가짜 히트(영구 동결) → **타일 계층**.
+    /// 지금은 질의의 Y 밴드와 겹치는 타일만 보므로, 평지 위를 지나는 긴 스윕은 볼 셀이
+    /// 거의 없어 **성공**한다. 반대로 모든 셀이 밴드와 겹치는 거친 지형에서는 진짜로
+    /// 볼 일이 많으므로 `ResourceLimit`으로 거절한다(가짜 히트로 위장하지 않는다).
     #[test]
-    fn long_heightfield_queries_either_hit_or_report_a_budget_error() {
-        let mut w = World::new(WorldParams::default());
+    fn tile_pruning_keeps_long_queries_cheap_and_still_reports_real_overload() {
+        // ① 평지 + 600m 지점의 벽 — 스윕 밴드(y≈1)는 평지 타일(0..0)과 안 겹친다.
+        let mut flat = World::new(WorldParams::default());
         let (nx, nz) = (8193u32, 3u32);
         let mut heights = vec![0.0f32; (nx * nz) as usize];
         for iz in 0..nz {
-            heights[(iz * nx + 6000) as usize] = 3.0; // 600m 지점의 벽
+            heights[(iz * nx + 6000) as usize] = 3.0;
         }
-        w.try_add_heightfield(&heights, nx, nz, 0.1, pose(0.0, 0.0, 0.0))
+        flat.try_add_heightfield(&heights, nx, nz, 0.1, pose(0.0, 0.0, 0.0))
             .expect("지형");
+        let hit = flat
+            .sweep_shape(
+                &Shape::Sphere { radius: 0.2 },
+                pose(0.0, 1.0, 0.1),
+                Vec3::new(800.0, 0.0, 0.0),
+                QueryFilter::ALL,
+            )
+            .expect("타일 가지치기 덕에 예산에 걸리지 않아야 한다");
+        assert!(hit.is_some(), "600m 앞의 벽을 놓쳤다");
 
-        // ① 예산을 넘는 질의는 **오류**다(조용한 미탐지가 아니라).
-        let huge = w.sweep_shape(
+        // ② 모든 셀이 스윕 밴드와 겹치는 거친 지형 — 진짜로 볼 일이 많다 → 오류.
+        let mut rough = World::new(WorldParams::default());
+        let mut rh = vec![0.0f32; (nx * nz) as usize];
+        for iz in 0..nz {
+            for ix in 0..nx {
+                // 밴드(y 0.8..1.2)를 가로지르도록 톱니
+                rh[(iz * nx + ix) as usize] = if ix % 2 == 0 { 0.0 } else { 2.0 };
+            }
+        }
+        rough
+            .try_add_heightfield(&rh, nx, nz, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형");
+        let r = rough.sweep_shape(
             &Shape::Sphere { radius: 0.2 },
             pose(0.0, 1.0, 0.1),
             Vec3::new(800.0, 0.0, 0.0),
             QueryFilter::ALL,
         );
         assert_eq!(
-            huge.err(),
+            r.err(),
             Some(ApiError::ResourceLimit),
-            "예산 초과가 조용한 미탐지로 처리됐다"
+            "볼 셀이 8천 개인 질의가 조용히 통과했다"
         );
 
-        // ② 예산 안(≈20m = 200셀)에서는 벽을 실제로 찾는다 — 4,096셀 상한 시절에도
-        //    통과했겠지만, 여기서 재는 것은 "짧은 질의는 정상"이라는 대조군이다.
-        let near = w
-            .sweep_shape(
-                &Shape::Sphere { radius: 0.2 },
-                pose(599.0, 1.0, 0.1),
-                Vec3::new(20.0, 0.0, 0.0),
-                QueryFilter::ALL,
-            )
-            .expect("질의");
-        assert!(near.is_some(), "20m 앞의 벽을 놓쳤다");
-
-        // ③ 레이는 DDA라 예산과 무관하게 격자를 끝까지 걷는다 — 600m 앞 벽을 본다.
-        let r = w
+        // ③ 레이는 DDA라 격자 크기에 묶여 있어 그대로 먼 벽을 본다.
+        let ray = flat
             .cast_ray(Vec3::new(0.05, 1.0, 0.1), Vec3::new(1.0, 0.0, 0.0), 1000.0)
             .expect("질의");
-        assert!(r.is_some(), "레이가 먼 벽을 놓쳤다");
+        assert!(ray.is_some(), "레이가 먼 벽을 놓쳤다");
     }
 
     /// 격자 **밖** 점은 지형 안이 아니다 (MAJOR: 마지막 셀 외삽).
@@ -3269,6 +3279,129 @@ mod tests {
             "멀쩡한 저장본이 손상으로 보고됐다 — 호스트가 버린다"
         );
         assert!(w.restore(&snap).is_ok(), "환경 복구 후에는 복원돼야 한다");
+    }
+
+    // ===== 확인검수 rev_e50670ad 회귀 =====
+
+    /// **타일 값이 높이와 맞지 않으면 거부한다** (BLOCKER: L0·복원 대칭 붕괴).
+    ///
+    /// 길이만 검사하면 평지에 `[(100,100)]`을 넣어 모든 지형을 건너뛰게 만들 수 있고,
+    /// 스냅샷은 타일을 저장하지 않으므로 **복원 월드는 올바른 타일**을 갖는다 —
+    /// 같은 바이트·같은 해시인데 다음 CCD가 달라진다.
+    #[test]
+    fn heightfield_with_forged_tiles_is_rejected() {
+        let heights = vec![0.0f32; 9 * 9];
+        let real = maru_collide::build_heightfield_tiles(&heights, 9, 9);
+        assert!(!real.is_empty());
+        // 길이는 맞지만 값이 거짓인 타일
+        let forged = vec![(100.0f32, 100.0f32); real.len()];
+        let bad = Shape::Heightfield {
+            heights: heights.clone(),
+            tiles: forged,
+            nx: 9,
+            nz: 9,
+            cell: 1.0,
+        };
+        assert!(
+            bad.validate().is_err(),
+            "거짓 타일이 검증을 통과했다 — 가지치기가 모든 지형을 건너뛴다"
+        );
+        assert!(Body::try_new_static(bad, pose(0.0, 0.0, 0.0)).is_err());
+        // 올바른 타일은 통과
+        let good = Shape::Heightfield {
+            heights,
+            tiles: real,
+            nx: 9,
+            nz: 9,
+            cell: 1.0,
+        };
+        assert!(good.validate().is_ok());
+    }
+
+    /// **멀리 있는 봉우리 하나가 정상 스텝을 비싸게 만들지 않는다** (MAJOR: raw 셀 수).
+    ///
+    /// 지형은 바디 하나라 전역 AABB가 봉우리까지 포함한다 — 그래서 브로드페이즈는 공중의
+    /// 물체도 후보로 넣는다. 예전에는 그 후보의 **raw 셀 수**를 세서 후보가 실제로 0개인
+    /// 질의까지 거절했고, 접촉 순회는 셀 전부를 돌았다. 타일 Y 밴드로 걸러야 한다.
+    ///
+    /// (셀 **예산** 초과는 이제 자연스러운 장면에서 재현하기 어렵다: 셀을 많이 보려면
+    /// 바디가 커야 하고, 큰 바디는 접촉을 먼저 64개 채워 포화로 끝난다. 예산은 남겨 둔
+    /// 최후 방어선이고, 그 신호가 포화와 **구분되는지**는 `ContactWalk` 타입이 잠근다.)
+    #[test]
+    fn a_distant_peak_does_not_make_a_hovering_body_expensive() {
+        let (nx, nz) = (600u32, 600u32);
+        let mut heights = vec![0.0f32; (nx * nz) as usize];
+        heights[0] = 3.0; // 전역 AABB만 높이는 봉우리 하나
+        let mut w = World::new(WorldParams::default());
+        w.try_add_heightfield(&heights, nx, nz, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형");
+        // 평지 위 2.5m 공중의 큰 박스 — 봉우리와 멀고 실제 접촉은 없다.
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(25.0, 1.0, 25.0),
+                radius: 0.0,
+            },
+            pose(30.0, 2.5, 30.0),
+            1.0,
+        ));
+        assert!(
+            w.try_step(DT).is_ok(),
+            "후보가 0개인 스텝이 자원 오류로 거절됐다 — raw 셀 수를 세고 있다"
+        );
+        // 질의도 같은 규칙이어야 한다.
+        assert!(w
+            .sweep_shape(
+                &Shape::Sphere { radius: 0.2 },
+                pose(30.0, 2.5, 30.0),
+                Vec3::new(0.0, 0.2, 0.0),
+                QueryFilter::ALL
+            )
+            .is_ok());
+        assert!(w.body(h).pose().pos.y.is_finite());
+    }
+
+    /// **비볼록 셰이프가 저수준 볼록 API로 들어가도 죽지 않는다** (BLOCKER: trap 경로).
+    #[test]
+    fn low_level_convex_apis_reject_non_convex_instead_of_trapping() {
+        let heights = vec![0.0f32; 4];
+        let hf = Shape::Heightfield {
+            heights: heights.clone(),
+            tiles: maru_collide::build_heightfield_tiles(&heights, 2, 2),
+            nx: 2,
+            nz: 2,
+            cell: 1.0,
+        };
+        let sphere = Shape::Sphere { radius: 0.5 };
+        let p = pose(0.0, 0.0, 0.0);
+        // 예전에는 여기서 `unreachable!`로 프로세스가 죽었다.
+        assert!(maru_collide::contact(&hf, &p, &sphere, &p, 0.02).is_none());
+        assert!(
+            maru_collide::shape_cast(&hf, &p, Vec3::new(1.0, 0.0, 0.0), &sphere, &p, 0.02)
+                .is_none()
+        );
+        // 디스패치 경로는 정상 동작(하이트필드를 펼친다)
+        let _ = maru_collide::shape_cast_dispatch(
+            &sphere,
+            &pose(0.5, 2.0, 0.5),
+            Vec3::new(0.0, -3.0, 0.0),
+            &hf,
+            &p,
+            0.02,
+        );
+    }
+
+    /// **거대한 유한 각은 조용히 항등이 되지 않는다** (MAJOR: 공개 계약 모순).
+    #[test]
+    fn huge_finite_axis_angle_is_rejected_not_silently_identity() {
+        let axis = Vec3::new(0.0, 0.0, 1.0);
+        assert!(Quat::try_from_axis_angle(axis, 1.0).is_some());
+        assert!(Quat::try_from_axis_angle(axis, 1.0e9).is_some());
+        assert!(
+            Quat::try_from_axis_angle(axis, 1.0e20).is_none(),
+            "결정적으로 접을 수 없는 각을 받아들였다"
+        );
+        assert!(Quat::try_from_axis_angle(axis, f32::INFINITY).is_none());
+        assert!(Quat::try_from_axis_angle(Vec3::ZERO, 1.0).is_none());
     }
 
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).

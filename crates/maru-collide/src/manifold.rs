@@ -161,7 +161,7 @@ fn heightfield_contacts(
     margin: f32,
     flip: bool,
     f: &mut dyn FnMut(u8, u8, Manifold),
-) -> bool {
+) -> ContactWalk {
     let hf = hf_shape.heightfield_ref().expect("Heightfield 변종");
     // 볼록 쪽 월드 AABB를 격자 로컬로 옮겨 셀 범위를 얻는다(margin만큼 넓힌다).
     let mut world = crate::transformed_aabb(sa.local_aabb(), pa);
@@ -169,17 +169,28 @@ fn heightfield_contacts(
     let pad = Vec3::new(margin, margin, margin);
     world = crate::Aabb::new(world.min - pad, world.max + pad);
     let local = crate::heightfield::world_aabb_to_local(world, hf_pose);
-    let Some((cx0, cz0, cx1, cz1)) = hf.cell_range(local) else {
-        return false;
+    let Some(range) = hf.cell_range(local) else {
+        return ContactWalk::Complete;
     };
+    let (y_lo, y_hi) = (local.min.y, local.max.y);
     let mut emitted = 0usize;
+    let mut visited = 0usize;
+    let mut saturated = false;
+    let mut over_budget = false;
     // 복합 자식도 함께 펼친다 — 자식 키는 그대로 콜백에 넘겨 네임스페이싱을 유지한다.
     let children: &[(Pose, Shape)] = match sa {
         Shape::Compound { children } => children,
         _ => &[],
     };
-    for cz in cz0..=cz1 {
-        for cx in cx0..=cx1 {
+    // **타일 → 셀** 순서로 걷는다. 겹치지 않는 타일의 셀은 방문조차 하지 않고,
+    // 방문 수가 예산을 넘으면 순회를 포기해 호출자가 자원 오류로 처리하게 한다.
+    crate::heightfield::for_each_overlapping_cell(&hf, range, y_lo, y_hi, |cx, cz| {
+        visited += 1;
+        if visited > crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
+            over_budget = true;
+            return false;
+        }
+        {
             for t in 0..2u8 {
                 let tri_local = hf.triangle(cx, cz, t);
                 let tri_shape = Shape::Triangle {
@@ -237,7 +248,8 @@ fn heightfield_contacts(
                             any = true;
                             emitted += 1;
                             if emitted >= crate::MAX_HEIGHTFIELD_MANIFOLDS {
-                                return true;
+                                saturated = true;
+                                return false;
                             }
                         }
                     }
@@ -246,18 +258,41 @@ fn heightfield_contacts(
                 if children.is_empty() && hit {
                     emitted += 1;
                     if emitted >= crate::MAX_HEIGHTFIELD_MANIFOLDS {
-                        return true;
+                        saturated = true;
+                        return false;
                     }
                 }
             }
         }
+        true
+    });
+    if over_budget {
+        return ContactWalk::BudgetExceeded;
     }
-    false
+    if saturated {
+        return ContactWalk::Saturated;
+    }
+    ContactWalk::Complete
 }
 
 /// 접촉 디스패처 — compound를 자식으로 펼쳐 자식쌍마다 매니폴드를 콜백에 준다.
 /// 비복합 쌍은 (0,0) 키로 1회. 자식 순서는 목록 순 — 결정적. 콜백이 받은 매니폴드의
 /// feature 네임스페이싱(자식쌍 키 접기)은 **호출자 책임**이다(키 조립 규약이 호출자에 있다).
+/// 접촉 순회 결과 — **포화와 예산 초과는 다른 사건**이다.
+///
+/// 포화는 "접촉을 64개 찾고 끊었다"(뒤에 더 있을 수 있다)이고, 예산 초과는 "볼 셀이 너무
+/// 많아 **판정 자체를 못 했다**"다. 후자를 포화로 뭉개면 접촉 없는 장면이 정상으로 보이는데
+/// 실제로는 순회가 잘렸다 — 뒤쪽의 진짜 접촉이 조용히 사라진다(확인검수 rev_e50670ad BLOCKER).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContactWalk {
+    /// 끝까지 걸었다.
+    Complete,
+    /// 매니폴드 상한(`MAX_HEIGHTFIELD_MANIFOLDS`)에서 끊었다.
+    Saturated,
+    /// 셀 예산을 넘어 순회를 포기했다 — 호출자는 이 스텝을 **자원 오류**로 다뤄야 한다.
+    BudgetExceeded,
+}
+
 pub fn for_each_contact(
     sa: &Shape,
     pa: &Pose,
@@ -265,7 +300,7 @@ pub fn for_each_contact(
     pb: &Pose,
     margin: f32,
     f: &mut dyn FnMut(u8, u8, Manifold),
-) -> bool {
+) -> ContactWalk {
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
         rot: parent.rot * child.rot,
@@ -310,10 +345,24 @@ pub fn for_each_contact(
             }
         }
     }
-    false
+    ContactWalk::Complete
+}
+
+/// 볼록 전용 경로에 비볼록 셰이프가 들어왔는가 — 들어오면 GJK가 `unreachable!`에 닿는다.
+#[inline]
+fn is_non_convex(s: &Shape) -> bool {
+    matches!(s, Shape::Compound { .. } | Shape::Heightfield { .. })
 }
 
 pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<Manifold> {
+    // **비볼록은 여기서 끝낸다.** 이 함수는 볼록 전용이고(디스패치는 `for_each_contact`),
+    // 그냥 넘기면 `support_core`의 `unreachable!`이 프로세스를 죽인다 — 라이브러리가
+    // 잘못된 입력에 trap하는 것은 이 저장소의 계약 위반이다(확인검수 rev_e50670ad BLOCKER).
+    // **디버그에서도 패닉하지 않는다**: 공개 API의 거동이 빌드 프로파일에 따라 달라지면
+    // "라이브러리는 trap하지 않는다"가 조건부 약속이 된다.
+    if is_non_convex(sa) || is_non_convex(sb) {
+        return None;
+    }
     debug_assert!(
         !matches!(sa, Shape::Compound { .. }) && !matches!(sb, Shape::Compound { .. }),
         "compound는 for_each_contact로 디스패치해야 한다"
