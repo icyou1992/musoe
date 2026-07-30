@@ -1324,6 +1324,16 @@ impl World {
         if !maru_collide::vec_in_range(pose.pos) || !maru_collide::vec_in_range(motion) {
             return Err(ApiError::InvalidValue);
         }
+        // **자세를 정규화한다.** 비단위 쿼터니언은 회전이 아니라 회전+축소를 만들어,
+        // 아래 AABB 선판정과 GJK가 **찌그러진 형상**으로 조용히 틀린 답을 낸다
+        // (확인검수 rev_2e93ebf2 BLOCKER). `set_pose`와 같은 규약이고, 부동소수 드리프트로
+        // 정확한 단위는 드물어 거절이 아니라 정규화가 맞다 — 불가능한 것(0·NaN)만 거절한다.
+        // 디스패처도 같은 정규화를 하지만 여기서 안 하면 **선판정이 그보다 먼저** 잘못된
+        // 자세를 쓴다(그러면 후보가 걸러져 캐스트에 도달하지도 않는다).
+        let pose = maru_collide::Pose {
+            pos: pose.pos,
+            rot: pose.rot.try_normalize().ok_or(ApiError::InvalidValue)?,
+        };
         if shape.validate().is_err() {
             return Err(ApiError::InvalidValue);
         }
@@ -1416,6 +1426,11 @@ impl World {
         if !maru_collide::vec_in_range(pose.pos) || shape.validate().is_err() {
             return Err(ApiError::InvalidValue);
         }
+        // 자세 정규화 — 근거는 `sweep_shape`의 같은 자리 주석에.
+        let pose = maru_collide::Pose {
+            pos: pose.pos,
+            rot: pose.rot.try_normalize().ok_or(ApiError::InvalidValue)?,
+        };
         let aabb = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
         let mut found = false;
         for i in 0..self.bodies.len() {
@@ -1425,21 +1440,11 @@ impl World {
             if !self.passes(i, filter) || !aabb.overlaps(self.body_aabb(i)) {
                 continue;
             }
-            // 하이트필드는 셀 예산을 본다 — 이 질의는 캐릭터가 **매 이동마다** 부르므로
-            // 공개 스윕의 예산을 우회하는 새 작업량 경로가 된다(확인검수 rev_d390e73d MAJOR).
-            if let Some(hf) = self.bodies[i].shape.heightfield_ref() {
-                let local = maru_collide::world_aabb_to_local(aabb, &self.bodies[i].pose);
-                if let Some(range) = hf.cell_range(local) {
-                    let cells =
-                        maru_collide::overlapping_cell_count(&hf, range, local.min.y, local.max.y);
-                    if cells > maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
-                        return Err(ApiError::ResourceLimit);
-                    }
-                }
-            }
-            // 순회 결과를 **버리지 않는다**: 위 선판정과 같은 계산이라 여기서 예산이 터질 수는
-            // 없지만, 둘 중 하나만 바뀌면 "판정 못 한 것"이 "겹치지 않음"으로 조용히 바뀐다.
-            // 캐릭터의 시작 겹침 검사가 그러면 벽 속에서 출발한다.
+            // **작업량 상한은 순회 안에 있다**(4096셀) — 예전에는 여기서 셀 수를 미리 세어
+            // 초과면 즉시 거절했는데, 그러면 첫 셀부터 깊이 박혀 있는 큰 바디도 AABB가 넓으면
+            // **증명 가능한 `true`를 영원히 못 받는다**(확인검수 rev_2e93ebf2 MAJOR:
+            // 캐릭터의 매 이동이 오류로 고정된다). `any_contact`와 같은 규칙을 쓴다 —
+            // 양성은 한 점으로 증명되고, 음성만 순회 완주를 요구한다.
             let walk = maru_collide::for_each_contact(
                 shape,
                 &pose,
@@ -1452,7 +1457,15 @@ impl World {
                     }
                 },
             );
-            if walk == maru_collide::ContactWalk::BudgetExceeded {
+            if found {
+                // 하나 찾았으면 끝 — 뒤에 무엇이 있든 "겹친다"는 답은 바뀌지 않는다.
+                return Ok(true);
+            }
+            // 못 찾았는데 순회가 끊겼다 = **판정하지 못했다**. `false`로 뭉개면 캐릭터가
+            // 벽 속에서 출발한다.
+            if walk != maru_collide::ContactWalk::Complete
+                && walk != maru_collide::ContactWalk::Saturated
+            {
                 return Err(ApiError::ResourceLimit);
             }
         }
@@ -3971,8 +3984,12 @@ impl World {
                                 let cast = match cast {
                                     Ok(c) => c,
                                     Err(_) => {
+                                        // **첫 실패에서 후보 순회를 끝낸다.** 결말(보수적 정지)이
+                                        // 이미 확정됐으므로 나머지 후보 검사는 전부 낭비다 —
+                                        // 같은 자리에 지형 100개를 겹쳐 두면 서브스텝당 40만 셀이
+                                        // 된다(확인검수 rev_2e93ebf2 MAJOR).
                                         cast_incomplete = true;
-                                        None
+                                        break;
                                     }
                                 };
                                 if let Some(hit) = cast {
@@ -4001,6 +4018,14 @@ impl World {
                             // `heightfield_saturated`와 같은 규약: 조용한 강등 금지).
                             d = Vec3::ZERO;
                             rot_toi = 0.0;
+                            // **속도도 멈춘다.** 위치만 얼리면 중력·솔버가 매 서브스텝 속도를
+                            // 계속 키워 `max_linear_velocity`까지 쌓이고, 호스트가 지형을 줄여
+                            // 판정이 가능해지는 순간 그 바디가 최대 속도로 발사된다
+                            // (확인검수 rev_2e93ebf2 MAJOR — 위치만 비교한 테스트가 놓쳤다).
+                            // 보수적 정지의 물리적 해석은 "막혔다"이므로 정지가 일관된다.
+                            st.lin[i] = Vec3::ZERO;
+                            st.ang[i] = Vec3::ZERO;
+                            ccd_frozen[ci] = true;
                             self.diag.ccd_incomplete += 1;
                         } else if let Some((toi, normal, point, sid)) = best {
                             // **절단 순간을 호스트에게 보고한다** (설계 §4.5 TOI-hit 큐).
@@ -4729,6 +4754,10 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
             // 불완전하다. 포화로 뭉개면 "접촉 없음"으로 계속 진행해 뒤쪽 접촉이 사라진다.
             // 자원 오류로 올려 호스트가 장면을 줄이거나 격자를 성기게 하도록 한다.
             maru_collide::ContactWalk::BudgetExceeded => out.budget_exceeded = true,
+            // 월드에 들어오는 형상은 삽입·복원에서 `validate()`를 통과했으므로 여기는
+            // 도달 불가다. 그래도 `Complete`로 뭉개지 않는다 — 언젠가 검증 경로가 갈리면
+            // "접촉 없음"으로 조용히 진행하는 대신 예산 초과와 같은 결말(스텝 포기)을 준다.
+            maru_collide::ContactWalk::InvalidShape => out.budget_exceeded = true,
         }
         // 센서 페어(또는 접촉만 있고 제약이 없는 경우의 이벤트 기준선).
         if touched && sensor_pair {

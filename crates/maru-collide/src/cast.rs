@@ -237,19 +237,47 @@ pub enum CastReject {
     BudgetExceeded,
 }
 
-/// 두 디스패처가 공유하는 산술 입력 검증 — **패닉 대신 값**.
+/// 두 디스패처가 공유하는 입력 정규화 — **패닉 대신 값**, 그리고 **왜곡 대신 거절**.
 ///
-/// 각만 검사하던 시절, `axis=(NaN,0,0)`에 유효한 각을 넣으면 내부에서 `t`가 NaN이 되어
-/// `angle * t`가 NaN이 되고 `Quat::from_axis_angle`의 assert가 프로세스를 죽였다
-/// (확인검수 rev_d5b32e22 BLOCKER — 패닉 입력 공간이 각에서 축·이동으로 옮겨갔을 뿐이었다).
-fn cast_inputs_ok(motion: Vec3, skin: f32, pa: &Pose, pb: &Pose) -> bool {
-    motion.is_finite()
-        && skin.is_finite()
-        && skin >= 0.0
-        && pa.pos.is_finite()
-        && pa.rot.is_finite()
-        && pb.pos.is_finite()
-        && pb.rot.is_finite()
+/// 세 가지를 한자리에서 처리한다:
+/// 1. 산술값 범위. 각만 검사하던 시절, `axis=(NaN,0,0)`에 유효한 각을 넣으면 내부에서 `t`가
+///    NaN이 되어 `angle * t`가 NaN이 되고 `Quat::from_axis_angle`의 assert가 프로세스를
+///    죽였다(확인검수 rev_d5b32e22 BLOCKER — 패닉 공간이 각에서 축·이동으로 옮겼을 뿐이었다).
+/// 2. **자세를 정규화한다.** `Quat::rotate`는 비단위 쿼터니언에 회전이 아니라 회전+축소를
+///    적용한다 — 0.5배한 정상 쿼터니언은 유한하고 정규화 가능하지만 단위가 아니어서,
+///    검사만 통과시키면 캐스트가 **찌그러진 형상**으로 조용히 틀린 답을 낸다
+///    (확인검수 rev_2e93ebf2 BLOCKER). 부동소수 드리프트로 정확한 단위는 드물기 때문에
+///    거절이 아니라 정규화가 맞고, 정규화가 불가능한 것(0·NaN)만 거절한다.
+///    `World::set_pose`도 같은 규약이다.
+/// 3. **형상 구조.** 불변식이 깨진 형상은 GJK에서 패닉하거나(빈 hull) 미스로 위장된다(빈 복합).
+fn canonical_cast_inputs(
+    sa: &Shape,
+    sb: &Shape,
+    motion: Vec3,
+    skin: f32,
+    pa: &Pose,
+    pb: &Pose,
+) -> Option<(Pose, Pose)> {
+    if !motion.is_finite()
+        || !skin.is_finite()
+        || skin < 0.0
+        || !pa.pos.is_finite()
+        || !pb.pos.is_finite()
+        || !sa.is_castable()
+        || !sb.is_castable()
+    {
+        return None;
+    }
+    Some((
+        Pose {
+            pos: pa.pos,
+            rot: pa.rot.try_normalize()?,
+        },
+        Pose {
+            pos: pb.pos,
+            rot: pb.rot.try_normalize()?,
+        },
+    ))
 }
 
 /// 회전 인지 복합 디스패치 — 자식은 **바디 COM(pivot)** 중심으로 함께 돈다.
@@ -269,16 +297,15 @@ pub fn try_shape_cast_dispatch_rotational(
 ) -> Result<Option<ShapeCastHit>, CastReject> {
     // 산술 입력은 **격자를 걷기 전에** 전부 검사한다. 축은 여기서 한 번 정규화해
     // 전 경로가 같은 값을 쓰게 한다(내부에서 각각 정규화하면 NaN 축이 살아남는다).
-    if !cast_inputs_ok(motion, skin, pa, pb)
-        // **비유한 축은 "축이 없음"이 아니라 잘못된 입력이다.** 0 축(회전 없음)과 달리
-        // NaN 축은 호출자 버그이고, 걸러내지 않으면 내부 `t`가 NaN이 되어 각 생성자의
-        // assert에 닿는다(확인검수 rev_d5b32e22 BLOCKER).
-        || !axis.is_finite()
-        || !angle.is_finite()
-        || angle.abs() > maru_math::Quat::MAX_AXIS_ANGLE
-    {
+    // **비유한 축은 "축이 없음"이 아니라 잘못된 입력이다.** 0 축(회전 없음)과 달리
+    // NaN 축은 호출자 버그이고, 걸러내지 않으면 내부 `t`가 NaN이 되어 각 생성자의
+    // assert에 닿는다(확인검수 rev_d5b32e22 BLOCKER).
+    if !axis.is_finite() || !angle.is_finite() || angle.abs() > maru_math::Quat::MAX_AXIS_ANGLE {
         return Err(CastReject::InvalidInput);
     }
+    let (npa, npb) =
+        canonical_cast_inputs(sa, sb, motion, skin, pa, pb).ok_or(CastReject::InvalidInput)?;
+    let (pa, pb) = (&npa, &npb);
     let axis = match axis.try_normalize() {
         Some(a) => a,
         // 축 길이가 0이면 회전이 없다 — 선형 캐스트와 같은 답이다(오류가 아니다).
@@ -407,9 +434,9 @@ pub fn try_shape_cast_dispatch(
     pb: &Pose,
     skin: f32,
 ) -> Result<Option<ShapeCastHit>, CastReject> {
-    if !cast_inputs_ok(motion, skin, pa, pb) {
-        return Err(CastReject::InvalidInput);
-    }
+    let (npa, npb) =
+        canonical_cast_inputs(sa, sb, motion, skin, pa, pb).ok_or(CastReject::InvalidInput)?;
+    let (pa, pb) = (&npa, &npb);
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
         rot: parent.rot * child.rot,

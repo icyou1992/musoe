@@ -417,6 +417,40 @@ pub unsafe extern "C" fn maru_step(p: *mut WasmWorld, dt: f32) -> i32 {
     }
 }
 
+/// 직전 스텝에서 **판정을 완료하지 못해 보수적으로 정지한** CCD 바디-서브스텝 수.
+///
+/// 그 경우 `maru_step`은 `OK`를 돌려준다(스텝 자체는 진행됐다). 이 값이 없으면 브라우저
+/// 호스트는 "정상적으로 안 움직였다"와 "판정을 못 해서 멈췄다"를 구분할 방법이 없다 —
+/// 그러면 "조용한 tier 강등 금지"가 주 배포 타깃에서만 깨진다(확인검수 rev_2e93ebf2 MAJOR).
+/// 0이 아니면 지형 해상도나 바디 크기를 줄여야 한다는 신호다.
+///
+/// null 포인터는 `u32::MAX`(불가능한 값)로 답한다 — 0을 돌려주면 "정상"과 구분되지 않는다.
+///
+/// # Safety
+/// `p`는 `maru_world_create`가 준 포인터이거나 null이어야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_ccd_incomplete(p: *mut WasmWorld) -> u32 {
+    let w = w_or!(p, u32::MAX);
+    w.world.diagnostics().ccd_incomplete.min(u32::MAX as usize) as u32
+}
+
+/// 직전 스텝에서 하이트필드 접촉이 **매니폴드 상한에서 끊긴** 페어 수(포화).
+///
+/// 포화는 오류가 아니지만(접촉을 찾고 끊었다) 접촉 집합이 잘렸다는 뜻이라, 같은 이유로
+/// 호스트가 볼 수 있어야 한다. 예산 초과(판정 불가)는 `maru_step`이 `ResourceLimit`으로
+/// 알리므로 별도 채널이 필요 없다.
+///
+/// # Safety
+/// `p`는 `maru_world_create`가 준 포인터이거나 null이어야 한다.
+#[no_mangle]
+pub unsafe extern "C" fn maru_heightfield_saturated(p: *mut WasmWorld) -> u32 {
+    let w = w_or!(p, u32::MAX);
+    w.world
+        .diagnostics()
+        .heightfield_saturated
+        .min(u32::MAX as usize) as u32
+}
+
 impl WasmWorld {
     /// 변환 버퍼를 월드와 일치시킨다. 실패하면 버퍼는 stale로 남는다(비워서
     /// 정상처럼 보이게 만들지 않는다 — 길이 0은 "슬롯 0개"라는 유효 상태다).
@@ -854,6 +888,28 @@ pub unsafe extern "C" fn maru_query_hit_handle(p: *mut WasmWorld) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// **조용한 강등 채널이 wasm ABI에도 있다** (MAJOR: 주 배포 타깃만 계약이 깨졌다).
+    ///
+    /// 판정을 완료하지 못한 CCD는 `maru_step`이 `OK`를 돌려주므로, 진단 게터가 없으면
+    /// 브라우저 호스트는 "정상적으로 안 움직였다"와 "판정을 못 해서 멈췄다"를 구분할 수 없다
+    /// (확인검수 rev_2e93ebf2 MAJOR). null은 0이 아니라 `u32::MAX`로 답해야 한다 —
+    /// 0은 "정상"과 같은 값이다.
+    #[test]
+    fn diagnostic_getters_exist_and_distinguish_null() {
+        unsafe {
+            assert_eq!(maru_ccd_incomplete(core::ptr::null_mut()), u32::MAX);
+            assert_eq!(maru_heightfield_saturated(core::ptr::null_mut()), u32::MAX);
+            let w = maru_world_create(0.0, -9.81, 0.0, 4);
+            assert!(!w.is_null());
+            // 갓 만든 월드는 둘 다 0 — "정상"의 값이 null의 값과 겹치지 않는다.
+            assert_eq!(maru_ccd_incomplete(w), 0);
+            assert_eq!(maru_heightfield_saturated(w), 0);
+            assert_eq!(maru_step(w, 1.0 / 60.0), OK);
+            assert_eq!(maru_ccd_incomplete(w), 0);
+            maru_world_destroy(w);
+        }
+    }
+
     /// **스냅샷 ABI 왕복** — 호스트가 쓰는 그 경로 그대로(버전 조회 → 뜨기 → 포인터 →
     /// 복원 → 해시 일치). ABI를 rlib으로도 빌드해 네이티브에서 도는 이유가 이것이다.
     #[test]

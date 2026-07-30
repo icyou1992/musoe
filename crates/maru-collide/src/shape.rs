@@ -151,6 +151,79 @@ fn hull_min_width(points: &[Vec3]) -> f32 {
 impl Shape {
     /// 형상 불변식 검증. **모든 바디 타입의 생성 경계에서 호출된다** — static/kinematic도
     /// 빈 hull이면 support/local_aabb가 `points[0]`에서 패닉한다(리뷰 지적).
+    /// **패닉 없이 캐스트·접촉에 넣을 수 있는 형상인가** — O(1)(복합은 자식 수) 구조 검사.
+    ///
+    /// `Shape`의 필드가 공개이므로 호스트는 `Hull { points: vec![] }`처럼 불변식을 깬 값을
+    /// 만들 수 있고, 그것이 GJK로 내려가면 `support_core`의 `points[0]`에서 프로세스가 죽는다
+    /// (확인검수 rev_2e93ebf2 BLOCKER — "공개 fallible 경로는 값을 낸다"가 거짓이었다).
+    /// 빈 복합은 반대로 조용히 "맞은 것 없음"이 되어 잘못된 형상이 미스로 위장한다.
+    ///
+    /// **`validate()`와 다르다.** 그쪽은 정책 전수 검사(높이 전량·타일 비트 일치·크기 범위)라
+    /// O(n)이고, 스텝 안의 CCD가 후보마다 부르면 지형 검증이 핫패스가 된다. 여기서는
+    /// **패닉·미스 위장을 막는 최소 구조**만 본다: 인덱싱 전제와 필수 필드의 유한성.
+    pub(crate) fn is_castable(&self) -> bool {
+        match self {
+            Shape::Sphere { radius } => radius.is_finite() && *radius >= 0.0,
+            Shape::Capsule {
+                half_height,
+                radius,
+            } => {
+                half_height.is_finite()
+                    && *half_height >= 0.0
+                    && radius.is_finite()
+                    && *radius >= 0.0
+            }
+            Shape::Box { half, radius } => {
+                half.is_finite()
+                    && half.x >= 0.0
+                    && half.y >= 0.0
+                    && half.z >= 0.0
+                    && radius.is_finite()
+                    && *radius >= 0.0
+            }
+            Shape::Triangle { points, radius } => {
+                points.iter().all(|p| p.is_finite()) && radius.is_finite() && *radius >= 0.0
+            }
+            // support_core가 `points[0]`을 읽는다 — 비면 패닉이다.
+            Shape::Hull { points, radius } => {
+                !points.is_empty()
+                    && points.len() <= crate::limits::MAX_HULL_POINTS
+                    && points.iter().all(|p| p.is_finite())
+                    && radius.is_finite()
+                    && *radius >= 0.0
+            }
+            // 자식이 없으면 "맞은 것 없음"으로 위장된다. 비볼록 자식은 GJK에서 trap이다.
+            Shape::Compound { children } => {
+                !children.is_empty()
+                    && children.iter().all(|(pose, child)| {
+                        pose.pos.is_finite()
+                            && pose.rot.is_finite()
+                            && !matches!(
+                                child,
+                                Shape::Compound { .. }
+                                    | Shape::Heightfield { .. }
+                                    | Shape::Triangle { .. }
+                            )
+                            && child.is_castable()
+                    })
+            }
+            // 셀 인덱싱과 나눗셈의 전제 — 개수 일치·최소 2×2·양의 유한 셀 크기.
+            Shape::Heightfield {
+                heights,
+                nx,
+                nz,
+                cell,
+                ..
+            } => {
+                *nx >= 2
+                    && *nz >= 2
+                    && (*nx as usize).checked_mul(*nz as usize) == Some(heights.len())
+                    && cell.is_finite()
+                    && *cell > 0.0
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         // 크기 상한까지 여기서 강제한다 — 라이브 생성과 역직렬화가 같은 정책을 쓴다.
         let r = self.radius();

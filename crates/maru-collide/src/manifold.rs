@@ -149,6 +149,8 @@ pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) ->
     match walk {
         // 포화는 접촉을 **찾고** 끊은 것이라 존재 판정에는 충분하다.
         ContactWalk::Complete | ContactWalk::Saturated => Some(found),
+        // 형상이 깨졌으면 판정 자체가 성립하지 않는다 — `false`(=없음)로 뭉개지 않는다.
+        ContactWalk::InvalidShape => None,
         // 예산이 터졌어도 **이미 하나 찾았으면 존재는 증명됐다** — 그때 `None`을 돌려주면
         // 지원 범위 안의 고정 장면(넓은 AABB + 접촉 몇 개)이 영구히 답을 못 받는다
         // (확인검수 rev_d5b32e22 MAJOR). 부정("없다")만 순회 완주를 요구한다.
@@ -300,6 +302,12 @@ fn heightfield_contacts(
 pub enum ContactWalk {
     /// 끝까지 걸었다.
     Complete,
+    /// **입력 형상의 불변식이 깨져 판정을 시작하지 못했다** (빈 hull·빈 복합·격자 개수 불일치).
+    ///
+    /// `Shape`의 필드가 공개라 호스트가 만들 수 있고, 그대로 GJK에 넣으면 `support_core`의
+    /// 인덱싱에서 프로세스가 죽는다. `Complete`로 뭉개면 잘못된 형상이 "접촉 없음"으로
+    /// 위장된다(확인검수 rev_2e93ebf2 BLOCKER의 접촉 쪽 형제 결함).
+    InvalidShape,
     /// 매니폴드 상한(`MAX_HEIGHTFIELD_MANIFOLDS`)에서 끊었다.
     Saturated,
     /// 셀 예산을 넘어 순회를 포기했다 — 호출자는 이 스텝을 **자원 오류**로 다뤄야 한다.
@@ -314,6 +322,11 @@ pub fn for_each_contact(
     margin: f32,
     f: &mut dyn FnMut(u8, u8, Manifold),
 ) -> ContactWalk {
+    // 캐스트와 **같은 구조 검사**(O(1)) — 불변식이 깨진 형상은 GJK에서 패닉하거나
+    // 미스로 위장된다. 정책 전수 검사(`validate`)는 O(n)이라 여기서 부르지 않는다.
+    if !sa.is_castable() || !sb.is_castable() {
+        return ContactWalk::InvalidShape;
+    }
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
         rot: parent.rot * child.rot,

@@ -3782,6 +3782,30 @@ mod tests {
             y0,
             "판정 미완료인데 이동했다 — 보수적 정지가 아니다"
         );
+        // **속도가 쌓이지 않는다.** 위치만 얼리면 중력·솔버가 속도를 계속 키워
+        // `max_linear_velocity`(500 m/s)까지 저장되고, 호스트가 지형을 줄여 판정이 가능해지는
+        // 순간 그 바디가 최대 속도로 발사된다(확인검수 rev_2e93ebf2 MAJOR — 위치만 본 이
+        // 테스트가 놓쳤다). 판정 미완료 서브스텝마다 속도를 0으로 되돌리므로, 한 스텝 안에서
+        // 정지 이후 남은 서브스텝의 중력만 남는다(약 0.12 m/s) — 그 이상 자라지 않는다.
+        // **저장된 에너지가 없다.** 위치만 얼리면 초기 400 m/s가 그대로 남고 중력이 계속
+        // 더해져 `max_linear_velocity`(500)까지 쌓인다 — 호스트가 지형을 줄여 판정이
+        // 가능해지는 순간 그 바디가 최대 속도로 발사된다(확인검수 rev_2e93ebf2 MAJOR:
+        // 위치만 본 이 테스트가 놓쳤다). 판정 미완료 서브스텝에서 속도까지 0으로 되돌리므로,
+        // 이후 2초 동안 속도는 한 자리 수를 넘지 않고 구는 지형 위에 안착한다.
+        let mut vmax = 0.0f32;
+        for _ in 0..120 {
+            assert_eq!(w.try_step(1.0 / 60.0), Ok(()));
+            vmax = vmax.max(w.body(big).linvel().length());
+        }
+        assert!(
+            vmax < 20.0,
+            "판정 미완료 정지가 에너지를 저장하고 있다: 최대 {vmax} m/s (초기 400, 상한 500)"
+        );
+        assert!(
+            w.body(big).pose().pos.y > 4.0,
+            "구가 지형을 뚫고 내려갔다: y={}",
+            w.body(big).pose().pos.y
+        );
         // **음성 대조** — 같은 지형·같은 속도의 작은 CCD 바디는 예산 안이라 정상적으로
         // 움직이고 지면에서 절단된다(상한이 CCD를 통째로 끈 게 아니다).
         let mut w2 = World::new(WorldParams::default());
@@ -3795,6 +3819,8 @@ mod tests {
             .expect("속도");
         assert_eq!(w2.try_step(1.0 / 60.0), Ok(()));
         assert_eq!(w2.diagnostics().ccd_incomplete, 0);
+        // 대조군은 속도가 살아 있다 — 정지 정책이 CCD 바디 전부를 얼린 게 아니다.
+        assert!(w2.body(small).linvel().y < 0.0);
         let y = w2.body(small).pose().pos.y;
         assert!(
             y < 5.3 && y > -0.5,
@@ -3844,6 +3870,224 @@ mod tests {
             "복합 toi {}가 단일 toi {}와 다르다",
             comp.toi,
             one.toi
+        );
+    }
+
+    /// **불변식이 깨진 형상은 공개 경로에서 값으로 거절된다** (BLOCKER: 패닉/미스 위장).
+    ///
+    /// `Shape`의 필드가 공개라 호스트는 `Hull { points: vec![] }`를 만들 수 있고, 예전에는
+    /// 그것이 GJK로 내려가 `support_core`의 `points[0]`에서 프로세스를 죽였다(wasm에서는
+    /// unwind가 trap이다). 빈 복합은 반대로 `Ok(None)`이 되어 잘못된 형상이 **실제 미스로
+    /// 위장**됐다 — 확인검수 rev_2e93ebf2 BLOCKER.
+    #[test]
+    fn malformed_shapes_are_rejected_by_value_on_public_paths() {
+        use maru_collide::CastReject;
+        let empty_hull = Shape::Hull {
+            points: Vec::new(),
+            radius: 0.0,
+        };
+        let empty_compound = Shape::Compound {
+            children: Vec::new(),
+        };
+        let ok = Shape::Sphere { radius: 0.5 };
+        let pa = pose(0.0, 0.0, 0.0);
+        let pb = pose(1.0, 0.0, 0.0);
+        let m = Vec3::new(1.0, 0.0, 0.0);
+        for bad in [&empty_hull, &empty_compound] {
+            // 어느 쪽 인자로 들어와도 같은 답이어야 한다(A/B 대칭).
+            assert_eq!(
+                maru_collide::try_shape_cast_dispatch(bad, &pa, m, &ok, &pb, 0.02),
+                Err(CastReject::InvalidInput)
+            );
+            assert_eq!(
+                maru_collide::try_shape_cast_dispatch(&ok, &pa, m, bad, &pb, 0.02),
+                Err(CastReject::InvalidInput)
+            );
+            assert_eq!(
+                maru_collide::try_shape_cast_dispatch_rotational(
+                    bad,
+                    &pa,
+                    m,
+                    Vec3::new(0.0, 1.0, 0.0),
+                    0.5,
+                    &ok,
+                    &pb,
+                    0.02
+                ),
+                Err(CastReject::InvalidInput)
+            );
+            // 접촉 쪽 형제 API도 같은 규칙 — `false`(없음)로 뭉개지 않는다.
+            assert_eq!(maru_collide::any_contact(bad, &pa, &ok, &pb, 0.02), None);
+            assert_eq!(
+                maru_collide::for_each_contact(bad, &pa, &ok, &pb, 0.02, &mut |_, _, _| {}),
+                maru_collide::ContactWalk::InvalidShape
+            );
+        }
+        // **음성 대조** — 점 하나만 넣어 정상 hull로 만들면 곧바로 통과하고 실제로 맞춘다.
+        let tiny_hull = Shape::Hull {
+            points: vec![Vec3::ZERO],
+            radius: 0.4,
+        };
+        let hit = maru_collide::try_shape_cast_dispatch(&tiny_hull, &pa, m, &ok, &pb, 0.02)
+            .expect("정상 hull이 거절됐다");
+        assert!(hit.is_some(), "정상 hull이 맞은 것을 못 찾았다");
+        assert_eq!(
+            maru_collide::any_contact(&tiny_hull, &pose(0.6, 0.0, 0.0), &ok, &pb, 0.02),
+            Some(true)
+        );
+    }
+
+    /// **비단위 자세는 찌그러진 형상이 아니라 정규화된 형상으로 판정된다** (BLOCKER: 조용한 왜곡).
+    ///
+    /// `Quat::rotate`는 비단위 쿼터니언에 회전+축소를 적용한다. 유한성만 검사하면 0.5배한
+    /// 정상 쿼터니언이 통과해 캐스트가 절반 크기 형상으로 답을 낸다(확인검수 rev_2e93ebf2).
+    /// 부동소수 드리프트로 정확한 단위는 드물기 때문에 **거절이 아니라 정규화**가 맞고,
+    /// 정규화 불가(0·NaN)만 거절한다.
+    #[test]
+    fn non_unit_pose_rotation_is_normalized_not_trusted() {
+        let long = Shape::Box {
+            half: Vec3::new(1.0, 0.2, 0.2),
+            radius: 0.0,
+        };
+        let wall = Shape::Box {
+            half: Vec3::new(0.2, 1.0, 1.0),
+            radius: 0.0,
+        };
+        let q = Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::FRAC_PI_2);
+        let unit = maru_collide::Pose {
+            pos: Vec3::ZERO,
+            rot: q,
+        };
+        let scaled = maru_collide::Pose {
+            pos: Vec3::ZERO,
+            rot: Quat {
+                x: q.x * 0.5,
+                y: q.y * 0.5,
+                z: q.z * 0.5,
+                w: q.w * 0.5,
+            },
+        };
+        // 90° 돌린 긴 박스는 z∈[-1,1]을 차지한다 — 벽은 그 **밖에** 둬야 한다(겹쳐서
+        // 시작하면 캐스트는 기존 관통이라 `None`이 맞고, 그러면 대조가 성립하지 않는다).
+        let pb = pose(0.0, 0.0, 2.4);
+        let m = Vec3::new(0.0, 0.0, 1.0);
+        let a = maru_collide::try_shape_cast_dispatch(&long, &unit, m, &wall, &pb, 0.02)
+            .expect("정상 자세");
+        let b = maru_collide::try_shape_cast_dispatch(&long, &scaled, m, &wall, &pb, 0.02)
+            .expect("정규화 가능한 자세");
+        // **음성 대조** — 이 배치에서 정상 자세는 실제로 맞춘다(둘 다 None이면 무의미하다).
+        assert!(
+            a.is_some(),
+            "정상 자세가 벽을 못 맞췄다 — 배치가 무의미하다"
+        );
+        assert_eq!(a, b, "비단위 자세가 다른 형상으로 판정됐다");
+        // 정규화 불가한 자세는 거절.
+        let zero = maru_collide::Pose {
+            pos: Vec3::ZERO,
+            rot: Quat {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 0.0,
+            },
+        };
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch(&long, &zero, m, &wall, &pb, 0.02),
+            Err(maru_collide::CastReject::InvalidInput)
+        );
+        // 월드 질의도 같은 규약 — 여기서 정규화하지 않으면 AABB 선판정이 먼저 왜곡된다.
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(wall.clone(), pb));
+        let s1 = w
+            .sweep_shape(&long, unit, m, QueryFilter::ALL)
+            .expect("질의");
+        let s2 = w
+            .sweep_shape(&long, scaled, m, QueryFilter::ALL)
+            .expect("질의");
+        assert!(s1.is_some(), "월드 질의에서 정상 자세가 벽을 못 맞췄다");
+        assert_eq!(
+            s1.map(|h| h.toi),
+            s2.map(|h| h.toi),
+            "월드 질의가 비단위 자세를 그대로 썼다"
+        );
+        assert_eq!(
+            w.sweep_shape(&long, zero, m, QueryFilter::ALL).err(),
+            Some(ApiError::InvalidValue)
+        );
+    }
+
+    /// **양성은 한 점으로 증명된다** — `shape_penetrates`가 넓은 AABB를 이유로 거절하지 않는다.
+    ///
+    /// 예전에는 접촉 순회 **전에** 셀 수만 세어 4096을 넘으면 즉시 `ResourceLimit`이었다.
+    /// 그러면 첫 셀부터 깊이 박혀 있는 큰 바디도 AABB가 넓으면 증명 가능한 `true`를 영원히
+    /// 못 받고, 캐릭터의 시작 겹침 검사가 매 호출 오류로 고정된다(확인검수 rev_2e93ebf2 MAJOR).
+    /// 작업량 상한은 순회 안에 있으므로(4096셀) 선판정 없이도 유계다.
+    #[test]
+    fn shape_penetrates_proves_positives_even_with_a_huge_aabb() {
+        let mut w = World::new(WorldParams::default());
+        let heights = vec![0.0f32; 257 * 257];
+        w.try_add_heightfield(&heights, 257, 257, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형 추가");
+        // 반지름 5m 구 = 100×100셀(예산 4096 초과). 중심을 지면 아래로 내려 **깊이 박아** 둔다.
+        let deep = Shape::Sphere { radius: 5.0 };
+        assert_eq!(
+            w.shape_penetrates(&deep, pose(12.8, -1.0, 12.8), QueryFilter::ALL),
+            Ok(true),
+            "박혀 있는 것이 증명 가능한데 AABB가 넓다는 이유로 거절됐다"
+        );
+        // **음성 대조 ①** — 같은 크기인데 안 닿는 높이면, 앞쪽 셀에서 아무것도 못 찾은 채
+        // 예산이 끊기므로 `Ok(false)`가 아니라 `Err(ResourceLimit)`(판정 미완료)이다.
+        assert_eq!(
+            w.shape_penetrates(&deep, pose(12.8, 5.0, 12.8), QueryFilter::ALL),
+            Err(ApiError::ResourceLimit),
+            "판정 미완료가 '겹치지 않음'으로 뭉개졌다"
+        );
+        // **음성 대조 ②** — 작은 바디는 예산 안이라 확정적인 답을 받는다(양쪽 다).
+        let small = Shape::Sphere { radius: 0.2 };
+        assert_eq!(
+            w.shape_penetrates(&small, pose(12.8, -0.1, 12.8), QueryFilter::ALL),
+            Ok(true)
+        );
+        assert_eq!(
+            w.shape_penetrates(&small, pose(12.8, 5.0, 12.8), QueryFilter::ALL),
+            Ok(false)
+        );
+    }
+
+    /// **`ResourceLimit`의 기준선은 "호출 직전"이 아니라 "커맨드 적용 직후"다.**
+    ///
+    /// README가 한때 "실패한 스텝은 한 비트도 바꾸지 않는다"라고 단정했는데, 커맨드 flush와
+    /// 속도 클램프는 실패보다 **먼저** 일어난다(그건 의도된 계약이다 — 빈 월드에 `AddBody`만
+    /// 큐잉하면 영원히 적용되지 않는 문제를 그렇게 막았다). 호스트가 그 문구를 믿고 오류 후
+    /// 커맨드를 다시 큐에 넣으면 같은 변경이 두 번 적용된다(확인검수 rev_2e93ebf2 MAJOR).
+    #[test]
+    fn resource_limit_applies_commands_but_skips_physics() {
+        let mut w = World::new(WorldParams::default());
+        let heights = vec![0.0f32; 257 * 257];
+        w.try_add_heightfield(&heights, 257, 257, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형 추가");
+        let slab = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 5.0 },
+            pose(12.8, 4.999, 12.8),
+            1.0,
+        ));
+        let marker = w.enqueue_add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.1 },
+            pose(1.0, 1.0, 1.0),
+            1.0,
+        ));
+        let pos_before = w.body(slab).pose().pos;
+        assert_eq!(w.try_step(1.0 / 60.0), Err(ApiError::ResourceLimit));
+        // 커맨드는 적용됐다 — 재큐잉하면 두 번 들어간다.
+        assert!(
+            w.is_alive(marker),
+            "실패 스텝이 커맨드를 삼켰다 — 호스트가 잃어버린다"
+        );
+        // 물리는 진행되지 않았다.
+        assert_eq!(
+            w.body(slab).pose().pos,
+            pos_before,
+            "실패 스텝이 물리를 진행시켰다"
         );
     }
 
