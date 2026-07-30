@@ -3360,34 +3360,54 @@ mod tests {
         assert!(w.body(h).pose().pos.y.is_finite());
     }
 
-    /// **비볼록 셰이프가 저수준 볼록 API로 들어가도 죽지 않는다** (BLOCKER: trap 경로).
+    /// **비볼록을 볼록 전용 경로에 넣을 방법이 아예 없다** (BLOCKER: trap → miss 위장 → 차단).
+    ///
+    /// 진화 과정: `unreachable!` 패닉 → `None` 반환(그러면 "접촉 없음"과 구분이 안 돼
+    /// 호스트가 "지나갈 수 있다"고 오판한다) → **공개 표면에서 제거**.
+    /// 지금 밖으로 나가는 것은 셰이프 무관 디스패처뿐이고, 그것들은 모든 셰이프를 옳게 다룬다.
+    /// 이 테스트는 디스패처가 하이트필드를 **정상 처리**하는 것으로 그 계약을 확인한다
+    /// (볼록 전용 API를 부르는 코드는 이제 컴파일되지 않는다 — 그게 최선의 방어다).
     #[test]
-    fn low_level_convex_apis_reject_non_convex_instead_of_trapping() {
-        let heights = vec![0.0f32; 4];
+    fn dispatchers_handle_heightfields_and_convex_only_apis_are_not_public() {
+        let heights = vec![0.0f32; 9 * 9];
         let hf = Shape::Heightfield {
-            heights: heights.clone(),
-            tiles: maru_collide::build_heightfield_tiles(&heights, 2, 2),
-            nx: 2,
-            nz: 2,
+            tiles: maru_collide::build_heightfield_tiles(&heights, 9, 9),
+            heights,
+            nx: 9,
+            nz: 9,
             cell: 1.0,
         };
         let sphere = Shape::Sphere { radius: 0.5 };
         let p = pose(0.0, 0.0, 0.0);
-        // 예전에는 여기서 `unreachable!`로 프로세스가 죽었다.
-        assert!(maru_collide::contact(&hf, &p, &sphere, &p, 0.02).is_none());
-        assert!(
-            maru_collide::shape_cast(&hf, &p, Vec3::new(1.0, 0.0, 0.0), &sphere, &p, 0.02)
-                .is_none()
-        );
-        // 디스패치 경로는 정상 동작(하이트필드를 펼친다)
-        let _ = maru_collide::shape_cast_dispatch(
+        // 디스패처는 어느 쪽에 하이트필드가 있어도 동작한다.
+        let mut hits = 0;
+        maru_collide::for_each_contact(
             &sphere,
-            &pose(0.5, 2.0, 0.5),
-            Vec3::new(0.0, -3.0, 0.0),
+            &pose(4.0, 0.4, 4.0),
             &hf,
             &p,
             0.02,
+            &mut |_, _, m| {
+                if !m.is_empty() {
+                    hits += 1;
+                }
+            },
         );
+        assert!(hits > 0, "지형 위 구가 접촉을 못 만들었다");
+        assert_eq!(
+            maru_collide::any_contact(&sphere, &pose(4.0, 0.4, 4.0), &hf, &p, 0.02),
+            Some(true)
+        );
+        // 스윕 디스패처도 지형을 펼친다.
+        assert!(maru_collide::shape_cast_dispatch(
+            &sphere,
+            &pose(4.0, 3.0, 4.0),
+            Vec3::new(0.0, -5.0, 0.0),
+            &hf,
+            &p,
+            0.02
+        )
+        .is_some());
     }
 
     /// **거대한 유한 각은 조용히 항등이 되지 않는다** (MAJOR: 공개 계약 모순).
@@ -3402,6 +3422,133 @@ mod tests {
         );
         assert!(Quat::try_from_axis_angle(axis, f32::INFINITY).is_none());
         assert!(Quat::try_from_axis_angle(Vec3::ZERO, 1.0).is_none());
+        // 0 축은 데이터에서 자연히 나오는 조건이라 `from_axis_angle`도 항등으로 통과시킨다
+        // (아래 패닉 테스트의 **음성 대조**: 패닉이 "무조건"이 아님을 보인다).
+        assert_eq!(Quat::from_axis_angle(Vec3::ZERO, 1.0), Quat::IDENTITY);
+    }
+
+    /// **표현 불가 각을 `from_axis_angle`에 넣으면 패닉한다** (조용한 항등 금지).
+    ///
+    /// `try_` 없는 생성자의 Rust 관례이며, 조용히 항등을 돌려주면 "물체가 왜 회전을
+    /// 멈췄나"를 추적할 단서가 아무것도 남지 않는다(확인검수 rev_1a31d83f MAJOR 6).
+    #[test]
+    #[should_panic(expected = "표현 불가한 각")]
+    fn from_axis_angle_panics_on_unrepresentable_angle() {
+        let _ = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 1.0e20);
+    }
+
+    #[test]
+    #[should_panic(expected = "표현 불가한 각")]
+    fn from_axis_angle_panics_on_nonfinite_angle() {
+        let _ = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), f32::NAN);
+    }
+
+    /// **공개 회전 캐스트는 그 패닉을 호스트로 흘리지 않는다.**
+    ///
+    /// 캐스트 루프는 매 반복 `from_axis_angle`을 부른다 — 각이 호스트 입력이므로
+    /// 라이브러리가 죽는 대신 값으로 거른다(`None` = 판정할 회전이 없음).
+    #[test]
+    fn rotational_cast_rejects_unrepresentable_angle_instead_of_panicking() {
+        // 회전 피벗은 **A의 위치(바디 COM)**다 — 구는 자기 중심 회전에 아무 데도 안 쓸어서
+        // 음성 대조가 될 수 없다. 긴 박스를 세로로 세워 90° 돌리면 이웃 박스를 쓸고 지나간다.
+        let a = Shape::Box {
+            half: Vec3::new(1.0, 0.2, 0.2),
+            radius: 0.0,
+        };
+        let b = Shape::Box {
+            half: Vec3::new(0.2, 0.2, 0.2),
+            radius: 0.0,
+        };
+        let pa = pose(0.0, 0.0, 0.0);
+        let pb = pose(0.0, 0.0, 1.05);
+        let axis = Vec3::new(0.0, 1.0, 0.0);
+        for bad in [1.0e20f32, f32::NAN, f32::INFINITY] {
+            assert!(
+                maru_collide::shape_cast_dispatch_rotational(
+                    &a,
+                    &pa,
+                    Vec3::ZERO,
+                    axis,
+                    bad,
+                    &b,
+                    &pb,
+                    0.02
+                )
+                .is_none(),
+                "표현 불가한 각 {bad}에 캐스트가 답을 만들어냈다"
+            );
+        }
+        // **음성 대조** — 같은 배치에서 정상 각은 실제로 맞춘다(가드가 전부를 막는 게 아니다).
+        let hit = maru_collide::shape_cast_dispatch_rotational(
+            &a,
+            &pa,
+            Vec3::ZERO,
+            axis,
+            core::f32::consts::FRAC_PI_2,
+            &b,
+            &pb,
+            0.02,
+        );
+        assert!(
+            hit.is_some_and(|h| h.toi > 0.0 && h.toi < 1.0),
+            "정상 회전 스윕이 접촉을 못 찾았다 — 테스트 배치가 무의미하다: {hit:?}"
+        );
+    }
+
+    /// **접촉 예산을 넘긴 스텝은 물리를 한 톱도 진행하지 않는다** (BLOCKER: 부분 물리 적용).
+    ///
+    /// 예전에는 `budget_exceeded`를 보면 플래그만 세우고 앞부분 제약으로 솔브·적분을 끝까지
+    /// 했다. 그러면 `ResourceLimit`("커맨드는 적용, 물리 스텝은 건너뜀") 계약이 깨지고,
+    /// 호스트가 오류를 보고 재시도할 때마다 불완전한 물리가 한 스텝씩 더 나아간다
+    /// (확인검수 rev_1a31d83f BLOCKER 1).
+    ///
+    /// 탈출구도 함께 확인한다: 커맨드는 스텝 0단계에서 이미 적용됐고 `resource_limit`은 매
+    /// 스텝 초기화되므로, 문제 바디를 지우면 다음 스텝은 정상으로 돌아온다(영구 동결 아님).
+    #[test]
+    fn contact_budget_exceeded_step_advances_nothing() {
+        let mut w = World::new(WorldParams::default());
+        // 256×256 평지(셀 0.1m). 셀 예산은 4096이다.
+        let heights = vec![0.0f32; 257 * 257];
+        w.try_add_heightfield(&heights, 257, 257, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형 추가");
+        // **AABB는 거대하지만 실제 접촉은 몇 개뿐인 바디**가 예산을 때린다: 반지름 5m 구를
+        // 평지에 살짝 닿게 놓으면 AABB는 100×100셀(=10000 > 4096)을 덮는데 접촉은 바닥
+        // 몇 셀뿐이다. 넓적한 판으로는 안 된다 — 판은 매니폴드 상한(64)에 먼저 걸려
+        // `Saturated`("찾았고 끊었다")가 되고 그건 예산 초과가 아니다.
+        // 띄우면(y 밴드가 지형 [0,0] 타일과 안 겹치면) 셀을 세지도 않으므로 닿게 놓는다.
+        let slab = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 5.0 },
+            pose(12.8, 4.999, 12.8),
+            1.0,
+        ));
+        let before = w.body(slab).pose().pos;
+        let before_v = w.body(slab).linvel();
+        assert_eq!(w.try_step(1.0 / 60.0), Err(ApiError::ResourceLimit));
+        assert_eq!(
+            w.body(slab).pose().pos,
+            before,
+            "예산 초과 스텝이 위치를 바꿨다 — 부분 물리가 적용됐다"
+        );
+        assert_eq!(
+            w.body(slab).linvel(),
+            before_v,
+            "예산 초과 스텝이 속도를 바꿨다 — 적분이 돌았다"
+        );
+        assert!(w.contact_events().is_empty());
+        // **음성 대조 ①** — 같은 세계에서 작은 바디만 남기면 스텝이 정상 통과하고 실제로
+        // 떨어진다(테스트가 '지형이 있으면 항상 실패'를 보는 게 아니다).
+        w.remove_body(slab).expect("제거");
+        let small = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.2 },
+            pose(12.8, 5.0, 12.8),
+            1.0,
+        ));
+        let y0 = w.body(small).pose().pos.y;
+        assert_eq!(w.try_step(1.0 / 60.0), Ok(()));
+        assert!(
+            w.body(small).pose().pos.y < y0,
+            "정상 스텝인데 중력이 안 걸렸다 — 대조군이 무의미하다"
+        );
     }
 
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.

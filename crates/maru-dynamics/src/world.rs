@@ -3134,16 +3134,22 @@ impl World {
                 if !(a_sleep && b_active) && !(b_sleep && active(a, self)) {
                     continue;
                 }
-                if (!excluded.is_empty()
-                    && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain))))
-                    || !any_contact(
-                        &self.bodies[a].shape,
-                        &self.bodies[a].pose,
-                        &self.bodies[b].shape,
-                        &self.bodies[b].pose,
-                        self.params.speculative_margin,
-                    )
+                // 제외 쌍은 접촉 판정 **전에** 걸러낸다(공짜 검사를 먼저).
+                if !excluded.is_empty()
+                    && excluded.contains(&(a_id.min(b_plain), a_id.max(b_plain)))
                 {
+                    continue;
+                }
+                // 판정 불가(`None`)는 **보수적으로 "후보 있음"**으로 본다 — 이 드라이런의
+                // 목적은 "전체 스윕을 생략해도 되는가"이고, 모르면 생략하면 안 된다.
+                let probe = any_contact(
+                    &self.bodies[a].shape,
+                    &self.bodies[a].pose,
+                    &self.bodies[b].shape,
+                    &self.bodies[b].pose,
+                    self.params.speculative_margin,
+                );
+                if probe == Some(false) {
                     continue;
                 }
                 need_full_sweep = true;
@@ -3194,18 +3200,30 @@ impl World {
                 continue;
             }
             // 실제 접촉이 있을 때만 깨운다 (AABB 근접만으로 깨우면 스택이 영영 못 잔다)
-            if any_contact(
+            match any_contact(
                 &self.bodies[a].shape,
                 &self.bodies[a].pose,
                 &self.bodies[b].shape,
                 &self.bodies[b].pose,
                 self.params.speculative_margin,
             ) {
-                if wake_a {
-                    self.wake(a);
+                Some(true) => {
+                    if wake_a {
+                        self.wake(a);
+                    }
+                    if wake_b {
+                        self.wake(b);
+                    }
                 }
-                if wake_b {
-                    self.wake(b);
+                Some(false) => {}
+                // **판정 불가면 스텝을 포기한다.** `false`로 넘기면 실제로 닿은 잠든 바디를
+                // 깨우지 않아 지지 접촉이 빠진 채 적분된다. 이미 깨운 바디가 남는 것은
+                // 보수적으로 안전하고(여분 기상은 성능 문제일 뿐), 물리는 적용되지 않는다.
+                None => {
+                    self.invalidate_bp();
+                    self.resource_limit = true;
+                    self.narrow_bufs = narrow_bufs;
+                    return;
                 }
             }
         }
@@ -3363,10 +3381,16 @@ impl World {
             self.diag.warm_total += b.warm_total;
             self.diag.warm_hits += b.warm_hits;
             self.diag.heightfield_saturated += b.heightfield_saturated;
-            if b.budget_exceeded {
-                // 접촉 판정이 불완전한 스텝은 **자원 오류**로 끝난다(조용한 누락 금지).
-                self.resource_limit = true;
-            }
+        }
+        // **접촉 판정이 불완전하면 여기서 끝낸다.** 플래그만 세우고 계속 풀면 앞부분
+        // 제약만으로 한 스텝을 적용한 뒤 오류를 돌려주게 되는데, `ResourceLimit` 계약은
+        // "커맨드는 적용됨, **물리 스텝은 건너뜀**"이다 — 호스트가 재시도하면 물리가 두 번
+        // 나아간다(확인검수 rev_1a31d83f BLOCKER). 솔브·적분·이벤트·PCM 전부 앞에서 끊는다.
+        if narrow_bufs[..n_par].iter().any(|b| b.budget_exceeded) {
+            self.narrow_bufs = narrow_bufs;
+            self.invalidate_bp();
+            self.resource_limit = true;
+            return;
         }
         self.narrow_bufs = narrow_bufs;
         // 진단은 **dispatch 뒤에** 읽는다 — 워커는 지연 생성이라 그 전에는 "요청한 수"만

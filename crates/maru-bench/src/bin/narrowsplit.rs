@@ -7,7 +7,14 @@
 //!
 //! 실행: cargo run --release -p maru-bench --bin narrowsplit -- [n] [warmup]
 
-use maru_collide::{contact, Aabb, Broadphase, Pose, Shape, STATIC_BIT};
+use maru_collide::{for_each_contact, Aabb, Broadphase, Manifold, Pose, Shape, STATIC_BIT};
+
+/// 볼록 쌍 하나의 매니폴드 — 공개 표면이 디스패처만이라 벤치도 그것을 쓴다(boxsplit와 동일).
+fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<Manifold> {
+    let mut out = None;
+    for_each_contact(sa, pa, sb, pb, margin, &mut |_, _, m| out = Some(m));
+    out
+}
 use maru_dynamics::{Body, World, WorldParams};
 use maru_math::{Quat, Vec3};
 use std::time::Instant;

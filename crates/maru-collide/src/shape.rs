@@ -368,7 +368,12 @@ impl Shape {
     }
 
     /// 방향 d(비정규화 허용, 0이면 임의점)의 **코어** support point (로컬 공간).
-    pub fn support_core(&self, d: Vec3) -> Vec3 {
+    /// **크레이트 전용**: 볼록 코어의 support point.
+    ///
+    /// 비볼록 변종(compound·heightfield)에서는 `unreachable!`이다 — 공개였다면 호스트가
+    /// `heightfield.support_core(d)` 한 줄로 프로세스를 죽일 수 있었다(확인검수 rev_1a31d83f).
+    /// 밖에서 필요한 것은 셰이프 무관 디스패처(`for_each_contact`·`shape_cast_dispatch`)다.
+    pub(crate) fn support_core(&self, d: Vec3) -> Vec3 {
         match self {
             Shape::Sphere { .. } => Vec3::ZERO,
             Shape::Capsule { half_height, .. } => Vec3::new(

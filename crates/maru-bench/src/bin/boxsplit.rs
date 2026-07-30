@@ -6,7 +6,17 @@
 //!
 //! 실행: cargo run --release -p maru-bench --bin boxsplit -- [tiers]
 
-use maru_collide::{contact, Aabb, Broadphase, Pose, Shape, FEATURE_GENERIC, STATIC_BIT};
+use maru_collide::{
+    for_each_contact, Aabb, Broadphase, Manifold, Pose, Shape, FEATURE_GENERIC, STATIC_BIT,
+};
+
+/// 볼록 쌍 하나의 매니폴드 — 공개 표면이 디스패처만 남았으므로(비볼록을 볼록 전용 경로에
+/// 넣지 못하게) 벤치도 디스패처를 쓴다. 볼록 쌍이면 콜백이 정확히 한 번 불린다.
+fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<Manifold> {
+    let mut out = None;
+    for_each_contact(sa, pa, sb, pb, margin, &mut |_, _, m| out = Some(m));
+    out
+}
 use maru_dynamics::{Body, World, WorldParams};
 use maru_math::{Quat, Vec3};
 use std::time::Instant;

@@ -120,10 +120,26 @@ impl Quat {
         w: 1.0,
     };
 
-    /// 축이 정규화 불가하거나 각이 비유한이면 **단위 쿼터니언**을 반환한다
-    /// (0 축에 대해 비단위 쿼터니언을 만들면 이후 회전이 조용히 붕괴한다).
+    /// 축·각에서 쿼터니언.
+    ///
+    /// 두 실패 모드를 **다르게** 취급한다 (확인검수 rev_1a31d83f MAJOR):
+    /// - **축을 정규화할 수 없으면 항등** — 0 축은 "회전축이 없다 = 회전이 없다"는 뜻으로
+    ///   데이터에서 자연히 나온다. 여기서 비단위 쿼터니언을 만들면 이후 회전이 조용히
+    ///   붕괴하므로 항등이 맞다(`Quat::normalize`와 같은 규약).
+    /// - **각이 비유한이거나 `MAX_AXIS_ANGLE`을 넘으면 패닉** — 이건 데이터가 아니라
+    ///   호출자의 버그다(도·라디안 혼동, 발산한 각속도). 예전에는 조용히 항등을 돌려줘서
+    ///   "1e11 rad 회전"이 "회전 안 함"으로 뭉개졌고, 물체가 도는 걸 멈춘 이유를 어디서도
+    ///   알 수 없었다. `try_` 접두사 없는 생성자가 표현 불가 입력에 패닉하는 것은
+    ///   Rust 관례이며, 조용히 틀리는 것보다 낫다.
+    ///
+    /// 표현 불가 각을 값으로 다뤄야 하면 `try_from_axis_angle`을 쓴다(패닉 없음).
     #[inline]
     pub fn from_axis_angle(axis: Vec3, angle: f32) -> Self {
+        assert!(
+            angle.is_finite() && angle.abs() <= Self::MAX_AXIS_ANGLE,
+            "Quat::from_axis_angle: 표현 불가한 각 {angle} (유한하고 |angle| <= {} 여야 한다; 값으로 처리하려면 try_from_axis_angle)",
+            Self::MAX_AXIS_ANGLE
+        );
         Self::try_from_axis_angle(axis, angle).unwrap_or(Self::IDENTITY)
     }
 

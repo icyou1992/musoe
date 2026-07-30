@@ -133,15 +133,24 @@ impl Manifold {
     }
 }
 
-/// 접촉 존재 판정 — wake 스윕용 (첫 히트에서 종료, 복합 디스패치 포함).
-pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> bool {
+/// 접촉 존재 판정 — wake 스윕용 (복합·하이트필드 디스패치 포함).
+///
+/// **`bool`이 아니라 `Option<bool>`이다**: 하이트필드 순회는 셀 예산에서 끊길 수 있고,
+/// 그때 `false`("접촉 없음")를 돌려주면 **실제로 닿아 있는 잠든 바디를 깨우지 않는다** —
+/// 접촉 제약이 빠진 채 스텝이 진행된다(확인검수 rev_1a31d83f BLOCKER).
+/// `None` = "판정하지 못했다"이고, 호출자는 그 스텝을 자원 오류로 끝내야 한다.
+pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<bool> {
     let mut found = false;
-    for_each_contact(sa, pa, sb, pb, margin, &mut |_, _, m| {
+    let walk = for_each_contact(sa, pa, sb, pb, margin, &mut |_, _, m| {
         if !m.is_empty() {
             found = true;
         }
     });
-    found
+    match walk {
+        // 포화는 접촉을 **찾고** 끊은 것이라 존재 판정에는 충분하다.
+        ContactWalk::Complete | ContactWalk::Saturated => Some(found),
+        ContactWalk::BudgetExceeded => None,
+    }
 }
 
 /// 하이트필드 접촉 — 겹치는 셀만 삼각형으로 펼친다.

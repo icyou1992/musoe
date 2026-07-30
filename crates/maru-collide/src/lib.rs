@@ -18,7 +18,14 @@ mod tolerance;
 mod tree;
 
 pub use aabb::Aabb;
-pub use cast::{shape_cast, shape_cast_dispatch, shape_cast_dispatch_rotational, ShapeCastHit};
+// **공개 표면은 셰이프 무관 디스패처만**이다.
+//
+// `contact`·`shape_cast`·`shape_cast_rotational`·`gjk`·`epa`·`support_core`는 볼록 전용이라
+// 비볼록이 들어오면 의미가 없다. 그걸 `None`으로 돌려주면 "접촉 없음"과 구분되지 않아
+// 호스트가 "지나갈 수 있다"고 오판하고(확인검수 rev_1a31d83f BLOCKER), 패닉으로 두면
+// 라이브러리가 잘못된 입력에 죽는다. **셋째 길은 애초에 못 부르게 하는 것**이다 —
+// 디스패처는 모든 셰이프를 옳게 처리하므로 밖에서 필요한 것은 이것뿐이다.
+pub use cast::{shape_cast_dispatch, shape_cast_dispatch_rotational, ShapeCastHit};
 // **`gjk`·`epa`는 크레이트 밖으로 내보내지 않는다.**
 //
 // 둘은 볼록 전용이고 `support_core`를 직접 부르므로, 비볼록 셰이프가 들어오면
@@ -44,9 +51,9 @@ pub use limits::{
     MAX_INPUT, MAX_SHAPE_EXTENT, MAX_SPEED, MAX_STATE, MIN_DT, MIN_INV_MASS, MIN_SHAPE_EXTENT,
 };
 pub use manifold::{
-    any_contact, contact, for_each_contact, weld_internal_edges, ContactPoint, ContactWalk,
-    FeatureId, Manifold, FEATURE_ANALYTIC, FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT,
-    FEATURE_GENERIC, MAX_MANIFOLD_POINTS,
+    any_contact, for_each_contact, weld_internal_edges, ContactPoint, ContactWalk, FeatureId,
+    Manifold, FEATURE_ANALYTIC, FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT, FEATURE_GENERIC,
+    MAX_MANIFOLD_POINTS,
 };
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};

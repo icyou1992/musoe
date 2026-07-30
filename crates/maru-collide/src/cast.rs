@@ -145,6 +145,13 @@ pub fn shape_cast_rotational(
     if is_non_convex(sa) || is_non_convex(sb) {
         return None;
     }
+    // **표현 불가한 각은 캐스트를 하지 않는다.** 아래 루프는 매 반복
+    // `Quat::from_axis_angle`을 부르고 그 함수는 비유한·초대형 각에 패닉한다 —
+    // 라이브러리가 호스트 입력 때문에 죽으면 안 되므로 여기서 값으로 거른다.
+    // (패닉 계약을 각 생성자에 두는 이유는 그쪽 문서 참조: 조용한 항등 회전 금지.)
+    if !angle.is_finite() || angle.abs() > maru_math::Quat::MAX_AXIS_ANGLE {
+        return None;
+    }
     let (ra, rb) = (sa.radius(), sb.radius());
     let offset = pa.pos - pivot;
     // 각 기여 상한 = 축 수직 오프셋 + **각 스윕 반지름**(코어의 축 수직 거리 —
@@ -230,6 +237,11 @@ pub fn shape_cast_dispatch_rotational(
     pb: &Pose,
     skin: f32,
 ) -> Option<ShapeCastHit> {
+    // 표현 불가한 각은 **격자를 걷기 전에** 거른다(볼록 경로에도 같은 가드가 있지만
+    // 거기까지 가면 후보 셀을 전부 훑고 나서야 None이 된다).
+    if !angle.is_finite() || angle.abs() > maru_math::Quat::MAX_AXIS_ANGLE {
+        return None;
+    }
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
         rot: parent.rot * child.rot,
@@ -261,13 +273,16 @@ pub fn shape_cast_dispatch_rotational(
                 // 그 타일의 셀은 보지 않는다. 궤도 봉투는 넓으므로 이게 없으면 최악이
                 // 격자 전체다(확인검수 rev_d390e73d BLOCKER — 회전 분기만 예산 밖이었다).
                 let (y_lo, y_hi) = (local.min.y, local.max.y);
-                for cz in cz0..=cz1 {
-                    for cx in cx0..=cx1 {
-                        let (t_lo, t_hi) = hf
-                            .tile_range(cx / crate::HEIGHTFIELD_TILE, cz / crate::HEIGHTFIELD_TILE);
-                        if t_hi < y_lo || t_lo > y_hi {
-                            continue;
-                        }
+                // **타일을 바깥 루프로.** 셀을 돌면서 타일을 조회하면 일은 줄어도 반복은
+                // 그대로다 — 후보가 0개인 1024×1024 격자에서 100만 번 돈다
+                // (확인검수 rev_1a31d83f: 내가 고쳤다고 보고했는데 치환이 조용히 실패했고
+                //  확인하지 않았다. 이제 헬퍼 하나만 쓴다 — 같은 코드를 두 번 적지 않는다).
+                crate::heightfield::for_each_overlapping_cell(
+                    &hf,
+                    (cx0, cz0, cx1, cz1),
+                    y_lo,
+                    y_hi,
+                    |cx, cz| {
                         for t in 0..2u8 {
                             let tri = Shape::Triangle {
                                 points: hf.triangle(cx, cz, t),
@@ -281,8 +296,9 @@ pub fn shape_cast_dispatch_rotational(
                                 }
                             }
                         }
-                    }
-                }
+                        true
+                    },
+                );
                 best
             }
             Shape::Compound { children } => children
@@ -380,13 +396,12 @@ pub fn shape_cast_dispatch(
             // 영구 동결시켰다(확인검수 rev_d390e73d BLOCKER). 가지치기는 근사가 아니라
             // 정확하다: 타일 밖 높이는 그 범위 안에 있다는 것이 build_tiles의 계약이다.
             let (y_lo, y_hi) = (local.min.y, local.max.y);
-            for cz in cz0..=cz1 {
-                for cx in cx0..=cx1 {
-                    let (t_lo, t_hi) =
-                        hf.tile_range(cx / crate::HEIGHTFIELD_TILE, cz / crate::HEIGHTFIELD_TILE);
-                    if t_hi < y_lo || t_lo > y_hi {
-                        continue;
-                    }
+            crate::heightfield::for_each_overlapping_cell(
+                &hf,
+                (cx0, cz0, cx1, cz1),
+                y_lo,
+                y_hi,
+                |cx, cz| {
                     for t in 0..2u8 {
                         let tri = Shape::Triangle {
                             points: hf.triangle(cx, cz, t),
@@ -396,8 +411,9 @@ pub fn shape_cast_dispatch(
                             consider(h);
                         }
                     }
-                }
-            }
+                    true
+                },
+            );
         }
         _ => return shape_cast(sa, pa, motion, sb, pb, skin),
     }
