@@ -4021,10 +4021,10 @@ impl World {
                     //    경계 밖의 유효한 장애물을 조용히 관통했다(rev_5ca93cb1).
                     //
                     // ④ 그래서 **절대 좌표를 쓰지 않는다.** 충돌 기하는 병진 불변이므로 두 자세에서
-                    //    같은 원점(움직이는 바디의 현재 위치)을 빼면 결과가 같고, 상대 거리는 항상
-                    //    지원 범위 안이다(후보는 스윕 AABB와 겹쳐야 하므로 |Δ| ≤ 두 바운딩 반경 +
-                    //    이동 ≤ 4.2km < MAX_INPUT). 덤으로 10km 좌표의 자리수 손실도 사라진다 —
-                    //    상대 좌표는 0 근처라 f32 정밀도를 온전히 쓴다.
+                    //    공통 원점을 빼면 결과가 같다. 원점은 **두 부모의 중점**이다(아래 캐스트
+                    //    자리 주석: 움직이는 바디에 두면 상대 자세 하나가 간격 전체를 떠안아
+                    //    유효한 후보가 범위 검사에 걸린다 — rev_6f54ca63). 덤으로 10km 좌표의
+                    //    자리수 손실도 사라진다 — 상대 좌표는 0 근처라 f32 정밀도를 온전히 쓴다.
                     if (!ccd_frozen[ci] && (d != Vec3::ZERO || rot_sweep))
                         || (ccd_frozen[ci] && rot_sweep)
                     {
@@ -4068,15 +4068,27 @@ impl World {
                                         continue;
                                     }
                                 }
-                                // **상대 좌표**(원점 = 움직이는 바디의 현재 위치). 근거는 위
-                                // 블록 주석 ④. 반환값 중 좌표계에 의존하는 것은 `point`뿐이라
-                                // 아래에서 원점을 다시 더한다(`toi`·`normal`은 병진 불변).
+                                // **상대 좌표 — 원점은 두 부모 위치의 중점**이다. 반환값 중
+                                // 좌표계에 의존하는 것은 `point`뿐이라 아래에서 원점을 다시
+                                // 더한다(`toi`·`normal`은 병진 불변).
+                                //
+                                // 처음에는 원점을 움직이는 바디에 뒀는데, 그러면 상대 자세
+                                // 하나(`cast_pb`)가 두 부모 간격 전체를 떠안아 **유효한 후보가
+                                // 디스패처의 `MAX_INPUT` 검사에 걸린다**. 내가 적었던
+                                // "|Δ| ≤ 4.2km"는 과소평가였다(확인검수 rev_6f54ca63):
+                                //   hull 점 (±1e3)³ → |p| = √3·1e3 = 1732m, + convex radius 1e3
+                                //   → 자식 2732m, + 자식 오프셋 √3·1e3 → 복합 반경 4464m.
+                                //   두 바디 8928m(축별), 벡터로 √3배 = 15464m, + 이동 2500m
+                                //   → 최악 17964m > MAX_INPUT.
+                                // 중점을 쓰면 각 상대 자세가 그 절반(≤ 8982m)이라 범위 안이고,
+                                // 기하는 공통 병진이라 그대로다.
+                                let cast_origin = ccd_cast_origin(pose_now.pos, sb.pose.pos);
                                 let cast_pa = maru_collide::Pose {
-                                    pos: Vec3::ZERO,
+                                    pos: pose_now.pos - cast_origin,
                                     rot: pose_now.rot,
                                 };
                                 let cast_pb = maru_collide::Pose {
-                                    pos: sb.pose.pos - pose_now.pos,
+                                    pos: sb.pose.pos - cast_origin,
                                     rot: sb.pose.rot,
                                 };
                                 let cast = if rot_sweep {
@@ -4113,7 +4125,7 @@ impl World {
                                 };
                                 // 접점만 월드 좌표로 되돌린다.
                                 let cast = cast.map(|h| maru_collide::ShapeCastHit {
-                                    point: h.point + pose_now.pos,
+                                    point: h.point + cast_origin,
                                     ..h
                                 });
                                 if let Some(hit) = cast {
@@ -4530,6 +4542,28 @@ impl World {
         self.diag.post_ns[3] = _t_hyg.ns();
         self.diag.phase_ns[4] = _t_post.ns();
     }
+}
+
+/// CCD 캐스트의 **공통 원점** — 두 부모 위치의 중점.
+///
+/// 캐스트는 이 원점을 뺀 상대 좌표로 돈다(충돌 기하는 병진 불변). 원점을 움직이는 바디에 두면
+/// 상대 자세 하나가 두 부모 간격 **전체**를 떠안아, 유효한 후보가 디스패처의 `MAX_INPUT` 검사에
+/// 걸린다(확인검수 rev_6f54ca63). 중점이면 각 상대 자세가 간격의 절반이다.
+///
+/// 간격의 상한: 후보는 스윕 AABB가 겹쳐야 하므로 축별 `|Δ| ≤ ha + hb + |motion|`이고,
+/// 회전된 AABB의 반크기는 바운딩 반경(복합 최대 4464m = √3·1e3 오프셋 + √3·1e3 점 + 1e3 반경)을
+/// 넘지 않는다. 즉 축별 ≤ 4464+4464+2500 = 11428m이고 벡터로는 최악 √3배지만, **중점을 쓰면
+/// 각 상대 자세가 그 절반**이라 `MAX_INPUT`(10km) 안에 남는다.
+fn ccd_cast_origin(a: Vec3, b: Vec3) -> Vec3 {
+    a + (b - a) * 0.5
+}
+
+/// 테스트 전용 노출 — 원점 선택은 산술 성질이라 씬 대신 직접 고정한다(그 근거는 테스트 문서에).
+/// `world` 모듈은 비공개라 `pub`만으로는 도달 불가 = dead code다(게이트가 잡았다).
+#[cfg(test)]
+#[doc(hidden)]
+pub fn ccd_cast_origin_pub_for_test(a: Vec3, b: Vec3) -> Vec3 {
+    ccd_cast_origin(a, b)
 }
 
 /// 셰이프의 월드 AABB — 자세를 명시 인자로 받는 정본 (body_aabb와 CCD 중간-서브스텝

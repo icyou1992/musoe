@@ -5008,6 +5008,46 @@ mod tests {
         assert!(!w_in.ccd_hits().is_empty());
     }
 
+    /// **CCD 상대 좌표의 원점 선택이 유효한 후보를 범위 밖으로 밀어내지 않는다** (BLOCKER).
+    ///
+    /// 원점을 움직이는 바디에 두면 상대 자세 하나가 두 부모 간격 **전체**를 떠안아, 간격이
+    /// 10km를 넘는 유효한 대형 후보가 디스패처의 `MAX_INPUT` 검사에 걸린다 — 그러면 실제
+    /// TOI를 계산하지 못하고 바디가 서브스텝 시작점에서 보수적으로 정지한다
+    /// (확인검수 rev_6f54ca63). 중점을 쓰면 각 상대 자세가 간격의 절반이다.
+    ///
+    /// 이 성질은 **산술**이므로 씬 대신 직접 고정한다. 씬으로 만들려면 최대 크기 형상 + 최대
+    /// 속도 + 최대 dt + 대각 배치가 모두 겹쳐야 해서(축별 AABB 겹침 조건 때문에 1차원
+    /// 배치로는 8.7km가 한계다) 취약하다 — 그 분석도 여기 남긴다.
+    #[test]
+    fn ccd_cast_origin_keeps_both_relative_poses_in_range() {
+        let max = maru_collide::MAX_INPUT;
+        // 후보가 될 수 있는 최악 간격(축별 4464+4464+2500 = 11428m, 대각이면 그 √3배).
+        let worst = 11428.0f32 * 3.0f32.sqrt();
+        for delta in [
+            Vec3::new(worst, 0.0, 0.0),
+            Vec3::new(11428.0, 11428.0, 11428.0),
+            Vec3::new(-10200.0, 3000.0, -7000.0),
+            Vec3::new(max, max, max),
+        ] {
+            let a = Vec3::new(-max * 0.5, max * 0.25, 0.0);
+            let b = a + delta;
+            let o = crate::world::ccd_cast_origin_pub_for_test(a, b);
+            assert!(
+                maru_collide::vec_in_range(a - o) && maru_collide::vec_in_range(b - o),
+                "간격 {delta:?}에서 상대 자세가 범위를 벗어났다: {:?} / {:?}",
+                a - o,
+                b - o
+            );
+        }
+        // **음성 대조** — 원점을 움직이는 바디에 두는 옛 방식은 같은 간격에서 실패한다.
+        let a = Vec3::ZERO;
+        let b = Vec3::new(11428.0, 0.0, 0.0);
+        assert!(
+            !maru_collide::vec_in_range(b - a),
+            "이 간격이 원래 범위 안이면 대조가 무의미하다"
+        );
+    }
+
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.
     ///
     /// 검수가 두 번 같은 계열을 지적했다(생성자 → enqueue). 한 곳만 빠지면 "비표준 환경
