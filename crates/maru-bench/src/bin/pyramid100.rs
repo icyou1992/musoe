@@ -197,8 +197,9 @@ fn main() {
         -1.0
     };
     println!("warm={warm_ratio:.3} ({}/{})", d.warm_hits, d.warm_total);
+    // 소수 3자리 — **A/B에 쓰려면 정수 ms는 해상도가 없다**(6.6ms 장면의 −5%가 0으로 보인다).
     println!(
-        "{ms_per_step:.0} ms/step  finite={finite}  vmax={vmax:.4}  top_y={top_y:.2}\n\
+        "{ms_per_step:.3} ms/step  finite={finite}  vmax={vmax:.4}  top_y={top_y:.2}\n\
          pairs={} / budget={} ({:.1}%)  oob={}  vclamp={}  sat={}",
         d.pairs,
         d.pair_budget,

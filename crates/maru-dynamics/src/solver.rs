@@ -7,11 +7,10 @@
 
 use crate::body::Body;
 use maru_collide::Manifold;
-use maru_math::{Mat3, Quat, Vec3};
-// SIMD 타입은 참조 구현(cfg(test) x4 경로)에서만 쓴다 — 프로덕션 SIMD는 `solver_block`이다.
-#[cfg(test)]
-use maru_math::{Mat3x4, Vec3x4};
-#[cfg(test)]
+use maru_math::{Mat3, Mat3x4, Quat, Vec3, Vec3x4};
+// 솔브 패스의 프로덕션 SIMD는 `solver_block`이다. 이 모듈이 SIMD를 쓰는 곳은
+// **제약 준비의 유효질량**(`effective_mass_x3`) 하나이고, 나머지 x4 코드는
+// 참조 구현(cfg(test))이다.
 use wide::{f32x4, CmpGt};
 
 #[derive(Clone)]
@@ -159,6 +158,43 @@ fn effective_mass(
     } else {
         0.0
     }
+}
+
+/// 유효질량 3개(법선 + 접선 2)를 **한 번의 4-wide 패스**로 만든다 — 레인이 방향이다.
+///
+/// 스칼라 `effective_mass`를 방향마다 세 번 부르면 같은 `ra`·`rb`에 대해 외적 2회·관성텐서
+/// 곱 2회·내적 2회를 세 번 되풀이한다. 방향을 레인에 실으면 그 세 번이 한 번이 된다
+/// (넷째 레인은 법선을 다시 실어 버린다 — 3방향뿐이라 25%는 낭비지만, 남는 레인을 채우려
+/// 접점을 섞으면 매니폴드마다 접점 수가 1~4로 달라 셔플이 이득을 먹는다).
+///
+/// 관성텐서는 **페어당 상수**다. 그래서 `Mat3x4::splat` 셋업은 호출자가 페어당 1회 하고
+/// 이 함수는 접점마다 `ra`·`rb` splat만 한다 — 셋업을 접점마다 하면 3회 스칼라보다 느려진다.
+///
+/// **결과는 스칼라 경로와 비트 동일하다.** 레인당 연산 순서가 같기 때문이다
+/// (`Vec3x4::cross`·`Mat3x4::mul_vec`·`Vec3x4::dot`이 스칼라판과 같은 결합 순서이고
+/// FMA에 의존하지 않는다 — 설계 §8 L0). 두 곳만 스칼라와 표현이 다르고, 둘 다 값이 같다:
+/// - `if k > 0.0` 분기 → `cmp_gt` + `blend`. NaN에서 둘 다 거짓이라 0.0으로 같다.
+/// - 나눗셈 전에 k를 1.0으로 **치환**한다. 0으로 나눠 inf를 만든 뒤 가리면 스칼라가
+///   만들지 않는 부동소수 예외 플래그를 남긴다(설계 §8의 fp 환경 규율).
+#[inline]
+fn effective_mass_x3(
+    inv_m_sum: f32x4,
+    inv_i_a: &Mat3x4,
+    inv_i_b: &Mat3x4,
+    ra: Vec3,
+    rb: Vec3,
+    dirs: Vec3x4,
+) -> [f32; 4] {
+    let rna = Vec3x4::splat(ra).cross(dirs);
+    let rnb = Vec3x4::splat(rb).cross(dirs);
+    // 결합 순서는 스칼라와 같다: ((inv_m_a + inv_m_b) + dotA) + dotB.
+    let k = inv_m_sum + rna.dot(inv_i_a.mul_vec(rna)) + rnb.dot(inv_i_b.mul_vec(rnb));
+    let zero = f32x4::splat(0.0);
+    let one = f32x4::splat(1.0);
+    let positive = k.cmp_gt(zero);
+    positive
+        .blend(one / positive.blend(k, one), zero)
+        .to_array()
 }
 
 /// 솔버 핫패스의 **압축 상태**(설계 §3: SoA 핫패스).
@@ -398,6 +434,29 @@ pub fn prepare(
     prepare_into(bodies, a, b, m, cache, dt, Vec::new())
 }
 
+/// 유효질량 경로 A/B 노브 (**측정 전용**, 기본 = SIMD).
+///
+/// `MARU_SCALAR_EFFMASS=1`이면 스칼라 3회 경로로 돈다. 이 노브가 있는 이유는 A/B를
+/// **같은 바이너리·같은 의존성 그래프**에서 번갈아 돌리기 위해서다 — 빌드를 갈아 A/B하면
+/// 그래프가 달라져 가짜 회귀(+80% 실측 사례)가 난다. 두 경로는 비트 동일하므로
+/// 이 노브는 결과를 바꾸지 않는다(결정론 테스트가 두 팔 모두를 지난다).
+///
+/// 읽기는 페어당 원자 로드 1회다(~1ns, 페어당 비용 수백 ns 대비 무해). 환경변수 파싱은
+/// 프로세스당 1회다 — 핫패스에서 `env::var`를 부르면 페어마다 할당이 난다.
+fn scalar_effective_mass_path() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(u8::MAX);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != u8::MAX {
+        return v == 1;
+    }
+    let on = std::env::var("MARU_SCALAR_EFFMASS")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    CACHED.store(on as u8, Ordering::Relaxed);
+    on
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_into(
     bodies: &[Body],
@@ -418,6 +477,13 @@ pub fn prepare_into(
     // 게이트가 얼마나 자주 매칭을 끊는지 보이지 않는다 — 지표가 거짓이면 회귀 테스트도 거짓이다.
     let mut warm_matched = 0u32;
     let (ia, ib) = (ba.inv_inertia_world(), bb.inv_inertia_world());
+    // 유효질량 4-wide 셋업 — **페어당 1회**. 관성텐서와 방향은 접점마다 같으므로
+    // 접점 루프 밖에 있어야 한다(안에 두면 splat 비용이 이득을 먹는다).
+    let ia4 = Mat3x4::splat(ia);
+    let ib4 = Mat3x4::splat(ib);
+    let inv_m_sum = f32x4::splat(ba.inv_mass + bb.inv_mass);
+    let dirs = Vec3x4::from_array([n, tangents[0], tangents[1], n]);
+    let scalar_mass = scalar_effective_mass_path();
     points.clear();
     if points.try_reserve(m.points().len()).is_err() {
         return Err(crate::world::ApiError::ResourceLimit);
@@ -462,17 +528,26 @@ pub fn prepare_into(
             warm.tangent_world.dot(tangents[0]),
             warm.tangent_world.dot(tangents[1]),
         ];
+        // 유효질량 = [법선, 접선0, 접선1]. 두 경로는 **비트 동일**이고(위 주석 + 단위 테스트),
+        // 스위치는 같은 바이너리로 A/B를 돌리기 위한 측정 노브다.
+        let mass = if scalar_mass {
+            [
+                effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, n),
+                effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[0]),
+                effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[1]),
+                0.0,
+            ]
+        } else {
+            effective_mass_x3(inv_m_sum, &ia4, &ib4, ra, rb, dirs)
+        };
         ContactPointConstraint {
             feature: p.feature,
             position: p.position,
             anchor_a: ba.pose.rot.conjugate().rotate(ra),
             anchor_b: bb.pose.rot.conjugate().rotate(rb),
             base_separation: p.separation,
-            normal_mass: effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, n),
-            tangent_mass: [
-                effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[0]),
-                effective_mass(ba.inv_mass, &ia, ra, bb.inv_mass, &ib, rb, tangents[1]),
-            ],
+            normal_mass: mass[0],
+            tangent_mass: [mass[1], mass[2]],
             normal_impulse: warm.normal,
             tangent_impulse: warm_t,
             max_normal_impulse: 0.0,
@@ -1347,6 +1422,79 @@ mod tests {
                 feature: FeatureId(FEATURE_GENERIC),
             }],
         )
+    }
+
+    /// 유효질량 4-wide 경로가 스칼라 3회와 **비트 동일**함을 잠근다.
+    ///
+    /// 이 테스트가 A/B 노브(`MARU_SCALAR_EFFMASS`)를 정당화한다 — 두 팔이 비트 동일하지
+    /// 않으면 성능 비교가 애초에 성립하지 않는다(다른 물리를 재는 것이 된다).
+    /// 근사 비교(`abs_diff < eps`)를 쓰지 않는 이유: 유효질량은 임펄스 크기를 정하므로
+    /// 마지막 ulp 차이가 서브스텝을 타고 궤적을 갈라 결정론(L0)을 깬다.
+    #[test]
+    fn effective_mass_x3_matches_scalar_bit_for_bit() {
+        // 이방성 관성 + 비축정렬 자세 + 퇴화 경우(양쪽 static = k 0)를 함께 덮는다.
+        let cases: &[(f32, Vec3, f32, Vec3, Vec3, Vec3, Vec3)] = &[
+            // (inv_m_a, inv_i_diag_a, inv_m_b, inv_i_diag_b, ra, rb, normal)
+            (
+                1.0,
+                Vec3::new(6.0, 6.0, 6.0),
+                0.0,
+                Vec3::ZERO,
+                Vec3::new(0.3, -0.5, 0.2),
+                Vec3::new(0.3, 0.5, 0.2),
+                Vec3::new(0.0, 1.0, 0.0),
+            ),
+            (
+                0.5,
+                Vec3::new(11.3, 2.7, 7.9),
+                2.0,
+                Vec3::new(0.4, 19.1, 3.3),
+                Vec3::new(-1.7, 0.9, 2.4),
+                Vec3::new(0.8, -2.2, 0.1),
+                Vec3::new(0.577, 0.577, 0.577),
+            ),
+            // 양쪽 무한질량·무한관성 → k = 0 → 유효질량 0 (분기/blend 경계)
+            (
+                0.0,
+                Vec3::ZERO,
+                0.0,
+                Vec3::ZERO,
+                Vec3::new(1.0, 2.0, 3.0),
+                Vec3::new(-1.0, 0.5, 0.25),
+                Vec3::new(1.0, 0.0, 0.0),
+            ),
+        ];
+        let rot = Quat::from_axis_angle(Vec3::new(0.3, 1.0, -0.2), 0.7);
+        for (inv_m_a, ii_a, inv_m_b, ii_b, ra, rb, n) in cases.iter().copied() {
+            let n = n.normalize_or_zero();
+            let ia = Mat3::rotate_inertia(ii_a, rot);
+            let ib = Mat3::rotate_inertia(ii_b, rot);
+            let tangents = tangent_basis(n);
+            let scalar = [
+                effective_mass(inv_m_a, &ia, ra, inv_m_b, &ib, rb, n),
+                effective_mass(inv_m_a, &ia, ra, inv_m_b, &ib, rb, tangents[0]),
+                effective_mass(inv_m_a, &ia, ra, inv_m_b, &ib, rb, tangents[1]),
+            ];
+            let simd = effective_mass_x3(
+                f32x4::splat(inv_m_a + inv_m_b),
+                &Mat3x4::splat(ia),
+                &Mat3x4::splat(ib),
+                ra,
+                rb,
+                Vec3x4::from_array([n, tangents[0], tangents[1], n]),
+            );
+            for i in 0..3 {
+                assert_eq!(
+                    scalar[i].to_bits(),
+                    simd[i].to_bits(),
+                    "레인 {i}: 스칼라 {} vs SIMD {}",
+                    scalar[i],
+                    simd[i]
+                );
+            }
+            // 넷째 레인은 법선을 다시 실은 것이므로 0번과 같아야 한다(셋업이 어긋나면 여기가 깨진다).
+            assert_eq!(simd[3].to_bits(), scalar[0].to_bits());
+        }
     }
 
     /// 회귀(자체 검수): **복합 자식의 generic 접점**(네임스페이스 비트 포함)도 위치 근접

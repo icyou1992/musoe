@@ -174,6 +174,20 @@ pub struct Mat3x4 {
 }
 
 impl Mat3x4 {
+    /// 같은 행렬을 네 레인에 — **레인이 방향(또는 접점)일 때** 쓰는 형태다.
+    /// `from_array([m; 4])`와 값은 같지만 그쪽은 레인마다 스칼라 gather를 돌린다;
+    /// 이쪽은 성분마다 splat 하나다(제약 준비의 페어당 1회 셋업 경로).
+    #[inline]
+    pub fn splat(m: Mat3) -> Self {
+        Self {
+            c: [
+                Vec3x4::splat(m.c[0]),
+                Vec3x4::splat(m.c[1]),
+                Vec3x4::splat(m.c[2]),
+            ],
+        }
+    }
+
     /// AoS 4개 → SoA 1개 (gather는 스칼라 — WASM에 gather 명령 없음, 설계 §3 정직한 범위).
     #[inline]
     pub fn from_array(m: [Mat3; 4]) -> Self {
