@@ -164,7 +164,11 @@ impl<'a> HeightfieldRef<'a> {
 
 impl<'a> HeightfieldRef<'a> {
     #[inline]
-    pub fn height(&self, ix: u32, iz: u32) -> f32 {
+    /// **크레이트 전용 — 범위를 검사하지 않는다.** 호출자는 `cell_range`/`cells`로 얻은
+    /// 인덱스만 넘긴다. 공개였을 때는 `height(0, 2)` 한 줄로 2×2 격자의 슬라이스를 넘어
+    /// 프로세스가 죽었다(확인검수 rev_201e3d20 BLOCKER). 밖에서 지형 높이를 읽는 길은
+    /// 경계를 검사하는 `height_at`이다.
+    pub(crate) fn height(&self, ix: u32, iz: u32) -> f32 {
         self.heights[(iz * self.nx + ix) as usize]
     }
 
@@ -199,7 +203,8 @@ impl<'a> HeightfieldRef<'a> {
     }
 
     #[inline]
-    pub fn vertex(&self, ix: u32, iz: u32) -> Vec3 {
+    /// 크레이트 전용 — 범위 미검사(`height`와 같은 규약).
+    pub(crate) fn vertex(&self, ix: u32, iz: u32) -> Vec3 {
         Vec3::new(
             ix as f32 * self.cell,
             self.height(ix, iz),
@@ -230,7 +235,8 @@ impl<'a> HeightfieldRef<'a> {
     ///
     /// 와인딩은 **+Y가 바깥**이다(위에서 봤을 때 CCW). 평평한 격자에서 두 삼각형의
     /// 법선이 모두 +Y인 것을 테스트가 잠근다.
-    pub fn triangle(&self, cx: u32, cz: u32, t: u8) -> [Vec3; 3] {
+    /// 크레이트 전용 — 범위 미검사(`height`와 같은 규약).
+    pub(crate) fn triangle(&self, cx: u32, cz: u32, t: u8) -> [Vec3; 3] {
         let v00 = self.vertex(cx, cz);
         let v10 = self.vertex(cx + 1, cz);
         let v01 = self.vertex(cx, cz + 1);
@@ -243,7 +249,8 @@ impl<'a> HeightfieldRef<'a> {
     }
 
     /// 삼각형의 단위 법선. 퇴화(면적 0)면 `None`.
-    pub fn triangle_normal(&self, cx: u32, cz: u32, t: u8) -> Option<Vec3> {
+    /// 크레이트 전용 — 범위 미검사(`height`와 같은 규약).
+    pub(crate) fn triangle_normal(&self, cx: u32, cz: u32, t: u8) -> Option<Vec3> {
         let tri = self.triangle(cx, cz, t);
         let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
         let scale = (tri[1] - tri[0])
@@ -277,7 +284,8 @@ impl<'a> HeightfieldRef<'a> {
     /// 능선·절벽은 남긴다: 거기서는 에지 법선이 물리적으로 옳다(공을 굴리면 실제로 튄다).
     /// 판정은 지형 등록부와 같은 각도 임계다 — 스케일 불변·대칭이라 스키니 삼각형에서도
     /// 임계가 부풀지 않는다(검수 rev_3398738c에서 배운 것).
-    pub fn weld_mask(&self, cx: u32, cz: u32, t: u8) -> u8 {
+    /// 크레이트 전용 — 범위 미검사(`height`와 같은 규약).
+    pub(crate) fn weld_mask(&self, cx: u32, cz: u32, t: u8) -> u8 {
         let Some(n) = self.triangle_normal(cx, cz, t) else {
             return 0;
         };
@@ -563,14 +571,27 @@ pub fn build_tiles(heights: &[f32], nx: u32, nz: u32) -> Vec<(f32, f32)> {
 /// 타일을 바깥 루프로 두면 겹치지 않는 타일의 셀 64개는 **아예 방문하지 않는다**.
 ///
 /// `f`가 `false`를 돌려주면 즉시 중단하고 `false`를 반환한다(예산 초과·조기 종료).
-pub fn for_each_overlapping_cell(
+/// **크레이트 전용** — 콜백이 받는 `(cx,cz)`를 그대로 `triangle()`에 넣는 계약이므로,
+/// 범위를 아는 호출자만 쓴다. 공개였을 때는 밖에서 `(0,0,7,7)`을 넘겨 존재하지 않는 셀을
+/// 콜백에 흘릴 수 있었다(확인검수 rev_201e3d20 BLOCKER). 방어적으로 격자에 클램프도 한다.
+pub(crate) fn for_each_overlapping_cell(
     hf: &HeightfieldRef<'_>,
     range: (u32, u32, u32, u32),
     y_lo: f32,
     y_hi: f32,
     mut f: impl FnMut(u32, u32) -> bool,
 ) -> bool {
+    // **격자에 클램프한다.** 범위는 호출자가 주는 값이고, 셀 차원을 넘으면 아래 루프가
+    // 존재하지 않는 셀을 방문한다(그 인덱스로 `triangle()`을 부르면 슬라이스 밖 읽기다).
+    let (ncx, ncz) = hf.cells();
+    if ncx == 0 || ncz == 0 {
+        return true;
+    }
     let (cx0, cz0, cx1, cz1) = range;
+    if cx0 >= ncx || cz0 >= ncz || cx1 < cx0 || cz1 < cz0 {
+        return true;
+    }
+    let (cx1, cz1) = (cx1.min(ncx - 1), cz1.min(ncz - 1));
     for tz in (cz0 / HEIGHTFIELD_TILE)..=(cz1 / HEIGHTFIELD_TILE) {
         for tx in (cx0 / HEIGHTFIELD_TILE)..=(cx1 / HEIGHTFIELD_TILE) {
             let (lo, hi) = hf.tile_range(tx, tz);

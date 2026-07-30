@@ -185,33 +185,39 @@ impl Shape {
 
     pub(crate) fn is_castable(&self) -> bool {
         match self {
-            Shape::Sphere { radius } => radius.is_finite() && *radius >= 0.0,
+            // **범위까지 본다**(`extent_in_range` = MAX_SHAPE_EXTENT). 유한성만 보면
+            // `half = f32::MAX`인 박스가 질의 경계를 통과하는데, 생성 경계(`validate`)는
+            // 거절한다 — 같은 형상에 두 정책이 되고, 45° 자세의 `transformed_aabb`에서
+            // 두 항의 합이 `Inf`가 된다(확인검수 rev_201e3d20 MAJOR).
+            Shape::Sphere { radius } => extent_in_range(*radius) && *radius >= 0.0,
             Shape::Capsule {
                 half_height,
                 radius,
             } => {
-                half_height.is_finite()
+                extent_in_range(*half_height)
                     && *half_height >= 0.0
-                    && radius.is_finite()
+                    && extent_in_range(*radius)
                     && *radius >= 0.0
             }
             Shape::Box { half, radius } => {
-                half.is_finite()
+                vec_extent_in_range(*half)
                     && half.x >= 0.0
                     && half.y >= 0.0
                     && half.z >= 0.0
-                    && radius.is_finite()
+                    && extent_in_range(*radius)
                     && *radius >= 0.0
             }
             Shape::Triangle { points, radius } => {
-                points.iter().all(|p| p.is_finite()) && radius.is_finite() && *radius >= 0.0
+                points.iter().all(|p| vec_extent_in_range(*p))
+                    && extent_in_range(*radius)
+                    && *radius >= 0.0
             }
             // support_core가 `points[0]`을 읽는다 — 비면 패닉이다.
             Shape::Hull { points, radius } => {
                 !points.is_empty()
                     && points.len() <= crate::limits::MAX_HULL_POINTS
-                    && points.iter().all(|p| p.is_finite())
-                    && radius.is_finite()
+                    && points.iter().all(|p| vec_extent_in_range(*p))
+                    && extent_in_range(*radius)
                     && *radius >= 0.0
             }
             // 자식이 없으면 "맞은 것 없음"으로 위장된다. 비볼록 자식은 GJK에서 trap이다.
@@ -222,8 +228,8 @@ impl Shape {
                 !children.is_empty()
                     && children.len() <= MAX_COMPOUND_CHILDREN
                     && children.iter().all(|(pose, child)| {
-                        pose.pos.is_finite()
-                            // 자식 자세는 **정규화 없이 곱해진다**(합성은 할당 없이 돌아야
+                        vec_extent_in_range(pose.pos)
+                            // 자식 자세는 **정규화해서** 곱해진다(합성은 할당 없이 돌아야
                             // 한다). 그래서 비단위 자식은 정규화가 아니라 거절이다 —
                             // 통과시키면 찌그러진 자식으로 조용히 틀린 답이 나온다
                             // (확인검수 rev_97887d75 BLOCKER).
@@ -432,7 +438,8 @@ impl Shape {
             Shape::Hull { points, .. } => points.iter().fold(0.0f32, |m, p| m.max(perp(*p))),
             Shape::Compound { children } => children.iter().fold(0.0f32, |m, (cp, cs)| {
                 // 자식 원점의 축 수직 거리 + 자식 자체의 스윕 반지름(자식 로컬 축).
-                let child_axis = cp.rot.conjugate().rotate(axis);
+                // 자식 회전 정규화 — 근거는 `cast.rs`의 compose 주석에.
+                let child_axis = cp.rot.normalize().conjugate().rotate(axis);
                 m.max(perp(cp.pos) + cs.angular_sweep_radius(child_axis))
             }),
         }
@@ -555,7 +562,14 @@ impl Shape {
             Shape::Compound { children } => {
                 let mut acc: Option<Aabb> = None;
                 for (pose, child) in children {
-                    let t = transformed_aabb(child.local_aabb(), pose);
+                    // 자식 회전 정규화 — 근거는 `cast.rs`의 compose 주석에.
+                    let t = transformed_aabb(
+                        child.local_aabb(),
+                        &Pose {
+                            pos: pose.pos,
+                            rot: pose.rot.normalize(),
+                        },
+                    );
                     acc = Some(match acc {
                         None => t,
                         Some(a) => a.merge(t),

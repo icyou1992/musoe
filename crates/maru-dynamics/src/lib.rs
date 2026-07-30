@@ -4429,6 +4429,127 @@ mod tests {
         }
     }
 
+    /// **비단위 자식 자세가 기하를 왜곡하지 않는다** (BLOCKER: 1m 규모의 조용한 오차).
+    ///
+    /// 수용 기준(길이 제곱 1e-3)은 *입력 관용*이고, 기하는 **정규화된 회전으로** 풀어야 한다.
+    /// 비단위 쿼터니언의 `rotate`는 회전이 아니라 회전+스케일이라, 최대 형상 반경(1000m)에서
+    /// 0.05%는 약 0.5m다 — speculative margin(0.05m)의 10배, 침투 임계(1e-4m)의 5000배다
+    /// (확인검수 rev_201e3d20 BLOCKER). AABB·레이·접촉·관성이 모두 이 값을 쓴다.
+    #[test]
+    fn non_unit_child_rotation_does_not_distort_geometry() {
+        let child = Shape::Box {
+            half: Vec3::new(300.0, 5.0, 5.0),
+            radius: 0.0,
+        };
+        let q = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), core::f32::consts::FRAC_PI_2);
+        // 수용 범위 안에서 최대로 부풀린 자식 회전(길이 제곱 ≈ 1+1e-3).
+        let k = (1.0f32 + 9.0e-4).sqrt();
+        let mk = |rot: Quat| Shape::Compound {
+            children: vec![(
+                maru_collide::Pose {
+                    pos: Vec3::new(400.0, 0.0, 0.0),
+                    rot,
+                },
+                child.clone(),
+            )],
+        };
+        let unit = mk(q);
+        let scaled = mk(Quat {
+            x: q.x * k,
+            y: q.y * k,
+            z: q.z * k,
+            w: q.w * k,
+        });
+        assert!(scaled.validate().is_ok(), "수용 범위 안인데 거절됐다");
+        // ① AABB가 같아야 한다.
+        let (a, b) = (
+            unit.try_local_aabb().expect("정상"),
+            scaled.try_local_aabb().expect("정상"),
+        );
+        let d = (a.min - b.min).length().max((a.max - b.max).length());
+        assert!(
+            d < 1.0e-3,
+            "비단위 자식이 AABB를 {d} m 만큼 왜곡했다 (침투 임계 1e-4 m)"
+        );
+        // ② 레이 히트 지점도 같아야 한다.
+        let p = pose(0.0, 0.0, 0.0);
+        // 자식은 (400,0,0)에 있고 90° 돌아 y로 길어진다 — 그 위에서 아래로 쏜다.
+        let o = Vec3::new(400.0, 900.0, 0.0);
+        let dir = Vec3::new(0.0, -1.0, 0.0);
+        let ha = maru_collide::try_cast_ray(&unit, &p, o, dir, 2000.0).expect("정상");
+        let hb = maru_collide::try_cast_ray(&scaled, &p, o, dir, 2000.0).expect("정상");
+        // **음성 대조** — 정상 자세가 실제로 맞춰야 비교가 의미 있다.
+        let ta = ha
+            .expect("정상 자세가 회전한 자식을 못 맞췄다 — 배치가 무의미하다")
+            .toi;
+        let tb = hb.expect("비단위 자세에서 히트가 사라졌다").toi;
+        assert!(
+            (ta - tb).abs() < 1.0e-3,
+            "레이 toi가 {} vs {}로 갈렸다",
+            ta,
+            tb
+        );
+        // ③ 관성·질량도 같아야 한다(동적 복합은 자식 회전으로 텐서를 돌린다).
+        let ba = Body::try_new_dynamic(unit, pose(0.0, 0.0, 0.0), 1.0).expect("정상");
+        let bb = Body::try_new_dynamic(scaled, pose(0.0, 0.0, 0.0), 1.0).expect("정상");
+        assert!((ba.inv_mass() - bb.inv_mass()).abs() <= f32::EPSILON * 4.0);
+        let (ia, ib) = (ba.inv_inertia_local(), bb.inv_inertia_local());
+        let rel = ((ia - ib).length() / ia.length().max(1.0e-12)).abs();
+        assert!(rel < 1.0e-3, "관성 텐서가 상대오차 {rel}로 갈렸다");
+    }
+
+    /// **범위 밖 거대 형상은 질의 경계에서도 거절된다** (MAJOR: 두 경계의 정책 불일치).
+    ///
+    /// `half = f32::MAX`인 박스는 생성 경계(`validate`)가 `MAX_SHAPE_EXTENT`로 거절하는데
+    /// 질의 경계(`is_castable`)는 유한성만 봐서 통과시켰다 — 45° 자세의 `transformed_aabb`에서
+    /// 두 항의 합이 `Inf`가 된다(확인검수 rev_201e3d20 MAJOR).
+    #[test]
+    fn out_of_range_shapes_are_rejected_at_the_query_boundary_too() {
+        use maru_collide::{QueryReject, ShapeReject};
+        let huge_box = Shape::Box {
+            half: Vec3::new(f32::MAX, f32::MAX, f32::MAX),
+            radius: 0.0,
+        };
+        let huge_hull = Shape::Hull {
+            points: vec![Vec3::new(f32::MAX, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)],
+            radius: 0.0,
+        };
+        let huge_offset = Shape::Compound {
+            children: vec![(pose(f32::MAX, 0.0, 0.0), Shape::Sphere { radius: 0.5 })],
+        };
+        let p = pose(0.0, 0.0, 0.0);
+        for bad in [&huge_box, &huge_hull, &huge_offset] {
+            assert!(bad.validate().is_err(), "생성 경계가 통과시켰다");
+            assert_eq!(
+                bad.try_local_aabb(),
+                Err(ShapeReject::InvalidShape),
+                "질의 경계가 통과시켰다 — transformed_aabb에서 Inf가 된다"
+            );
+            assert_eq!(
+                maru_collide::try_cast_ray(bad, &p, Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0), 10.0),
+                Err(QueryReject::InvalidInput)
+            );
+            assert_eq!(
+                maru_collide::try_shape_cast_dispatch(
+                    bad,
+                    &p,
+                    Vec3::new(1.0, 0.0, 0.0),
+                    &Shape::Sphere { radius: 0.5 },
+                    &pose(5.0, 0.0, 0.0),
+                    0.02
+                ),
+                Err(maru_collide::CastReject::InvalidInput)
+            );
+        }
+        // **음성 대조** — 상한 안(1000m)의 큰 형상은 양쪽 경계를 통과한다.
+        let big_ok = Shape::Box {
+            half: Vec3::new(900.0, 900.0, 900.0),
+            radius: 0.0,
+        };
+        assert!(big_ok.validate().is_ok());
+        assert!(big_ok.try_local_aabb().is_ok());
+    }
+
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.
     ///
     /// 검수가 두 번 같은 계열을 지적했다(생성자 → enqueue). 한 곳만 빠지면 "비표준 환경

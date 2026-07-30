@@ -143,7 +143,8 @@ pub(crate) fn cast_ray(
                 // 자식 로컬로 다시 변환해 재귀 대신 직접 호출 (중첩은 validate가 금지).
                 let world_child = Pose {
                     pos: pose.pos + pose.rot.rotate(cp.pos),
-                    rot: pose.rot * cp.rot,
+                    // 자식 회전 정규화 — 근거는 `cast.rs`의 compose 주석에.
+                    rot: pose.rot * cp.rot.normalize(),
                 };
                 if let Some(hit) = cast_ray(child, &world_child, origin, dir, max_toi) {
                     let better = best.as_ref().is_none_or(|b| hit.toi < b.toi);
@@ -205,7 +206,8 @@ pub(crate) fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
         Shape::Compound { ref children } => children.iter().any(|(cp, child)| {
             let world_child = Pose {
                 pos: pose.pos + pose.rot.rotate(cp.pos),
-                rot: pose.rot * cp.rot,
+                // 자식 회전 정규화 — 근거는 `cast.rs`의 compose 주석에.
+                rot: pose.rot * cp.rot.normalize(),
             };
             contains_point(child, &world_child, p)
         }),

@@ -314,7 +314,12 @@ pub fn try_shape_cast_dispatch_rotational(
     let mut budget = crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY;
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
-        rot: parent.rot * child.rot,
+        // **자식 회전을 정규화해서 합성한다.** 허용 오차(길이 제곱 1e-3)는 *수용* 기준이고
+        // 기하는 정규화된 회전으로 풀어야 한다 — 비단위 쿼터니언의 `rotate`는 회전이 아니라
+        // 회전+스케일이고, 최대 형상 반경(1000m)에서 그 0.05%는 약 0.5m다(speculative margin
+        // 0.05m의 10배, 침투 임계 1e-4m의 5000배 — 확인검수 rev_201e3d20 BLOCKER).
+        // 비용은 자식당 sqrt 한 번이고 자식은 최대 8개다.
+        rot: parent.rot * child.rot.normalize(),
     };
     let cast_one =
         |csa: &Shape, cpa: &Pose, budget: &mut usize| -> Result<Option<ShapeCastHit>, CastReject> {
@@ -439,7 +444,12 @@ pub fn try_shape_cast_dispatch(
     let (pa, pb) = (&npa, &npb);
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
-        rot: parent.rot * child.rot,
+        // **자식 회전을 정규화해서 합성한다.** 허용 오차(길이 제곱 1e-3)는 *수용* 기준이고
+        // 기하는 정규화된 회전으로 풀어야 한다 — 비단위 쿼터니언의 `rotate`는 회전이 아니라
+        // 회전+스케일이고, 최대 형상 반경(1000m)에서 그 0.05%는 약 0.5m다(speculative margin
+        // 0.05m의 10배, 침투 임계 1e-4m의 5000배 — 확인검수 rev_201e3d20 BLOCKER).
+        // 비용은 자식당 sqrt 한 번이고 자식은 최대 8개다.
+        rot: parent.rot * child.rot.normalize(),
     };
     let mut best: Option<ShapeCastHit> = None;
     let mut budget = crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY;

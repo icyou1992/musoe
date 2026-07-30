@@ -683,6 +683,13 @@ fn bake_compound(shape: Shape, pose: Pose, density: f32) -> (Shape, Pose, Vec3, 
     let mut total_m = 0.0f32;
     let mut com = Vec3::ZERO;
     for (cp, child) in &children {
+        // **자식 회전을 정규화해서 관성을 돈다.** 아래 텐서 회전은 `Mat3::from_quat(cp.rot)`을
+        // 쓰는데, 비단위 쿼터니언은 비직교 행렬을 만들어 질량 특성이 그만큼 찌그러진다
+        // (확인검수 rev_201e3d20 BLOCKER). 수용 기준(1e-3)은 입력 관용이고 계산은 정규화로 한다.
+        let cp = &Pose {
+            pos: cp.pos,
+            rot: cp.rot.normalize(),
+        };
         let (m, i_diag, local_com) = match child {
             Shape::Hull { points, .. } => {
                 let (mut min, mut max) = (points[0], points[0]);

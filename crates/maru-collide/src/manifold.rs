@@ -266,7 +266,8 @@ fn heightfield_contacts(
                     for (i, (cp, cs)) in children.iter().enumerate() {
                         let wp = Pose {
                             pos: pa.pos + pa.rot.rotate(cp.pos),
-                            rot: pa.rot * cp.rot,
+                            // 자식 회전 정규화 — 근거는 `cast.rs`의 compose 주석에.
+                            rot: pa.rot * cp.rot.normalize(),
                         };
                         if emit(i as u8, cs, &wp) {
                             any = true;
@@ -381,7 +382,8 @@ pub fn for_each_contact_with_budget(
     let (pa, pb) = (&npa, &npb);
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
-        rot: parent.rot * child.rot,
+        // 자식 회전 정규화 — 근거는 `cast.rs`의 같은 자리 주석에.
+        rot: parent.rot * child.rot.normalize(),
     };
     // 하이트필드는 바디 하나가 삼각형 수천 개다 — 겹치는 셀만 펼치고 **상한에서 끊는다**.
     // 끊었다는 사실은 반환값으로 나간다(조용한 누락 금지 — 호출자가 진단에 싣는다).

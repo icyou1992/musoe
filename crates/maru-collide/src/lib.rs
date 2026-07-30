@@ -40,9 +40,9 @@ pub use cast::{
 
 pub use gjk::{Pose, SupportPoint};
 pub use heightfield::{
-    build_tiles as build_heightfield_tiles, for_each_overlapping_cell, overlapping_cell_count,
-    world_aabb_to_local, HeightfieldGrid, HeightfieldRef, COS_COPLANAR, HEIGHTFIELD_TILE,
-    MAX_HEIGHTFIELD_CELLS_PER_QUERY, MAX_HEIGHTFIELD_MANIFOLDS, MAX_HEIGHTFIELD_SAMPLES,
+    overlapping_cell_count, world_aabb_to_local, HeightfieldGrid, HeightfieldRef, COS_COPLANAR,
+    HEIGHTFIELD_TILE, MAX_HEIGHTFIELD_CELLS_PER_QUERY, MAX_HEIGHTFIELD_MANIFOLDS,
+    MAX_HEIGHTFIELD_SAMPLES,
 };
 pub use limits::{
     anchor_in_range, angular_in_range, extent_in_range, in_range, in_state_range,
