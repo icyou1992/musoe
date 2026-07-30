@@ -9,9 +9,9 @@
 
 use crate::epa::epa;
 use crate::gjk::{gjk, GjkResult};
-use crate::tolerance::{area_eps, characteristic_length};
+use crate::tolerance::{area_eps, characteristic_length, length_sq_eps};
 use crate::{Pose, Shape};
-use maru_math::{Quat, Vec3};
+use maru_math::{Mat3, Quat, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct FeatureId(pub u32);
@@ -482,11 +482,20 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
         },
     ) = (sa, sb)
     {
-        match box_box_axis(*ha, *rab, pa, *hb, *rbb, pb, margin) {
+        // **회전행렬은 페어당 한 번**이고 SAT와 클리퍼가 공유한다. 예전에는 같은 자세로
+        // 쿼터니언 회전을 SAT에서 6번·클리퍼에서 21번 다시 돌렸다(페어당 27회).
+        // `Mat3::from_quat`이 하는 일이 바로 그 축 3개 회전이므로 SAT 쪽은 **비트 동일**이고
+        // (`sat_axes_match_quaternion_rotation_bit_for_bit`가 잠근다), 클리퍼 쪽은
+        // 행렬-벡터 곱으로 바뀌어 값이 마지막 비트에서 달라진다(아래 클리퍼 주석).
+        let ma = Mat3::from_quat(pa.rot);
+        let mb = Mat3::from_quat(pb.rot);
+        match box_box_axis(*ha, *rab, pa, &ma, *hb, *rbb, pb, &mb, margin) {
             SatResult::Apart => return None,
             SatResult::Axis(n) => {
-                let eps_area = area_eps(characteristic_length(sa, sb));
-                if let Some(m) = clip_box_box(eps_area, *ha, *rab, pa, *hb, *rbb, pb, n, margin) {
+                let char_len = characteristic_length(sa, sb);
+                if let Some(m) =
+                    clip_box_box(char_len, *ha, *rab, pa, &ma, *hb, *rbb, pb, &mb, n, margin)
+                {
                     return Some(m);
                 }
             }
@@ -525,9 +534,13 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
         },
     ) = (sa, sb)
     {
-        let eps_area = area_eps(characteristic_length(sa, sb));
-        if let Some(m) = clip_box_box(eps_area, *ha, *ra_box, pa, *hb, *rb_box, pb, normal, margin)
-        {
+        let char_len = characteristic_length(sa, sb);
+        // 이 경로는 GJK/EPA가 법선을 준 뒤의 클리핑 재시도라 위쪽 SAT 경로의 행렬이 닿지 않는다.
+        // 페어당 2회 변환은 클리퍼가 아끼는 회전 21회에 비하면 작다.
+        let (ma, mb) = (Mat3::from_quat(pa.rot), Mat3::from_quat(pb.rot));
+        if let Some(m) = clip_box_box(
+            char_len, *ha, *ra_box, pa, &ma, *hb, *rb_box, pb, &mb, normal, margin,
+        ) {
             return Some(m);
         }
     }
@@ -576,24 +589,20 @@ fn box_box_axis(
     ha: Vec3,
     ra: f32,
     pa: &Pose,
+    ma: &Mat3,
     hb: Vec3,
     rb: f32,
     pb: &Pose,
+    mb: &Mat3,
     margin: f32,
 ) -> SatResult {
     let core =
         |h: Vec3, r: f32| Vec3::new((h.x - r).max(0.0), (h.y - r).max(0.0), (h.z - r).max(0.0));
     let (ca, cb) = (core(ha, ra), core(hb, rb));
-    let axes_a = [
-        pa.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
-        pa.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
-        pa.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
-    ];
-    let axes_b = [
-        pb.rot.rotate(Vec3::new(1.0, 0.0, 0.0)),
-        pb.rot.rotate(Vec3::new(0.0, 1.0, 0.0)),
-        pb.rot.rotate(Vec3::new(0.0, 0.0, 1.0)),
-    ];
+    // 회전행렬의 열 = 회전된 단위축. `Mat3::from_quat`이 정확히 `rot.rotate(e_i)`를 계산하므로
+    // 이 대입은 **비트 동일**이다(값이 아니라 계산 위치만 옮긴다).
+    let axes_a = ma.c;
+    let axes_b = mb.c;
     let d = pb.pos - pa.pos;
     let extent = |axes: &[Vec3; 3], c: Vec3, n: Vec3| -> f32 {
         (axes[0].dot(n) * c.x).abs() + (axes[1].dot(n) * c.y).abs() + (axes[2].dot(n) * c.z).abs()
@@ -884,15 +893,21 @@ fn sphere_box(
 // ---------- box face 유틸 ----------
 
 /// 면 f = axis*2 + (양의 방향이면 1). 월드 법선.
-fn box_face_normal(f: usize, rot: Quat) -> Vec3 {
-    let axis = f / 2;
-    let sign = if f % 2 == 1 { 1.0 } else { -1.0 };
-    let local = match axis {
-        0 => Vec3::new(sign, 0.0, 0.0),
-        1 => Vec3::new(0.0, sign, 0.0),
-        _ => Vec3::new(0.0, 0.0, sign),
-    };
-    rot.rotate(local)
+/// 면 f의 바깥 법선 = 회전행렬 **열의 ±**. 회전을 새로 돌리지 않는다.
+///
+/// 예전 판은 `rot.rotate(±e_axis)`로 면마다 쿼터니언 회전을 돌렸다. 열의 부호를 뒤집는 것은
+/// 그것과 **비트 동일이 아니다** — `rotate(-e_x)`의 0 성분은 `+0.0`인데 `-rotate(e_x)`는
+/// `-0.0`이고, 그 차이는 내적이 통째로 0일 때 부호로 살아남는다. 여기서는 그 차이를 감수한다:
+/// 클리퍼 전체가 이미 행렬-벡터 곱으로 옮겨져 값이 마지막 비트에서 달라지고, 그 대가는
+/// 봉투 재검증으로 치렀다(README '매니폴드 생성' 절).
+#[inline]
+fn box_face_normal(f: usize, m: &Mat3) -> Vec3 {
+    let c = m.c[f / 2];
+    if f % 2 == 1 {
+        c
+    } else {
+        Vec3::new(-c.x, -c.y, -c.z)
+    }
 }
 
 /// 면 f의 4개 꼭짓점 (로컬, 바깥에서 볼 때 CCW — 결정적 순서).
@@ -958,11 +973,11 @@ fn box_face_verts(f: usize, half: Vec3, radius: f32) -> [Vec3; 4] {
 /// 페어당 0.67us 중 SAT 0.25 = 38%, 클리핑 0.41 = 62%). 남은 큰 덩어리는 여기가 아니라
 /// **클리핑의 면 정점 회전**(페어마다 8회)이고, 그건 바디별 회전행렬을 스텝당 한 번 만들어
 /// 내려보내는 **구조 변경**이라야 없어진다.
-fn best_face(rot: Quat, want: Vec3) -> (usize, f32) {
+fn best_face(m: &Mat3, want: Vec3) -> (usize, f32) {
     let mut best = 0;
     let mut best_dot = -f32::INFINITY;
     for f in 0..6 {
-        let d = box_face_normal(f, rot).dot(want);
+        let d = box_face_normal(f, m).dot(want);
         if d > best_dot + 1.0e-6 {
             best_dot = d;
             best = f;
@@ -974,35 +989,38 @@ fn best_face(rot: Quat, want: Vec3) -> (usize, f32) {
 /// box-box 면 클리핑. 법선이 면 지배적이 아니면 None(→ witness 폴백).
 #[allow(clippy::too_many_arguments)]
 fn clip_box_box(
-    eps_area: f32,
+    char_len: f32,
     ha: Vec3,
     ra: f32,
     pa: &Pose,
+    ma: &Mat3,
     hb: Vec3,
     rb: f32,
     pb: &Pose,
+    mb: &Mat3,
     normal: Vec3,
     margin: f32,
 ) -> Option<Manifold> {
+    let eps_area = area_eps(char_len);
     // A에서 B를 향하는 면(법선 ≈ −normal), B에서 A를 향하는 면(≈ +normal)
-    let (fa, da) = best_face(pa.rot, -normal);
-    let (fb, db) = best_face(pb.rot, normal);
+    let (fa, da) = best_face(ma, -normal);
+    let (fb, db) = best_face(mb, normal);
     if da.max(db) < FACE_DOT_MIN {
         return None; // 에지-에지 지배 — witness 단일점 경로
     }
     // reference = 더 정렬된 쪽 (동률 = A — 결정론)
     let ref_is_a = da >= db;
-    let (rf, rh, rr, rp, ih, ir, ip) = if ref_is_a {
-        (fa, ha, ra, pa, hb, rb, pb)
+    let (rf, rh, rr, rp, rm, ih, ir, ip, im) = if ref_is_a {
+        (fa, ha, ra, pa, ma, hb, rb, pb, mb)
     } else {
-        (fb, hb, rb, pb, ha, ra, pa)
+        (fb, hb, rb, pb, mb, ha, ra, pa, ma)
     };
 
-    let rn = box_face_normal(rf, rp.rot); // reference 바깥 법선 (월드)
-    let rverts: [Vec3; 4] = box_face_verts(rf, rh, rr).map(|v| rp.pos + rp.rot.rotate(v));
+    let rn = box_face_normal(rf, rm); // reference 바깥 법선 (월드)
+    let rverts: [Vec3; 4] = box_face_verts(rf, rh, rr).map(|v| rp.pos + rm.mul_vec(v));
     // incident = 상대 박스에서 rn과 가장 반대인 면
-    let (inc_f, _) = best_face(ip.rot, -rn);
-    let iverts: [Vec3; 4] = box_face_verts(inc_f, ih, ir).map(|v| ip.pos + ip.rot.rotate(v));
+    let (inc_f, _) = best_face(im, -rn);
+    let iverts: [Vec3; 4] = box_face_verts(inc_f, ih, ir).map(|v| ip.pos + im.mul_vec(v));
     // radius가 half를 잠식해 평면 패치가 선/점으로 퇴화하면 클리핑 불가 → witness 폴백
     // cross 길이 = 면적(L²) → L² 임계와 비교 (length_sq는 L⁴)
     if (rverts[1] - rverts[0])
@@ -1069,6 +1087,10 @@ fn clip_box_box(
             // 교점은 **엄격한 부호 반대**일 때만 생성 (확인 라운드 MAJOR 반영 — d0==0인 경계
             // 정점은 위에서 이미 보존되므로 t=0 교점까지 만들면 같은 위치가 서로 다른 계보
             // 마스크로 중복 진입해 솔버가 동일 지점에 제약을 중복 적용한다).
+            //
+            // **이 부호 규칙은 마지막 ulp에 기댄다** — 경계 정점이 정확히 `d == 0.0`일 때만
+            // 막아 준다. 같은 기하라도 회전을 어떻게 계산했느냐에 따라 `±1e-9`가 되면 중복이
+            // 부활한다. 그래서 아래 접점 수집에서 **위치 중복**을 최종 방어선으로 한 번 더 친다.
             if (d0 > 0.0 && d1 < 0.0) || (d0 < 0.0 && d1 > 0.0) {
                 let t = d0 / (d0 - d1);
                 let x = v0.position + (v1.position - v0.position) * t;
@@ -1093,6 +1115,12 @@ fn clip_box_box(
     // reference 평면 아래(margin 이내)만 채택, separation = 평면까지 부호 거리
     let mut pts = [ContactPoint::default(); CLIP_CAP];
     let mut pts_len = 0usize;
+    // **같은 자리에 접점이 둘 들어가면 솔버가 그 지점에 제약을 두 번 건다.** 위 부호 규칙은
+    // 값이 정확히 0일 때만 막으므로, 서로 다른 측면에서 생긴 교점이 같은 코너로 모이는 경우
+    // (45° 박스의 코너가 참조면 코너와 만나는 배치)는 통과한다 — 실제로 회전 계산을 바꾸자
+    // 6e-8 떨어진 접점 두 개가 나왔다. 임계는 톨러런스 정책대로 **특성 길이에서 유도**한다
+    // (절대 상수 금지: 1mm 부품 씬과 100m 씬이 같은 임계를 쓰면 한쪽이 반드시 틀린다).
+    let dup_eps_sq = length_sq_eps(char_len);
     for v in poly.iter().take(poly_len) {
         let sep = rn.dot(v.position - rverts[0]);
         if sep <= margin {
@@ -1103,8 +1131,15 @@ fn clip_box_box(
                 | ((inc_f as u32) << 25)
                 | ((v.reference_mask as u32) << 4)
                 | v.incident_mask as u32;
+            let position = (v.position + proj) * 0.5;
+            if pts[..pts_len]
+                .iter()
+                .any(|q| (q.position - position).length_sq() <= dup_eps_sq)
+            {
+                continue; // 이미 같은 자리에 접점이 있다
+            }
             pts[pts_len] = ContactPoint {
-                position: (v.position + proj) * 0.5,
+                position,
                 separation: sep,
                 feature: FeatureId(feature),
             };
@@ -1633,7 +1668,8 @@ mod tests {
                 pos: base + jitter,
                 rot: tilt(0.0, 0.0, 1.0),
             };
-            let sat = match box_box_axis(half, 0.0, &pa, half, 0.0, &pb, 0.05) {
+            let (ma, mb) = (Mat3::from_quat(pa.rot), Mat3::from_quat(pb.rot));
+            let sat = match box_box_axis(half, 0.0, &pa, &ma, half, 0.0, &pb, &mb, 0.05) {
                 SatResult::Axis(n) => n,
                 _ => continue,
             };
