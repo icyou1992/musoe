@@ -4923,6 +4923,91 @@ mod tests {
         assert_eq!(w_ccd.body(h_ccd).linvel(), w_plain.body(h_plain).linvel());
     }
 
+    /// **경계 밖의 유효한 정적 기하도 CCD가 잡는다** (BLOCKER: "밖에는 부딪힐 것이 없다"는 오류).
+    ///
+    /// 정적 바디는 **부모 자세만** `MAX_INPUT` 안이면 되고, 복합 자식 오프셋과 격자는
+    /// `MAX_SHAPE_EXTENT`(1km)까지 더 뻗을 수 있다. 그래서 "월드 범위 밖에는 충돌할 것이 없다"는
+    /// 내 전제가 틀렸고, 바디 원점이 범위 밖이라고 캐스트를 생략하면 유효한 장애물을 조용히
+    /// 관통한다(확인검수 rev_5ca93cb1). 지금은 캐스트를 **상대 좌표**로 돌아 범위 문제 자체가 없다.
+    #[test]
+    fn ccd_catches_static_geometry_beyond_the_world_bound() {
+        let max = maru_collide::MAX_INPUT;
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::new(-100.0, 0.0, 0.0),
+            substeps: 64,
+            ..WorldParams::default()
+        });
+        // 장애물: 부모 자세는 경계 위(허용), 자식은 로컬 +0.3m → 실제 중심은 경계 **밖**이다.
+        // 모든 생성 정책을 통과한다. 오프셋이 이만큼 커야 탄환이 **원점이 이미 범위 밖일 때**
+        // 도달한다 — 0.12m로는 첫 서브스텝(원점이 아직 안쪽)에 닿아서 옛 가드로도 잡혔다.
+        let obstacle = Shape::Compound {
+            children: vec![(pose(0.3, 0.0, 0.0), Shape::Sphere { radius: 0.05 })],
+        };
+        assert!(
+            obstacle.validate().is_ok(),
+            "장애물이 정책을 위반한다 — 전제가 다르다"
+        );
+        w.add_body(Body::new_static(obstacle, pose(max, 0.0, 0.0)));
+        // 탄환: 경계 코앞에서 바깥으로. 중력이 되돌리므로 스텝 말에는 다시 안쪽이다
+        // (그래서 `out_of_bounds`도 안 뜨고, 관통이 조용히 지나갔던 것이다).
+        let h = w.add_body(
+            Body::new_dynamic(
+                Shape::Sphere { radius: 0.05 },
+                pose(max - 0.01, 0.0, 0.0),
+                1.0,
+            )
+            .with_ccd(),
+        );
+        w.set_linear_velocity(h, Vec3::new(10.0, 0.0, 0.0))
+            .expect("속도");
+        assert_eq!(w.try_step(0.25), Ok(()));
+        assert!(
+            !w.ccd_hits().is_empty(),
+            "경계 밖 장애물을 CCD가 못 봤다 — 관통이 조용히 지나갔다 (x={}, oob={})",
+            w.body(h).pose().pos.x,
+            w.diagnostics().out_of_bounds
+        );
+        // **음성 대조 ①** — 장애물이 없으면 히트도 없다(위 단언이 배치와 무관하게 참이 아니다).
+        let mut w0 = World::new(WorldParams {
+            gravity: Vec3::new(-100.0, 0.0, 0.0),
+            substeps: 64,
+            ..WorldParams::default()
+        });
+        let h0 = w0.add_body(
+            Body::new_dynamic(
+                Shape::Sphere { radius: 0.05 },
+                pose(max - 0.01, 0.0, 0.0),
+                1.0,
+            )
+            .with_ccd(),
+        );
+        w0.set_linear_velocity(h0, Vec3::new(10.0, 0.0, 0.0))
+            .expect("속도");
+        assert_eq!(w0.try_step(0.25), Ok(()));
+        assert!(w0.ccd_hits().is_empty());
+        // **음성 대조 ②** — 같은 장애물을 월드 **안쪽**에 두면 원래도 잡혔다(이 결함은
+        // 경계 밖 기하에 한정된다).
+        let mut w_in = World::new(WorldParams {
+            gravity: Vec3::new(-100.0, 0.0, 0.0),
+            substeps: 64,
+            ..WorldParams::default()
+        });
+        w_in.add_body(Body::new_static(
+            Shape::Compound {
+                children: vec![(pose(0.3, 0.0, 0.0), Shape::Sphere { radius: 0.05 })],
+            },
+            pose(0.0, 0.0, 0.0),
+        ));
+        let h_in = w_in.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.05 }, pose(-0.01, 0.0, 0.0), 1.0)
+                .with_ccd(),
+        );
+        w_in.set_linear_velocity(h_in, Vec3::new(10.0, 0.0, 0.0))
+            .expect("속도");
+        assert_eq!(w_in.try_step(0.25), Ok(()));
+        assert!(!w_in.ccd_hits().is_empty());
+    }
+
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.
     ///
     /// 검수가 두 번 같은 계열을 지적했다(생성자 → enqueue). 한 곳만 빠지면 "비표준 환경

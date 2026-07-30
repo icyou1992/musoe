@@ -4010,20 +4010,23 @@ impl World {
                     // **원인이 잘못 보고된다**(`ccd_incomplete` 문서는 "지형 해상도·바디 크기를
                     // 보라"고 말한다). 범위 이탈은 스텝 말 OOB 패스가 `out_of_bounds`로 센다.
                     //
-                    // **캐스트만 건너뛴다 — 적분은 막지 않는다.** 처음 두 판은 여기서 더 나갔고
-                    // 둘 다 틀렸다: ① `continue`로 회전까지 건너뛰어 감지 서브스텝만 회전이
-                    // 빠지는 비대칭(rev_59dcb940) ② `d=0` + `ccd_frozen`으로 병진을 얼려서,
-                    // 잠깐 넘었다가 중력·조인트가 안쪽으로 되돌릴 바디가 **복귀하지 못하고
-                    // 영구 OOB로 제거**되는 결함(rev_cccbba53). 후자는 정적 후보가 0개인
-                    // 장면에서도 **CCD 켬/끔이 궤적을 바꾸므로** 반박 불가다.
+                    // **캐스트는 상대 좌표로 돈다** — 이 자리를 네 판 틀린 끝에 나온 답이다.
                     //
-                    // 범위 밖 산술이 한 스텝 안에서는 안전하다는 것이 아래 `enforce_world_bounds`
-                    // 문서의 실측 근거이고, 그 논증을 받아들였다면 적분을 막을 이유가 없다.
-                    // 최종 위치가 여전히 밖이면 그때 `enforce_world_bounds`가 OOB를 세운다.
-                    let pos_in_range = maru_collide::vec_in_range(st.pos[i]);
-                    if pos_in_range
-                        && ((!ccd_frozen[ci] && (d != Vec3::ZERO || rot_sweep))
-                            || (ccd_frozen[ci] && rot_sweep))
+                    // ① `continue`로 회전 적분까지 건너뜀 → 감지 서브스텝만 회전이 빠지는
+                    //    비대칭(rev_59dcb940). ② `d=0`+`ccd_frozen`으로 병진 동결 → 잠깐 넘었다
+                    //    돌아올 바디가 복귀 불가·영구 OOB, 정적 후보 0개인데도 CCD 켬/끔이 궤적을
+                    //    바꿈(rev_cccbba53). ③ 범위 밖이면 캐스트만 생략 → **"밖에는 부딪힐 것이
+                    //    없다"는 내 전제가 틀렸다**: 정적 바디는 **부모 자세만** `MAX_INPUT` 안이면
+                    //    되고 복합 자식 오프셋·격자는 `MAX_SHAPE_EXTENT`(1km)까지 더 뻗을 수 있다.
+                    //    경계 밖의 유효한 장애물을 조용히 관통했다(rev_5ca93cb1).
+                    //
+                    // ④ 그래서 **절대 좌표를 쓰지 않는다.** 충돌 기하는 병진 불변이므로 두 자세에서
+                    //    같은 원점(움직이는 바디의 현재 위치)을 빼면 결과가 같고, 상대 거리는 항상
+                    //    지원 범위 안이다(후보는 스윕 AABB와 겹쳐야 하므로 |Δ| ≤ 두 바운딩 반경 +
+                    //    이동 ≤ 4.2km < MAX_INPUT). 덤으로 10km 좌표의 자리수 손실도 사라진다 —
+                    //    상대 좌표는 0 근처라 f32 정밀도를 온전히 쓴다.
+                    if (!ccd_frozen[ci] && (d != Vec3::ZERO || rot_sweep))
+                        || (ccd_frozen[ci] && rot_sweep)
                     {
                         let body = &self.bodies[i];
                         let pose_now = maru_collide::Pose {
@@ -4065,24 +4068,35 @@ impl World {
                                         continue;
                                     }
                                 }
+                                // **상대 좌표**(원점 = 움직이는 바디의 현재 위치). 근거는 위
+                                // 블록 주석 ④. 반환값 중 좌표계에 의존하는 것은 `point`뿐이라
+                                // 아래에서 원점을 다시 더한다(`toi`·`normal`은 병진 불변).
+                                let cast_pa = maru_collide::Pose {
+                                    pos: Vec3::ZERO,
+                                    rot: pose_now.rot,
+                                };
+                                let cast_pb = maru_collide::Pose {
+                                    pos: sb.pose.pos - pose_now.pos,
+                                    rot: sb.pose.rot,
+                                };
                                 let cast = if rot_sweep {
                                     maru_collide::try_shape_cast_dispatch_rotational(
                                         &body.shape,
-                                        &pose_now,
+                                        &cast_pa,
                                         d,
                                         omega * (1.0 / omega.length()),
                                         sub_angle,
                                         &sb.shape,
-                                        &sb.pose,
+                                        &cast_pb,
                                         skin,
                                     )
                                 } else {
                                     try_shape_cast_dispatch(
                                         &body.shape,
-                                        &pose_now,
+                                        &cast_pa,
                                         d,
                                         &sb.shape,
-                                        &sb.pose,
+                                        &cast_pb,
                                         skin,
                                     )
                                 };
@@ -4097,6 +4111,11 @@ impl World {
                                         break;
                                     }
                                 };
+                                // 접점만 월드 좌표로 되돌린다.
+                                let cast = cast.map(|h| maru_collide::ShapeCastHit {
+                                    point: h.point + pose_now.pos,
+                                    ..h
+                                });
                                 if let Some(hit) = cast {
                                     // 결정적 최소: (toi, static id) 사전식 — 동시 hit 동률 절단.
                                     let better = match best {
