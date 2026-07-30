@@ -9,7 +9,7 @@
 
 use crate::epa::epa;
 use crate::gjk::{gjk, GjkResult};
-use crate::tolerance::{area_eps, characteristic_length, length_sq_eps};
+use crate::tolerance::{area_eps, characteristic_length, length_sq_eps, min_feature_size};
 use crate::{Pose, Shape};
 use maru_math::{Mat3, Quat, Vec3};
 
@@ -468,6 +468,8 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
     if let (Shape::Box { half, radius: rbox }, Shape::Sphere { radius: rs }) = (sa, sb) {
         return sphere_box(*rs, pb.pos, *half, *rbox, pa, margin, false);
     }
+    // 박스 쌍의 회전행렬 — SAT·클리퍼·GJK 폴백 클리핑이 **모두 이 하나**를 공유한다.
+    let mut box_mats: Option<(Mat3, Mat3)> = None;
     // **박스-박스는 SAT로 법선만 구한다.** 클리퍼는 법선만 요구하므로(깊이는 안 쓴다)
     // GJK+EPA 전체를 돌릴 이유가 없다. 클리퍼 자체는 M1에서 검증된 코드 그대로 쓰고
     // 법선의 출처만 바꾼다 — 실패하면(에지-에지 지배·퇴화) 아래 GJK 경로로 떨어진다.
@@ -487,15 +489,19 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
         // `Mat3::from_quat`이 하는 일이 바로 그 축 3개 회전이므로 SAT 쪽은 **비트 동일**이고
         // (`sat_axes_match_quaternion_rotation_bit_for_bit`가 잠근다), 클리퍼 쪽은
         // 행렬-벡터 곱으로 바뀌어 값이 마지막 비트에서 달라진다(아래 클리퍼 주석).
-        let ma = Mat3::from_quat(pa.rot);
-        let mb = Mat3::from_quat(pb.rot);
-        match box_box_axis(*ha, *rab, pa, &ma, *hb, *rbb, pb, &mb, margin) {
+        // **폴백까지 살려서 재사용한다.** 아래 GJK/EPA 경로의 클리핑 재시도가 같은 자세로
+        // 행렬을 다시 만들면 퇴화·에지 지배 페어만 회전을 12회 더 돌게 되고, "페어당 한 번"이
+        // 그 경로에서 거짓이 된다(교차검수 rev_7a05abc1 MINOR).
+        box_mats = Some((Mat3::from_quat(pa.rot), Mat3::from_quat(pb.rot)));
+        let (ma, mb) = box_mats.as_ref().expect("방금 넣었다");
+        match box_box_axis(*ha, *rab, pa, ma, *hb, *rbb, pb, mb, margin) {
             SatResult::Apart => return None,
             SatResult::Axis(n) => {
                 let char_len = characteristic_length(sa, sb);
-                if let Some(m) =
-                    clip_box_box(char_len, *ha, *rab, pa, &ma, *hb, *rbb, pb, &mb, n, margin)
-                {
+                let dup_len = min_feature_size(sa, sb);
+                if let Some(m) = clip_box_box(
+                    char_len, dup_len, *ha, *rab, pa, ma, *hb, *rbb, pb, mb, n, margin,
+                ) {
                     return Some(m);
                 }
             }
@@ -535,11 +541,15 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
     ) = (sa, sb)
     {
         let char_len = characteristic_length(sa, sb);
-        // 이 경로는 GJK/EPA가 법선을 준 뒤의 클리핑 재시도라 위쪽 SAT 경로의 행렬이 닿지 않는다.
-        // 페어당 2회 변환은 클리퍼가 아끼는 회전 21회에 비하면 작다.
-        let (ma, mb) = (Mat3::from_quat(pa.rot), Mat3::from_quat(pb.rot));
+        let dup_len = min_feature_size(sa, sb);
+        // 위 SAT 경로에서 만든 행렬을 그대로 쓴다. 자세는 그 사이에 바뀌지 않는다(같은 호출의
+        // 같은 `pa`/`pb`다). 박스 쌍인데 위 블록을 안 지났을 수는 없지만, 없으면 만든다.
+        let (ma, mb) = match &box_mats {
+            Some(m) => (m.0, m.1),
+            None => (Mat3::from_quat(pa.rot), Mat3::from_quat(pb.rot)),
+        };
         if let Some(m) = clip_box_box(
-            char_len, *ha, *ra_box, pa, &ma, *hb, *rb_box, pb, &mb, normal, margin,
+            char_len, dup_len, *ha, *ra_box, pa, &ma, *hb, *rb_box, pb, &mb, normal, margin,
         ) {
             return Some(m);
         }
@@ -990,6 +1000,7 @@ fn best_face(m: &Mat3, want: Vec3) -> (usize, f32) {
 #[allow(clippy::too_many_arguments)]
 fn clip_box_box(
     char_len: f32,
+    dup_len: f32,
     ha: Vec3,
     ra: f32,
     pa: &Pose,
@@ -1118,9 +1129,16 @@ fn clip_box_box(
     // **같은 자리에 접점이 둘 들어가면 솔버가 그 지점에 제약을 두 번 건다.** 위 부호 규칙은
     // 값이 정확히 0일 때만 막으므로, 서로 다른 측면에서 생긴 교점이 같은 코너로 모이는 경우
     // (45° 박스의 코너가 참조면 코너와 만나는 배치)는 통과한다 — 실제로 회전 계산을 바꾸자
-    // 6e-8 떨어진 접점 두 개가 나왔다. 임계는 톨러런스 정책대로 **특성 길이에서 유도**한다
-    // (절대 상수 금지: 1mm 부품 씬과 100m 씬이 같은 임계를 쓰면 한쪽이 반드시 틀린다).
-    let dup_eps_sq = length_sq_eps(char_len);
+    // 6e-8 떨어진 접점 두 개가 나왔다.
+    //
+    // 임계는 절대 상수가 아니라 형상에서 유도하되, **접촉 국소 척도**(`min_feature_size`)를
+    // 쓴다. AABB 대각(`characteristic_length`)을 쓰면 고종횡비 형상에서 임계가 접촉 패치보다
+    // 수천 배 커진다 — 1000×0.001×1000 판 두 장의 1mm 패치에서 임계가 2.8mm가 되어 네 모서리가
+    // 전부 한 점으로 합쳐지고 면 접촉이 점 접촉으로 붕괴한다(회전 저항 상실).
+    // `tolerance.rs`가 바로 이 목적으로 두 척도를 나눠 두었고 주석도 "접촉 국소 판정에는
+    // 이 값을 쓴다"고 적어 두었는데 첫 구현이 그것을 어겼다(교차검수 rev_7a05abc1 BLOCKER,
+    // `thin_large_boxes_keep_distinct_contact_patch_points`가 잠근다).
+    let dup_eps_sq = length_sq_eps(dup_len);
     for v in poly.iter().take(poly_len) {
         let sep = rn.dot(v.position - rverts[0]);
         if sep <= margin {
@@ -1633,6 +1651,34 @@ mod tests {
                 assert!(d > 1.0e-8, "중복 접점: {p:?} vs {q:?}");
             }
         }
+    }
+
+    /// 고종횡비 형상의 **국소 접촉 패치**가 중복 판정에 삼켜지지 않는지.
+    ///
+    /// 교차검수 rev_7a05abc1 BLOCKER: 중복 임계를 `characteristic_length`(작은 쪽 AABB 대각)로
+    /// 잡으면 얇고 큰 판에서 임계가 접촉 패치보다 수천 배 커진다. 아래 판 두 장의 겹침은
+    /// 약 1mm×1mm인데 대각은 2.8km라 임계가 2.8mm — 네 모서리가 전부 "같은 점"이 되어
+    /// 면 접촉이 점 접촉으로 붕괴하고 회전 저항이 사라진다.
+    #[test]
+    fn thin_large_boxes_keep_distinct_contact_patch_points() {
+        let plate = Shape::Box {
+            half: Vec3::new(1000.0, 0.001, 1000.0),
+            radius: 0.0,
+        };
+        let m = contact(
+            &plate,
+            &pose(0.0, 0.0, 0.0),
+            &plate,
+            &pose(1999.999, 0.0019, 1999.999),
+            0.001,
+        )
+        .expect("1mm×1mm 면 접촉이 존재한다");
+        assert_eq!(
+            m.points().len(),
+            4,
+            "중복 임계가 얇은 접촉 패치를 합쳤다: {:?}",
+            m.points()
+        );
     }
 
     /// 리뷰 요구: **metamorphic 스케일 테스트**. 같은 씬을 1e-3~1e2배로 변환해도
