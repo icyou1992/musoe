@@ -321,22 +321,10 @@ impl Shape {
                     }
                 }
             }
-            // 구조 불변식(개수·유한성·타일 무결성)은 `HeightfieldGrid::new`가 이미 세웠다 —
-            // 위조된 타일은 타입 수준에서 불가능하므로 여기서는 **크기 정책만** 본다.
-            Shape::Heightfield(g) => {
-                if !extent_in_range(g.cell()) || g.cell() < MIN_SHAPE_EXTENT {
-                    return Err("heightfield cell size must be within extent range");
-                }
-                // 격자 전체 폭도 범위 안이어야 한다 — 셀은 작아도 개수가 크면 넘는다.
-                if !extent_in_range((g.nx() - 1) as f32 * g.cell())
-                    || !extent_in_range((g.nz() - 1) as f32 * g.cell())
-                {
-                    return Err("heightfield extent exceeds MAX_SHAPE_EXTENT");
-                }
-                if !g.heights().iter().all(|h| extent_in_range(*h)) {
-                    return Err("heightfield heights must be finite and within extent range");
-                }
-            }
+            // 구조 불변식과 **크기 정책 모두** `HeightfieldGrid::new`가 세웠다(필드 비공개).
+            // 그래서 여기도, O(1)인 `is_castable`도 다시 볼 것이 없다 — 두 경계가 같은 기준을
+            // 쓰는 방법이 "양쪽에서 같은 검사를 반복"이 아니라 "생성자만이 만들 수 있게"다.
+            Shape::Heightfield(_) => {}
             Shape::Triangle { .. } => {
                 // 내부 전용 — 호스트 입력 경계에서는 언제나 거부한다.
                 return Err("triangle is an internal shape and cannot be added to a world");

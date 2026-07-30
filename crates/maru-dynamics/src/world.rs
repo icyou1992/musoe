@@ -1320,7 +1320,19 @@ impl World {
         motion: Vec3,
         filter: QueryFilter,
     ) -> Result<Option<SweepHit>, ApiError> {
-        if !maru_collide::vec_in_range(pose.pos) || !maru_collide::vec_in_range(motion) {
+        // 변위 상한은 `2*MAX_INPUT`(두 지원 위치의 최대 차)이고, **끝점**은 지원 월드 안이어야
+        // 한다 — 예전 검사는 정상 18km 스윕을 거절하면서 x=9km에서 +9km(끝점 18km, 월드 밖)는
+        // 통과시켰다(확인검수 rev_7b22e13d MAJOR). 월드 층은 "지원 월드" 개념을 갖고 있으므로
+        // 끝점까지 본다(저수준 디스패처는 그 개념이 없어 `Inf` 차단만 한다).
+        let max_motion = 2.0 * maru_collide::MAX_INPUT;
+        let motion_ok = motion.is_finite()
+            && motion.x.abs() <= max_motion
+            && motion.y.abs() <= max_motion
+            && motion.z.abs() <= max_motion;
+        if !maru_collide::vec_in_range(pose.pos)
+            || !motion_ok
+            || !maru_collide::vec_in_range(pose.pos + motion)
+        {
             return Err(ApiError::InvalidValue);
         }
         // **자세를 정규화한다.** 비단위 쿼터니언은 회전이 아니라 회전+축소를 만들어,
@@ -3973,6 +3985,27 @@ impl World {
                             pos: st.pos[i],
                             rot: st.rot[i],
                         };
+                        // **월드 범위를 이미 벗어났으면 캐스트하지 않고 얼린다** (자기 검수
+                        // 2026-07-30). 경계 고정(`enforce_world_bounds`)은 스텝 **말**에 도는데,
+                        // 빠른 바디는 스텝 중간에 10km를 넘을 수 있다. 그 자세로 캐스트를 부르면
+                        // 이제 디스패처가 `InvalidInput`을 내고(직전 라운드에 범위 검사를 넣었다)
+                        // 그것이 `cast_incomplete`로 접혀 **원인이 잘못 보고된다**
+                        // (`ccd_incomplete`의 문서는 "지형 해상도·바디 크기를 보라"고 말한다).
+                        // 여기서 끊으면 동작은 같고(보수적 정지) 보고는 정직하다 —
+                        // 범위 이탈은 스텝 말 OOB 패스가 `out_of_bounds`로 센다.
+                        //
+                        // **defense-in-depth이며 테스트가 없다.** 이 가드가 실제로 도는 조건은
+                        // "정적 후보가 스윕 AABB와 겹치는데 캐스트는 빗나간다 + 그 스텝에 경계를
+                        // 넘는다"인데, 그 배치는 취약하다(벽을 두면 CCD가 먼저 막아 경계를 못
+                        // 넘고, 안 두면 후보가 없어 캐스트가 안 돈다 — 둘 다 실측했다).
+                        // 관련 계약의 단위 고정은 `out_of_range_arithmetic_input_is_rejected_…`,
+                        // 씬 계약은 `ccd_body_crossing_the_world_bound_…`가 맡는다.
+                        if !maru_collide::vec_in_range(pose_now.pos) {
+                            // `continue`가 아래 회전 적분까지 건너뛴다 = 이 서브스텝은 이동도
+                            // 회전도 없다(그래서 `rot_toi`를 세울 필요가 없다).
+                            ccd_frozen[ci] = true;
+                            continue;
+                        }
                         let a0 = shape_world_aabb(&body.shape, &pose_now);
                         // 회전 스윕이면 외접 반지름 상자로 봉투를 넓힌다 — 스윕 AABB가
                         // 후보를 놓치면 캐스트는 옳아도 관통이 조용히 지나간다.

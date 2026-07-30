@@ -3293,9 +3293,24 @@ mod tests {
         assert!(Shape::heightfield(vec![0.0; 4], 2, 2, 0.0).is_none());
         // **음성 대조** — 정상 입력은 통과한다(생성자가 전부 거절하는 게 아니다).
         assert!(Shape::heightfield(vec![0.0; 4], 2, 2, 1.0).is_some());
-        // 크기 **정책**은 여전히 validate 소관이다(생성자는 구조만 본다).
-        let huge = Shape::heightfield(vec![0.0; 4], 2, 2, 1.0e9).expect("구조는 정상");
-        assert!(huge.validate().is_err(), "MAX_SHAPE_EXTENT 정책이 빠졌다");
+        // 크기 **정책도 생성자가 세운다**(rev_7b22e13d BLOCKER 이후): 정책을 `validate`에만
+        // 두면 `is_castable`이 하이트필드를 무조건 통과시키므로 공개 질의가 `Inf` AABB를 낸다.
+        assert!(
+            Shape::heightfield(vec![0.0; 4], 2, 2, 1.0e9).is_none(),
+            "셀 크기가 MAX_SHAPE_EXTENT를 넘는데 생성됐다"
+        );
+        assert!(
+            Shape::heightfield(vec![0.0; 4], 2, 2, f32::MAX).is_none(),
+            "cell=f32::MAX 격자가 생성됐다 — try_local_aabb가 Inf를 낸다"
+        );
+        // 격자 **전체 폭**도 상한 안이어야 한다(셀은 작아도 개수가 크면 넘는다).
+        assert!(Shape::heightfield(vec![0.0; 4], 2, 2, 999.0).is_some());
+        assert!(
+            Shape::heightfield(vec![0.0; 9], 3, 3, 900.0).is_none(),
+            "전체 폭 1800m가 MAX_SHAPE_EXTENT를 넘는데 생성됐다"
+        );
+        // 높이 값도 상한 안이어야 한다.
+        assert!(Shape::heightfield(vec![1.0e9; 4], 2, 2, 1.0).is_none());
     }
 
     /// **멀리 있는 봉우리 하나가 정상 스텝을 비싸게 만들지 않는다** (MAJOR: raw 셀 수).
@@ -4687,6 +4702,121 @@ mod tests {
         assert!(
             hit.is_some(),
             "정상 회전 스윕이 벽을 못 맞췄다 — 배치가 무의미하다"
+        );
+    }
+
+    /// **월드 경계를 넘는 CCD 바디는 경계 고정으로 끝난다 — 판정 미완료가 아니다.**
+    ///
+    /// 이 테스트가 고정하는 것: 빠른 CCD 바디가 스텝 중간에 10km를 넘어도 스텝은 `Ok`이고,
+    /// 상태는 경계 안으로 고정되며(`out_of_bounds` 보고), `ccd_incomplete`는 0이다.
+    ///
+    /// **주의 — 이 테스트는 world.rs의 "범위 밖 자세면 캐스트하지 않는다" 가드를 검증하지
+    /// 않는다.** 그 가드가 도는 조건은 "정적 후보가 스윕 AABB와 겹치는데 캐스트는 빗나간다"이고,
+    /// 그런 배치는 만들기가 취약하다(벽을 두면 CCD가 먼저 막아 경계를 못 넘고, 안 두면 캐스트가
+    /// 아예 안 돈다 — 실제로 두 배치를 다 시도해 확인했다). 가드는 원인 오보(범위 이탈이
+    /// `ccd_incomplete`로 보고되는 것)를 막는 **defense-in-depth**이며, 그 사실을 여기 적어 둔다.
+    /// 지원 범위 밖 입력을 디스패처가 거절한다는 것 자체는
+    /// `out_of_range_arithmetic_input_is_rejected_not_reinterpreted`가 단위로 고정한다.
+    #[test]
+    fn ccd_body_crossing_the_world_bound_reports_out_of_bounds_not_incomplete() {
+        let mut w = World::new(WorldParams::default());
+        // 경계(10km) 바로 안쪽에서 바깥으로 달린다. 한 스텝 이동은 **물리 상한**
+        // (`max_linear_velocity`, 기본 500 m/s)로 정해지므로 8.3m다 — 그보다 가까이 둔다.
+        let max = maru_collide::MAX_INPUT;
+        let h = w.add_body(
+            Body::new_dynamic(
+                Shape::Sphere { radius: 0.5 },
+                pose(max - 4.0, 0.0, 0.0),
+                1.0,
+            )
+            .with_ccd(),
+        );
+        w.set_linear_velocity(h, Vec3::new(w.params().max_linear_velocity, 0.0, 0.0))
+            .expect("속도");
+        assert_eq!(w.try_step(1.0 / 60.0), Ok(()));
+        assert_eq!(
+            w.diagnostics().ccd_incomplete,
+            0,
+            "범위 이탈이 '판정 미완료'로 보고됐다 — 호스트가 지형 해상도를 의심하게 된다"
+        );
+        assert!(
+            w.diagnostics().out_of_bounds > 0,
+            "범위 이탈이 보고되지 않았다 (pos={:?})",
+            w.body(h).pose().pos
+        );
+        // 상태는 경계 안으로 고정된다(OOB 계약).
+        assert!(maru_collide::vec_in_range(w.body(h).pose().pos));
+        // **음성 대조** — 경계에서 멀리 있는 같은 바디는 아무 진단도 올리지 않는다.
+        let mut w2 = World::new(WorldParams::default());
+        let h2 = w2.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.5 }, pose(0.0, 0.0, 0.0), 1.0).with_ccd(),
+        );
+        w2.set_linear_velocity(h2, Vec3::new(100.0, 0.0, 0.0))
+            .expect("속도");
+        assert_eq!(w2.try_step(1.0 / 60.0), Ok(()));
+        assert_eq!(w2.diagnostics().ccd_incomplete, 0);
+        assert_eq!(w2.diagnostics().out_of_bounds, 0);
+        assert!(w2.body(h2).pose().pos.x > 0.0, "정상 바디가 안 움직였다");
+    }
+
+    /// **변위 범위는 위치 범위의 두 배다 — 정상 월드 횡단 스윕을 막지 않는다** (MAJOR).
+    ///
+    /// 지원 범위 안의 두 위치 사이 변위는 최대 `2*MAX_INPUT`(20km)다. 위치 상한 하나로 자르면
+    /// x=-9km → +9km 같은 정상 스윕이 거절되고, 반대로 x=9km에서 `motion=+9km`(끝점 18km,
+    /// 월드 밖)는 통과했다 — 차원을 잘못 묶은 내 검사의 양방향 오류였다
+    /// (확인검수 rev_7b22e13d MAJOR). 월드 층은 **끝점**까지 본다(지원 월드 개념이 있으므로).
+    #[test]
+    fn sweep_motion_range_is_twice_the_position_range_and_the_endpoint_must_be_inside() {
+        let probe = Shape::Sphere { radius: 0.5 };
+        let target = Shape::Box {
+            half: Vec3::new(1.0, 5.0, 5.0),
+            radius: 0.0,
+        };
+        // ① 저수준 디스패처: 18km 변위는 정상이고 실제로 맞춘다.
+        let hit = maru_collide::try_shape_cast_dispatch(
+            &probe,
+            &pose(-9000.0, 0.0, 0.0),
+            Vec3::new(18000.0, 0.0, 0.0),
+            &target,
+            &pose(0.0, 0.0, 0.0),
+            0.02,
+        )
+        .expect("18km 변위가 거절됐다 — 위치 상한으로 변위를 잘랐다");
+        assert!(hit.is_some(), "월드를 횡단하는 스윕이 타깃을 못 맞췄다");
+        // 20km를 넘는 변위는 거절(두 지원 위치의 차로 설명할 수 없다).
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch(
+                &probe,
+                &pose(-9000.0, 0.0, 0.0),
+                Vec3::new(21000.0, 0.0, 0.0),
+                &target,
+                &pose(0.0, 0.0, 0.0),
+                0.02
+            ),
+            Err(maru_collide::CastReject::InvalidInput)
+        );
+        // ② 월드 질의: 같은 18km 스윕은 통과하고, 끝점이 월드 밖인 스윕은 거절된다.
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(target, pose(0.0, 0.0, 0.0)));
+        assert!(matches!(
+            w.sweep_shape(
+                &probe,
+                pose(-9000.0, 0.0, 0.0),
+                Vec3::new(18000.0, 0.0, 0.0),
+                QueryFilter::ALL
+            ),
+            Ok(Some(_))
+        ));
+        assert_eq!(
+            w.sweep_shape(
+                &probe,
+                pose(9000.0, 0.0, 0.0),
+                Vec3::new(9000.0, 0.0, 0.0),
+                QueryFilter::ALL
+            )
+            .err(),
+            Some(ApiError::InvalidValue),
+            "끝점이 월드 밖(18km)인데 통과했다"
         );
     }
 

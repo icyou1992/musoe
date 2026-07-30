@@ -262,7 +262,16 @@ fn canonical_cast_inputs(
     // 차가 `Inf`가 되고, GJK의 비유한 위생이 그것을 거리 0으로 강등해 **무한히 멀리 떨어진
     // 두 형상이 `toi=0` 히트**로 나온다(확인검수 rev_b85e4e4a BLOCKER). 월드의 모든 바디
     // 자세는 이미 이 범위 안이다(`Body::validate` + `enforce_world_bounds`).
-    if !crate::vec_in_range(motion)
+    // **변위는 위치와 같은 차원이지만 같은 범위가 아니다.** 지원 범위 안의 두 위치 사이
+    // 변위는 최대 `2*MAX_INPUT`(20km)다 — 위치 상한 하나로 자르면 x=-9km에서 +9km로 가는
+    // 정상 스윕을 거절한다(확인검수 rev_7b22e13d MAJOR: 내 범위 검사의 차원 오류).
+    // 목적은 `Inf` 차단이고 3e4는 f32 정밀도에 여유가 크다.
+    let max_motion = 2.0 * crate::MAX_INPUT;
+    let motion_ok = motion.is_finite()
+        && motion.x.abs() <= max_motion
+        && motion.y.abs() <= max_motion
+        && motion.z.abs() <= max_motion;
+    if !motion_ok
         || !crate::in_range(skin)
         || skin < 0.0
         || !crate::vec_in_range(pa.pos)

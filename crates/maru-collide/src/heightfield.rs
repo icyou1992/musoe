@@ -85,7 +85,19 @@ impl HeightfieldGrid {
         if nx < 2 || nz < 2 || n != heights.len() || n > MAX_HEIGHTFIELD_SAMPLES {
             return None;
         }
-        if !cell.is_finite() || cell <= 0.0 || !heights.iter().all(|h| h.is_finite()) {
+        // **크기 정책까지 생성자가 세운다.** 예전에는 정책을 `Shape::validate`에만 뒀고
+        // `is_castable`은 하이트필드를 무조건 통과시켰다 — 그래서 `cell = f32::MAX`인 격자가
+        // 생성 경계에서는 거절되면서 공개 질의에서는 정상 형상이 되어 `try_local_aabb`가
+        // `Inf` AABB를 돌려줬다(확인검수 rev_7b22e13d BLOCKER). 필드가 비공개이므로 여기서
+        // 한 번 세우면 질의 경계는 O(1)로 `true`를 유지할 수 있다 — 그게 이 타입의 값이다.
+        let extent_x = (nx - 1) as f32 * cell;
+        let extent_z = (nz - 1) as f32 * cell;
+        if !crate::extent_in_range(cell)
+            || cell < crate::MIN_SHAPE_EXTENT
+            || !crate::extent_in_range(extent_x)
+            || !crate::extent_in_range(extent_z)
+            || !heights.iter().all(|h| crate::extent_in_range(*h))
+        {
             return None;
         }
         let tiles = build_tiles(&heights, nx, nz);
