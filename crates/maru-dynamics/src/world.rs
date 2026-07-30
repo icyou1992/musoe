@@ -4544,6 +4544,20 @@ impl World {
         // (리더가 `Body::validate`를 그대로 쓰는 근거).
         self.clamp_velocities();
         self.enforce_world_bounds();
+        // **접점 버퍼를 풀로 되돌린다.** 병합이 제약을 이 지역 벡터로 **옮겼기** 때문에,
+        // 여기서 회수하지 않으면 스텝 끝 드롭에서 버퍼가 통째로 해제되고 다음 스텝이 다시
+        // 수천 번 할당한다(설계 §6 "스텝 중 할당 0"). 참여자별로 나눠 담아 병렬 청크도
+        // 자기 풀을 갖게 한다.
+        let n_bufs = self.narrow_bufs.len().max(1);
+        for (i, c) in constraints.drain(..).enumerate() {
+            let buf = c.into_points_buf();
+            // 풀은 제약 상한을 넘지 않는다 — 보유 용량은 아래 회계가 세고, 무한 성장은 막는다.
+            if let Some(b) = self.narrow_bufs.get_mut(i % n_bufs) {
+                if b.point_pool.len() < constraint_cap {
+                    b.point_pool.push(buf);
+                }
+            }
+        }
         // 캐시는 insert 시점에 닫았다(위 5절) — 그 hit도 이 스텝의 포화 카운트다.
         self.diag.state_saturations = cache_sat_hits + self.close_state_policy();
         self.diag.post_ns[3] = _t_hyg.ns();
@@ -4673,6 +4687,13 @@ pub(crate) struct NarrowOut {
     budget_exceeded: bool,
     /// 접점 힙 할당 실패(극단 OOM) — 직렬 경로의 `bail`과 같은 뜻이다.
     bail: bool,
+    /// **접점 버퍼 풀** — 스텝당 수천 회 할당을 없앤다(설계 §6 "스텝 중 할당 0").
+    ///
+    /// `reset`이 직전 스텝 제약의 버퍼를 여기 담고, `narrow_chunk`가 꺼내 쓴다. 스텝 말에
+    /// 병합된 제약의 버퍼도 되돌려준다(`recycle_constraint_points`) — 병합이 제약을 지역
+    /// 벡터로 **옮기기** 때문에, 그러지 않으면 스텝 끝 드롭에서 통째로 해제된다.
+    /// 보유 용량은 `persistent_excess_bytes` 회계에 들어간다(상한 계약 유지).
+    point_pool: Vec<Vec<solver::ContactPointConstraint>>,
 }
 
 impl NarrowOut {
@@ -4727,6 +4748,10 @@ impl NarrowOut {
     }
 
     fn reset(&mut self) {
+        // 제약을 버리기 전에 접점 버퍼를 풀로 회수한다(용량 보존 — 다음 스텝이 재사용한다).
+        for c in self.constraints.drain(..) {
+            self.point_pool.push(c.into_points_buf());
+        }
         self.constraints.clear();
         self.keys.clear();
         self.live.clear();
@@ -4902,7 +4927,9 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
                 // 실제 작업의 몇 %가 되어 계측기가 대상을 왜곡한다(2026-07-29 실측:
                 // 40단에서 스텝당 ~0.2ms). 내역이 필요하면 `maru-bench --bin boxsplit`
                 // (매니폴드 생성)과 `narrow` 총계의 차로 귀속한다.
-                let Ok(c) = solver::prepare(cx.bodies, a_id, b_id, &m, cached, cx.dt) else {
+                let buf = out.point_pool.pop().unwrap_or_default();
+                let Ok(c) = solver::prepare_into(cx.bodies, a_id, b_id, &m, cached, cx.dt, buf)
+                else {
                     out.bail = true;
                     return;
                 };

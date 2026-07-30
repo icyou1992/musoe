@@ -123,6 +123,15 @@ pub struct ContactConstraint {
     pub warm_matched: u32,
 }
 
+impl ContactConstraint {
+    /// 접점 버퍼를 **비운 채로 꺼낸다** — 풀에 되돌려 다음 스텝이 용량을 재사용한다.
+    /// (`std::mem::take`로 꺼내면 제약은 빈 벡터를 들고 드롭된다 = 할당 없음.)
+    pub(crate) fn into_points_buf(mut self) -> Vec<ContactPointConstraint> {
+        self.points.clear();
+        core::mem::take(&mut self.points)
+    }
+}
+
 /// 법선에서 결정적 접선 기저.
 fn tangent_basis(n: Vec3) -> [Vec3; 2] {
     let t1 = if n.x.abs() > 0.707 {
@@ -367,6 +376,17 @@ pub struct CachedImpulse {
 /// 접점 Vec은 narrowphase(=wake 이후)에서 불가피하게 할당되므로 **fallible**하다 — wasm OOM을
 /// trap이 아니라 `ResourceLimit`으로 돌려준다(교차검수 rev_2ade4bf3 MAJOR). 접점 수 ≤4라 실할당은
 /// 미미하지만 trap 경로는 닫는다.
+/// **접점 버퍼는 호출자가 준다** (2026-07-30). 예전에는 여기서 `Vec::new()`로 매번 새로 잡아
+/// 스텝당 수천 회 할당이 났다 — 설계 §6의 "스텝 중 할당 0" 위반이었고 실측으로 확인했다
+/// (구 더미 3000: 스텝당 6,136회). 호출자(`NarrowOut`)가 풀에서 꺼내 주면 두 번째 스텝부터
+/// 할당이 사라진다.
+///
+/// **반환형을 키우지 않는다** — `[ContactPointConstraint; 4]` 인라인은 2026-07-26에
+/// narrow +40%로 이미 기각됐다(`prepare`가 큰 구조체를 값으로 돌려주고 push가 복사한다).
+/// 버퍼를 받아 채워 돌려주면 그 문제 없이 할당만 없앤다.
+/// 풀 없이 부르는 편의판 — **테스트·단발 호출 전용**이다. 스텝 핫패스는 `prepare_into`로
+/// 버퍼를 재사용해야 한다(그게 이 분리의 이유다).
+#[cfg(test)]
 pub fn prepare(
     bodies: &[Body],
     a: usize,
@@ -374,6 +394,19 @@ pub fn prepare(
     m: &Manifold,
     cache: &[(maru_collide::FeatureId, CachedImpulse)],
     dt: f32,
+) -> Result<ContactConstraint, crate::world::ApiError> {
+    prepare_into(bodies, a, b, m, cache, dt, Vec::new())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_into(
+    bodies: &[Body],
+    a: usize,
+    b: usize,
+    m: &Manifold,
+    cache: &[(maru_collide::FeatureId, CachedImpulse)],
+    dt: f32,
+    mut points: Vec<ContactPointConstraint>,
 ) -> Result<ContactConstraint, crate::world::ApiError> {
     // 기하 바닥은 형상 크기에 비례해야 한다(절대 상수 금지 — 톨러런스 정책과 동일 원칙).
     let geo_tol =
@@ -385,7 +418,7 @@ pub fn prepare(
     // 게이트가 얼마나 자주 매칭을 끊는지 보이지 않는다 — 지표가 거짓이면 회귀 테스트도 거짓이다.
     let mut warm_matched = 0u32;
     let (ia, ib) = (ba.inv_inertia_world(), bb.inv_inertia_world());
-    let mut points = Vec::new();
+    points.clear();
     if points.try_reserve(m.points().len()).is_err() {
         return Err(crate::world::ApiError::ResourceLimit);
     }
