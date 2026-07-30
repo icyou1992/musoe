@@ -9081,6 +9081,14 @@ mod tests {
     }
 
     /// 거동: 평평한 이음새를 미끄러져 건너는 구가 옆으로 차이지 않는다.
+    ///
+    /// **이 테스트는 용접(내부 에지 억제)을 검증하지 않는다** — 2026-07-30에 실측으로 확인했다:
+    /// `weld_internal_edges` 호출을 통째로 비활성화해도 통과하고, 같은 지형을 용접 없는 개별
+    /// static hull로 깔면 측면 속도가 오히려 **더 작다**(0.019 vs 0.037). 평평한 격자에서는
+    /// 이음새 법선이 이미 면 법선과 같아 용접이 no-op이기 때문이다(같은 함정이 하이트필드
+    /// 이음매 테스트에서도 한 번 잡혔다 — 기제 증거는 **경사 격자에 구를 파묻어야** 나온다).
+    /// 용접의 진짜 가드는 `maru-collide`의 `welding_snaps_seam_contact_normal_to_the_face`다.
+    /// 여기 남기는 이유는 **거동 스모크**(이음새를 건너다 튀지 않는다)로는 유효하기 때문이다.
     #[test]
     fn sphere_slides_across_welded_seam_without_lateral_kick() {
         let mut w = World::new(WorldParams::default());
@@ -9099,16 +9107,27 @@ mod tests {
         b.linvel = Vec3::new(2.5, 0.0, 0.0);
         let ball = w.add_body(b);
         let mut crossed = false;
+        // **착지 전이와 이음새를 나눠 잰다.** 예전에는 전 구간에 절대 임계(0.05) 하나를 걸었는데,
+        // 실측하니 측면 속도의 최댓값은 **이음새가 아니라 착지**에서 나온다(궤적 계측:
+        // 착지 0.046 / 이음새 0.037, substeps=4 기준). 즉 그 단언은 이름과 달리 착지 과도응답을
+        // 재고 있었고, 서브스텝을 4→2로 낮추자(2026-07-30 "속도 우선") 착지 0.058로 임계를
+        // 넘겨 실패했다 — 이음새는 0.046으로 여전히 착지보다 낮았다.
+        //
+        // 그래서 **관계로** 검사한다: 이음새를 건너는 것이 착지보다 더 차면 안 된다.
+        // 절대 임계보다 강한 진술이고(용접이 깨지면 이음새가 착지를 넘어선다), 서브스텝 수에
+        // 의존하지 않는다. 절대 상한은 폭발 감지용으로만 느슨하게 남긴다.
+        let mut max_landing = 0.0f32;
+        let mut max_seam = 0.0f32;
         for _ in 0..90 {
             w.step(DT);
             let p = w.body(ball).pose().pos;
             let v = w.body(ball).linvel();
-            assert!(
-                v.z.abs() < 0.05,
-                "이음새에서 측면 속도 발생: vz={} (x={})",
-                v.z,
-                p.x
-            );
+            if p.x < -0.5 {
+                max_landing = max_landing.max(v.z.abs());
+            } else {
+                max_seam = max_seam.max(v.z.abs());
+            }
+            assert!(v.z.abs() < 0.1, "측면 폭발: vz={} (x={})", v.z, p.x);
             assert!(v.y < 0.5, "이음새에서 수직 킥: vy={} (x={})", v.y, p.x);
             if p.x > 0.5 {
                 crossed = true;
@@ -9118,6 +9137,15 @@ mod tests {
         assert!(
             crossed,
             "이음새를 건너지 못했다 — 테스트가 아무것도 증명 안 함"
+        );
+        // **음성 대조**: 착지에서 실제로 측면 성분이 생겨야 이 비교가 의미 있다.
+        assert!(
+            max_landing > 0.01,
+            "착지 전이가 없어 비교가 무의미하다: {max_landing}"
+        );
+        assert!(
+            max_seam <= max_landing,
+            "이음새가 착지보다 더 찼다 — 내부 에지 억제가 깨졌다 (이음새 {max_seam} > 착지 {max_landing})"
         );
     }
 
