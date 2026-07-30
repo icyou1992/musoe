@@ -421,8 +421,14 @@ pub struct Diagnostics {
     /// 0이 아니면 그 페어의 접촉 일부가 이번 스텝에서 빠졌다는 뜻이다 — 격자를 성기게
     /// 하거나 바디를 작게 하라는 신호다(조용한 누락이 아니라 관측 가능한 포화).
     pub heightfield_saturated: usize,
-    /// 접촉 제약 그래프 컬러링이 쓴 색 수 = 솔브 패스당 배리어 수.
+    /// 접촉 제약 그래프 컬러링이 쓴 **비어 있지 않은** 색 수 = 솔브 패스당 배리어 수.
     pub colors: usize,
+    /// 색 상한(`MARU_COLOR_CAP`)에 밀려 오버플로 버킷에 들어간 제약 수.
+    ///
+    /// 오버플로는 **한 참여자가 순서대로** 푸는 직렬 잔여다 — 병렬 폭을 유계로 사는 대가이고,
+    /// 이 수치가 곧 그 대가의 크기다(Amdahl 직렬 분율). 상한을 정하는 판단은 `colors`(배리어
+    /// 수)와 이 값(직렬 분율)의 거래이므로 둘을 함께 보고한다.
+    pub color_overflow: usize,
     /// 이번 스텝 솔브 패스를 나눠 돈 참여자 수 (1 = 직렬).
     pub solve_threads: usize,
     /// 솔버 work 항목 수 (블록 + 스칼라 잔여) — 색 병렬의 분배 단위.
@@ -1758,6 +1764,15 @@ impl World {
     }
 
     /// 살아있는 바디 수 (제거된 슬롯 제외).
+    /// 바디가 속한 아일랜드 id (`u32::MAX` = 아일랜드 밖 = static·무접촉·수면).
+    ///
+    /// 테스트 전용 창이다. **병렬 솔버 전략을 아일랜드 위에 세울 수 있는지**가 이 분포에
+    /// 달려 있어서 있다(`island_structure_of_target_scenes`가 그것을 측정한다).
+    #[cfg(test)]
+    pub fn island_of_index(&self, i: usize) -> u32 {
+        self.island[i]
+    }
+
     pub fn body_count(&self) -> usize {
         self.alive.iter().filter(|a| **a).count()
     }
@@ -3627,7 +3642,13 @@ impl World {
                 (c.a as u32, c.b as u32)
             }));
             body_color.resize(nb, 0u64);
-            solver::color_constraints(&endpoints, &conflict, &mut body_color, &mut color_of);
+            solver::color_constraints(
+                &endpoints,
+                &conflict,
+                &mut body_color,
+                &mut color_of,
+                color_cap(),
+            );
             // ③ 색으로 **안정** 재그룹: 최종 순서 = 색 오름차순, 색 내 canonical 순서 보존.
             //    제약'간' 순서만 red-black으로 바뀌고 색 안의 GS 순서는 canonical 그대로다.
             //    색은 0..=COLOR_OVERFLOW(63) 유계라 offs는 **고정 배열**(할당 없음).
@@ -3700,6 +3721,11 @@ impl World {
         }
 
         self.diag.colors = color_work.len();
+        // 오버플로 제약 수 — 색 상한의 대가(직렬 잔여)를 관측 가능하게 남긴다.
+        self.diag.color_overflow = color_ranges
+            .get(solver::COLOR_OVERFLOW as usize)
+            .map(|&(s, e)| (e - s) as usize)
+            .unwrap_or(0);
         self.diag.solve_work = work.len();
         self.diag.solve_threads =
             solver_block::solve_participants(&self.pool, self.parallel_solver, &work);
@@ -4563,6 +4589,30 @@ impl World {
         self.diag.post_ns[3] = _t_hyg.ns();
         self.diag.phase_ns[4] = _t_post.ns();
     }
+}
+
+/// 그래프 컬러링의 색 상한 = **병렬 솔브의 패스당 배리어 상한**
+/// (근거는 `solver::COLOR_CAP_DEFAULT` 문서).
+///
+/// `MARU_COLOR_CAP`으로 바꾼다. 프로세스당 1회만 읽는다 — 스텝 중간에 값이 바뀌면 제약
+/// 순서가 스텝마다 달라져 결정론이 깨진다. **스레드 수에 의존해서는 안 된다**(같은 이유).
+///
+/// 이것이 측정 노브인 이유: 상한은 궤적을 바꾸므로(제약 순서가 바뀐다) 성능만 보고 정할 수
+/// 없고 안정 봉투와 함께 재야 한다. 기본값은 오늘 동작(64 = 실질적 무제한)이다.
+fn color_cap() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CACHED: AtomicU32 = AtomicU32::new(u32::MAX);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    let cap = std::env::var("MARU_COLOR_CAP")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|c| c.clamp(1, 64))
+        .unwrap_or(solver::COLOR_CAP_DEFAULT);
+    CACHED.store(cap, Ordering::Relaxed);
+    cap
 }
 
 /// CCD 캐스트의 **공통 원점** — 두 부모 위치의 중점.

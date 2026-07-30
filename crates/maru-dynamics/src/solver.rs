@@ -1360,13 +1360,30 @@ pub const COLOR_OVERFLOW: u32 = 63;
 ///
 /// `conflict[i]`=바디 i가 솔버 write 대상(dynamic&active)인가. `body_color`=스크래치
 /// (len=바디수, 0으로 채워 전달, 각 바디의 배정색 비트마스크). `out`에 제약별 색을 채운다.
+/// 색 상한의 기본값 — 64색 전부 허용(= 오버플로는 실질적으로 안 생긴다).
+///
+/// **왜 상한이 파라미터인가.** 색 수는 **패스당 배리어 수**다: 병렬 솔브는 색 경계마다
+/// 배리어를 쳐야 한다(다른 색은 바디를 공유하므로 Gauss-Seidel 순서가 결과를 바꾼다).
+/// 40단 피라미드는 색이 7개라 스텝당 배리어가 7 × 5패스 × 4서브스텝 = 140회이고,
+/// 색당 참여자 몫이 수십 us뿐이라 동기화가 이득을 먹었다(README '스레드 모드' 실측).
+/// 상한을 P로 두면 배리어가 P+1로 유계가 되고, 들어가지 못한 제약은 오버플로 버킷으로
+/// 밀려 **한 참여자가 순서대로** 푼다 — Jolt의 large island splitter와 같은 거래다
+/// (병렬 폭을 유계로 사고 그 대가를 직렬 잔여로 지불한다).
+///
+/// **상한은 스레드 수와 무관해야 한다.** 상한이 바뀌면 제약 순서가 바뀌고 궤적이 바뀐다 —
+/// 스레드 수에 따라 정하면 결정론(설계 §8 L0)이 깨진다.
+pub const COLOR_CAP_DEFAULT: u32 = 64;
+
 pub fn color_constraints(
     endpoints: &[(u32, u32)],
     conflict: &[bool],
     body_color: &mut [u64],
     out: &mut Vec<u32>,
+    color_cap: u32,
 ) {
     out.clear();
+    // 상한 0은 의미가 없다(전부 오버플로) — 1 이상으로 죈다. 64는 u64 비트폭 상한이다.
+    let cap = color_cap.clamp(1, 64);
     for &(a, b) in endpoints {
         let (a, b) = (a as usize, b as usize);
         let mut forbidden = 0u64;
@@ -1376,8 +1393,9 @@ pub fn color_constraints(
         if conflict[b] {
             forbidden |= body_color[b];
         }
-        // 최소 free 색 = forbidden의 최하위 0비트. 64색 초과면 오버플로 버킷.
-        let color = (!forbidden).trailing_zeros().min(COLOR_OVERFLOW);
+        // 최소 free 색 = forbidden의 최하위 0비트. 상한을 넘으면 오버플로 버킷.
+        let free = (!forbidden).trailing_zeros();
+        let color = if free >= cap { COLOR_OVERFLOW } else { free };
         let bit = 1u64 << color;
         if conflict[a] {
             body_color[a] |= bit;
@@ -1623,13 +1641,19 @@ mod tests {
         let conflict = [true, true, true, true];
         let mut bc = vec![0u64; 4];
         let mut out = Vec::new();
-        color_constraints(&endpoints, &conflict, &mut bc, &mut out);
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out, COLOR_CAP_DEFAULT);
         // (0,1)=0 → (1,2)는 색0 금지 → 1 → (2,3)은 색1만 금지 → 0
         assert_eq!(out, vec![0, 1, 0]);
         // 결정성: 같은 입력 → 같은 색
         let mut bc2 = vec![0u64; 4];
         let mut out2 = Vec::new();
-        color_constraints(&endpoints, &conflict, &mut bc2, &mut out2);
+        color_constraints(
+            &endpoints,
+            &conflict,
+            &mut bc2,
+            &mut out2,
+            COLOR_CAP_DEFAULT,
+        );
         assert_eq!(out, out2);
         // 색 내 conflict-free 불변식: 같은 색 제약들은 conflict 바디를 공유하지 않는다.
         assert_conflict_free(&endpoints, &conflict, &out);
@@ -1643,7 +1667,7 @@ mod tests {
         let conflict = [false, true, true, true];
         let mut bc = vec![0u64; 4];
         let mut out = Vec::new();
-        color_constraints(&endpoints, &conflict, &mut bc, &mut out);
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out, COLOR_CAP_DEFAULT);
         assert_eq!(out, vec![0, 0, 0]);
         assert_conflict_free(&endpoints, &conflict, &out);
     }
@@ -1657,13 +1681,61 @@ mod tests {
         let conflict = vec![true; 66];
         let mut bc = vec![0u64; 66];
         let mut out = Vec::new();
-        color_constraints(&endpoints, &conflict, &mut bc, &mut out);
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out, COLOR_CAP_DEFAULT);
         // 첫 64개는 색 0..63, 65번째는 오버플로 색 63으로 몰린다.
         assert_eq!(&out[..64], (0u32..64).collect::<Vec<_>>().as_slice());
         assert_eq!(out[64], COLOR_OVERFLOW);
         assert_eq!(out.iter().filter(|&&c| c == COLOR_OVERFLOW).count(), 2);
         // 오버플로를 스킵하므로 합법 충돌을 오판하지 않는다.
         assert_conflict_free(&endpoints, &conflict, &out);
+    }
+
+    /// 색 상한(= 배리어 상한)의 계약: 상한 아래 색은 여전히 conflict-free이고,
+    /// 들어가지 못한 제약은 **오버플로 버킷**으로 간다(그 버킷만 순서대로 직렬 처리된다).
+    ///
+    /// 이 테스트가 없으면 상한을 낮췄을 때 "같은 색 = 바디 비공유" 불변식이 조용히 깨져도
+    /// 모른다 — 그 불변식이 4-wide 레인 독립과 병렬 안전의 **유일한** 근거다.
+    #[test]
+    fn color_cap_bounds_colors_and_spills_the_rest() {
+        // 중심 바디 0에 12개가 매달린 부채꼴: 상한이 없으면 색 0..11이 필요하다.
+        let endpoints: Vec<(u32, u32)> = (1..=12).map(|i| (0, i)).collect();
+        let conflict = vec![true; 13];
+
+        // 상한 64(기본) — 색이 12개 나온다.
+        let mut bc = vec![0u64; 13];
+        let mut out = Vec::new();
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out, 64);
+        assert_eq!(out, (0u32..12).collect::<Vec<_>>());
+        assert_conflict_free(&endpoints, &conflict, &out);
+
+        // 상한 4 — 앞 4개만 색을 받고 나머지 8개는 오버플로로 몰린다.
+        let mut bc = vec![0u64; 13];
+        let mut out = Vec::new();
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out, 4);
+        assert_eq!(&out[..4], &[0, 1, 2, 3]);
+        assert!(
+            out[4..].iter().all(|&c| c == COLOR_OVERFLOW),
+            "상한 초과분은 전부 오버플로여야 한다: {out:?}"
+        );
+        // 상한 아래 색들은 여전히 바디를 공유하지 않는다(오버플로는 판정에서 제외된다).
+        assert_conflict_free(&endpoints, &conflict, &out);
+        // 실제로 나온 **비어 있지 않은** 색 수 = 상한 + 오버플로 1개.
+        let mut used: Vec<u32> = out.clone();
+        used.sort_unstable();
+        used.dedup();
+        assert_eq!(used.len(), 5, "색 4개 + 오버플로 1개여야 한다: {used:?}");
+
+        // 상한 1 — 색 0 하나만, 나머지 전부 오버플로(퇴화 경계).
+        let mut bc = vec![0u64; 13];
+        let mut out = Vec::new();
+        color_constraints(&endpoints, &conflict, &mut bc, &mut out, 1);
+        assert_eq!(out[0], 0);
+        assert!(out[1..].iter().all(|&c| c == COLOR_OVERFLOW));
+        // 상한 0은 1로 죄어진다 — 전부 오버플로가 되면 병렬 폭이 0이라 무의미하다.
+        let mut bc0 = vec![0u64; 13];
+        let mut out0 = Vec::new();
+        color_constraints(&endpoints, &conflict, &mut bc0, &mut out0, 0);
+        assert_eq!(out0, out, "상한 0은 상한 1과 같아야 한다(클램프)");
     }
 
     // --- Unit 3: SIMD warm_start 비트 동일성 ---

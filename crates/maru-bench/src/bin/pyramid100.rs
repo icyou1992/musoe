@@ -72,8 +72,14 @@ fn main() {
     {
         w.set_threads(n);
     }
+    // 솔버 색 병렬 스위치 — 기본 off(엔진 기본과 같다). 색 상한(MARU_COLOR_CAP)의 이득은
+    // 켠 상태에서만 나타나므로 벤치가 그 팔을 만들 수 있어야 한다.
+    let par_solver = std::env::var("MARU_PARALLEL_SOLVER")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    w.set_parallel_solver(par_solver);
     println!(
-        "bodies={} tiers={tiers} substeps={substeps} steps={steps} hertz={hertz} threads={}",
+        "bodies={} tiers={tiers} substeps={substeps} steps={steps} hertz={hertz} threads={} par_solver={par_solver}",
         w.body_count(),
         w.threads()
     );
@@ -197,6 +203,11 @@ fn main() {
         -1.0
     };
     println!("warm={warm_ratio:.3} ({}/{})", d.warm_hits, d.warm_total);
+    // 색 상한 판정용: 색 수 = 패스당 배리어 수, 오버플로 = 직렬 잔여(Amdahl 분율).
+    println!(
+        "colors={} overflow={} work={} solve_threads={}",
+        d.colors, d.color_overflow, d.solve_work, d.solve_threads
+    );
     // 소수 3자리 — **A/B에 쓰려면 정수 ms는 해상도가 없다**(6.6ms 장면의 −5%가 0으로 보인다).
     println!(
         "{ms_per_step:.3} ms/step  finite={finite}  vmax={vmax:.4}  top_y={top_y:.2}\n\

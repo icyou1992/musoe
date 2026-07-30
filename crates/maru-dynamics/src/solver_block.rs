@@ -445,6 +445,13 @@ pub fn plan(
     let _ = constraints;
     for (color, &(start, end)) in color_ranges.iter().enumerate() {
         let (start, end) = (start as usize, end as usize);
+        // **빈 색은 색 목록에 넣지 않는다.** color_work 항목 하나가 배리어 하나이므로 빈 색은
+        // "아무 일도 없는 동기화"다. 색 상한을 쓰면(`COLOR_CAP_DEFAULT` 주석) 오버플로 색이
+        // 63번이라 그 사이 색들이 통째로 비는데, 그것들을 넣으면 배리어가 색 상한이 아니라
+        // **63개**로 늘어 상한을 도입한 목적이 정확히 반대로 뒤집힌다.
+        if start >= end {
+            continue;
+        }
         // 색마다 **자기 work 구간**을 남긴다 — 병렬 솔브가 색 경계에서 배리어를 치려면
         // "이 색의 일" 목록이 필요하다. 색 안은 순서 무관(공유 dynamic 바디 없음),
         // 색 사이는 순서 필수(Gauss-Seidel)라는 비대칭이 이 자료구조의 존재 이유다.
