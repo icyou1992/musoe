@@ -149,6 +149,10 @@ pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) ->
     match walk {
         // 포화는 접촉을 **찾고** 끊은 것이라 존재 판정에는 충분하다.
         ContactWalk::Complete | ContactWalk::Saturated => Some(found),
+        // 예산이 터졌어도 **이미 하나 찾았으면 존재는 증명됐다** — 그때 `None`을 돌려주면
+        // 지원 범위 안의 고정 장면(넓은 AABB + 접촉 몇 개)이 영구히 답을 못 받는다
+        // (확인검수 rev_d5b32e22 MAJOR). 부정("없다")만 순회 완주를 요구한다.
+        ContactWalk::BudgetExceeded if found => Some(true),
         ContactWalk::BudgetExceeded => None,
     }
 }

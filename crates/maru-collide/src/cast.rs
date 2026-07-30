@@ -9,7 +9,7 @@ use crate::gjk::{gjk, GjkResult};
 use crate::{Pose, Shape};
 use maru_math::Vec3;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapeCastHit {
     /// `motion`의 분율 [0,1] — 이 시각에 표면 거리 ≤ skin.
     pub toi: f32,
@@ -224,10 +224,40 @@ pub fn shape_cast_rotational(
     })
 }
 
+/// 캐스트가 **답을 낼 수 없는** 두 가지 이유 — 어느 쪽도 "맞은 것이 없다"가 아니다.
+///
+/// 이 구분이 없으면 잘못된 입력이나 미완료 순회가 `None`(=미스)으로 위장되고, 호출자는
+/// "지나갈 수 있다"고 오판해 지형을 통과한다 — 저수준 볼록 API를 공개 표면에서 뺀 것과
+/// 같은 이유다(확인검수 rev_d5b32e22 BLOCKER/MAJOR).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CastReject {
+    /// 산술 입력이 비유한이거나 표현 범위를 벗어났다(축·이동·skin·각). **호출자 버그**다.
+    InvalidInput,
+    /// 지형 셀 예산(`MAX_HEIGHTFIELD_CELLS_PER_QUERY`)을 넘겨 순회를 완료하지 못했다.
+    BudgetExceeded,
+}
+
+/// 두 디스패처가 공유하는 산술 입력 검증 — **패닉 대신 값**.
+///
+/// 각만 검사하던 시절, `axis=(NaN,0,0)`에 유효한 각을 넣으면 내부에서 `t`가 NaN이 되어
+/// `angle * t`가 NaN이 되고 `Quat::from_axis_angle`의 assert가 프로세스를 죽였다
+/// (확인검수 rev_d5b32e22 BLOCKER — 패닉 입력 공간이 각에서 축·이동으로 옮겨갔을 뿐이었다).
+fn cast_inputs_ok(motion: Vec3, skin: f32, pa: &Pose, pb: &Pose) -> bool {
+    motion.is_finite()
+        && skin.is_finite()
+        && skin >= 0.0
+        && pa.pos.is_finite()
+        && pa.rot.is_finite()
+        && pb.pos.is_finite()
+        && pb.rot.is_finite()
+}
+
 /// 회전 인지 복합 디스패치 — 자식은 **바디 COM(pivot)** 중심으로 함께 돈다.
 /// 비복합은 자기 자신 1건으로 동작이 같다.
+///
+/// `Err`는 **미스가 아니다** — `CastReject` 참조.
 #[allow(clippy::too_many_arguments)]
-pub fn shape_cast_dispatch_rotational(
+pub fn try_shape_cast_dispatch_rotational(
     sa: &Shape,
     pa: &Pose,
     motion: Vec3,
@@ -236,188 +266,243 @@ pub fn shape_cast_dispatch_rotational(
     sb: &Shape,
     pb: &Pose,
     skin: f32,
-) -> Option<ShapeCastHit> {
-    // 표현 불가한 각은 **격자를 걷기 전에** 거른다(볼록 경로에도 같은 가드가 있지만
-    // 거기까지 가면 후보 셀을 전부 훑고 나서야 None이 된다).
-    if !angle.is_finite() || angle.abs() > maru_math::Quat::MAX_AXIS_ANGLE {
-        return None;
+) -> Result<Option<ShapeCastHit>, CastReject> {
+    // 산술 입력은 **격자를 걷기 전에** 전부 검사한다. 축은 여기서 한 번 정규화해
+    // 전 경로가 같은 값을 쓰게 한다(내부에서 각각 정규화하면 NaN 축이 살아남는다).
+    if !cast_inputs_ok(motion, skin, pa, pb)
+        // **비유한 축은 "축이 없음"이 아니라 잘못된 입력이다.** 0 축(회전 없음)과 달리
+        // NaN 축은 호출자 버그이고, 걸러내지 않으면 내부 `t`가 NaN이 되어 각 생성자의
+        // assert에 닿는다(확인검수 rev_d5b32e22 BLOCKER).
+        || !axis.is_finite()
+        || !angle.is_finite()
+        || angle.abs() > maru_math::Quat::MAX_AXIS_ANGLE
+    {
+        return Err(CastReject::InvalidInput);
     }
+    let axis = match axis.try_normalize() {
+        Some(a) => a,
+        // 축 길이가 0이면 회전이 없다 — 선형 캐스트와 같은 답이다(오류가 아니다).
+        None => return try_shape_cast_dispatch(sa, pa, motion, sb, pb, skin),
+    };
+    let mut budget = crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY;
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
         rot: parent.rot * child.rot,
     };
-    let cast_one = |csa: &Shape, cpa: &Pose| -> Option<ShapeCastHit> {
-        match sb {
-            // **하이트필드는 볼록이 아니다** — 그냥 넘기면 GJK가 `support_core`의
-            // `unreachable!`에 닿아 trap이 된다(검수 rev_1e81559e BLOCKER: 회전 CCD를 켠
-            // 블레이드를 지형 옆에 두면 선속도 0에서도 즉시 재현). 선형 경로와 같은 규칙으로
-            // 스윕 봉투가 덮는 셀만 삼각형으로 펼친다. 회전 봉투는 외접 반지름으로 넓힌다.
-            Shape::Heightfield { .. } => {
-                let hf = sb.heightfield_ref().expect("Heightfield 변종");
-                // **자식은 자기 원점이 아니라 부모 피벗 주위를 돈다.** 자식 반경만 넓히면
-                // COM에서 10m 떨어진 자식이 90° 도는 궤도를 못 덮어, 캐스트가 `None`을
-                // 내면서 자식이 지형을 관통한다(확인검수 rev_7efe4e35 BLOCKER).
-                // 봉투는 피벗 중심의 궤도 반경(|자식-피벗| + 자식 반경)으로 잡는다.
-                let orbit_r = (cpa.pos - pa.pos).length() + csa.bounding_radius();
-                let e = Vec3::new(orbit_r, orbit_r, orbit_r);
-                let a0 = crate::Aabb::new(pa.pos - e, pa.pos + e);
-                let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
-                let expanded = crate::Aabb::new(
-                    sweep.min - Vec3::new(skin, skin, skin),
-                    sweep.max + Vec3::new(skin, skin, skin),
-                );
-                let local = crate::heightfield::world_aabb_to_local(expanded, pb);
-                let (cx0, cz0, cx1, cz1) = hf.cell_range(local)?;
-                let mut best: Option<ShapeCastHit> = None;
-                // 선형 경로와 **같은 가지치기**: 타일 높이 범위가 스윕 Y 밴드와 안 겹치면
-                // 그 타일의 셀은 보지 않는다. 궤도 봉투는 넓으므로 이게 없으면 최악이
-                // 격자 전체다(확인검수 rev_d390e73d BLOCKER — 회전 분기만 예산 밖이었다).
-                let (y_lo, y_hi) = (local.min.y, local.max.y);
-                // **타일을 바깥 루프로.** 셀을 돌면서 타일을 조회하면 일은 줄어도 반복은
-                // 그대로다 — 후보가 0개인 1024×1024 격자에서 100만 번 돈다
-                // (확인검수 rev_1a31d83f: 내가 고쳤다고 보고했는데 치환이 조용히 실패했고
-                //  확인하지 않았다. 이제 헬퍼 하나만 쓴다 — 같은 코드를 두 번 적지 않는다).
-                crate::heightfield::for_each_overlapping_cell(
-                    &hf,
-                    (cx0, cz0, cx1, cz1),
-                    y_lo,
-                    y_hi,
-                    |cx, cz| {
-                        for t in 0..2u8 {
-                            let tri = Shape::Triangle {
-                                points: hf.triangle(cx, cz, t),
-                                radius: 0.0,
-                            };
-                            if let Some(h) = shape_cast_rotational(
-                                csa, cpa, motion, axis, angle, pa.pos, &tri, pb, skin,
-                            ) {
-                                if best.as_ref().is_none_or(|b| h.toi < b.toi) {
-                                    best = Some(h);
+    let cast_one =
+        |csa: &Shape, cpa: &Pose, budget: &mut usize| -> Result<Option<ShapeCastHit>, CastReject> {
+            Ok(match sb {
+                // **하이트필드는 볼록이 아니다** — 그냥 넘기면 GJK가 `support_core`의
+                // `unreachable!`에 닿아 trap이 된다(검수 rev_1e81559e BLOCKER: 회전 CCD를 켠
+                // 블레이드를 지형 옆에 두면 선속도 0에서도 즉시 재현). 선형 경로와 같은 규칙으로
+                // 스윕 봉투가 덮는 셀만 삼각형으로 펼친다. 회전 봉투는 외접 반지름으로 넓힌다.
+                Shape::Heightfield { .. } => {
+                    let hf = sb.heightfield_ref().expect("Heightfield 변종");
+                    // **자식은 자기 원점이 아니라 부모 피벗 주위를 돈다.** 자식 반경만 넓히면
+                    // COM에서 10m 떨어진 자식이 90° 도는 궤도를 못 덮어, 캐스트가 `None`을
+                    // 내면서 자식이 지형을 관통한다(확인검수 rev_7efe4e35 BLOCKER).
+                    // 봉투는 피벗 중심의 궤도 반경(|자식-피벗| + 자식 반경)으로 잡는다.
+                    let orbit_r = (cpa.pos - pa.pos).length() + csa.bounding_radius();
+                    let e = Vec3::new(orbit_r, orbit_r, orbit_r);
+                    let a0 = crate::Aabb::new(pa.pos - e, pa.pos + e);
+                    let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
+                    let expanded = crate::Aabb::new(
+                        sweep.min - Vec3::new(skin, skin, skin),
+                        sweep.max + Vec3::new(skin, skin, skin),
+                    );
+                    let local = crate::heightfield::world_aabb_to_local(expanded, pb);
+                    let Some((cx0, cz0, cx1, cz1)) = hf.cell_range(local) else {
+                        return Ok(None);
+                    };
+                    let mut best: Option<ShapeCastHit> = None;
+                    // 선형 경로와 **같은 가지치기**: 타일 높이 범위가 스윕 Y 밴드와 안 겹치면
+                    // 그 타일의 셀은 보지 않는다. 궤도 봉투는 넓으므로 이게 없으면 최악이
+                    // 격자 전체다(확인검수 rev_d390e73d BLOCKER — 회전 분기만 예산 밖이었다).
+                    let (y_lo, y_hi) = (local.min.y, local.max.y);
+                    // **타일을 바깥 루프로.** 셀을 돌면서 타일을 조회하면 일은 줄어도 반복은
+                    // 그대로다 — 후보가 0개인 1024×1024 격자에서 100만 번 돈다
+                    // (확인검수 rev_1a31d83f: 내가 고쳤다고 보고했는데 치환이 조용히 실패했고
+                    //  확인하지 않았다. 이제 헬퍼 하나만 쓴다 — 같은 코드를 두 번 적지 않는다).
+                    // **작업량 상한.** 타일 가지치기는 후보가 0인 지형의 100만 셀 반복을
+                    // 없애지만, Y 밴드가 실제로 겹치면 상한이 없다 — 1024×1024 지형을 덮는
+                    // CCD 바디 하나가 서브스텝마다 100만 셀·200만 삼각형 캐스트를 돌려
+                    // wasm 프레임을 멈춘다(확인검수 rev_d5b32e22 MAJOR). 예산을 넘으면
+                    // **자르지 않고 오류로 올린다**: 잘라서 `None`을 내면 진짜 접촉을 놓쳐
+                    // 지형을 통과하고, 가짜 `toi=0` 히트를 만들면 정상 장면이 영구 동결된다
+                    // (rev_d390e73d에서 실제로 그랬다). 보수적 정지 정책은 **소비자**가 고른다.
+                    let complete = crate::heightfield::for_each_overlapping_cell(
+                        &hf,
+                        (cx0, cz0, cx1, cz1),
+                        y_lo,
+                        y_hi,
+                        |cx, cz| {
+                            if *budget == 0 {
+                                return false;
+                            }
+                            *budget -= 1;
+                            for t in 0..2u8 {
+                                let tri = Shape::Triangle {
+                                    points: hf.triangle(cx, cz, t),
+                                    radius: 0.0,
+                                };
+                                if let Some(h) = shape_cast_rotational(
+                                    csa, cpa, motion, axis, angle, pa.pos, &tri, pb, skin,
+                                ) {
+                                    if best.as_ref().is_none_or(|b| h.toi < b.toi) {
+                                        best = Some(h);
+                                    }
                                 }
                             }
-                        }
-                        true
-                    },
-                );
-                best
-            }
-            Shape::Compound { children } => children
-                .iter()
-                .filter_map(|(cpb, csb)| {
-                    shape_cast_rotational(
-                        csa,
-                        cpa,
-                        motion,
-                        axis,
-                        angle,
-                        pa.pos,
-                        csb,
-                        &compose(pb, cpb),
-                        skin,
-                    )
-                })
-                .min_by(|x, y| x.toi.total_cmp(&y.toi)),
-            _ => shape_cast_rotational(csa, cpa, motion, axis, angle, pa.pos, sb, pb, skin),
-        }
-    };
+                            true
+                        },
+                    );
+                    if !complete {
+                        return Err(CastReject::BudgetExceeded);
+                    }
+                    best
+                }
+                Shape::Compound { children } => children
+                    .iter()
+                    .filter_map(|(cpb, csb)| {
+                        shape_cast_rotational(
+                            csa,
+                            cpa,
+                            motion,
+                            axis,
+                            angle,
+                            pa.pos,
+                            csb,
+                            &compose(pb, cpb),
+                            skin,
+                        )
+                    })
+                    .min_by(|x, y| x.toi.total_cmp(&y.toi)),
+                _ => shape_cast_rotational(csa, cpa, motion, axis, angle, pa.pos, sb, pb, skin),
+            })
+        };
     match sa {
-        Shape::Compound { children } => children
-            .iter()
-            .filter_map(|(cp, cs)| cast_one(cs, &compose(pa, cp)))
-            .min_by(|x, y| x.toi.total_cmp(&y.toi)),
-        _ => cast_one(sa, pa),
+        Shape::Compound { children } => {
+            let mut best: Option<ShapeCastHit> = None;
+            for (cp, cs) in children {
+                if let Some(h) = cast_one(cs, &compose(pa, cp), &mut budget)? {
+                    if best.as_ref().is_none_or(|b| h.toi < b.toi) {
+                        best = Some(h);
+                    }
+                }
+            }
+            Ok(best)
+        }
+        _ => cast_one(sa, pa, &mut budget),
     }
 }
 
 /// 복합 디스패치 셰이프 캐스트 — 자식쌍의 earliest TOI (동률은 자식 순서 — 결정적).
-pub fn shape_cast_dispatch(
+///
+/// `Err`는 **미스가 아니다** — `CastReject` 참조.
+pub fn try_shape_cast_dispatch(
     sa: &Shape,
     pa: &Pose,
     motion: Vec3,
     sb: &Shape,
     pb: &Pose,
     skin: f32,
-) -> Option<ShapeCastHit> {
+) -> Result<Option<ShapeCastHit>, CastReject> {
+    if !cast_inputs_ok(motion, skin, pa, pb) {
+        return Err(CastReject::InvalidInput);
+    }
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
         rot: parent.rot * child.rot,
     };
     let mut best: Option<ShapeCastHit> = None;
-    let mut consider = |h: ShapeCastHit| {
-        if best.as_ref().is_none_or(|b| h.toi < b.toi) {
-            best = Some(h);
-        }
-    };
-    match (sa, sb) {
-        (Shape::Compound { children: ca }, Shape::Compound { children: cb }) => {
-            for (cpa, csa) in ca {
-                let wpa = compose(pa, cpa);
-                for (cpb, csb) in cb {
-                    if let Some(h) = shape_cast(csa, &wpa, motion, csb, &compose(pb, cpb), skin) {
+    let mut budget = crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY;
+    // **B쪽 디스패치를 A쪽 루프에서 분리한다.** 예전에는 `match (sa, sb)`가 `(Compound, _)`를
+    // 먼저 잡아, 복합 바디가 지형으로 스윕하면 각 자식이 **볼록 전용** `shape_cast`에 지형을
+    // 그대로 넘겼다 — 그 함수는 비볼록에 `None`을 돌려주므로 "맞은 것 없음"이 되어 복합
+    // 바디가 지형을 그냥 통과했다(자기 검수 2026-07-30, 회전 분기는 이미 이 구조였다).
+    let cast_one = |csa: &Shape,
+                    cpa: &Pose,
+                    best: &mut Option<ShapeCastHit>,
+                    budget: &mut usize|
+     -> Result<(), CastReject> {
+        let mut consider = |h: ShapeCastHit| {
+            if best.as_ref().is_none_or(|b| h.toi < b.toi) {
+                *best = Some(h);
+            }
+        };
+        match sb {
+            Shape::Compound { children } => {
+                for (cpb, csb) in children {
+                    if let Some(h) = shape_cast(csa, cpa, motion, csb, &compose(pb, cpb), skin) {
                         consider(h);
                     }
                 }
             }
-        }
-        (Shape::Compound { children }, _) => {
-            for (cp, cs) in children {
-                if let Some(h) = shape_cast(cs, &compose(pa, cp), motion, sb, pb, skin) {
-                    consider(h);
-                }
-            }
-        }
-        (_, Shape::Compound { children }) => {
-            for (cp, cs) in children {
-                if let Some(h) = shape_cast(sa, pa, motion, cs, &compose(pb, cp), skin) {
-                    consider(h);
-                }
-            }
-        }
-        // 하이트필드가 대상이면 스윕 봉투가 덮는 셀만 삼각형으로 펼친다.
-        // CCD의 유일한 대상이 static이므로(설계 §4 linear cast) 이 경로가 지형 관통을 막는다.
-        (_, Shape::Heightfield { .. }) => {
-            let hf = sb.heightfield_ref().expect("Heightfield 변종");
-            let a0 = crate::transformed_aabb(sa.local_aabb(), pa);
-            let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
-            let expanded = crate::Aabb::new(
-                sweep.min - Vec3::new(skin, skin, skin),
-                sweep.max + Vec3::new(skin, skin, skin),
-            );
-            let local = crate::heightfield::world_aabb_to_local(expanded, pb);
-            let (cx0, cz0, cx1, cz1) = hf.cell_range(local)?;
-            // **예산을 넘으면 자르지 않고 막는다.** 셀 수로 잘라 `None`을 내면 진짜 접촉을
-            // 넘겨 지형을 통과하고(검수 rev_1e81559e), 자르지 않으면 1024×1024 격자를 덮는
-            // 스윕 한 번이 200만 회 캐스트가 된다(확인검수 rev_7efe4e35 MAJOR).
-            // 그래서 **보수적으로 정지**시킨다: 이동을 toi=0에서 막는 히트를 만들어
-            // 관통 대신 멈춤을 고른다. 질의 API는 이 경우를 오류로 따로 보고한다.
-            // **타일 높이 범위로 먼저 쳐낸다.** 스윕의 Y 밴드와 안 겹치는 타일은 셀을
-            // 하나도 볼 필요가 없다 — 이게 없으면 총알이 평평한 통로를 지나가는 것만으로
-            // 수천 셀을 검사하고, 그 비용을 피하려던 "예산 초과 = 가짜 히트"가 정상 장면을
-            // 영구 동결시켰다(확인검수 rev_d390e73d BLOCKER). 가지치기는 근사가 아니라
-            // 정확하다: 타일 밖 높이는 그 범위 안에 있다는 것이 build_tiles의 계약이다.
-            let (y_lo, y_hi) = (local.min.y, local.max.y);
-            crate::heightfield::for_each_overlapping_cell(
-                &hf,
-                (cx0, cz0, cx1, cz1),
-                y_lo,
-                y_hi,
-                |cx, cz| {
-                    for t in 0..2u8 {
-                        let tri = Shape::Triangle {
-                            points: hf.triangle(cx, cz, t),
-                            radius: 0.0,
-                        };
-                        if let Some(h) = shape_cast(sa, pa, motion, &tri, pb, skin) {
-                            consider(h);
+            // 하이트필드가 대상이면 스윕 봉투가 덮는 셀만 삼각형으로 펼친다.
+            // CCD의 유일한 대상이 static이므로(설계 §4 linear cast) 이 경로가 지형 관통을 막는다.
+            Shape::Heightfield { .. } => {
+                let hf = sb.heightfield_ref().expect("Heightfield 변종");
+                let a0 = crate::transformed_aabb(csa.local_aabb(), cpa);
+                let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
+                let expanded = crate::Aabb::new(
+                    sweep.min - Vec3::new(skin, skin, skin),
+                    sweep.max + Vec3::new(skin, skin, skin),
+                );
+                let local = crate::heightfield::world_aabb_to_local(expanded, pb);
+                let Some(range) = hf.cell_range(local) else {
+                    return Ok(());
+                };
+                // **타일 높이 범위로 먼저 쳐낸다.** 스윕의 Y 밴드와 안 겹치는 타일은 셀을
+                // 하나도 볼 필요가 없다 — 이게 없으면 총알이 평평한 통로를 지나가는 것만으로
+                // 수천 셀을 검사하고, 그 비용을 피하려던 "예산 초과 = 가짜 히트"가 정상 장면을
+                // 영구 동결시켰다(확인검수 rev_d390e73d BLOCKER). 가지치기는 근사가 아니라
+                // 정확하다: 타일 밖 높이는 그 범위 안에 있다는 것이 build_tiles의 계약이다.
+                let (y_lo, y_hi) = (local.min.y, local.max.y);
+                // **작업량 상한.** 예산을 넘으면 자르지 않고 오류로 올린다 — 근거는
+                // 회전 분기의 같은 자리 주석에 있다(자르면 관통, 가짜 히트면 영구 동결).
+                let complete = crate::heightfield::for_each_overlapping_cell(
+                    &hf,
+                    range,
+                    y_lo,
+                    y_hi,
+                    |cx, cz| {
+                        if *budget == 0 {
+                            return false;
                         }
-                    }
-                    true
-                },
-            );
+                        *budget -= 1;
+                        for t in 0..2u8 {
+                            let tri = Shape::Triangle {
+                                points: hf.triangle(cx, cz, t),
+                                radius: 0.0,
+                            };
+                            if let Some(h) = shape_cast(csa, cpa, motion, &tri, pb, skin) {
+                                consider(h);
+                            }
+                        }
+                        true
+                    },
+                );
+                if !complete {
+                    return Err(CastReject::BudgetExceeded);
+                }
+            }
+            _ => {
+                if let Some(h) = shape_cast(csa, cpa, motion, sb, pb, skin) {
+                    consider(h);
+                }
+            }
         }
-        _ => return shape_cast(sa, pa, motion, sb, pb, skin),
+        Ok(())
+    };
+    match sa {
+        Shape::Compound { children } => {
+            for (cp, cs) in children {
+                cast_one(cs, &compose(pa, cp), &mut best, &mut budget)?;
+            }
+        }
+        _ => cast_one(sa, pa, &mut best, &mut budget)?,
     }
-    best
+    Ok(best)
 }
 
 #[cfg(test)]

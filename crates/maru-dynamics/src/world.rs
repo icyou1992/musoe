@@ -11,7 +11,7 @@ use crate::joint::{self, Joint};
 use crate::solver::{self, CachedImpulse, ContactConstraint, Softness, SolverParams};
 use crate::solver_block;
 use maru_collide::{
-    any_contact, for_each_contact, shape_cast_dispatch, Aabb, Broadphase, FeatureId, STATIC_BIT,
+    any_contact, for_each_contact, try_shape_cast_dispatch, Aabb, Broadphase, FeatureId, STATIC_BIT,
 };
 use maru_math::Vec3;
 use std::collections::HashMap;
@@ -343,6 +343,15 @@ pub struct World {
     pool: crate::threads::Pool,
     /// 내로우페이즈 참여자별 출력 버퍼 (스텝 사이 재사용 — 할당 0).
     narrow_bufs: Vec<NarrowOut>,
+    /// wake 폐쇄 **직전**의 sleep 상태 복사본 — 스텝이 자원 오류로 끝날 때 되돌리는 기준선.
+    ///
+    /// `asleep`·`sleep_timer`는 스냅샷에 실리는 **캐노니컬 상태**다. wake는 narrowphase보다
+    /// 먼저 돌므로, 뒤에서 접촉 예산이 터져 스텝을 포기하면 "물리 스텝은 건너뜀"이라 말하면서
+    /// 잠들어 있어야 할 아일랜드를 깨워 놓은 채 끝난다 — 호스트가 문제 바디를 지우고 재시도해도
+    /// 그 아일랜드는 이미 중력·적분 대상이 되어 실패 전과 다른 미래를 만든다
+    /// (확인검수 rev_d5b32e22 BLOCKER). 용량은 wake 이전 통합 fallible 블록에서 잡는다.
+    sleep_bak: Vec<bool>,
+    sleep_timer_bak: Vec<f32>,
     /// 접촉 솔버 색 병렬 스위치 — **기본 off**. 근거는 `set_parallel_solver` 문서.
     parallel_solver: bool,
 }
@@ -418,6 +427,13 @@ pub struct Diagnostics {
     /// 상한(`MAX_CCD_HITS`)을 넘겨 버려진 CCD 히트 수. 0이 아니면 호스트가 보는
     /// 히트 목록이 이번 스텝의 전부가 아니다 — 조용한 유실과 구분되어야 한다.
     pub ccd_hits_dropped: usize,
+    /// CCD 캐스트가 **판정을 완료하지 못한** 횟수(지형 셀 예산 초과 등).
+    ///
+    /// 그 바디는 해당 서브스텝의 이동·회전이 0으로 묶인다(보수적 정지 — 관통보다 멈춤).
+    /// 스텝 자체는 진행되므로 `try_step`은 `Ok`다: 적분 중에는 스텝을 되돌릴 수 없어
+    /// `ResourceLimit`("스텝 건너뜀")을 쓸 수 없다. 이 값이 0이 아니면 그 프레임에
+    /// 어떤 바디가 조용히 멈춰 있다는 뜻이므로, 호스트는 지형 해상도나 바디 크기를 봐야 한다.
+    pub ccd_incomplete: usize,
     /// 단계별 소요 (ns) — 프로파일용.
     /// `[aabb, broad, narrow, solve, post]`
     /// - `aabb`: 바디 순회 + 회전 월드 AABB 구성 (예전에는 broad에서 **빠져 있었다**)
@@ -606,6 +622,8 @@ impl World {
             // 안전하고, 원하면 `set_threads`로 1(완전 직렬)까지 내릴 수 있다.
             pool: crate::threads::Pool::new(crate::threads::default_threads()),
             narrow_bufs: Vec::new(),
+            sleep_bak: Vec::new(),
+            sleep_timer_bak: Vec::new(),
             parallel_solver: false,
         }
     }
@@ -1350,14 +1368,21 @@ impl World {
                     }
                 }
             }
-            let hit = maru_collide::shape_cast_dispatch(
+            // 디스패처는 **오류를 값으로** 돌려준다 — 예산 초과와 잘못된 입력이 미스로
+            // 위장되지 않는다(위 선판정이 같은 예산을 보므로 여기 오류는 이론상 안 나지만,
+            // 두 계산이 갈리는 날 조용히 "지나갈 수 있다"가 되는 것을 막는다).
+            let hit = maru_collide::try_shape_cast_dispatch(
                 shape,
                 &pose,
                 motion,
                 &self.bodies[i].shape,
                 &self.bodies[i].pose,
                 self.params.speculative_margin,
-            );
+            )
+            .map_err(|e| match e {
+                maru_collide::CastReject::BudgetExceeded => ApiError::ResourceLimit,
+                maru_collide::CastReject::InvalidInput => ApiError::InvalidValue,
+            })?;
             if let Some(h) = hit {
                 let better = best.as_ref().is_none_or(|b| h.toi < b.toi);
                 if better {
@@ -1412,7 +1437,10 @@ impl World {
                     }
                 }
             }
-            maru_collide::for_each_contact(
+            // 순회 결과를 **버리지 않는다**: 위 선판정과 같은 계산이라 여기서 예산이 터질 수는
+            // 없지만, 둘 중 하나만 바뀌면 "판정 못 한 것"이 "겹치지 않음"으로 조용히 바뀐다.
+            // 캐릭터의 시작 겹침 검사가 그러면 벽 속에서 출발한다.
+            let walk = maru_collide::for_each_contact(
                 shape,
                 &pose,
                 &self.bodies[i].shape,
@@ -1424,6 +1452,9 @@ impl World {
                     }
                 },
             );
+            if walk == maru_collide::ContactWalk::BudgetExceeded {
+                return Err(ApiError::ResourceLimit);
+            }
         }
         Ok(found)
     }
@@ -1991,6 +2022,12 @@ impl World {
                 nbody,
                 core::mem::size_of::<usize>(),
             ))
+            .saturating_add(ex(self.sleep_bak.capacity(), nbody, 1))
+            .saturating_add(ex(
+                self.sleep_timer_bak.capacity(),
+                nbody,
+                core::mem::size_of::<f32>(),
+            ))
             .saturating_add(ex(
                 self.contact_blocks.capacity(),
                 constraint_cap / 4,
@@ -2027,6 +2064,8 @@ impl World {
         trim!(self.damping, nbody);
         trim!(self.island_parent, nbody);
         trim!(self.gravity_gate, nbody);
+        trim!(self.sleep_bak, nbody);
+        trim!(self.sleep_timer_bak, nbody);
         // 블록·참여자 버퍼는 이 시점에 목표를 모른다 — 직전 스텝 사용량(len)을 근사로 쓴다.
         let blocks_need = self.contact_blocks.len();
         trim!(self.contact_blocks, blocks_need);
@@ -2063,6 +2102,8 @@ impl World {
         self.bp_pairs = Vec::new();
         self.bp_pairs_scratch = Vec::new();
         self.gravity_gate = Vec::new();
+        self.sleep_bak = Vec::new();
+        self.sleep_timer_bak = Vec::new();
         if !preserve_integrate_gate {
             self.integrate_gate = Vec::new();
         }
@@ -2399,6 +2440,24 @@ impl World {
     }
 
     /// 아일랜드 단위 wake (설계 §4.6). 직전 스텝의 아일랜드 대표가 같은 동적 바디를 모두 깨운다.
+    /// wake 폐쇄가 바꾼 캐노니컬 sleep 상태를 기준선으로 되돌린다.
+    ///
+    /// 스텝을 자원 오류로 포기하는 모든 경로가 이것을 부른다 — 그러지 않으면 "물리 스텝은
+    /// 건너뜀"이라 말하면서 sleep 상태만 앞으로 나가고, 그건 스냅샷에 실리는 캐노니컬
+    /// 상태라 실패 전과 다른 미래를 만든다(확인검수 rev_d5b32e22 BLOCKER).
+    ///
+    /// 길이가 다르면(= 이 스텝에 기준선을 못 잡았다) 아무것도 하지 않는다 — wake 이전에
+    /// 끝난 경로이므로 되돌릴 것도 없다. **할당하지 않는다**(자원이 빠듯한 순간에 불린다).
+    fn rollback_wake(&mut self) {
+        if self.sleep_bak.len() != self.asleep.len()
+            || self.sleep_timer_bak.len() != self.sleep_timer.len()
+        {
+            return;
+        }
+        self.asleep.copy_from_slice(&self.sleep_bak);
+        self.sleep_timer.copy_from_slice(&self.sleep_timer_bak);
+    }
+
     fn wake(&mut self, i: usize) {
         let island = self.island[i];
         self.asleep[i] = false;
@@ -2712,7 +2771,9 @@ impl World {
             + 2 * core::mem::size_of::<bool>()                           // integrate/gravity gates
             + core::mem::size_of::<usize>()                              // island_parent
             + core::mem::size_of::<u64>()
-            + core::mem::size_of::<bool>(); // 컬러 body_color/conflict
+            + core::mem::size_of::<bool>()                                // 컬러 body_color/conflict
+            + core::mem::size_of::<bool>()                                // sleep_bak
+            + core::mem::size_of::<f32>(); // sleep_timer_bak
         let fixed_body_bytes = self.bodies.len().saturating_mul(per_body_bytes);
         // 조인트 비례 스크래치: joint_pairs·active_joints·excluded. **조인트 수는 pairs·bodies의
         // 상한이 아니므로** 별도로 차감해야 총상한이 성립한다 (교차검수 rev_ba3ca887 MAJOR).
@@ -3023,6 +3084,14 @@ impl World {
             || self.island_parent
                 .try_reserve(nbody.saturating_sub(self.island_parent.len()))
                 .is_err()
+            // sleep 롤백 기준선 — **wake 이전에** 용량을 잡아야 의미가 있다(예약 실패가
+            // wake 뒤로 밀리면 되돌릴 수 없는 상태에서 오류를 내게 된다).
+            || self.sleep_bak
+                .try_reserve(nbody.saturating_sub(self.sleep_bak.len()))
+                .is_err()
+            || self.sleep_timer_bak
+                .try_reserve(nbody.saturating_sub(self.sleep_timer_bak.len()))
+                .is_err()
             || reserve_narrow_bufs(&mut narrow_bufs, n_par, &chunk_caps).is_err()
         {
             self.bp_pairs = pairs;
@@ -3030,6 +3099,12 @@ impl World {
             self.resource_limit = true;
             return;
         }
+        // === sleep 롤백 기준선 (wake 폐쇄 직전) ===
+        // 용량은 위 블록이 이미 잡았다 — `clear` 뒤 `extend`는 재할당하지 않는다(스텝 중 할당 0).
+        self.sleep_bak.clear();
+        self.sleep_bak.extend_from_slice(&self.asleep);
+        self.sleep_timer_bak.clear();
+        self.sleep_timer_bak.extend_from_slice(&self.sleep_timer);
         self.diag.sub_ns[0] = _t_res.ns();
         // 조인트 연결 쌍은 충돌 제외 (collide_connected=false 기본).
         // excluded는 위 통합 블록에서 선점됨(실패 bail이 bp_pairs를 복원 — 캐시 재사용 스텝에
@@ -3220,6 +3295,7 @@ impl World {
                 // 깨우지 않아 지지 접촉이 빠진 채 적분된다. 이미 깨운 바디가 남는 것은
                 // 보수적으로 안전하고(여분 기상은 성능 문제일 뿐), 물리는 적용되지 않는다.
                 None => {
+                    self.rollback_wake();
                     self.invalidate_bp();
                     self.resource_limit = true;
                     self.narrow_bufs = narrow_bufs;
@@ -3355,6 +3431,8 @@ impl World {
         if narrow_bufs[..n_par].iter().any(|b| b.bail) {
             // 접점 힙 할당 실패(극단 OOM). narrowphase는 wake 이후이고 pairs를 대여 중이라
             // bp_pairs를 되돌릴 수 없다 — 구조를 버려 다음 스텝이 재빌드하게 한다.
+            // sleep 상태는 캐노니컬이므로 되돌린다.
+            self.rollback_wake();
             self.narrow_bufs = narrow_bufs;
             self.invalidate_bp();
             self.resource_limit = true;
@@ -3387,6 +3465,7 @@ impl World {
         // "커맨드는 적용됨, **물리 스텝은 건너뜀**"이다 — 호스트가 재시도하면 물리가 두 번
         // 나아간다(확인검수 rev_1a31d83f BLOCKER). 솔브·적분·이벤트·PCM 전부 앞에서 끊는다.
         if narrow_bufs[..n_par].iter().any(|b| b.budget_exceeded) {
+            self.rollback_wake();
             self.narrow_bufs = narrow_bufs;
             self.invalidate_bp();
             self.resource_limit = true;
@@ -3847,6 +3926,12 @@ impl World {
                         // static 후보 — bp 구조는 브로드페이즈 단계가 항상 남긴다(무효화
                         // 경로는 전부 그 전에 return). 방어적으로 없으면 캐스트 생략.
                         let mut best: Option<(f32, Vec3, Vec3, u32)> = None;
+                        // 캐스트가 판정을 완료하지 못한 경우(지형 셀 예산 초과 등).
+                        // **여기는 이미 솔브·적분 뒤라 스텝을 되돌릴 수 없다** — 그래서
+                        // 소비자 정책으로 처리한다: 이 서브스텝의 이동·회전을 0으로 묶어
+                        // 관통을 막고(보수적 정지), `resource_limit`으로 호스트에 알린다.
+                        // 캐스트가 가짜 히트를 만들어 내려보내지 않는 이유는 그쪽 주석에 있다.
+                        let mut cast_incomplete = false;
                         if let Some(bp) = &self.bp {
                             ccd_cand.clear();
                             bp.query_static(sweep, &mut ccd_cand, &mut ccd_stack);
@@ -3863,7 +3948,7 @@ impl World {
                                     }
                                 }
                                 let cast = if rot_sweep {
-                                    maru_collide::shape_cast_dispatch_rotational(
+                                    maru_collide::try_shape_cast_dispatch_rotational(
                                         &body.shape,
                                         &pose_now,
                                         d,
@@ -3874,7 +3959,7 @@ impl World {
                                         skin,
                                     )
                                 } else {
-                                    shape_cast_dispatch(
+                                    try_shape_cast_dispatch(
                                         &body.shape,
                                         &pose_now,
                                         d,
@@ -3882,6 +3967,13 @@ impl World {
                                         &sb.pose,
                                         skin,
                                     )
+                                };
+                                let cast = match cast {
+                                    Ok(c) => c,
+                                    Err(_) => {
+                                        cast_incomplete = true;
+                                        None
+                                    }
                                 };
                                 if let Some(hit) = cast {
                                     // 결정적 최소: (toi, static id) 사전식 — 동시 hit 동률 절단.
@@ -3897,7 +3989,20 @@ impl World {
                                 }
                             }
                         }
-                        if let Some((toi, normal, point, sid)) = best {
+                        if cast_incomplete {
+                            // 판정 미완료 = "막혔다"로 취급한다(보수적 정지). 미스로 넘기면
+                            // 지형을 통과한다.
+                            //
+                            // **`resource_limit`은 세우지 않는다.** 그 플래그의 계약은
+                            // "커맨드는 적용, 물리 스텝은 건너뜀"이고, 여기는 이미 솔브·적분
+                            // 중이라 스텝을 건너뛸 수 없다 — 세우면 한 플래그가 두 가지를
+                            // 뜻하게 되고 호스트는 "안 움직였다"고 오해한다. 보고 채널은
+                            // `Diagnostics::ccd_incomplete`다(`ccd_hits_dropped`·
+                            // `heightfield_saturated`와 같은 규약: 조용한 강등 금지).
+                            d = Vec3::ZERO;
+                            rot_toi = 0.0;
+                            self.diag.ccd_incomplete += 1;
+                        } else if let Some((toi, normal, point, sid)) = best {
                             // **절단 순간을 호스트에게 보고한다** (설계 §4.5 TOI-hit 큐).
                             // 상한을 넘으면 뒤에 온 것부터 버린다 — 바디 순회(활성 인덱스
                             // 오름차순)와 서브스텝 순서가 결정적이라 버려지는 집합도 결정적이다.

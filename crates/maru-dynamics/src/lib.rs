@@ -3399,7 +3399,7 @@ mod tests {
             Some(true)
         );
         // 스윕 디스패처도 지형을 펼친다.
-        assert!(maru_collide::shape_cast_dispatch(
+        assert!(maru_collide::try_shape_cast_dispatch(
             &sphere,
             &pose(4.0, 3.0, 4.0),
             Vec3::new(0.0, -5.0, 0.0),
@@ -3407,6 +3407,7 @@ mod tests {
             &p,
             0.02
         )
+        .expect("정상 입력")
         .is_some());
     }
 
@@ -3443,12 +3444,19 @@ mod tests {
         let _ = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), f32::NAN);
     }
 
-    /// **공개 회전 캐스트는 그 패닉을 호스트로 흘리지 않는다.**
+    /// **공개 회전 캐스트는 패닉하지 않고, 잘못된 입력을 미스로 위장하지도 않는다.**
     ///
-    /// 캐스트 루프는 매 반복 `from_axis_angle`을 부른다 — 각이 호스트 입력이므로
-    /// 라이브러리가 죽는 대신 값으로 거른다(`None` = 판정할 회전이 없음).
+    /// 두 계약이 함께 있어야 의미가 있다. 캐스트 루프는 매 반복 `from_axis_angle`을 부르고
+    /// 그 함수는 표현 불가 각에 패닉하므로 (a) 호스트 입력이 그 패닉에 닿아선 안 되고,
+    /// (b) 그렇다고 `None`(=미스)으로 돌려주면 호출자가 "경로가 비었다"고 읽어 그대로
+    /// 이동시킨다 — 저수준 볼록 API를 공개 표면에서 뺀 것과 같은 결함이다.
+    /// 그래서 공개 경로는 `Result`이고 `Err(CastReject::InvalidInput)`을 낸다.
+    ///
+    /// 각만 검사하면 부족하다: 유효한 각 + NaN 축/이동이면 내부에서 `t`가 NaN이 되어
+    /// `angle * t`가 다시 표현 불가 각이 된다(확인검수 rev_d5b32e22 BLOCKER).
     #[test]
-    fn rotational_cast_rejects_unrepresentable_angle_instead_of_panicking() {
+    fn rotational_cast_rejects_bad_input_as_error_not_miss() {
+        use maru_collide::CastReject;
         // 회전 피벗은 **A의 위치(바디 COM)**다 — 구는 자기 중심 회전에 아무 데도 안 쓸어서
         // 음성 대조가 될 수 없다. 긴 박스를 세로로 세워 90° 돌리면 이웃 박스를 쓸고 지나간다.
         let a = Shape::Box {
@@ -3461,38 +3469,123 @@ mod tests {
         };
         let pa = pose(0.0, 0.0, 0.0);
         let pb = pose(0.0, 0.0, 1.05);
-        let axis = Vec3::new(0.0, 1.0, 0.0);
+        let good_axis = Vec3::new(0.0, 1.0, 0.0);
+        let good_angle = core::f32::consts::FRAC_PI_2;
+        // ① 표현 불가한 각
         for bad in [1.0e20f32, f32::NAN, f32::INFINITY] {
-            assert!(
-                maru_collide::shape_cast_dispatch_rotational(
+            assert_eq!(
+                maru_collide::try_shape_cast_dispatch_rotational(
                     &a,
                     &pa,
                     Vec3::ZERO,
-                    axis,
+                    good_axis,
                     bad,
                     &b,
                     &pb,
                     0.02
-                )
-                .is_none(),
-                "표현 불가한 각 {bad}에 캐스트가 답을 만들어냈다"
+                ),
+                Err(CastReject::InvalidInput),
+                "표현 불가한 각 {bad}"
             );
         }
-        // **음성 대조** — 같은 배치에서 정상 각은 실제로 맞춘다(가드가 전부를 막는 게 아니다).
-        let hit = maru_collide::shape_cast_dispatch_rotational(
+        // ② 유효한 각 + 비유한 축/이동 — 예전에는 이 조합이 내부 assert를 때렸다.
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch_rotational(
+                &a,
+                &pa,
+                Vec3::ZERO,
+                Vec3::new(f32::NAN, 0.0, 0.0),
+                good_angle,
+                &b,
+                &pb,
+                0.02
+            ),
+            Err(CastReject::InvalidInput)
+        );
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch_rotational(
+                &a,
+                &pa,
+                Vec3::new(f32::NAN, 0.0, 0.0),
+                good_axis,
+                good_angle,
+                &b,
+                &pb,
+                0.02
+            ),
+            Err(CastReject::InvalidInput)
+        );
+        // ③ 선형 디스패처도 같은 규칙
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch(
+                &a,
+                &pa,
+                Vec3::new(0.0, f32::INFINITY, 0.0),
+                &b,
+                &pb,
+                0.02
+            ),
+            Err(CastReject::InvalidInput)
+        );
+        // **음성 대조** — 같은 배치에서 정상 입력은 실제로 맞춘다(가드가 전부를 막는 게 아니다).
+        let hit = maru_collide::try_shape_cast_dispatch_rotational(
             &a,
             &pa,
             Vec3::ZERO,
-            axis,
-            core::f32::consts::FRAC_PI_2,
+            good_axis,
+            good_angle,
             &b,
             &pb,
             0.02,
-        );
+        )
+        .expect("정상 입력이 거절됐다");
         assert!(
             hit.is_some_and(|h| h.toi > 0.0 && h.toi < 1.0),
             "정상 회전 스윕이 접촉을 못 찾았다 — 테스트 배치가 무의미하다: {hit:?}"
         );
+    }
+
+    /// **지형 캐스트에는 작업량 상한이 있고, 초과는 미스가 아니라 오류다.**
+    ///
+    /// 타일 가지치기는 후보 0인 지형의 반복만 없앤다 — Y 밴드가 실제로 겹치면 상한이
+    /// 없어서 큰 바디 하나가 서브스텝마다 100만 셀을 훑었다(확인검수 rev_d5b32e22 MAJOR).
+    #[test]
+    fn heightfield_cast_reports_budget_instead_of_walking_forever() {
+        use maru_collide::CastReject;
+        let heights = vec![0.0f32; 257 * 257];
+        let hf = Shape::Heightfield {
+            tiles: maru_collide::build_heightfield_tiles(&heights, 257, 257),
+            heights,
+            nx: 257,
+            nz: 257,
+            cell: 0.1,
+        };
+        let p = pose(0.0, 0.0, 0.0);
+        // 반지름 5m 구 = 100×100셀(=10000 > 4096 예산)을 덮는다.
+        let big = Shape::Sphere { radius: 5.0 };
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch(
+                &big,
+                &pose(12.8, 5.0, 12.8),
+                Vec3::new(0.0, -1.0, 0.0),
+                &hf,
+                &p,
+                0.02
+            ),
+            Err(CastReject::BudgetExceeded)
+        );
+        // **음성 대조** — 작은 바디는 같은 지형에서 정상적으로 지면을 맞춘다.
+        let small = Shape::Sphere { radius: 0.2 };
+        let hit = maru_collide::try_shape_cast_dispatch(
+            &small,
+            &pose(12.8, 1.0, 12.8),
+            Vec3::new(0.0, -2.0, 0.0),
+            &hf,
+            &p,
+            0.02,
+        )
+        .expect("작은 바디가 예산에 걸렸다");
+        assert!(hit.is_some(), "지면을 향한 스윕이 아무것도 못 맞췄다");
     }
 
     /// **접촉 예산을 넘긴 스텝은 물리를 한 톱도 진행하지 않는다** (BLOCKER: 부분 물리 적용).
@@ -3548,6 +3641,209 @@ mod tests {
         assert!(
             w.body(small).pose().pos.y < y0,
             "정상 스텝인데 중력이 안 걸렸다 — 대조군이 무의미하다"
+        );
+    }
+
+    /// **실패한 스텝은 sleep 상태도 되돌린다** (BLOCKER: 캐노니컬 상태가 앞으로 나감).
+    ///
+    /// wake 폐쇄는 narrowphase보다 먼저 돈다. 그래서 뒤에서 접촉 예산이 터져 스텝을
+    /// 포기하면, "물리 스텝은 건너뜀"이라 말하면서 잠들어 있어야 할 바디를 깨워 놓은 채
+    /// 끝난다 — `asleep`은 스냅샷에 실리는 캐노니컬 상태이므로, 호스트가 문제 바디를
+    /// 지우고 재시도해도 그 바디는 이미 중력·적분 대상이 되어 실패 전과 다른 미래를 만든다
+    /// (확인검수 rev_d5b32e22 BLOCKER 1).
+    #[test]
+    fn failed_step_rolls_back_wake() {
+        let mut w = World::new(WorldParams {
+            time_to_sleep: 0.1,
+            ..WorldParams::default()
+        });
+        let heights = vec![0.0f32; 257 * 257];
+        w.try_add_heightfield(&heights, 257, 257, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형 추가");
+        let sleeper = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.2 },
+            pose(12.8, 0.2, 12.8),
+            1.0,
+        ));
+        // 지면에 앉아 잠들 때까지 돌린다.
+        for _ in 0..300 {
+            assert_eq!(w.try_step(1.0 / 60.0), Ok(()));
+            if w.is_asleep(sleeper) {
+                break;
+            }
+        }
+        assert!(w.is_asleep(sleeper), "테스트 전제(잠듦)가 성립하지 않았다");
+        let pos_before = w.body(sleeper).pose().pos;
+        // 예산을 터뜨리는 큰 바디를 **잠든 바디 위에** 놓는다: wake 폐쇄가 먼저 돌아
+        // 잠든 아일랜드를 깨우고, 그 다음 narrowphase가 셀 예산에서 판정을 포기한다.
+        let slab = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 5.0 },
+            pose(12.8, 4.999, 12.8),
+            1.0,
+        ));
+        // 기준선은 **바디를 추가한 뒤**에 잡는다 — 추가 자체는 캐노니컬 변경이 맞다.
+        let hash_before = w.state_hash();
+        assert_eq!(w.try_step(1.0 / 60.0), Err(ApiError::ResourceLimit));
+        // **가장 강한 단언**: 실패한 스텝은 캐노니컬 상태를 한 비트도 바꾸지 않는다.
+        assert_eq!(
+            w.state_hash(),
+            hash_before,
+            "실패 스텝이 캐노니컬 상태를 바꿨다"
+        );
+        assert!(
+            w.is_asleep(sleeper),
+            "실패한 스텝이 잠든 바디를 깨운 채 끝났다 — 캐노니컬 상태가 앞으로 나갔다"
+        );
+        assert_eq!(w.body(sleeper).pose().pos, pos_before);
+        // **음성 대조 ①** — 문제 바디를 지우면 다음 스텝은 정상이고, 잠든 바디는 계속 잔다
+        // (롤백이 sleep 타이머를 망가뜨려 즉시 깨어나는 일이 없다).
+        w.remove_body(slab).expect("제거");
+        assert_eq!(w.try_step(1.0 / 60.0), Ok(()));
+        assert!(w.is_asleep(sleeper), "복구된 스텝이 잠든 바디를 깨웠다");
+    }
+
+    /// **존재 질의는 하나 찾으면 예산 초과와 무관하게 `Some(true)`다.**
+    ///
+    /// 부정("접촉 없음")만 순회 완주를 요구한다. 긍정을 `None`으로 돌려주면 지원 범위 안의
+    /// 고정 장면(넓은 AABB + 접촉 몇 개)이 영구히 답을 못 받는다(확인검수 rev_d5b32e22 MAJOR).
+    #[test]
+    fn any_contact_keeps_a_proven_hit_even_when_the_budget_blows() {
+        let nx = 257usize;
+        let mut heights = vec![0.0f32; nx * nx];
+        // 순회 **앞쪽**(예산 4096 안)에 구 표면에 닿는 봉우리를 하나 만든다. 셀 0.1m이므로
+        // 격자 좌표 100 ≈ 월드 10.0m이고, 중심 (12.8, 5.0)에서 수평 3.96m 떨어진 지점의
+        // 구 표면 높이는 약 1.95m다.
+        for gz in 99..=101 {
+            for gx in 99..=101 {
+                heights[gz * nx + gx] = 1.95;
+            }
+        }
+        let hf = Shape::Heightfield {
+            tiles: maru_collide::build_heightfield_tiles(&heights, nx as u32, nx as u32),
+            heights,
+            nx: nx as u32,
+            nz: nx as u32,
+            cell: 0.1,
+        };
+        let p = pose(0.0, 0.0, 0.0);
+        let big = Shape::Sphere { radius: 5.0 };
+        // 봉우리에 닿는 배치: 접촉을 앞쪽 셀에서 찾고, 그 뒤 수천 셀에서 예산이 터진다.
+        assert_eq!(
+            maru_collide::any_contact(&big, &pose(12.8, 5.0, 12.8), &hf, &p, 0.02),
+            Some(true),
+            "증명된 접촉이 예산 초과 때문에 사라졌다"
+        );
+        // **음성 대조 ①** — 봉우리를 벗어난 자리(같은 크기 AABB, 앞쪽 셀에 접촉 없음)에서는
+        // 예산이 터질 때까지 아무것도 못 찾았으므로 `Some(false)`가 아니라 `None`이다.
+        // 이쪽이 무너지면 "판정 미완료"가 "접촉 없음"으로 뭉개진다.
+        assert_eq!(
+            maru_collide::any_contact(&big, &pose(12.8, 5.0, 20.0), &hf, &p, 0.02),
+            None,
+            "판정 미완료가 '접촉 없음'으로 뭉개졌다"
+        );
+        // **음성 대조 ②** — 타일 가지치기가 전부 걸러내면 순회는 **완주**한 것이므로
+        // `Some(false)`가 맞다(예산과 무관하게 확정적인 '없음').
+        assert_eq!(
+            maru_collide::any_contact(&big, &pose(12.8, 40.0, 12.8), &hf, &p, 0.02),
+            Some(false)
+        );
+    }
+
+    /// **내부 CCD 캐스트도 작업량 상한 안에서 돈다** (MAJOR: 스텝 안의 무한 작업량).
+    ///
+    /// 공개 질의(`sweep_shape`)만 사전 예산을 봤고, 물리 스텝 안의 CCD는 디스패처를 직접
+    /// 불러 예산을 우회했다 — 1024×1024 지형을 덮는 큰 CCD 바디 하나가 서브스텝마다
+    /// 100만 셀을 훑어 프레임을 멈출 수 있었다(확인검수 rev_d5b32e22 MAJOR).
+    ///
+    /// 초과 시 정책은 **보수적 정지**(그 서브스텝 이동·회전 0)이고, 보고는
+    /// `Diagnostics::ccd_incomplete`다. `ResourceLimit`을 쓸 수 없는 이유는 그 필드 문서에.
+    #[test]
+    fn internal_ccd_cast_is_bounded_and_reports_incompleteness() {
+        let mut w = World::new(WorldParams::default());
+        let heights = vec![0.0f32; 257 * 257];
+        w.try_add_heightfield(&heights, 257, 257, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형 추가");
+        // 바닥에서 0.3m 뜬 반지름 5m 구. 접촉(내로우페이즈)은 타일 Y밴드 가지치기로 0셀이라
+        // 스텝이 예산에 걸리지 않지만, 아래로 빠르게 쏘면 **CCD 스윕 봉투**가 100×100셀을
+        // 덮어 예산(4096)을 넘는다 — 예전에는 이 경로에 상한이 아예 없었다.
+        let big = w.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 5.0 }, pose(12.8, 5.3, 12.8), 1.0).with_ccd(),
+        );
+        w.set_linear_velocity(big, Vec3::new(0.0, -400.0, 0.0))
+            .expect("속도");
+        let y0 = w.body(big).pose().pos.y;
+        assert_eq!(w.try_step(1.0 / 60.0), Ok(()));
+        assert!(
+            w.diagnostics().ccd_incomplete > 0,
+            "CCD가 예산을 넘겼는데 보고가 없다 — 상한이 없거나 조용히 강등됐다"
+        );
+        assert_eq!(
+            w.body(big).pose().pos.y,
+            y0,
+            "판정 미완료인데 이동했다 — 보수적 정지가 아니다"
+        );
+        // **음성 대조** — 같은 지형·같은 속도의 작은 CCD 바디는 예산 안이라 정상적으로
+        // 움직이고 지면에서 절단된다(상한이 CCD를 통째로 끈 게 아니다).
+        let mut w2 = World::new(WorldParams::default());
+        let heights2 = vec![0.0f32; 257 * 257];
+        w2.try_add_heightfield(&heights2, 257, 257, 0.1, pose(0.0, 0.0, 0.0))
+            .expect("지형 추가");
+        let small = w2.add_body(
+            Body::new_dynamic(Shape::Sphere { radius: 0.2 }, pose(12.8, 5.3, 12.8), 1.0).with_ccd(),
+        );
+        w2.set_linear_velocity(small, Vec3::new(0.0, -400.0, 0.0))
+            .expect("속도");
+        assert_eq!(w2.try_step(1.0 / 60.0), Ok(()));
+        assert_eq!(w2.diagnostics().ccd_incomplete, 0);
+        let y = w2.body(small).pose().pos.y;
+        assert!(
+            y < 5.3 && y > -0.5,
+            "작은 CCD 바디가 안 움직였거나 지형을 관통했다: y={y}"
+        );
+    }
+
+    /// **복합 바디도 지형 스윕에서 히트를 얻는다** (자기 검수: 관통 경로).
+    ///
+    /// 선형 디스패처가 `match (sa, sb)`로 짜여 있어서 `(Compound, _)` 팔이 먼저 잡혔고,
+    /// 각 자식이 **볼록 전용** 캐스트에 지형을 그대로 넘겼다 — 그 함수는 비볼록에 `None`을
+    /// 내므로 결과가 "맞은 것 없음"이 되어 복합 바디가 지형을 통과했다(회전 분기는 애초에
+    /// B쪽 디스패치를 안쪽에 두어 이 함정이 없었다).
+    #[test]
+    fn compound_body_sweeping_into_terrain_reports_a_hit() {
+        let heights = vec![0.0f32; 17 * 17];
+        let hf = Shape::Heightfield {
+            tiles: maru_collide::build_heightfield_tiles(&heights, 17, 17),
+            heights,
+            nx: 17,
+            nz: 17,
+            cell: 1.0,
+        };
+        let p = pose(0.0, 0.0, 0.0);
+        let child = Shape::Box {
+            half: Vec3::new(0.3, 0.3, 0.3),
+            radius: 0.0,
+        };
+        let comp = Shape::Compound {
+            children: vec![
+                (pose(-0.5, 0.0, 0.0), child.clone()),
+                (pose(0.5, 0.0, 0.0), child.clone()),
+            ],
+        };
+        let start = pose(8.0, 3.0, 8.0);
+        let down = Vec3::new(0.0, -5.0, 0.0);
+        let comp_hit = maru_collide::try_shape_cast_dispatch(&comp, &start, down, &hf, &p, 0.02)
+            .expect("정상 입력");
+        // **음성 대조** — 같은 배치의 단일 셰이프는 원래도 맞췄다. 두 결과의 toi가 사실상
+        // 같아야 한다(같은 높이에서 같은 지면으로 떨어지므로): 복합 경로만 고장났던 것이다.
+        let one_hit = maru_collide::try_shape_cast_dispatch(&child, &start, down, &hf, &p, 0.02)
+            .expect("정상 입력");
+        let one = one_hit.expect("단일 박스가 지면을 못 맞췄다 — 배치가 무의미하다");
+        let comp = comp_hit.expect("복합 바디가 지형을 통과했다");
+        assert!(
+            (comp.toi - one.toi).abs() < 1.0e-3,
+            "복합 toi {}가 단일 toi {}와 다르다",
+            comp.toi,
+            one.toi
         );
     }
 
