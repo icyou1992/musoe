@@ -4550,6 +4550,146 @@ mod tests {
         assert!(big_ok.try_local_aabb().is_ok());
     }
 
+    /// **형상 내부 관계가 깨진 박스는 모든 공개 질의가 같이 거절한다** (BLOCKER: 질의끼리 불일치).
+    ///
+    /// `Box { half: 1, radius: 2 }`는 `validate`가 거절하지만 질의 경계는 범위만 봐서
+    /// 통과시켰다. 그 형상에서 AABB·점 질의는 반경 1로, 레이·GJK는 반경 2로 답한다 —
+    /// 호스트가 공개 AABB로 후보를 쳐낸 뒤 레이를 쓰면 히트가 사라진다
+    /// (확인검수 rev_b85e4e4a BLOCKER).
+    #[test]
+    fn box_with_radius_larger_than_half_is_rejected_everywhere() {
+        use maru_collide::{CastReject, QueryReject, ShapeReject};
+        let bad = Shape::Box {
+            half: Vec3::new(1.0, 1.0, 1.0),
+            radius: 2.0,
+        };
+        let p = pose(0.0, 0.0, 0.0);
+        assert!(bad.validate().is_err(), "생성 경계는 원래 거절했다");
+        assert_eq!(bad.try_local_aabb(), Err(ShapeReject::InvalidShape));
+        assert_eq!(
+            maru_collide::try_contains_point(&bad, &p, Vec3::new(1.5, 0.0, 0.0)),
+            Err(QueryReject::InvalidInput)
+        );
+        assert_eq!(
+            maru_collide::try_cast_ray(
+                &bad,
+                &p,
+                Vec3::new(1.5, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                10.0
+            ),
+            Err(QueryReject::InvalidInput)
+        );
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch(
+                &bad,
+                &p,
+                Vec3::new(1.0, 0.0, 0.0),
+                &Shape::Sphere { radius: 0.5 },
+                &pose(5.0, 0.0, 0.0),
+                0.02
+            ),
+            Err(CastReject::InvalidInput)
+        );
+        assert_eq!(
+            maru_collide::any_contact(&bad, &p, &Shape::Sphere { radius: 0.5 }, &p, 0.02),
+            None
+        );
+        // **음성 대조** — 관계가 성립하는 둥근 박스(radius ≤ min half)는 전부 통과한다.
+        let ok = Shape::Box {
+            half: Vec3::new(1.0, 1.0, 1.0),
+            radius: 0.4,
+        };
+        assert!(ok.validate().is_ok());
+        assert!(ok.try_local_aabb().is_ok());
+        assert_eq!(
+            maru_collide::try_contains_point(&ok, &p, Vec3::new(0.5, 0.0, 0.0)),
+            Ok(true)
+        );
+    }
+
+    /// **지원 범위 밖 입력은 "유한하다"는 이유로 통과하지 못한다** (BLOCKER: 거짓 히트/미스).
+    ///
+    /// 두 가지가 독립적으로 재현됐다(확인검수 rev_b85e4e4a):
+    /// ① `axis=(f32::MAX,0,0)`은 유한하지만 `length_sq`가 `Inf`라 `try_normalize`가 `None`을
+    ///    내고, 그것을 "축이 없다"로 읽으면 **회전 캐스트가 선형으로 폴백해 제자리 회전
+    ///    히트를 놓친다**.
+    /// ② 자세를 `±f32::MAX`에 두면 중심 차가 `Inf`가 되고 GJK의 비유한 위생이 그것을 거리 0으로
+    ///    강등해 **무한히 멀리 떨어진 두 형상이 `toi=0` 히트**가 된다.
+    #[test]
+    fn out_of_range_arithmetic_input_is_rejected_not_reinterpreted() {
+        use maru_collide::{CastReject, ContactWalk};
+        let blade = Shape::Box {
+            half: Vec3::new(1.5, 0.05, 0.05),
+            radius: 0.0,
+        };
+        let wall = Shape::Box {
+            half: Vec3::new(0.2, 1.0, 1.0),
+            radius: 0.0,
+        };
+        // ① 거대한 축 — 0축(회전 없음)으로 오해하면 안 된다.
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch_rotational(
+                &blade,
+                &pose(0.0, 0.0, 0.0),
+                Vec3::ZERO,
+                Vec3::new(f32::MAX, 0.0, 0.0),
+                core::f32::consts::FRAC_PI_2,
+                &wall,
+                &pose(0.0, 0.0, 2.0),
+                0.02
+            ),
+            Err(CastReject::InvalidInput)
+        );
+        // ② 범위 밖 자세 — 무한히 먼 두 형상이 접촉으로 나오면 안 된다.
+        let far_a = pose(f32::MAX, 0.0, 0.0);
+        let far_b = pose(-f32::MAX, 0.0, 0.0);
+        let s = Shape::Sphere { radius: 0.5 };
+        assert_eq!(
+            maru_collide::try_shape_cast_dispatch(
+                &s,
+                &far_a,
+                Vec3::new(-1.0, 0.0, 0.0),
+                &s,
+                &far_b,
+                0.02
+            ),
+            Err(CastReject::InvalidInput)
+        );
+        assert_eq!(
+            maru_collide::for_each_contact(&s, &far_a, &s, &far_b, 0.02, &mut |_, _, _| {}),
+            ContactWalk::InvalidInput
+        );
+        assert_eq!(
+            maru_collide::any_contact(&s, &far_a, &s, &far_b, 0.02),
+            None
+        );
+        // **음성 대조** — 같은 배치를 범위 안(±5000m)으로 옮기면 정상 판정이다.
+        let a = pose(5000.0, 0.0, 0.0);
+        let b = pose(-5000.0, 0.0, 0.0);
+        assert_eq!(
+            maru_collide::any_contact(&s, &a, &s, &b, 0.02),
+            Some(false),
+            "범위 안의 먼 쌍은 '접촉 없음'이 확정 답이다"
+        );
+        // 그리고 정상 회전 캐스트는 실제로 맞춘다(가드가 회전 경로를 죽인 게 아니다).
+        let hit = maru_collide::try_shape_cast_dispatch_rotational(
+            &blade,
+            &pose(0.0, 0.0, 0.0),
+            Vec3::ZERO,
+            Vec3::new(0.0, 1.0, 0.0),
+            core::f32::consts::FRAC_PI_2,
+            &wall,
+            &pose(0.0, 0.0, 1.7),
+            0.02,
+        )
+        .expect("정상 입력");
+        assert!(
+            hit.is_some(),
+            "정상 회전 스윕이 벽을 못 맞췄다 — 배치가 무의미하다"
+        );
+    }
+
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.
     ///
     /// 검수가 두 번 같은 계열을 지적했다(생성자 → enqueue). 한 곳만 빠지면 "비표준 환경

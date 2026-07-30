@@ -363,7 +363,12 @@ pub fn for_each_contact_with_budget(
     // 산술 입력 검사와 자세 정규화 — 캐스트 디스패처와 같은 규약(그쪽
     // `canonical_cast_inputs` 주석 참조). margin이 NaN이면 거리 비교가 전부 false가 되어
     // 접촉이 **없는 곳에서 생긴다**.
-    if !margin.is_finite() || margin < 0.0 || !pa.pos.is_finite() || !pb.pos.is_finite() {
+    // 캐스트와 같은 규약 — 유한성이 아니라 지원 범위로 잰다(그쪽 주석의 `Inf` 차 논증).
+    if !crate::in_range(margin)
+        || margin < 0.0
+        || !crate::vec_in_range(pa.pos)
+        || !crate::vec_in_range(pb.pos)
+    {
         return ContactWalk::InvalidInput;
     }
     let (Some(ra), Some(rb)) = (pa.rot.try_normalize(), pb.rot.try_normalize()) else {

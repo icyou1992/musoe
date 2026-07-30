@@ -206,6 +206,12 @@ impl Shape {
                     && half.z >= 0.0
                     && extent_in_range(*radius)
                     && *radius >= 0.0
+                    // **형상 내부 관계도 불변식이다.** support 코어는 `half - radius`를 쓰고
+                    // AABB·점 질의는 `half`를 쓴다. `radius > min(half)`이면 코어가 0으로
+                    // 눌리고 겉면 반경은 radius가 되어, 같은 공개 형상을 AABB는 반경 1로
+                    // 레이/GJK는 반경 2로 해석한다 — 호스트가 AABB로 후보를 쳐낸 뒤 레이를
+                    // 쓰면 히트가 사라진다(확인검수 rev_b85e4e4a BLOCKER).
+                    && *radius <= half.x.min(half.y).min(half.z)
             }
             Shape::Triangle { points, radius } => {
                 points.iter().all(|p| vec_extent_in_range(*p))

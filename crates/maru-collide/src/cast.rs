@@ -258,11 +258,15 @@ fn canonical_cast_inputs(
     pa: &Pose,
     pb: &Pose,
 ) -> Option<(Pose, Pose)> {
-    if !motion.is_finite()
-        || !skin.is_finite()
+    // **유한성이 아니라 지원 범위(`MAX_INPUT`)로 잰다.** `f32::MAX`는 유한하지만 두 자세의
+    // 차가 `Inf`가 되고, GJK의 비유한 위생이 그것을 거리 0으로 강등해 **무한히 멀리 떨어진
+    // 두 형상이 `toi=0` 히트**로 나온다(확인검수 rev_b85e4e4a BLOCKER). 월드의 모든 바디
+    // 자세는 이미 이 범위 안이다(`Body::validate` + `enforce_world_bounds`).
+    if !crate::vec_in_range(motion)
+        || !crate::in_range(skin)
         || skin < 0.0
-        || !pa.pos.is_finite()
-        || !pb.pos.is_finite()
+        || !crate::vec_in_range(pa.pos)
+        || !crate::vec_in_range(pb.pos)
         || !sa.is_castable()
         || !sb.is_castable()
     {
@@ -300,7 +304,13 @@ pub fn try_shape_cast_dispatch_rotational(
     // **비유한 축은 "축이 없음"이 아니라 잘못된 입력이다.** 0 축(회전 없음)과 달리
     // NaN 축은 호출자 버그이고, 걸러내지 않으면 내부 `t`가 NaN이 되어 각 생성자의
     // assert에 닿는다(확인검수 rev_d5b32e22 BLOCKER).
-    if !axis.is_finite() || !angle.is_finite() || angle.abs() > maru_math::Quat::MAX_AXIS_ANGLE {
+    // 축도 범위로 잰다: `axis=(f32::MAX,0,0)`는 유한하지만 `length_sq`가 `Inf`라
+    // `try_normalize`가 `None`을 내고, 그걸 "축이 없다"로 읽으면 **회전 캐스트가 선형으로
+    // 폴백해 제자리 회전 히트를 놓친다**(확인검수 rev_b85e4e4a BLOCKER).
+    if !crate::vec_in_range(axis)
+        || !angle.is_finite()
+        || angle.abs() > maru_math::Quat::MAX_AXIS_ANGLE
+    {
         return Err(CastReject::InvalidInput);
     }
     let (npa, npb) =
