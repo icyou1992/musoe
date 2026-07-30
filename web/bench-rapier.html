@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8" /><title>Rapier.js — 브라우저 벤치</title></head>
+<body>
+<pre id="out">준비 중…</pre>
+<script type="module">
+// **`bench.html`의 rapier.js 판** — 같은 씬 기하·같은 스텝 수·같은 측정 규약(전체 평균 +
+// 후반창 평균)으로 맞춘다. 다른 것은 엔진뿐이다.
+//
+// 공정성 메모:
+// - rapier도 **각자의 기본 파라미터**로 돌린다(compare 하네스와 같은 원칙). rapier의 웹 배포는
+//   `rapier3d-compat`(wasm 내장 단일 번들)이고, 이것이 호스트가 실제로 쓰는 물건이다.
+// - maru판은 렌더 없이 `maru_step`만 잰다. 여기서도 `world.step()`만 잰다. 다만 rapier.js는
+//   변환을 **바디별 객체 호출**로 읽는 API라, 렌더가 붙으면 그 비용이 추가된다(설계서가
+//   말한 "JS↔WASM 마샬링" 세금). 이 벤치는 그걸 **재지 않는다** — 스텝 비용만의 비교다.
+import RAPIER from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.19.3/+esm';
+await RAPIER.init();
+
+function buildPyramid(w, tiers) {
+  const g = w.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, -1, 0));
+  w.createCollider(RAPIER.ColliderDesc.cuboid(200, 1, 40), g);
+  for (let t = 0; t < tiers; t++) {
+    const count = tiers - t, y = 0.5 + t;
+    for (let i = 0; i < count; i++) {
+      const x = (i - (count - 1) * 0.5) * 1.02;
+      const b = w.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x, y, 0));
+      w.createCollider(RAPIER.ColliderDesc.cuboid(0.5, 0.5, 0.5).setDensity(1), b);
+    }
+  }
+}
+
+function buildSpheres(w, n) {
+  const g = w.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, -1, 0));
+  w.createCollider(RAPIER.ColliderDesc.cuboid(30, 1, 30), g);
+  const side = Math.ceil(Math.cbrt(n));
+  let count = 0;
+  outer: for (let iy = 0; iy < side * 3; iy++) {
+    for (let ix = 0; ix < side; ix++) {
+      for (let iz = 0; iz < side; iz++) {
+        if (count >= n) break outer;
+        const x = ix * 1.1 - side * 0.55, z = iz * 1.1 - side * 0.55, y = 0.55 + iy * 1.1;
+        const b = w.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x, y, z));
+        w.createCollider(RAPIER.ColliderDesc.ball(0.5).setDensity(1), b);
+        count++;
+      }
+    }
+  }
+}
+
+function runScene(name, build, steps) {
+  const w = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+  w.timestep = 1 / 60;
+  build(w);
+  const times = new Float64Array(steps);
+  for (let s = 0; s < steps; s++) {
+    const t0 = performance.now();
+    w.step();
+    times[s] = performance.now() - t0;
+  }
+  let lowest = Infinity, top = -Infinity, bodies = 0;
+  w.forEachRigidBody(b => {
+    if (b.isFixed()) return;
+    bodies++;
+    const y = b.translation().y;
+    lowest = Math.min(lowest, y); top = Math.max(top, y);
+  });
+  w.free();
+  const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
+  const full = avg(Array.from(times));
+  const settled = avg(Array.from(times.slice(steps / 2)));
+  return { name, bodies, steps, full_ms: +full.toFixed(3), settled_ms: +settled.toFixed(4),
+           lowest: +lowest.toFixed(3), top: +top.toFixed(3) };
+}
+
+const results = [];
+for (const [name, build, steps] of [
+  ['pyramid20', w => buildPyramid(w, 20), 240],
+  ['pyramid40', w => buildPyramid(w, 40), 240],
+  ['spheres500', w => buildSpheres(w, 500), 240],
+  ['spheres3000', w => buildSpheres(w, 3000), 240],
+]) {
+  results.push(runScene(name, build, steps));
+  document.getElementById('out').textContent = JSON.stringify(results, null, 2);
+  await new Promise(r => setTimeout(r, 0));
+}
+window.__RESULTS__ = results;
+document.title = 'DONE';
+</script>
+</body>
+</html>

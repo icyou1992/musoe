@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // 브라우저 wasm 실측 드라이버 — web/bench.html을 헤드리스 크로미엄에서 돌리고 결과를 회수한다.
-//   node scripts/browser-bench.mjs
+//   node scripts/browser-bench.mjs                          # maru
+//   BENCH_PAGE=bench-rapier.html node scripts/browser-bench.mjs   # 같은 씬의 rapier.js 판
 // 의존: workspace/verify/node_modules/playwright-core + ~/.cache/ms-playwright 크로미엄.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -37,7 +38,8 @@ const browser = await chromium.launch({
 const page = await browser.newPage();
 page.on('console', m => console.error('[page]', m.text()));
 page.on('pageerror', e => { console.error('[pageerror]', e.message); process.exitCode = 1; });
-await page.goto(`http://127.0.0.1:${port}/bench.html`);
+// 페이지는 환경변수로 고른다 — `BENCH_PAGE=bench-rapier.html`이면 같은 씬을 rapier.js로 돈다.
+await page.goto(`http://127.0.0.1:${port}/${process.env.BENCH_PAGE ?? 'bench.html'}`);
 await page.waitForFunction(() => document.title === 'DONE', null, { timeout: 300_000 });
 const results = await page.evaluate(() => window.__RESULTS__);
 console.log(JSON.stringify(results, null, 2));
