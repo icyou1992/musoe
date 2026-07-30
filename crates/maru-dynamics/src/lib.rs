@@ -3404,6 +3404,88 @@ mod tests {
         assert!(Quat::try_from_axis_angle(Vec3::ZERO, 1.0).is_none());
     }
 
+    /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.
+    ///
+    /// 검수가 두 번 같은 계열을 지적했다(생성자 → enqueue). 한 곳만 빠지면 "비표준 환경
+    /// 진입은 상태를 바꾸지 않는다"가 API 선택에 따라 갈리므로, 목록으로 잠근다.
+    #[test]
+    fn every_canonical_mutation_entry_point_is_guarded() {
+        let mut w = World::new(WorldParams::default());
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(0.0, 2.0, 0.0),
+            1.0,
+        ));
+        let h2 = w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.3 },
+            pose(2.0, 2.0, 0.0),
+            1.0,
+        ));
+        let snap = w.snapshot();
+        // 환경을 깨기 **전에** 정상 Body를 하나 만들어 둔다 — `try_add_body`의 가드를 보려면
+        // 인자가 유효해야 한다(생성자 가드에 먼저 걸리면 그 경로를 못 본다).
+        let pending =
+            Body::try_new_static(Shape::Sphere { radius: 0.2 }, pose(5.0, 5.0, 5.0)).expect("생성");
+        if !maru_math::force_flush_to_zero_for_test() {
+            return;
+        }
+        // fallible 판은 모두 FpEnvironment를 돌려준다.
+        let e = Some(ApiError::FpEnvironment);
+        assert_eq!(
+            w.set_pose(
+                h,
+                maru_collide::Pose {
+                    pos: Vec3::ZERO,
+                    rot: Quat::IDENTITY
+                }
+            )
+            .err(),
+            e
+        );
+        assert_eq!(w.set_linear_velocity(h, Vec3::ZERO).err(), e);
+        assert_eq!(w.set_angular_velocity(h, Vec3::ZERO).err(), e);
+        assert_eq!(w.apply_force(h, Vec3::ZERO).err(), e);
+        assert_eq!(w.apply_torque(h, Vec3::ZERO).err(), e);
+        assert_eq!(w.apply_impulse(h, Vec3::ZERO).err(), e);
+        assert_eq!(w.apply_angular_impulse(h, Vec3::ZERO).err(), e);
+        assert_eq!(w.apply_impulse_at_point(h, Vec3::ZERO, Vec3::ZERO).err(), e);
+        assert_eq!(w.clear_forces(h).err(), e);
+        assert_eq!(w.set_damping(h, 0.1, 0.1).err(), e);
+        assert_eq!(w.set_material(h, 0.5, 0.1).err(), e);
+        assert_eq!(w.remove_body(h2).err(), e);
+        assert_eq!(w.try_set_params(WorldParams::default()).err(), e);
+        assert_eq!(w.try_set_sleep_thresholds(0.1, 0.2, 0.5).err(), e);
+        assert_eq!(w.try_flush_commands().err(), e);
+        assert_eq!(w.try_step(DT).err(), e);
+        assert_eq!(
+            w.restore(&snap).err(),
+            Some(crate::SnapshotError::FpEnvironment)
+        );
+        assert_eq!(
+            w.try_add_body(pending).err(),
+            e,
+            "미리 만든 Body 추가가 통과했다"
+        );
+        // 생성자 자체도 거부한다(우회 경로 차단).
+        assert_eq!(
+            Body::try_new_static(Shape::Sphere { radius: 0.2 }, pose(1.0, 1.0, 1.0)).err(),
+            e
+        );
+        assert!(World::canonicalize_fp_environment());
+        // 복구 후에는 전부 정상.
+        assert!(w
+            .set_pose(
+                h,
+                maru_collide::Pose {
+                    pos: Vec3::ZERO,
+                    rot: Quat::IDENTITY
+                }
+            )
+            .is_ok());
+        assert!(w.try_step(DT).is_ok());
+        assert!(w.is_alive(h2), "거부된 remove가 실제로 지웠다");
+    }
+
     /// 설계 §8이 규정한 **1,000스텝** 판 — release 전용(debug는 수 분).
     /// `cargo test --release -p maru-dynamics -- --ignored`
     #[test]

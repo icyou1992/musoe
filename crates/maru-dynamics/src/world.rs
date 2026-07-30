@@ -641,6 +641,13 @@ impl World {
 
     /// 파라미터 교체 — 생성자와 **같은 불변식**을 통과해야 한다.
     pub fn set_params(&mut self, params: WorldParams) {
+        // FP 가드 — 캐노니컬 상태를 바꾸는 모든 진입점에 같은 규칙을 적용한다
+        // (비-fallible 판은 관례대로 패닉). 한 곳만 빠지면 "비표준 환경 진입은 상태를
+        // 바꾸지 않는다"가 API 선택에 따라 갈린다(검수가 두 번 지적한 계열).
+        assert!(
+            maru_math::fp_verify(),
+            "non-canonical FP environment (see World::canonicalize_fp_environment)"
+        );
         validate_params(&params);
         self.invalidate_bp();
         self.params = params;
@@ -908,6 +915,13 @@ impl World {
     }
 
     pub fn add_body(&mut self, body: Body) -> BodyHandle {
+        // FP 가드 — 캐노니컬 상태를 바꾸는 모든 진입점에 같은 규칙을 적용한다
+        // (비-fallible 판은 관례대로 패닉). 한 곳만 빠지면 "비표준 환경 진입은 상태를
+        // 바꾸지 않는다"가 API 선택에 따라 갈린다(검수가 두 번 지적한 계열).
+        assert!(
+            maru_math::fp_verify(),
+            "non-canonical FP environment (see World::canonicalize_fp_environment)"
+        );
         body.validate().expect("invalid body");
         self.add_body_validated(body)
     }
@@ -947,6 +961,7 @@ impl World {
     /// ①변이 전 그래프에서 wake 대상 수집·적용 → ②구조 변경 → ③인접(조인트·PCM) 정리.
     /// 받침을 지웠는데 위 바디가 공중에 잠든 채 남는 것을 막는다.
     pub fn remove_body(&mut self, h: BodyHandle) -> Result<(), ApiError> {
+        Self::fp_guard()?;
         let i = self.resolve(h)?;
         // ① 변이 전: 이 바디를 참조하는 접촉/조인트로 도달하는 상대를 깨운다(아일랜드 단위)
         let mut neighbors: Vec<usize> = Vec::new();

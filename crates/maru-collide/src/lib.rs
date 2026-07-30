@@ -19,8 +19,17 @@ mod tree;
 
 pub use aabb::Aabb;
 pub use cast::{shape_cast, shape_cast_dispatch, shape_cast_dispatch_rotational, ShapeCastHit};
-pub use epa::{epa, Penetration};
-pub use gjk::{gjk, GjkResult, Pose, SupportPoint};
+// **`gjk`·`epa`는 크레이트 밖으로 내보내지 않는다.**
+//
+// 둘은 볼록 전용이고 `support_core`를 직접 부르므로, 비볼록 셰이프가 들어오면
+// `unreachable!`로 프로세스가 죽는다 — 공개 API가 잘못된 입력에 trap하는 것은 이 저장소의
+// 계약 위반이다(확인검수 rev_e50670ad가 지적한 경로 중 하나였고, `contact`·`shape_cast`는
+// `None` 반환으로 닫았지만 이 둘은 반환형에 "입력이 틀렸다"를 담을 자리가 없다).
+// 크레이트 안에서는 디스패치가 볼록만 넘긴다는 것이 보장되고, 밖에서 필요한 것은
+// `contact`/`shape_cast`/`for_each_contact`뿐이다 — 외부 사용처는 없다(전수 확인).
+// (모듈 안에서 직접 경로로 쓴다 — 재수출하지 않는다.)
+
+pub use gjk::{Pose, SupportPoint};
 pub use heightfield::{
     build_tiles as build_heightfield_tiles, for_each_overlapping_cell, overlapping_cell_count,
     tiles_match as heightfield_tiles_match, world_aabb_to_local, HeightfieldRef, COS_COPLANAR,
