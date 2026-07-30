@@ -62,7 +62,7 @@ pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};
 // 크레이트 내부용이다. 잘못된 형상을 `None`/`false`로 돌려주면 "맞은 것 없음"으로 위장되고,
 // 빈 hull은 GJK에서 프로세스를 죽인다(확인검수 rev_97887d75 BLOCKER).
 pub use ray::{try_cast_ray, try_contains_point, QueryReject, RayCast};
-pub use shape::{transformed_aabb, Shape, MAX_COMPOUND_CHILDREN};
+pub use shape::{transformed_aabb, Shape, ShapeReject, MAX_COMPOUND_CHILDREN};
 pub use tolerance::{
     area_eps, bary_denom_eps, characteristic_length, length_eps, length_sq_eps, min_feature_size,
     volume_eps,

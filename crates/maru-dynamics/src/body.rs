@@ -592,7 +592,10 @@ impl Body {
 fn inertia_matches_shape(b: &Body) -> bool {
     const LO: f32 = 0.1;
     const HI: f32 = 1000.0;
-    let bb = b.shape.local_aabb();
+    // 이 함수는 **검증 층**이라 아직 불변식이 안 선 형상을 볼 수 있다 — 패닉 대신 거절.
+    let Ok(bb) = b.shape.try_local_aabb() else {
+        return false;
+    };
     let h = Vec3::new(
         bb.min.x.abs().max(bb.max.x.abs()),
         bb.min.y.abs().max(bb.max.y.abs()),
@@ -665,6 +668,10 @@ fn recenter_hull(shape: Shape, pose: Pose) -> (Shape, Pose, Vec3) {
 /// (자식 회전 R·diag·Rᵀ + 평행축 m(|d|²E − ddᵀ)) → Jacobi 주축 분해 → 주축 회전 q_p를
 /// 바디 pose에 접고 자식 pose를 주축 프레임으로 재표현. 결과적으로 솔버의 두 가정
 /// (pose.pos = COM, 로컬 관성 = 대각)이 **정확하게** 참이 된다.
+/// **전제: 자식 자세가 단위에 가깝다**(`Shape::validate`가 길이 제곱 1e-3 안으로 강제하고,
+/// 호출자는 그 검증 뒤에 이 함수를 부른다). 자식 회전은 정규화 없이 관성 텐서 회전에 쓰이므로
+/// 그 전제가 풀리면 질량 특성이 그만큼 찌그러진다 — 검증을 느슨하게 하려면 여기서 정규화부터
+/// 해야 한다(확인검수 rev_c73f897c BLOCKER의 두 번째 절).
 fn bake_compound(shape: Shape, pose: Pose, density: f32) -> (Shape, Pose, Vec3, f32, Vec3) {
     use maru_math::{Mat3, Quat};
     let Shape::Compound { children } = shape else {

@@ -4256,6 +4256,179 @@ mod tests {
         ));
     }
 
+    /// **자식 자세 정책이 생성 경계와 질의 경계에서 같다** (BLOCKER: 같은 바디, API마다 다른 답).
+    ///
+    /// 길이 제곱 1.0404(≈ w 1.02)는 옛 `0.9..=1.1`을 통과해 월드에 들어갔지만 질의 쪽
+    /// `is_castable`(1e-3)에서는 거절됐다. 그러면 같은 바디가 레이 질의에서는 미스, 점 질의에서는
+    /// `InvalidValue`, 물리 스텝에서는 `ResourceLimit`이 된다 — 게다가 동적 복합은
+    /// `bake_compound`가 그 비단위 회전으로 관성 텐서를 계산한다
+    /// (확인검수 rev_c73f897c BLOCKER — 내가 질의 쪽만 조이고 이 자리를 빠뜨렸다).
+    #[test]
+    fn compound_child_rotation_policy_is_the_same_at_both_boundaries() {
+        let child = Shape::Box {
+            half: Vec3::new(0.3, 0.3, 0.3),
+            radius: 0.0,
+        };
+        let scaled = |k: f32| maru_collide::Pose {
+            pos: Vec3::new(0.5, 0.0, 0.0),
+            rot: Quat {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: k,
+            },
+        };
+        let make = |k: f32| Shape::Compound {
+            children: vec![(scaled(k), child.clone())],
+        };
+        // w=1.02 → 길이 제곱 1.0404: 옛 기준은 통과, 새 기준은 거절.
+        let bad = make(1.02);
+        assert!(
+            bad.validate().is_err(),
+            "생성 경계가 비단위 자식을 통과시켰다 — 질의 경계와 정책이 갈린다"
+        );
+        assert!(!bad.is_castable_pub_for_test());
+        assert!(Body::try_new_static(bad.clone(), pose(0.0, 0.0, 0.0)).is_err());
+        assert!(Body::try_new_dynamic(bad, pose(0.0, 0.0, 0.0), 1.0).is_err());
+        // **음성 대조** — 드리프트 수준(1e-4)은 양쪽 다 통과한다(정상 입력을 막지 않는다).
+        let drift = make(1.0 + 5.0e-5);
+        assert!(drift.validate().is_ok(), "정상 드리프트가 거절됐다");
+        assert!(drift.is_castable_pub_for_test());
+        assert!(Body::try_new_static(drift, pose(0.0, 0.0, 0.0)).is_ok());
+        // 자식 수 상한도 두 경계에서 같다 — 콜백 키가 u8이라 래핑하면 자식이 서로 섞인다.
+        let many = Shape::Compound {
+            children: (0..9)
+                .map(|i| {
+                    (
+                        pose(i as f32 * 0.8, 0.0, 0.0),
+                        Shape::Sphere { radius: 0.2 },
+                    )
+                })
+                .collect(),
+        };
+        assert!(many.validate().is_err());
+        assert!(!many.is_castable_pub_for_test());
+    }
+
+    /// **레이 질의는 0 방향과 거대한 원점을 값으로 거절한다** (BLOCKER: 계약 위반 결과).
+    ///
+    /// 유한성만 보면 (a) `dir=0`이 법선 0 벡터인 히트를 만들고("법선은 단위 벡터" 계약 파기),
+    /// (b) `origin=f32::MAX`가 중간 계산에서 `inf-inf=NaN`이 되어 `toi`·`normal`이 NaN인
+    /// 히트를 `Ok(Some)`으로 내보낸다(확인검수 rev_c73f897c BLOCKER).
+    #[test]
+    fn ray_query_rejects_zero_direction_and_out_of_range_origin() {
+        use maru_collide::QueryReject;
+        let s = Shape::Sphere { radius: 1.0 };
+        let p = pose(0.0, 0.0, 0.0);
+        assert_eq!(
+            maru_collide::try_cast_ray(&s, &p, Vec3::ZERO, Vec3::ZERO, 10.0),
+            Err(QueryReject::InvalidInput),
+            "0 방향이 통과했다 — 법선이 0 벡터인 히트가 나온다"
+        );
+        assert_eq!(
+            maru_collide::try_cast_ray(
+                &s,
+                &p,
+                Vec3::new(f32::MAX, 0.0, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+                f32::MAX
+            ),
+            Err(QueryReject::InvalidInput),
+            "범위 밖 원점이 통과했다 — NaN 히트가 나온다"
+        );
+        assert_eq!(
+            maru_collide::try_contains_point(&s, &p, Vec3::new(f32::MAX, 0.0, 0.0)),
+            Err(QueryReject::InvalidInput)
+        );
+        // **음성 대조** — 정상 입력은 맞추고, 법선은 단위 벡터다.
+        let h = maru_collide::try_cast_ray(
+            &s,
+            &p,
+            Vec3::new(-3.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            10.0,
+        )
+        .expect("정상 입력")
+        .expect("구를 못 맞췄다");
+        assert!(
+            (h.normal.length() - 1.0).abs() < 1.0e-4,
+            "법선이 단위가 아니다"
+        );
+    }
+
+    /// **AABB 질의도 패닉하지 않는다** (BLOCKER: 공개 표면의 남은 패닉 경로).
+    ///
+    /// 레이·점만 `try_`로 바꾸고 `local_aabb()`를 열어 두면, 빈 hull은 `points[0]`에서
+    /// 빈 복합은 누적값 `expect`에서 여전히 프로세스를 죽인다(확인검수 rev_c73f897c BLOCKER).
+    #[test]
+    fn aabb_query_rejects_malformed_shapes_instead_of_panicking() {
+        use maru_collide::ShapeReject;
+        for bad in [
+            Shape::Hull {
+                points: Vec::new(),
+                radius: 0.0,
+            },
+            Shape::Compound {
+                children: Vec::new(),
+            },
+        ] {
+            assert_eq!(bad.try_local_aabb(), Err(ShapeReject::InvalidShape));
+        }
+        // **음성 대조** — 정상 형상은 실제 AABB를 준다.
+        let s = Shape::Sphere { radius: 0.5 };
+        let a = s.try_local_aabb().expect("정상 형상");
+        assert!((a.max.x - 0.5).abs() < 1.0e-6 && (a.min.x + 0.5).abs() < 1.0e-6);
+    }
+
+    /// **존재 질의의 답이 삽입 순서에 의존하지 않는다** (MAJOR: 같은 장면, 다른 답).
+    ///
+    /// 판정 미완료(포화·예산)에서 즉시 오류로 나가면, 포화하는 지형이 앞 슬롯일 때 뒤에 깊게
+    /// 박힌 바디를 못 본다 — 같은 형상 집합이 삭제·재삽입 순서에 따라 "침투함"과 "판정 불가"로
+    /// 갈린다(확인검수 rev_c73f897c MAJOR). 미완료는 기억만 하고, 확정 양성이 있으면 그것이 이긴다.
+    #[test]
+    fn shape_penetrates_answer_does_not_depend_on_slot_order() {
+        let probe = Shape::Box {
+            half: Vec3::new(6.0, 0.2, 6.0),
+            radius: 0.0,
+        };
+        let at = pose(8.0, 0.2, 8.0);
+        // 지형만 있으면 포화로 "판정 미완료"다(직전 라운드 테스트가 고정한 계약).
+        let mut only_hf = World::new(WorldParams::default());
+        only_hf
+            .try_add_heightfield(&vec![0.0f32; 65 * 65], 65, 65, 0.5, pose(0.0, 0.0, 0.0))
+            .expect("지형");
+        assert_eq!(
+            only_hf.shape_penetrates(&probe, at, QueryFilter::ALL),
+            Err(ApiError::ResourceLimit)
+        );
+        // 같은 장면 + 프로브에 **깊게 박힌 구**. 두 삽입 순서 모두 `Ok(true)`여야 한다.
+        for hf_first in [true, false] {
+            let mut w = World::new(WorldParams::default());
+            let add_hf = |w: &mut World| {
+                w.try_add_heightfield(&vec![0.0f32; 65 * 65], 65, 65, 0.5, pose(0.0, 0.0, 0.0))
+                    .expect("지형");
+            };
+            let add_ball = |w: &mut World| {
+                w.add_body(Body::new_static(
+                    Shape::Sphere { radius: 0.5 },
+                    pose(8.0, 0.2, 8.0),
+                ));
+            };
+            if hf_first {
+                add_hf(&mut w);
+                add_ball(&mut w);
+            } else {
+                add_ball(&mut w);
+                add_hf(&mut w);
+            }
+            assert_eq!(
+                w.shape_penetrates(&probe, at, QueryFilter::ALL),
+                Ok(true),
+                "삽입 순서(지형 먼저={hf_first})가 답을 바꿨다"
+            );
+        }
+    }
+
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.
     ///
     /// 검수가 두 번 같은 계열을 지적했다(생성자 → enqueue). 한 곳만 빠지면 "비표준 환경

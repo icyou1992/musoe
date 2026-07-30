@@ -543,7 +543,10 @@ fn validate_params(params: &WorldParams) {
 /// 바운딩 반경의 배수까지 허용한다.
 pub(crate) fn anchor_fits(b: &Body, anchor: Vec3) -> bool {
     const ANCHOR_SCALE: f32 = 4.0;
-    let bb = b.shape.local_aabb();
+    // 검증 층 — 불변식이 안 선 형상은 거절한다(패닉 금지).
+    let Ok(bb) = b.shape.try_local_aabb() else {
+        return false;
+    };
     // **바디 원점에서 가장 먼 AABB 코너까지의 거리**를 쓴다. 앵커는 원점 기준 좌표이므로
     // 척도도 원점 기준이어야 한다(원점에서 떨어진 hull의 정상 표면 앵커 허용).
     //
@@ -1343,7 +1346,10 @@ impl World {
             return Err(ApiError::InvalidValue);
         }
         // 스윕 봉투로 후보를 거른다 — 전수 검사보다 싸고 결과는 같다.
-        let a0 = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
+        let a0 = maru_collide::transformed_aabb(
+            shape.try_local_aabb().map_err(|_| ApiError::InvalidValue)?,
+            &pose,
+        );
         let sweep = a0.merge(Aabb::new(a0.min + motion, a0.max + motion));
         let mut best: Option<SweepHit> = None;
         let mut spent_cells = 0usize;
@@ -1359,7 +1365,10 @@ impl World {
             if let Some(hf) = self.bodies[i].shape.heightfield_ref() {
                 // **디스패치와 정확히 같은 봉투**를 재야 한다 — margin을 빼면 경계에서
                 // "질의는 예산 안, 내부는 예산 밖"이 되어 계약이 갈린다(확인검수 rev_d390e73d).
-                let a0 = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
+                let a0 = maru_collide::transformed_aabb(
+                    shape.try_local_aabb().map_err(|_| ApiError::InvalidValue)?,
+                    &pose,
+                );
                 let sw = a0.merge(Aabb::new(a0.min + motion, a0.max + motion));
                 let m = self.params.speculative_margin;
                 let pad = Vec3::new(m, m, m);
@@ -1432,11 +1441,16 @@ impl World {
             pos: pose.pos,
             rot: pose.rot.try_normalize().ok_or(ApiError::InvalidValue)?,
         };
-        let aabb = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
+        let aabb = maru_collide::transformed_aabb(
+            shape.try_local_aabb().map_err(|_| ApiError::InvalidValue)?,
+            &pose,
+        );
         // **예산은 질의 하나가 나눠 쓴다.** 바디마다 새로 4096이면 같은 자리에 지형 100개를
         // 겹친 장면에서 한 번의 질의가 40만 셀을 훑는다(확인검수 rev_97887d75 MAJOR).
         let mut cells = maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY;
         let mut found = false;
+        // 순회가 끊긴 바디가 하나라도 있으면 **음성 답을 확정할 수 없다**(양성은 예외).
+        let mut incomplete = false;
         for i in 0..self.bodies.len() {
             if found {
                 break;
@@ -1466,6 +1480,11 @@ impl World {
                 // 하나 찾았으면 끝 — 뒤에 무엇이 있든 "겹친다"는 답은 바뀌지 않는다.
                 return Ok(true);
             }
+            // 판정 미완료는 **기억만 하고 계속 본다**. 즉시 오류로 나가면 답이 슬롯 순서에
+            // 의존한다: 포화하는 지형이 앞 슬롯이면 뒤에 깊게 박힌 구를 못 보고
+            // `ResourceLimit`, 구가 앞이면 `Ok(true)`가 된다 — 같은 장면이 삽입 순서에 따라
+            // 다른 답을 낸다(확인검수 rev_c73f897c MAJOR). 뒤쪽에 확정 양성이 있으면 그것이
+            // 이긴다. 작업량은 예산이 이미 묶었으므로 계속 봐도 유계다.
             // 못 찾았는데 순회가 끊겼다 = **판정하지 못했다**. `false`로 뭉개면 캐릭터가
             // 벽 속에서 출발한다. **포화도 완주가 아니다**(확인검수 rev_97887d75 MAJOR):
             // 64번째 매니폴드에서 끊겼다는 뜻이고, 앞 64개가 침투 임계에 못 미치는 얕은
@@ -1473,16 +1492,22 @@ impl World {
             match walk {
                 maru_collide::ContactWalk::Complete => {}
                 maru_collide::ContactWalk::Saturated
-                | maru_collide::ContactWalk::BudgetExceeded => {
-                    return Err(ApiError::ResourceLimit);
-                }
+                | maru_collide::ContactWalk::BudgetExceeded => incomplete = true,
+                // 형상·입력 오류는 **즉시** 오류다(순서 의존이 아니라 계약 위반이다).
                 maru_collide::ContactWalk::InvalidShape
                 | maru_collide::ContactWalk::InvalidInput => {
                     return Err(ApiError::InvalidValue);
                 }
             }
         }
-        Ok(found)
+        // 여기까지 왔으면 양성은 없었다. 순회가 한 번이라도 끊겼으면 "겹치지 않는다"를
+        // 확정할 수 없다 — 그 경우만 자원 오류다.
+        debug_assert!(!found, "양성은 루프 안에서 즉시 반환한다");
+        if incomplete {
+            Err(ApiError::ResourceLimit)
+        } else {
+            Ok(false)
+        }
     }
 
     /// 점을 품은 물체들 (슬롯 오름차순). 겉면 기준 — convex radius를 포함한다.
@@ -4434,7 +4459,10 @@ impl World {
 /// 셰이프의 월드 AABB — 자세를 명시 인자로 받는 정본 (body_aabb와 CCD 중간-서브스텝
 /// 캐스트가 같은 정의를 공유한다: 후자는 솔버 스크래치의 현재 자세를 써야 한다).
 fn shape_world_aabb(shape: &maru_collide::Shape, pose: &maru_collide::Pose) -> Aabb {
-    let local = shape.local_aabb();
+    // 월드 바디의 형상은 삽입·복원 경계에서 검증됐다 — 거절할 것이 없다.
+    let local = shape
+        .try_local_aabb()
+        .expect("월드 바디는 삽입·복원 경계에서 검증된다");
     let c = (local.max + local.min) * 0.5;
     let hl = (local.max - local.min) * 0.5;
     let (ax, ay, az) = (

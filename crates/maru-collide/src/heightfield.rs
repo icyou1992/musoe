@@ -125,18 +125,41 @@ impl HeightfieldGrid {
 /// 셰이프가 소유한 데이터를 빌려 쓰기만 한다(복사 없음).
 #[derive(Clone, Copy)]
 pub struct HeightfieldRef<'a> {
-    pub heights: &'a [f32],
+    pub(crate) heights: &'a [f32],
     /// 타일별 (최소, 최대) 높이 — **질의가 셀을 안 보고 통째로 건너뛰는 근거**.
     ///
     /// 이게 없으면 총알이 평평한 통로를 50m 지나가는 것만으로 5,000셀을 검사해야 한다
     /// (확인검수 rev_d390e73d BLOCKER: 그 비용을 피하려고 넣은 "예산 초과 = 가짜 히트"가
     /// 정상 장면을 영구 동결시켰다). 타일의 높이 범위가 질의의 Y 밴드와 안 겹치면
     /// 그 타일의 셀 64개는 볼 필요가 **없다** — 근사가 아니라 정확한 가지치기다.
-    pub tiles: &'a [(f32, f32)],
-    pub nx: u32,
-    pub nz: u32,
-    pub cell: f32,
-    pub radius: f32,
+    pub(crate) tiles: &'a [(f32, f32)],
+    pub(crate) nx: u32,
+    pub(crate) nz: u32,
+    pub(crate) cell: f32,
+    pub(crate) radius: f32,
+}
+
+impl<'a> HeightfieldRef<'a> {
+    // **필드는 비공개다.** 공개였을 때는 밖에서 `HeightfieldRef { tiles: &[(100,100)], .. }`를
+    // 직접 조립할 수 있었고, 그러면 `Shape` 쪽을 생성자로 봉인해도 공개 격자 헬퍼
+    // (`for_each_overlapping_cell`·`overlapping_cell_count`)에서 **위조된 타일로 진짜 셀을
+    // 건너뛰는** 같은 결함이 재현됐다(확인검수 rev_c73f897c MAJOR). 뷰를 얻는 유일한 길은
+    // `Shape::heightfield_ref()`이고, 그 셰이프는 생성자를 통과한 격자만 담는다.
+    pub fn heights(&self) -> &'a [f32] {
+        self.heights
+    }
+    pub fn nx(&self) -> u32 {
+        self.nx
+    }
+    pub fn nz(&self) -> u32 {
+        self.nz
+    }
+    pub fn cell(&self) -> f32 {
+        self.cell
+    }
+    pub fn radius(&self) -> f32 {
+        self.radius
+    }
 }
 
 impl<'a> HeightfieldRef<'a> {

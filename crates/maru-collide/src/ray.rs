@@ -46,12 +46,20 @@ pub fn try_cast_ray(
     dir: Vec3,
     max_toi: f32,
 ) -> Result<Option<RayCast>, QueryReject> {
+    // **유한성만으로는 부족하다**(확인검수 rev_c73f897c BLOCKER):
+    // ① `dir = 0`이면 히트의 법선이 0 벡터가 되어 "법선은 단위 벡터"라는 반환 계약이 깨진다.
+    // ② `origin = f32::MAX`는 유한하지만 중간 계산에서 `inf - inf = NaN`이 되고, NaN은 모든
+    //    비교를 false로 만들어 `toi`·`normal`이 NaN인 히트가 `Ok(Some)`으로 나간다.
+    // 그래서 범위(MAX_INPUT)로 재고 방향은 길이로 본다.
+    let dir_l2 = dir.length_sq();
     if !shape.is_castable()
-        || !origin.is_finite()
-        || !dir.is_finite()
+        || !crate::vec_in_range(origin)
+        || !crate::vec_in_range(dir)
+        || !dir_l2.is_finite()
+        || dir_l2 <= 0.0
         || !max_toi.is_finite()
         || max_toi < 0.0
-        || !pose.pos.is_finite()
+        || !crate::vec_in_range(pose.pos)
     {
         return Err(QueryReject::InvalidInput);
     }
@@ -65,7 +73,7 @@ pub fn try_cast_ray(
 
 /// 공개 점 포함 판정 — `try_cast_ray`와 같은 검증 규약.
 pub fn try_contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> Result<bool, QueryReject> {
-    if !shape.is_castable() || !p.is_finite() || !pose.pos.is_finite() {
+    if !shape.is_castable() || !crate::vec_in_range(p) || !crate::vec_in_range(pose.pos) {
         return Err(QueryReject::InvalidInput);
     }
     let pose = Pose {

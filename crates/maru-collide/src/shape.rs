@@ -44,6 +44,13 @@ pub enum Shape {
     Triangle { points: [Vec3; 3], radius: f32 },
 }
 
+/// 형상 질의가 **답을 낼 수 없는 이유** — 캐스트의 `CastReject`·레이의 `QueryReject`와 같은 취지.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShapeReject {
+    /// 형상 불변식이 깨졌다(빈 hull·빈/과다 복합·비단위 자식 자세 등).
+    InvalidShape,
+}
+
 /// 쿼터니언이 **단위에 충분히 가까운가** — 정상 입력의 부동소수 드리프트만 허용한다.
 ///
 /// 길이 제곱으로 재고 허용 오차는 1e-3이다(형상 왜곡 0.05% 미만). 자세를 정규화할 수 있는
@@ -169,6 +176,13 @@ impl Shape {
     /// **`validate()`와 다르다.** 그쪽은 정책 전수 검사(높이 전량·타일 비트 일치·크기 범위)라
     /// O(n)이고, 스텝 안의 CCD가 후보마다 부르면 지형 검증이 핫패스가 된다. 여기서는
     /// **패닉·미스 위장을 막는 최소 구조**만 본다: 인덱싱 전제와 필수 필드의 유한성.
+    /// 테스트 전용 노출 — 생성 경계(`validate`)와 질의 경계(`is_castable`)의 정책이 같은지
+    /// 크레이트 밖 테스트가 직접 대조할 수 있어야 한다(둘이 갈리는 것이 실제 결함이었다).
+    #[doc(hidden)]
+    pub fn is_castable_pub_for_test(&self) -> bool {
+        self.is_castable()
+    }
+
     pub(crate) fn is_castable(&self) -> bool {
         match self {
             Shape::Sphere { radius } => radius.is_finite() && *radius >= 0.0,
@@ -202,7 +216,11 @@ impl Shape {
             }
             // 자식이 없으면 "맞은 것 없음"으로 위장된다. 비볼록 자식은 GJK에서 trap이다.
             Shape::Compound { children } => {
+                // **자식 수 상한도 구조 불변식이다.** 콜백 키가 `u8`이라 257자식이면 256이
+                // 0으로 래핑해 서로 다른 자식이 같은 키를 받는다 — feature 네임스페이스와
+                // warm-start 식별이 충돌한다(확인검수 rev_c73f897c MAJOR).
                 !children.is_empty()
+                    && children.len() <= MAX_COMPOUND_CHILDREN
                     && children.iter().all(|(pose, child)| {
                         pose.pos.is_finite()
                             // 자식 자세는 **정규화 없이 곱해진다**(합성은 할당 없이 돌아야
@@ -281,9 +299,12 @@ impl Shape {
                     if !vec_extent_in_range(pose.pos) {
                         return Err("compound child offset must be finite and within extent range");
                     }
-                    let q = pose.rot;
-                    let l2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
-                    if !l2.is_finite() || !(0.9..=1.1).contains(&l2) {
+                    // **질의 경계와 같은 기준이어야 한다**(`unit_quat_l2_ok`). 예전 0.9..=1.1은
+                    // 길이 제곱 기준이라 회전 스케일 ±5%가 통과했고, 그러면 삽입은 되지만
+                    // `is_castable`(1e-3)에서 거절돼 같은 바디가 API마다 다른 답을 냈다:
+                    // 레이는 미스, 점 질의는 InvalidValue, 물리 스텝은 ResourceLimit
+                    // (확인검수 rev_c73f897c BLOCKER — 내가 조이면서 이 자리를 빠뜨렸다).
+                    if !unit_quat_l2_ok(pose.rot) {
                         return Err("compound child rotation must be a unit quaternion");
                     }
                 }
@@ -495,8 +516,21 @@ impl Shape {
         }
     }
 
-    /// 겉면 기준 로컬 AABB (코어 + radius 재팽창 포함).
-    pub fn local_aabb(&self) -> Aabb {
+    /// **공개 로컬 AABB 질의** — 불변식이 깨진 형상은 패닉 대신 오류다.
+    ///
+    /// 빈 hull은 `points[0]`에서, 빈 복합은 누적값 `expect`에서 프로세스를 죽였다. 레이·점
+    /// 질의만 `try_`로 바꾸고 이 함수를 열어 두면 같은 패닉 경로가 남는다
+    /// (확인검수 rev_c73f897c BLOCKER).
+    pub fn try_local_aabb(&self) -> Result<Aabb, ShapeReject> {
+        if !self.is_castable() {
+            return Err(ShapeReject::InvalidShape);
+        }
+        Ok(self.local_aabb())
+    }
+
+    /// **검증된 입력 전용** 로컬 AABB (코어 + radius 재팽창 포함). 공개 진입은
+    /// `try_local_aabb`다 — 월드 내부는 삽입·복원 경계에서 이미 검증했으므로 이쪽을 쓴다.
+    pub(crate) fn local_aabb(&self) -> Aabb {
         let r = self.radius();
         match self {
             Shape::Sphere { .. } => Aabb::from_center(Vec3::ZERO, Vec3::new(r, r, r)),
