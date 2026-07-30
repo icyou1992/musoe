@@ -1970,9 +1970,16 @@ impl World {
     ///   월드 전체의 그 프레임을 under-integrate하는 관측 가능한 인공물이다.
     ///
     /// 없는 인공물을 막으려고 있는 인공물을 만들지 않는다. 대신 이탈은 이 함수가 관측 가능하게
-    /// 보고하고(`Diagnostics::out_of_bounds`), CCD는 범위 밖 자세로 캐스트만 하지 않는다
+    /// 보고하고(`Diagnostics::out_of_bounds`), CCD는 범위 밖 자세로 **캐스트만** 하지 않는다
     /// (원인 오보 방지 — 그 자리 주석 참조). `is_out_of_bounds` 계약("시뮬레이션에서 제외")은
     /// **플래그가 선 뒤**, 즉 다음 스텝부터 성립한다.
+    ///
+    /// **"끝까지 돈다"는 병진 적분도 포함한다.** 처음 두 판은 범위 밖에서 `d=0`·`ccd_frozen`으로
+    /// 병진을 얼렸고, 그러면 잠깐 넘었다가 중력·조인트가 되돌릴 바디가 복귀하지 못해 여기서
+    /// 영구 제거됐다 — 정적 후보가 0개인 장면에서도 **CCD 켬/끔이 궤적을 바꾸는** 결함이다
+    /// (확인검수 rev_cccbba53). 위 정밀도 논증을 받아들였다면 적분을 막을 이유가 없고,
+    /// 최종 위치가 여전히 밖일 때만 이 함수가 OOB를 세운다.
+    /// 회귀: `ccd_does_not_change_the_trajectory_when_there_are_no_static_candidates`.
     ///
     /// 월드 범위를 벗어난 바디를 **경계에 고정하고 재운다**(리뷰 BLOCKER: 위치 정밀도
     /// 계약이 step에 대해 닫혀 있지 않았다). 10km 밖에서는 f32 간격이 최소 특징 크기를
@@ -4003,15 +4010,17 @@ impl World {
                     // **원인이 잘못 보고된다**(`ccd_incomplete` 문서는 "지형 해상도·바디 크기를
                     // 보라"고 말한다). 범위 이탈은 스텝 말 OOB 패스가 `out_of_bounds`로 센다.
                     //
-                    // 이동만 얼리고 **회전은 `ccd_frozen` 규약 그대로** 둔다. 처음에는 여기서
-                    // `continue`로 회전 적분까지 건너뛰었는데, 그러면 감지 서브스텝만 회전이
-                    // 빠지고 이후 서브스텝(`ccd_frozen && !rot_sweep`)은 전체 회전을 적분하는
-                    // **비대칭**이 생긴다(확인검수 rev_59dcb940가 지적).
+                    // **캐스트만 건너뛴다 — 적분은 막지 않는다.** 처음 두 판은 여기서 더 나갔고
+                    // 둘 다 틀렸다: ① `continue`로 회전까지 건너뛰어 감지 서브스텝만 회전이
+                    // 빠지는 비대칭(rev_59dcb940) ② `d=0` + `ccd_frozen`으로 병진을 얼려서,
+                    // 잠깐 넘었다가 중력·조인트가 안쪽으로 되돌릴 바디가 **복귀하지 못하고
+                    // 영구 OOB로 제거**되는 결함(rev_cccbba53). 후자는 정적 후보가 0개인
+                    // 장면에서도 **CCD 켬/끔이 궤적을 바꾸므로** 반박 불가다.
+                    //
+                    // 범위 밖 산술이 한 스텝 안에서는 안전하다는 것이 아래 `enforce_world_bounds`
+                    // 문서의 실측 근거이고, 그 논증을 받아들였다면 적분을 막을 이유가 없다.
+                    // 최종 위치가 여전히 밖이면 그때 `enforce_world_bounds`가 OOB를 세운다.
                     let pos_in_range = maru_collide::vec_in_range(st.pos[i]);
-                    if !pos_in_range {
-                        d = Vec3::ZERO;
-                        ccd_frozen[ci] = true;
-                    }
                     if pos_in_range
                         && ((!ccd_frozen[ci] && (d != Vec3::ZERO || rot_sweep))
                             || (ccd_frozen[ci] && rot_sweep))

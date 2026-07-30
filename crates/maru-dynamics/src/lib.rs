@@ -4872,6 +4872,57 @@ mod tests {
         );
     }
 
+    /// **정적 후보가 없는 장면에서 CCD 켬/끔은 궤적을 바꾸지 않는다** (BLOCKER: 영구 OOB 오제거).
+    ///
+    /// 내 OOB 가드가 `d=0` + `ccd_frozen`으로 병진을 얼렸다. 그러면 잠깐 경계를 넘었다가
+    /// 중력이 안쪽으로 되돌릴 바디가 **복귀하지 못하고 스텝 말에 영구 OOB로 제거**된다.
+    /// 정적 후보가 0개면 CCD가 할 일이 없으므로 켬/끔이 결과를 바꿀 이유가 없다 — 그 불일치가
+    /// 이 결함의 반박 불가 증거다(확인검수 rev_cccbba53).
+    #[test]
+    fn ccd_does_not_change_the_trajectory_when_there_are_no_static_candidates() {
+        // 검수가 제시한 장면: 강한 역방향 중력 + 많은 서브스텝 + 경계 코앞에서 밖으로 향하는 속도.
+        // 첫 서브스텝만 경계를 살짝 넘고, 전체 스텝의 순변위는 안쪽이다.
+        let params = |()| WorldParams {
+            gravity: Vec3::new(-100.0, 0.0, 0.0),
+            substeps: 64,
+            ..WorldParams::default()
+        };
+        let build = |ccd: bool| {
+            let mut w = World::new(params(()));
+            let b = Body::new_dynamic(
+                Shape::Sphere { radius: 0.2 },
+                pose(maru_collide::MAX_INPUT - 0.01, 0.0, 0.0),
+                1.0,
+            );
+            let h = w.add_body(if ccd { b.with_ccd() } else { b });
+            w.set_linear_velocity(h, Vec3::new(10.0, 0.0, 0.0))
+                .expect("속도");
+            (w, h)
+        };
+        let (mut w_ccd, h_ccd) = build(true);
+        let (mut w_plain, h_plain) = build(false);
+        assert_eq!(w_ccd.try_step(0.25), Ok(()));
+        assert_eq!(w_plain.try_step(0.25), Ok(()));
+        // **음성 대조** — CCD 없는 쪽이 실제로 경계 안으로 돌아와야 비교가 의미 있다.
+        assert!(
+            !w_plain.is_out_of_bounds(h_plain),
+            "대조군이 복귀하지 못했다 — 장면이 무의미하다: x={}",
+            w_plain.body(h_plain).pose().pos.x
+        );
+        assert!(w_plain.body(h_plain).pose().pos.x < maru_collide::MAX_INPUT);
+        // CCD를 켠 쪽도 같아야 한다(할 일이 없는 CCD가 궤적을 바꾸면 안 된다).
+        assert!(
+            !w_ccd.is_out_of_bounds(h_ccd),
+            "CCD를 켰더니 영구 OOB로 제거됐다 — 후보가 0개인데 CCD가 궤적을 바꿨다"
+        );
+        assert_eq!(
+            w_ccd.body(h_ccd).pose().pos,
+            w_plain.body(h_plain).pose().pos,
+            "CCD 켬/끔이 위치를 바꿨다"
+        );
+        assert_eq!(w_ccd.body(h_ccd).linvel(), w_plain.body(h_plain).linvel());
+    }
+
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.
     ///
     /// 검수가 두 번 같은 계열을 지적했다(생성자 → enqueue). 한 곳만 빠지면 "비표준 환경
