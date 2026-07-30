@@ -308,23 +308,17 @@ fn write_shape(w: &mut Writer, s: &Shape) {
             w.vec3(*half);
             w.f32(*radius);
         }
-        Shape::Heightfield {
-            heights,
-            nx,
-            nz,
-            cell,
-            // 타일은 높이의 파생물이라 **직렬화하지 않는다** — 복원에서 다시 만든다.
-            // 파생을 저장하면 "바이트는 같은데 파생이 다른" 상태가 생길 수 있다.
-            tiles: _,
-        } => {
+        // 타일은 높이의 파생물이라 **직렬화하지 않는다** — 복원에서 생성자가 다시 만든다.
+        // 파생을 저장하면 "바이트는 같은데 파생이 다른" 상태가 생길 수 있다.
+        Shape::Heightfield(g) => {
             w.u8(5);
-            w.u32(*nx);
-            w.u32(*nz);
-            w.f32(*cell);
+            w.u32(g.nx());
+            w.u32(g.nz());
+            w.f32(g.cell());
             // 개수는 nx·nz로 유도되지만 **명시로 쓴다** — 리더가 곱셈 오버플로를 만나기
             // 전에 남은 바이트로 예산을 걸 수 있어야 한다(count 계약).
-            w.u32(heights.len() as u32);
-            for h in heights {
+            w.u32(g.heights().len() as u32);
+            for h in g.heights() {
                 w.f32(*h);
             }
         }
@@ -387,14 +381,11 @@ fn read_shape(r: &mut Reader, allow_compound: bool) -> Result<Shape, SnapshotErr
             for _ in 0..n {
                 heights.push(r.f32()?);
             }
-            let tiles = maru_collide::build_heightfield_tiles(&heights, nx, nz);
-            Shape::Heightfield {
-                heights,
-                tiles,
-                nx,
-                nz,
-                cell,
-            }
+            // **타일은 생성자가 만든다** — 스냅샷 바이트에 파생물이 없으므로 위조 벡터가
+            // 아예 없다(예전에는 `tiles_match`로 비트 검증해야 했다). 구조 불변식을 어기면
+            // 생성자가 `None`을 내고, 그건 손상된 스냅샷이므로 형식 오류로 올린다.
+            maru_collide::Shape::heightfield(heights, nx, nz, cell)
+                .ok_or(SnapshotError::BadShape)?
         }
         4 => {
             // **재귀 전에 깊이를 자른다**(교차검수 rev_e4075e85 BLOCKER): 자식을 읽고 나서
@@ -770,7 +761,7 @@ fn shape_size(s: &Shape) -> usize {
         Shape::Box { .. } => 16,
         Shape::Hull { points, .. } => 4 + points.len() * 12 + 4,
         // nx4 + nz4 + cell4 + count4 + 높이 4바이트씩
-        Shape::Heightfield { heights, .. } => 4 + 4 + 4 + 4 + heights.len() * 4,
+        Shape::Heightfield(g) => 4 + 4 + 4 + 4 + g.heights().len() * 4,
         Shape::Triangle { .. } => unreachable!("triangle is never serialized"),
         Shape::Compound { children } => {
             1 + children

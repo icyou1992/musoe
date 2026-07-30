@@ -149,8 +149,8 @@ pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) ->
     match walk {
         // 포화는 접촉을 **찾고** 끊은 것이라 존재 판정에는 충분하다.
         ContactWalk::Complete | ContactWalk::Saturated => Some(found),
-        // 형상이 깨졌으면 판정 자체가 성립하지 않는다 — `false`(=없음)로 뭉개지 않는다.
-        ContactWalk::InvalidShape => None,
+        // 형상·입력이 깨졌으면 판정 자체가 성립하지 않는다 — `false`(=없음)로 뭉개지 않는다.
+        ContactWalk::InvalidShape | ContactWalk::InvalidInput => None,
         // 예산이 터졌어도 **이미 하나 찾았으면 존재는 증명됐다** — 그때 `None`을 돌려주면
         // 지원 범위 안의 고정 장면(넓은 AABB + 접촉 몇 개)이 영구히 답을 못 받는다
         // (확인검수 rev_d5b32e22 MAJOR). 부정("없다")만 순회 완주를 요구한다.
@@ -168,6 +168,7 @@ pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) ->
 /// 다르면 같은 값이 나올 수 있어(같은 페어 안에서 충돌) warm start가 남의 임펄스를
 /// 물려받는다. generic은 위치 근접으로 매칭되므로 삼각형이 달라도 옳게 갈린다 —
 /// 계보 대신 위치를 쓰는 대가는 슬라이딩 시 계승률 하락뿐이다.
+#[allow(clippy::too_many_arguments)]
 fn heightfield_contacts(
     sa: &Shape,
     pa: &Pose,
@@ -175,6 +176,7 @@ fn heightfield_contacts(
     hf_pose: &Pose,
     margin: f32,
     flip: bool,
+    budget: &mut usize,
     f: &mut dyn FnMut(u8, u8, Manifold),
 ) -> ContactWalk {
     let hf = hf_shape.heightfield_ref().expect("Heightfield 변종");
@@ -200,6 +202,13 @@ fn heightfield_contacts(
     // **타일 → 셀** 순서로 걷는다. 겹치지 않는 타일의 셀은 방문조차 하지 않고,
     // 방문 수가 예산을 넘으면 순회를 포기해 호출자가 자원 오류로 처리하게 한다.
     crate::heightfield::for_each_overlapping_cell(&hf, range, y_lo, y_hi, |cx, cz| {
+        // 예산은 **호출자 소유**다(질의 단위). 페어마다 새로 4096이면 여러 바디를 도는
+        // 질의의 총 작업량이 유계가 아니다.
+        if *budget == 0 {
+            over_budget = true;
+            return false;
+        }
+        *budget -= 1;
         visited += 1;
         if visited > crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
             over_budget = true;
@@ -302,6 +311,11 @@ fn heightfield_contacts(
 pub enum ContactWalk {
     /// 끝까지 걸었다.
     Complete,
+    /// **산술 입력이 잘못돼 판정을 시작하지 못했다** (margin 비유한·음수, 자세 정규화 불가).
+    ///
+    /// NaN margin은 특히 조용하다: `dist2 > reach*reach` 비교가 NaN 때문에 false가 되어
+    /// **멀리 떨어진 두 구가 접촉을 만든다**(확인검수 rev_97887d75 MAJOR).
+    InvalidInput,
     /// **입력 형상의 불변식이 깨져 판정을 시작하지 못했다** (빈 hull·빈 복합·격자 개수 불일치).
     ///
     /// `Shape`의 필드가 공개라 호스트가 만들 수 있고, 그대로 GJK에 넣으면 `support_core`의
@@ -322,11 +336,49 @@ pub fn for_each_contact(
     margin: f32,
     f: &mut dyn FnMut(u8, u8, Manifold),
 ) -> ContactWalk {
+    let mut budget = crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY;
+    for_each_contact_with_budget(sa, pa, sb, pb, margin, &mut budget, f)
+}
+
+/// `for_each_contact` + **호출자가 소유하는 셀 예산**.
+///
+/// 예산이 호출마다 새로 4096이면 한 질의의 **총** 작업량은 유계가 아니다: 같은 자리에 지형
+/// 100개를 겹치면 `shape_penetrates` 한 번이 40만 셀을 훑는다(확인검수 rev_97887d75 MAJOR).
+/// 여러 바디를 도는 질의는 예산 하나를 만들어 이 함수로 넘겨 **질의 단위**로 묶는다.
+pub fn for_each_contact_with_budget(
+    sa: &Shape,
+    pa: &Pose,
+    sb: &Shape,
+    pb: &Pose,
+    margin: f32,
+    budget: &mut usize,
+    f: &mut dyn FnMut(u8, u8, Manifold),
+) -> ContactWalk {
     // 캐스트와 **같은 구조 검사**(O(1)) — 불변식이 깨진 형상은 GJK에서 패닉하거나
     // 미스로 위장된다. 정책 전수 검사(`validate`)는 O(n)이라 여기서 부르지 않는다.
     if !sa.is_castable() || !sb.is_castable() {
         return ContactWalk::InvalidShape;
     }
+    // 산술 입력 검사와 자세 정규화 — 캐스트 디스패처와 같은 규약(그쪽
+    // `canonical_cast_inputs` 주석 참조). margin이 NaN이면 거리 비교가 전부 false가 되어
+    // 접촉이 **없는 곳에서 생긴다**.
+    if !margin.is_finite() || margin < 0.0 || !pa.pos.is_finite() || !pb.pos.is_finite() {
+        return ContactWalk::InvalidInput;
+    }
+    let (Some(ra), Some(rb)) = (pa.rot.try_normalize(), pb.rot.try_normalize()) else {
+        return ContactWalk::InvalidInput;
+    };
+    let (npa, npb) = (
+        Pose {
+            pos: pa.pos,
+            rot: ra,
+        },
+        Pose {
+            pos: pb.pos,
+            rot: rb,
+        },
+    );
+    let (pa, pb) = (&npa, &npb);
     let compose = |parent: &Pose, child: &Pose| Pose {
         pos: parent.pos + parent.rot.rotate(child.pos),
         rot: parent.rot * child.rot,
@@ -334,11 +386,11 @@ pub fn for_each_contact(
     // 하이트필드는 바디 하나가 삼각형 수천 개다 — 겹치는 셀만 펼치고 **상한에서 끊는다**.
     // 끊었다는 사실은 반환값으로 나간다(조용한 누락 금지 — 호출자가 진단에 싣는다).
     if matches!(sb, Shape::Heightfield { .. }) {
-        return heightfield_contacts(sa, pa, sb, pb, margin, false, f);
+        return heightfield_contacts(sa, pa, sb, pb, margin, false, budget, f);
     }
     if matches!(sa, Shape::Heightfield { .. }) {
         // 하이트필드가 A쪽인 경우(질의 경로) — 역할을 바꿔 풀고 매니폴드를 뒤집는다.
-        return heightfield_contacts(sb, pb, sa, pa, margin, true, f);
+        return heightfield_contacts(sb, pb, sa, pa, margin, true, budget, f);
     }
     match (sa, sb) {
         (Shape::Compound { children: ca }, Shape::Compound { children: cb }) => {
@@ -1314,13 +1366,7 @@ mod heightfield_contact_tests {
                 heights[(iz * nx + ix) as usize] = iz as f32 * 0.07;
             }
         }
-        let hf_shape = Shape::Heightfield {
-            tiles: crate::heightfield::build_tiles(&heights, nx, nz),
-            heights,
-            nx,
-            nz,
-            cell: 1.0,
-        };
+        let hf_shape = Shape::heightfield(heights, nx, nz, 1.0).expect("격자");
         let hf = hf_shape.heightfield_ref().unwrap();
         // 이음매(z=2)를 **넘어선 쪽**에 중심을 두고 살짝 파고들게 놓는다.
         // 이러면 뒤 셀(1,1) 삼각형에서 최근접 특징이 **공유 에지**가 되고, 에지에서

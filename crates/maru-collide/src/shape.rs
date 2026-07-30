@@ -32,23 +32,25 @@ pub enum Shape {
     /// 모든 진입점이 삼각형으로 디스패치하고 `support_core`는 unreachable이다.
     /// static 전용(월드가 강제): 질량·관성 계산 경로가 없다.
     /// 로컬 좌표는 `x = ix·cell`, `z = iz·cell`, 높이는 `heights[iz·nx + ix]`.
-    Heightfield {
-        heights: Vec<f32>,
-        /// 타일별 (최소, 최대) 높이 — **높이 배열의 파생물**이다(캐노니컬 상태 아님).
-        /// 생성·복원에서 `heightfield::build_tiles`로 만들고 스냅샷에는 넣지 않는다.
-        /// 질의가 이걸로 타일 단위 가지치기를 해서, 총알이 평평한 통로를 지나갈 때
-        /// 셀을 하나도 안 보게 된다.
-        tiles: Vec<(f32, f32)>,
-        nx: u32,
-        nz: u32,
-        cell: f32,
-    },
+    /// **데이터는 `HeightfieldGrid`가 소유하고, 필드는 비공개다** — 파생물인 타일을
+    /// 호스트가 위조하면 가지치기가 진짜 접촉을 조용히 건너뛴다(그 타입 문서 참조).
+    /// 만들려면 `Shape::heightfield(heights, nx, nz, cell)`.
+    Heightfield(crate::heightfield::HeightfieldGrid),
     /// **내부 전용 삼각형** — 하이트필드/메시가 접촉 순간에 펼치는 임시 셰이프다.
     ///
     /// 호스트가 만들 수 없다(`validate`가 거부하고 스냅샷도 쓰지 않는다): 스텝마다
     /// 수십 개가 생기는데 `Hull`로 만들면 삼각형마다 `Vec` 하나를 힙에 잡아
     /// "스텝 중 할당 0" 규율이 깨지기 때문이다. 배열이라 스택에 산다.
     Triangle { points: [Vec3; 3], radius: f32 },
+}
+
+/// 쿼터니언이 **단위에 충분히 가까운가** — 정상 입력의 부동소수 드리프트만 허용한다.
+///
+/// 길이 제곱으로 재고 허용 오차는 1e-3이다(형상 왜곡 0.05% 미만). 자세를 정규화할 수 있는
+/// 경로(최상위 pose)는 정규화하고, 정규화 없이 합성되는 경로(복합 자식)는 이걸로 거절한다.
+pub(crate) fn unit_quat_l2_ok(q: maru_math::Quat) -> bool {
+    let l2 = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    l2.is_finite() && (l2 - 1.0).abs() <= 1.0e-3
 }
 
 /// 점 집합의 **회전 불변** 최소 폭 **하한 추정**.
@@ -151,6 +153,12 @@ fn hull_min_width(points: &[Vec3]) -> f32 {
 impl Shape {
     /// 형상 불변식 검증. **모든 바디 타입의 생성 경계에서 호출된다** — static/kinematic도
     /// 빈 hull이면 support/local_aabb가 `points[0]`에서 패닉한다(리뷰 지적).
+    /// 격자 하이트필드를 만든다 — 구조 불변식 검사와 타일 계산을 생성자가 한다.
+    /// 어기면 `None`(`HeightfieldGrid::new` 참조).
+    pub fn heightfield(heights: Vec<f32>, nx: u32, nz: u32, cell: f32) -> Option<Self> {
+        crate::heightfield::HeightfieldGrid::new(heights, nx, nz, cell).map(Shape::Heightfield)
+    }
+
     /// **패닉 없이 캐스트·접촉에 넣을 수 있는 형상인가** — O(1)(복합은 자식 수) 구조 검사.
     ///
     /// `Shape`의 필드가 공개이므로 호스트는 `Hull { points: vec![] }`처럼 불변식을 깬 값을
@@ -197,7 +205,11 @@ impl Shape {
                 !children.is_empty()
                     && children.iter().all(|(pose, child)| {
                         pose.pos.is_finite()
-                            && pose.rot.is_finite()
+                            // 자식 자세는 **정규화 없이 곱해진다**(합성은 할당 없이 돌아야
+                            // 한다). 그래서 비단위 자식은 정규화가 아니라 거절이다 —
+                            // 통과시키면 찌그러진 자식으로 조용히 틀린 답이 나온다
+                            // (확인검수 rev_97887d75 BLOCKER).
+                            && unit_quat_l2_ok(pose.rot)
                             && !matches!(
                                 child,
                                 Shape::Compound { .. }
@@ -207,20 +219,10 @@ impl Shape {
                             && child.is_castable()
                     })
             }
-            // 셀 인덱싱과 나눗셈의 전제 — 개수 일치·최소 2×2·양의 유한 셀 크기.
-            Shape::Heightfield {
-                heights,
-                nx,
-                nz,
-                cell,
-                ..
-            } => {
-                *nx >= 2
-                    && *nz >= 2
-                    && (*nx as usize).checked_mul(*nz as usize) == Some(heights.len())
-                    && cell.is_finite()
-                    && *cell > 0.0
-            }
+            // 셀 인덱싱·나눗셈의 전제와 타일 무결성은 **생성자가 세운다**(`HeightfieldGrid`).
+            // 위조된 타일이 타입 수준에서 불가능하므로 여기서 다시 볼 것이 없다 —
+            // 예전에는 O(1) 검사로 그걸 잡을 방법이 없어 구멍이었다(rev_97887d75 BLOCKER).
+            Shape::Heightfield(_) => true,
         }
     }
 
@@ -286,45 +288,20 @@ impl Shape {
                     }
                 }
             }
-            Shape::Heightfield {
-                heights,
-                tiles,
-                nx,
-                nz,
-                cell,
-            } => {
-                if *nx < 2 || *nz < 2 {
-                    return Err("heightfield must be at least 2x2 samples");
-                }
-                let n = (*nx as usize).saturating_mul(*nz as usize);
-                if n != heights.len() {
-                    return Err("heightfield sample count must equal nx*nz");
-                }
-                if n > crate::heightfield::MAX_HEIGHTFIELD_SAMPLES {
-                    return Err("heightfield sample count exceeds MAX_HEIGHTFIELD_SAMPLES");
-                }
-                if !extent_in_range(*cell) || *cell < MIN_SHAPE_EXTENT {
+            // 구조 불변식(개수·유한성·타일 무결성)은 `HeightfieldGrid::new`가 이미 세웠다 —
+            // 위조된 타일은 타입 수준에서 불가능하므로 여기서는 **크기 정책만** 본다.
+            Shape::Heightfield(g) => {
+                if !extent_in_range(g.cell()) || g.cell() < MIN_SHAPE_EXTENT {
                     return Err("heightfield cell size must be within extent range");
                 }
                 // 격자 전체 폭도 범위 안이어야 한다 — 셀은 작아도 개수가 크면 넘는다.
-                if !extent_in_range((*nx - 1) as f32 * *cell)
-                    || !extent_in_range((*nz - 1) as f32 * *cell)
+                if !extent_in_range((g.nx() - 1) as f32 * g.cell())
+                    || !extent_in_range((g.nz() - 1) as f32 * g.cell())
                 {
                     return Err("heightfield extent exceeds MAX_SHAPE_EXTENT");
                 }
-                if !heights.iter().all(|h| extent_in_range(*h)) {
+                if !g.heights().iter().all(|h| extent_in_range(*h)) {
                     return Err("heightfield heights must be finite and within extent range");
-                }
-                // 타일은 파생물이지만 **모양이 맞아야** 한다 — 엉뚱한 타일을 들고 오면
-                // 가지치기가 진짜 접촉을 건너뛴다(정확성 문제다). 개수·범위 검사 뒤에 본다.
-                let (ntx, ntz) = (
-                    (nx - 1).div_ceil(crate::heightfield::HEIGHTFIELD_TILE),
-                    (nz - 1).div_ceil(crate::heightfield::HEIGHTFIELD_TILE),
-                );
-                if tiles.len() != (ntx as usize) * (ntz as usize)
-                    || !crate::heightfield::tiles_match(heights, *nx, *nz, tiles)
-                {
-                    return Err("heightfield tile pyramid does not match the grid");
                 }
             }
             Shape::Triangle { .. } => {
@@ -506,18 +483,12 @@ impl Shape {
     /// 하이트필드 뷰 — 격자 계산의 단일 진입점(다른 변종이면 `None`).
     pub fn heightfield_ref(&self) -> Option<crate::HeightfieldRef<'_>> {
         match self {
-            Shape::Heightfield {
-                heights,
-                tiles,
-                nx,
-                nz,
-                cell,
-            } => Some(crate::HeightfieldRef {
-                heights,
-                tiles,
-                nx: *nx,
-                nz: *nz,
-                cell: *cell,
+            Shape::Heightfield(g) => Some(crate::HeightfieldRef {
+                heights: g.heights(),
+                tiles: g.tiles(),
+                nx: g.nx(),
+                nz: g.nz(),
+                cell: g.cell(),
                 radius: 0.0,
             }),
             _ => None,

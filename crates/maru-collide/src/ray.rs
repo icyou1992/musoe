@@ -26,7 +26,58 @@ pub struct RayCast {
 ///
 /// 셰이프별 해석해가 있으면 그것을 쓰고(정확하고 빠르다), 없으면 support 함수 기반
 /// 보수적 전진(GJK ray cast)으로 떨어진다 — hull과 둥근 박스가 그 경로다.
-pub fn cast_ray(
+/// **질의가 답을 낼 수 없는 이유** — "맞은 것이 없다"와 구분된다.
+///
+/// 캐스트 쪽 `CastReject`와 같은 취지다: 잘못된 입력을 `None`/`false`로 돌려주면 호출자가
+/// "비어 있다"고 읽어 그대로 진행한다(확인검수 rev_97887d75 BLOCKER — README가 이 두 함수를
+/// "모든 셰이프를 옳게 처리하는 공개 표면"으로 열거하는데 방어가 캐스트에만 있었다).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QueryReject {
+    /// 형상 불변식이 깨졌거나(빈 hull → GJK 패닉, 빈 복합 → 미스 위장) 산술 입력이
+    /// 비유한이거나 자세를 정규화할 수 없다.
+    InvalidInput,
+}
+
+/// 공개 레이 캐스트 — 형상·산술 입력을 검사하고 자세를 정규화한 뒤 푼다.
+pub fn try_cast_ray(
+    shape: &Shape,
+    pose: &Pose,
+    origin: Vec3,
+    dir: Vec3,
+    max_toi: f32,
+) -> Result<Option<RayCast>, QueryReject> {
+    if !shape.is_castable()
+        || !origin.is_finite()
+        || !dir.is_finite()
+        || !max_toi.is_finite()
+        || max_toi < 0.0
+        || !pose.pos.is_finite()
+    {
+        return Err(QueryReject::InvalidInput);
+    }
+    // 자세 정규화 — 비단위 쿼터니언은 회전+축소라 찌그러진 형상으로 답이 나온다.
+    let pose = Pose {
+        pos: pose.pos,
+        rot: pose.rot.try_normalize().ok_or(QueryReject::InvalidInput)?,
+    };
+    Ok(cast_ray(shape, &pose, origin, dir, max_toi))
+}
+
+/// 공개 점 포함 판정 — `try_cast_ray`와 같은 검증 규약.
+pub fn try_contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> Result<bool, QueryReject> {
+    if !shape.is_castable() || !p.is_finite() || !pose.pos.is_finite() {
+        return Err(QueryReject::InvalidInput);
+    }
+    let pose = Pose {
+        pos: pose.pos,
+        rot: pose.rot.try_normalize().ok_or(QueryReject::InvalidInput)?,
+    };
+    Ok(contains_point(shape, &pose, p))
+}
+
+/// **검증된 입력 전용**(크레이트 내부·월드 경계 통과분). 공개 진입은 `try_cast_ray`다 —
+/// 자세가 단위 쿼터니언이고 형상 불변식이 성립한다고 가정한다.
+pub(crate) fn cast_ray(
     shape: &Shape,
     pose: &Pose,
     origin: Vec3,
@@ -110,7 +161,8 @@ pub fn cast_ray(
 }
 
 /// 점이 셰이프 안에 있는가 (겉면 기준 — convex radius 포함).
-pub fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
+/// **검증된 입력 전용** — 공개 진입은 `try_contains_point`다.
+pub(crate) fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
     let local = pose.rot.conjugate().rotate(p - pose.pos);
     let r = shape.radius();
     match *shape {

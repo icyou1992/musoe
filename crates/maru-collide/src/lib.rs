@@ -41,9 +41,8 @@ pub use cast::{
 pub use gjk::{Pose, SupportPoint};
 pub use heightfield::{
     build_tiles as build_heightfield_tiles, for_each_overlapping_cell, overlapping_cell_count,
-    tiles_match as heightfield_tiles_match, world_aabb_to_local, HeightfieldRef, COS_COPLANAR,
-    HEIGHTFIELD_TILE, MAX_HEIGHTFIELD_CELLS_PER_QUERY, MAX_HEIGHTFIELD_MANIFOLDS,
-    MAX_HEIGHTFIELD_SAMPLES,
+    world_aabb_to_local, HeightfieldGrid, HeightfieldRef, COS_COPLANAR, HEIGHTFIELD_TILE,
+    MAX_HEIGHTFIELD_CELLS_PER_QUERY, MAX_HEIGHTFIELD_MANIFOLDS, MAX_HEIGHTFIELD_SAMPLES,
 };
 pub use limits::{
     anchor_in_range, angular_in_range, extent_in_range, in_range, in_state_range,
@@ -53,13 +52,16 @@ pub use limits::{
     MAX_INPUT, MAX_SHAPE_EXTENT, MAX_SPEED, MAX_STATE, MIN_DT, MIN_INV_MASS, MIN_SHAPE_EXTENT,
 };
 pub use manifold::{
-    any_contact, for_each_contact, weld_internal_edges, ContactPoint, ContactWalk, FeatureId,
-    Manifold, FEATURE_ANALYTIC, FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT, FEATURE_GENERIC,
-    MAX_MANIFOLD_POINTS,
+    any_contact, for_each_contact, for_each_contact_with_budget, weld_internal_edges, ContactPoint,
+    ContactWalk, FeatureId, Manifold, FEATURE_ANALYTIC, FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT,
+    FEATURE_GENERIC, MAX_MANIFOLD_POINTS,
 };
 pub use maru_math::Aabbx4;
 pub use pairs::{Broadphase, MAX_PAIRS, STATIC_BIT};
-pub use ray::{cast_ray, contains_point, RayCast};
+// **공개 진입은 `try_*`뿐이다** — `cast_ray`·`contains_point`는 검증된 입력을 가정하는
+// 크레이트 내부용이다. 잘못된 형상을 `None`/`false`로 돌려주면 "맞은 것 없음"으로 위장되고,
+// 빈 hull은 GJK에서 프로세스를 죽인다(확인검수 rev_97887d75 BLOCKER).
+pub use ray::{try_cast_ray, try_contains_point, QueryReject, RayCast};
 pub use shape::{transformed_aabb, Shape, MAX_COMPOUND_CHILDREN};
 pub use tolerance::{
     area_eps, bary_denom_eps, characteristic_length, length_eps, length_sq_eps, min_feature_size,

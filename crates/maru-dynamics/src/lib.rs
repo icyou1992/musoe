@@ -2620,13 +2620,7 @@ mod tests {
     #[should_panic(expected = "dynamic shape must have finite positive mass")]
     fn dynamic_heightfield_is_rejected_at_construction() {
         let _ = Body::new_dynamic(
-            Shape::Heightfield {
-                tiles: maru_collide::build_heightfield_tiles(&[0.0; 4], 2, 2),
-                heights: vec![0.0; 4],
-                nx: 2,
-                nz: 2,
-                cell: 1.0,
-            },
+            Shape::heightfield(vec![0.0; 4], 2, 2, 1.0).expect("격자"),
             hf_pose(),
             1.0,
         );
@@ -3024,13 +3018,7 @@ mod tests {
     /// (BLOCKER: 복원에서만 막으면 `restore(snapshot())`가 자기 스냅샷을 거부한다).
     #[test]
     fn heightfield_static_only_is_enforced_at_creation_too() {
-        let hf = || Shape::Heightfield {
-            tiles: maru_collide::build_heightfield_tiles(&[0.0; 4], 2, 2),
-            heights: vec![0.0; 4],
-            nx: 2,
-            nz: 2,
-            cell: 1.0,
-        };
+        let hf = || Shape::heightfield(vec![0.0; 4], 2, 2, 1.0).expect("격자");
         // **fallible 생성자로** 본다 — 비-fallible 쪽은 계약 위반에 패닉하는 것이 규약이다.
         assert!(
             Body::try_new_kinematic(hf(), pose(0.0, 0.0, 0.0)).is_err(),
@@ -3075,25 +3063,13 @@ mod tests {
             .is_err());
         // 비볼록 셰이프는 스윕 주체가 될 수 없다
         let mut c3 = capsule_char(0.0, 0.8, 0.0);
-        c3.shape = Shape::Heightfield {
-            tiles: maru_collide::build_heightfield_tiles(&[0.0; 4], 2, 2),
-            heights: vec![0.0; 4],
-            nx: 2,
-            nz: 2,
-            cell: 1.0,
-        };
+        c3.shape = Shape::heightfield(vec![0.0; 4], 2, 2, 1.0).expect("격자");
         assert!(c3
             .move_and_slide(&w, Vec3::new(1.0, 0.0, 0.0), QueryFilter::ALL)
             .is_err());
         assert!(w
             .sweep_shape(
-                &Shape::Heightfield {
-                    tiles: maru_collide::build_heightfield_tiles(&[0.0; 4], 2, 2),
-                    heights: vec![0.0; 4],
-                    nx: 2,
-                    nz: 2,
-                    cell: 1.0
-                },
+                &Shape::heightfield(vec![0.0; 4], 2, 2, 1.0).expect("격자"),
                 pose(0.0, 0.0, 0.0),
                 Vec3::new(1.0, 0.0, 0.0),
                 QueryFilter::ALL
@@ -3283,39 +3259,43 @@ mod tests {
 
     // ===== 확인검수 rev_e50670ad 회귀 =====
 
-    /// **타일 값이 높이와 맞지 않으면 거부한다** (BLOCKER: L0·복원 대칭 붕괴).
+    /// **위조된 타일은 이제 존재할 수 없다** (BLOCKER: L0·복원 대칭 → 구성으로 봉인).
     ///
-    /// 길이만 검사하면 평지에 `[(100,100)]`을 넣어 모든 지형을 건너뛰게 만들 수 있고,
-    /// 스냅샷은 타일을 저장하지 않으므로 **복원 월드는 올바른 타일**을 갖는다 —
-    /// 같은 바이트·같은 해시인데 다음 CCD가 달라진다.
+    /// 예전에는 `Shape::Heightfield { tiles, .. }`가 공개 필드라 평지에 `[(100,100)]`을 넣어
+    /// 모든 지형을 가지치기로 건너뛰게 만들 수 있었다. 스냅샷은 타일을 저장하지 않으므로
+    /// 복원 월드는 **올바른** 타일을 갖는다 — 같은 바이트·같은 해시인데 다음 CCD가 달라졌다
+    /// (rev_e50670ad). 처음에는 `validate`에서 비트 검증으로 막았지만, 그 검사는 O(n)이라
+    /// 라이브 질의(스텝 안의 CCD가 후보마다 부른다)에 넣을 수 없었고 그래서 라이브 경로에
+    /// 구멍이 남았다(rev_97887d75 BLOCKER).
+    ///
+    /// **지금은 검사 대신 구성으로 막는다.** 데이터는 `HeightfieldGrid`가 소유하고 필드는
+    /// 비공개이므로, 타일을 넣는 코드는 **컴파일되지 않는다** — 어느 경로에서도 재검증이
+    /// 필요 없고 런타임 비용은 0이다. 이 테스트는 그 대체 계약을 확인한다: 생성자가 유일한
+    /// 입구이고, 그 입구가 구조 불변식을 세우며, 나온 타일이 실제 높이와 일치한다.
     #[test]
-    fn heightfield_with_forged_tiles_is_rejected() {
-        let heights = vec![0.0f32; 9 * 9];
-        let real = maru_collide::build_heightfield_tiles(&heights, 9, 9);
-        assert!(!real.is_empty());
-        // 길이는 맞지만 값이 거짓인 타일
-        let forged = vec![(100.0f32, 100.0f32); real.len()];
-        let bad = Shape::Heightfield {
-            heights: heights.clone(),
-            tiles: forged,
-            nx: 9,
-            nz: 9,
-            cell: 1.0,
-        };
-        assert!(
-            bad.validate().is_err(),
-            "거짓 타일이 검증을 통과했다 — 가지치기가 모든 지형을 건너뛴다"
-        );
-        assert!(Body::try_new_static(bad, pose(0.0, 0.0, 0.0)).is_err());
-        // 올바른 타일은 통과
-        let good = Shape::Heightfield {
-            heights,
-            tiles: real,
-            nx: 9,
-            nz: 9,
-            cell: 1.0,
-        };
-        assert!(good.validate().is_ok());
+    fn heightfield_tiles_are_derived_by_the_constructor_and_cannot_be_supplied() {
+        // 봉우리가 있는 격자 — 타일 범위가 평평하지 않아야 대조가 의미 있다.
+        let (nx, nz) = (9u32, 9u32);
+        let mut heights = vec![0.0f32; (nx * nz) as usize];
+        heights[(4 * nx + 4) as usize] = 3.0;
+        let s = Shape::heightfield(heights.clone(), nx, nz, 1.0).expect("격자");
+        assert!(s.validate().is_ok());
+        assert!(Body::try_new_static(s.clone(), pose(0.0, 0.0, 0.0)).is_ok());
+        // 생성자가 만든 타일이 높이와 일치한다 — 봉우리를 품은 타일의 최대가 3.0이다.
+        let hf = s.heightfield_ref().expect("하이트필드");
+        let (lo, hi) = hf.tile_range(0, 0);
+        assert_eq!((lo, hi), (0.0, 3.0), "타일 범위가 높이와 다르다");
+        // 구조 불변식을 어기는 입력은 생성자가 거절한다(개수 불일치·너무 작은 격자·
+        // 비유한 높이·0 셀 크기). 예전에는 이런 값이 셰이프 안까지 들어왔다.
+        assert!(Shape::heightfield(vec![0.0; 8], 3, 3, 1.0).is_none());
+        assert!(Shape::heightfield(vec![0.0; 1], 1, 1, 1.0).is_none());
+        assert!(Shape::heightfield(vec![f32::NAN; 4], 2, 2, 1.0).is_none());
+        assert!(Shape::heightfield(vec![0.0; 4], 2, 2, 0.0).is_none());
+        // **음성 대조** — 정상 입력은 통과한다(생성자가 전부 거절하는 게 아니다).
+        assert!(Shape::heightfield(vec![0.0; 4], 2, 2, 1.0).is_some());
+        // 크기 **정책**은 여전히 validate 소관이다(생성자는 구조만 본다).
+        let huge = Shape::heightfield(vec![0.0; 4], 2, 2, 1.0e9).expect("구조는 정상");
+        assert!(huge.validate().is_err(), "MAX_SHAPE_EXTENT 정책이 빠졌다");
     }
 
     /// **멀리 있는 봉우리 하나가 정상 스텝을 비싸게 만들지 않는다** (MAJOR: raw 셀 수).
@@ -3370,13 +3350,7 @@ mod tests {
     #[test]
     fn dispatchers_handle_heightfields_and_convex_only_apis_are_not_public() {
         let heights = vec![0.0f32; 9 * 9];
-        let hf = Shape::Heightfield {
-            tiles: maru_collide::build_heightfield_tiles(&heights, 9, 9),
-            heights,
-            nx: 9,
-            nz: 9,
-            cell: 1.0,
-        };
+        let hf = Shape::heightfield(heights, 9, 9, 1.0).expect("격자");
         let sphere = Shape::Sphere { radius: 0.5 };
         let p = pose(0.0, 0.0, 0.0);
         // 디스패처는 어느 쪽에 하이트필드가 있어도 동작한다.
@@ -3553,13 +3527,7 @@ mod tests {
     fn heightfield_cast_reports_budget_instead_of_walking_forever() {
         use maru_collide::CastReject;
         let heights = vec![0.0f32; 257 * 257];
-        let hf = Shape::Heightfield {
-            tiles: maru_collide::build_heightfield_tiles(&heights, 257, 257),
-            heights,
-            nx: 257,
-            nz: 257,
-            cell: 0.1,
-        };
+        let hf = Shape::heightfield(heights, 257, 257, 0.1).expect("격자");
         let p = pose(0.0, 0.0, 0.0);
         // 반지름 5m 구 = 100×100셀(=10000 > 4096 예산)을 덮는다.
         let big = Shape::Sphere { radius: 5.0 };
@@ -3718,13 +3686,7 @@ mod tests {
                 heights[gz * nx + gx] = 1.95;
             }
         }
-        let hf = Shape::Heightfield {
-            tiles: maru_collide::build_heightfield_tiles(&heights, nx as u32, nx as u32),
-            heights,
-            nx: nx as u32,
-            nz: nx as u32,
-            cell: 0.1,
-        };
+        let hf = Shape::heightfield(heights, nx as u32, nx as u32, 0.1).expect("격자");
         let p = pose(0.0, 0.0, 0.0);
         let big = Shape::Sphere { radius: 5.0 };
         // 봉우리에 닿는 배치: 접촉을 앞쪽 셀에서 찾고, 그 뒤 수천 셀에서 예산이 터진다.
@@ -3837,13 +3799,7 @@ mod tests {
     #[test]
     fn compound_body_sweeping_into_terrain_reports_a_hit() {
         let heights = vec![0.0f32; 17 * 17];
-        let hf = Shape::Heightfield {
-            tiles: maru_collide::build_heightfield_tiles(&heights, 17, 17),
-            heights,
-            nx: 17,
-            nz: 17,
-            cell: 1.0,
-        };
+        let hf = Shape::heightfield(heights, 17, 17, 1.0).expect("격자");
         let p = pose(0.0, 0.0, 0.0);
         let child = Shape::Box {
             half: Vec3::new(0.3, 0.3, 0.3),
@@ -4089,6 +4045,215 @@ mod tests {
             pos_before,
             "실패 스텝이 물리를 진행시켰다"
         );
+    }
+
+    /// **레이·점 질의도 잘못된 입력을 값으로 거절한다** (BLOCKER: 공개 표면의 절반만 방어).
+    ///
+    /// README가 `cast_ray`·`contains_point`를 "모든 셰이프를 옳게 처리하는 공개 표면"으로
+    /// 열거하는데 방어는 캐스트 두 함수에만 있었다 — 빈 hull을 넣으면 GJK에서 프로세스가
+    /// 죽고, 빈 복합은 `None`/`false`가 되어 잘못된 형상이 미스로 위장됐다
+    /// (확인검수 rev_97887d75 BLOCKER).
+    #[test]
+    fn ray_and_point_queries_reject_bad_input_by_value() {
+        use maru_collide::QueryReject;
+        let empty_hull = Shape::Hull {
+            points: Vec::new(),
+            radius: 0.0,
+        };
+        let empty_compound = Shape::Compound {
+            children: Vec::new(),
+        };
+        let p = pose(0.0, 0.0, 0.0);
+        let o = Vec3::new(-3.0, 0.0, 0.0);
+        let d = Vec3::new(1.0, 0.0, 0.0);
+        for bad in [&empty_hull, &empty_compound] {
+            assert_eq!(
+                maru_collide::try_cast_ray(bad, &p, o, d, 10.0),
+                Err(QueryReject::InvalidInput)
+            );
+            assert_eq!(
+                maru_collide::try_contains_point(bad, &p, Vec3::ZERO),
+                Err(QueryReject::InvalidInput)
+            );
+        }
+        // 산술 입력·정규화 불가 자세도 같은 규칙.
+        let ok = Shape::Sphere { radius: 1.0 };
+        assert_eq!(
+            maru_collide::try_cast_ray(&ok, &p, o, Vec3::new(f32::NAN, 0.0, 0.0), 10.0),
+            Err(QueryReject::InvalidInput)
+        );
+        let zero_rot = maru_collide::Pose {
+            pos: Vec3::ZERO,
+            rot: Quat {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 0.0,
+            },
+        };
+        assert_eq!(
+            maru_collide::try_contains_point(&ok, &zero_rot, Vec3::ZERO),
+            Err(QueryReject::InvalidInput)
+        );
+        // **음성 대조** — 정상 입력은 실제로 맞추고 실제로 품는다.
+        assert!(maru_collide::try_cast_ray(&ok, &p, o, d, 10.0)
+            .expect("정상 입력")
+            .is_some());
+        assert_eq!(
+            maru_collide::try_contains_point(&ok, &p, Vec3::new(0.5, 0.0, 0.0)),
+            Ok(true)
+        );
+        // 비단위(정규화 가능) 자세는 정규화해서 단위와 같은 답을 낸다.
+        let q = Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), 0.7);
+        let long = Shape::Box {
+            half: Vec3::new(2.0, 0.2, 0.2),
+            radius: 0.0,
+        };
+        let unit = maru_collide::Pose {
+            pos: Vec3::ZERO,
+            rot: q,
+        };
+        let scaled = maru_collide::Pose {
+            pos: Vec3::ZERO,
+            rot: Quat {
+                x: q.x * 0.5,
+                y: q.y * 0.5,
+                z: q.z * 0.5,
+                w: q.w * 0.5,
+            },
+        };
+        let a = maru_collide::try_cast_ray(&long, &unit, o, d, 10.0).expect("정상");
+        let b = maru_collide::try_cast_ray(&long, &scaled, o, d, 10.0).expect("정규화 가능");
+        assert!(
+            a.is_some(),
+            "정상 자세가 박스를 못 맞췄다 — 배치가 무의미하다"
+        );
+        assert_eq!(
+            a.map(|h| h.toi),
+            b.map(|h| h.toi),
+            "비단위 자세가 찌그러진 형상으로 판정됐다"
+        );
+    }
+
+    /// **NaN margin이 접촉을 만들어내지 않는다** (MAJOR: 없는 접촉이 생긴다).
+    ///
+    /// `dist2 > reach*reach` 비교가 NaN 때문에 false가 되면 멀리 떨어진 두 구가 접촉을 만든다.
+    /// 캐스트에서 막은 "잘못된 입력이 판정으로 위장" 결함이 바로 옆 API에 남아 있었다
+    /// (확인검수 rev_97887d75 MAJOR).
+    #[test]
+    fn contact_api_rejects_bad_arithmetic_input() {
+        let a = Shape::Sphere { radius: 0.5 };
+        let b = Shape::Sphere { radius: 0.5 };
+        let pa = pose(0.0, 0.0, 0.0);
+        let far = pose(50.0, 0.0, 0.0);
+        for bad in [f32::NAN, -1.0, f32::INFINITY] {
+            assert_eq!(
+                maru_collide::for_each_contact(&a, &pa, &b, &far, bad, &mut |_, _, _| {}),
+                maru_collide::ContactWalk::InvalidInput,
+                "margin={bad}"
+            );
+            assert_eq!(maru_collide::any_contact(&a, &pa, &b, &far, bad), None);
+        }
+        // **음성 대조** — 정상 margin이면 멀리 있는 쌍은 접촉이 없고, 가까운 쌍은 있다.
+        assert_eq!(
+            maru_collide::any_contact(&a, &pa, &b, &far, 0.02),
+            Some(false)
+        );
+        assert_eq!(
+            maru_collide::any_contact(&a, &pa, &b, &pose(0.8, 0.0, 0.0), 0.02),
+            Some(true)
+        );
+    }
+
+    /// **포화는 완주가 아니다** — 음성 판정은 순회를 끝까지 걸어야 한다 (MAJOR).
+    ///
+    /// `shape_penetrates`가 `Saturated`를 `Complete`처럼 다루면, 앞 64개 매니폴드가 침투
+    /// 임계에 못 미치는 얕은 접촉이었을 때 뒤쪽의 깊은 침투를 못 본 채 "안 겹친다"가 된다 —
+    /// 캐릭터가 지형 안에서 이동을 시작한다(확인검수 rev_97887d75 MAJOR).
+    ///
+    /// 넓은 판을 평지에 **살짝 얹으면**(침투 없음) 매니폴드가 64개에서 포화한다. 그때 답은
+    /// `Ok(false)`가 아니라 "판정 미완료"다.
+    #[test]
+    fn shape_penetrates_treats_saturation_as_incomplete_not_negative() {
+        let mut w = World::new(WorldParams::default());
+        let heights = vec![0.0f32; 65 * 65];
+        w.try_add_heightfield(&heights, 65, 65, 0.5, pose(0.0, 0.0, 0.0))
+            .expect("지형 추가");
+        // 12m×12m 판을 지면 **위에** 얹는다(겹침 없음) — 셀마다 접촉이 생겨 64개에서 포화.
+        let slab = Shape::Box {
+            half: Vec3::new(6.0, 0.2, 6.0),
+            radius: 0.0,
+        };
+        assert_eq!(
+            w.shape_penetrates(&slab, pose(8.0, 0.2, 8.0), QueryFilter::ALL),
+            Err(ApiError::ResourceLimit),
+            "포화를 확정 음성으로 취급했다 — 뒤쪽 깊은 침투를 못 본 채 '안 겹친다'가 된다"
+        );
+        // **음성 대조 ①** — 확실히 박히면 양성이 먼저 증명되므로 포화와 무관하게 `true`.
+        assert_eq!(
+            w.shape_penetrates(&slab, pose(8.0, -0.1, 8.0), QueryFilter::ALL),
+            Ok(true)
+        );
+        // **음성 대조 ②** — 작은 바디는 포화하지 않으므로 확정적인 답을 받는다.
+        let small = Shape::Box {
+            half: Vec3::new(0.2, 0.2, 0.2),
+            radius: 0.0,
+        };
+        assert_eq!(
+            w.shape_penetrates(&small, pose(8.0, 2.0, 8.0), QueryFilter::ALL),
+            Ok(false)
+        );
+        assert_eq!(
+            w.shape_penetrates(&small, pose(8.0, -0.1, 8.0), QueryFilter::ALL),
+            Ok(true)
+        );
+    }
+
+    /// **셀 예산은 질의 하나가 나눠 쓴다** (MAJOR: 바디 수만큼 곱해지는 작업량).
+    ///
+    /// 예산이 바디마다 새로 4096이면 같은 자리에 지형을 여러 장 겹친 장면에서 한 번의 질의가
+    /// 바디 수 × 4096셀을 훑는다 — "작업량 상한은 순회 안에 있다"는 주장이 페어에만
+    /// 참이었다(확인검수 rev_97887d75 MAJOR). 스윕 질의로 확인한다: 셀 수는 스윕 봉투에서
+    /// 세므로 접촉이 있는지와 무관하게 관측된다.
+    #[test]
+    fn query_cell_budget_is_shared_across_bodies() {
+        let probe = Shape::Box {
+            half: Vec3::new(15.0, 0.2, 15.0),
+            radius: 0.0,
+        };
+        let start = pose(16.0, 2.0, 16.0);
+        let down = Vec3::new(0.0, -4.0, 0.0);
+        // 지형 한 장(65×65, 셀 0.5m = 32m 폭). 30m 판의 스윕 봉투는 약 60×60 = 3600셀 —
+        // 예산(4096) 안이다. 두 장이면 7200으로 넘는다.
+        let mut w1 = World::new(WorldParams::default());
+        w1.try_add_heightfield(&vec![0.0f32; 65 * 65], 65, 65, 0.5, pose(0.0, 0.0, 0.0))
+            .expect("지형");
+        let one = w1.sweep_shape(&probe, start, down, QueryFilter::ALL);
+        assert!(
+            matches!(one, Ok(Some(_))),
+            "한 장짜리 장면이 예산에 걸렸다 — 대조가 성립하지 않는다: {one:?}"
+        );
+        // **같은 자리에 두 장을 겹친다.** 예산이 공유되면 총합이 4096을 넘어 판정 미완료가
+        // 되고, 공유가 아니면 장 수만큼 곱해진 작업을 끝까지 한다.
+        let mut w3 = World::new(WorldParams::default());
+        for _ in 0..2 {
+            w3.try_add_heightfield(&vec![0.0f32; 65 * 65], 65, 65, 0.5, pose(0.0, 0.0, 0.0))
+                .expect("지형");
+        }
+        assert_eq!(
+            w3.sweep_shape(&probe, start, down, QueryFilter::ALL).err(),
+            Some(ApiError::ResourceLimit),
+            "예산이 바디마다 새로 주어지고 있다 — 총 작업량이 유계가 아니다"
+        );
+        // **음성 대조** — 작은 바디는 두 장을 훑어도 예산 안이라 답을 받는다.
+        let small = Shape::Box {
+            half: Vec3::new(0.2, 0.2, 0.2),
+            radius: 0.0,
+        };
+        assert!(matches!(
+            w3.sweep_shape(&small, start, down, QueryFilter::ALL),
+            Ok(Some(_))
+        ));
     }
 
     /// **FP 가드 전수** — 캐노니컬 상태를 바꾸는 공개 진입점 전부가 같은 규칙을 따른다.

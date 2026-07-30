@@ -790,14 +790,10 @@ impl World {
             .try_reserve_exact(heights.len())
             .map_err(|_| ApiError::ResourceLimit)?;
         owned.extend_from_slice(heights);
-        let tiles = maru_collide::build_heightfield_tiles(&owned, nx, nz);
-        let shape = maru_collide::Shape::Heightfield {
-            heights: owned,
-            tiles,
-            nx,
-            nz,
-            cell,
-        };
+        // 구조 불변식과 타일은 **생성자가** 세운다(`HeightfieldGrid::new`) — 위조된 타일이
+        // 타입 수준에서 불가능하므로 어느 질의도 재검증하지 않는다.
+        let shape =
+            maru_collide::Shape::heightfield(owned, nx, nz, cell).ok_or(ApiError::InvalidValue)?;
         // 검증은 라이브·복원 공통 정본(`Shape::validate`)이 한다 — 여기서 따로 적으면
         // 두 경계의 정책이 갈린다.
         shape.validate().map_err(|_| ApiError::InvalidValue)?;
@@ -1350,6 +1346,7 @@ impl World {
         let a0 = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
         let sweep = a0.merge(Aabb::new(a0.min + motion, a0.max + motion));
         let mut best: Option<SweepHit> = None;
+        let mut spent_cells = 0usize;
         for i in 0..self.bodies.len() {
             if !self.passes(i, filter) {
                 continue;
@@ -1373,7 +1370,11 @@ impl World {
                     // 지형 AABB를 높여 후보가 0개인 질의까지 거절한다(확인검수 rev_e50670ad).
                     let cells =
                         maru_collide::overlapping_cell_count(&hf, range, local.min.y, local.max.y);
-                    if cells > maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
+                    // **질의 하나가 나눠 쓰는 예산.** 바디마다 따로 4096을 주면 같은 자리에
+                    // 지형 100개를 겹친 장면에서 한 번의 스윕이 40만 셀을 훑는다
+                    // (확인검수 rev_97887d75 MAJOR의 `shape_penetrates`와 같은 결함).
+                    spent_cells = spent_cells.saturating_add(cells);
+                    if spent_cells > maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY {
                         return Err(ApiError::ResourceLimit);
                     }
                 }
@@ -1432,6 +1433,9 @@ impl World {
             rot: pose.rot.try_normalize().ok_or(ApiError::InvalidValue)?,
         };
         let aabb = maru_collide::transformed_aabb(shape.local_aabb(), &pose);
+        // **예산은 질의 하나가 나눠 쓴다.** 바디마다 새로 4096이면 같은 자리에 지형 100개를
+        // 겹친 장면에서 한 번의 질의가 40만 셀을 훑는다(확인검수 rev_97887d75 MAJOR).
+        let mut cells = maru_collide::MAX_HEIGHTFIELD_CELLS_PER_QUERY;
         let mut found = false;
         for i in 0..self.bodies.len() {
             if found {
@@ -1445,12 +1449,13 @@ impl World {
             // **증명 가능한 `true`를 영원히 못 받는다**(확인검수 rev_2e93ebf2 MAJOR:
             // 캐릭터의 매 이동이 오류로 고정된다). `any_contact`와 같은 규칙을 쓴다 —
             // 양성은 한 점으로 증명되고, 음성만 순회 완주를 요구한다.
-            let walk = maru_collide::for_each_contact(
+            let walk = maru_collide::for_each_contact_with_budget(
                 shape,
                 &pose,
                 &self.bodies[i].shape,
                 &self.bodies[i].pose,
                 0.0,
+                &mut cells,
                 &mut |_, _, m| {
                     if m.points().iter().any(|p| p.separation < -1e-4) {
                         found = true;
@@ -1462,11 +1467,19 @@ impl World {
                 return Ok(true);
             }
             // 못 찾았는데 순회가 끊겼다 = **판정하지 못했다**. `false`로 뭉개면 캐릭터가
-            // 벽 속에서 출발한다.
-            if walk != maru_collide::ContactWalk::Complete
-                && walk != maru_collide::ContactWalk::Saturated
-            {
-                return Err(ApiError::ResourceLimit);
+            // 벽 속에서 출발한다. **포화도 완주가 아니다**(확인검수 rev_97887d75 MAJOR):
+            // 64번째 매니폴드에서 끊겼다는 뜻이고, 앞 64개가 침투 임계에 못 미치는 얕은
+            // 접촉이었다면 뒤쪽의 깊은 침투를 못 본 채 "안 겹친다"가 된다.
+            match walk {
+                maru_collide::ContactWalk::Complete => {}
+                maru_collide::ContactWalk::Saturated
+                | maru_collide::ContactWalk::BudgetExceeded => {
+                    return Err(ApiError::ResourceLimit);
+                }
+                maru_collide::ContactWalk::InvalidShape
+                | maru_collide::ContactWalk::InvalidInput => {
+                    return Err(ApiError::InvalidValue);
+                }
             }
         }
         Ok(found)
@@ -1496,7 +1509,12 @@ impl World {
                 continue;
             }
             let b = &self.bodies[i];
-            if maru_collide::contains_point(&b.shape, &b.pose, p) {
+            // 월드 바디의 형상·자세는 삽입·복원 경계에서 검증됐으므로 `try_` 오류는
+            // 도달 불가다. 그래도 값으로 받아 **미스로 뭉개지 않는다** — 언젠가 경계가
+            // 갈리면 "점이 안 들어 있다"가 아니라 오류로 드러나야 한다.
+            if maru_collide::try_contains_point(&b.shape, &b.pose, p)
+                .map_err(|_| ApiError::InvalidValue)?
+            {
                 out.push(self.handle_of(i));
             }
         }
@@ -1575,7 +1593,12 @@ impl World {
             return None;
         }
         let b = &self.bodies[i];
-        let rc = maru_collide::cast_ray(&b.shape, &b.pose, origin, dir, max_toi)?;
+        // 월드 바디는 검증됐다(위 `query_point_filtered` 주석과 같은 규약) — 오류는
+        // 도달 불가이고, 여기 시그니처는 `Option`이라 오류를 미스로 접는다. 그래서
+        // **호출 전에 인자를 검증하는 책임은 공개 진입점**(`cast_ray`·`cast_ray_all`)에 있다.
+        let rc = maru_collide::try_cast_ray(&b.shape, &b.pose, origin, dir, max_toi)
+            .ok()
+            .flatten()?;
         Some(RayHit {
             body: self.handle_of(i),
             toi: rc.toi,
@@ -4757,7 +4780,9 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
             // 월드에 들어오는 형상은 삽입·복원에서 `validate()`를 통과했으므로 여기는
             // 도달 불가다. 그래도 `Complete`로 뭉개지 않는다 — 언젠가 검증 경로가 갈리면
             // "접촉 없음"으로 조용히 진행하는 대신 예산 초과와 같은 결말(스텝 포기)을 준다.
-            maru_collide::ContactWalk::InvalidShape => out.budget_exceeded = true,
+            maru_collide::ContactWalk::InvalidShape | maru_collide::ContactWalk::InvalidInput => {
+                out.budget_exceeded = true
+            }
         }
         // 센서 페어(또는 접촉만 있고 제약이 없는 경우의 이벤트 기준선).
         if touched && sensor_pair {

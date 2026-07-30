@@ -52,6 +52,74 @@ pub const COS_COPLANAR: f32 = 0.995;
 /// 이 정도면 캐시에 들어가고, 스윕 하나가 훑을 타일 수는 셀 수의 1/64이다.
 pub const HEIGHTFIELD_TILE: u32 = 8;
 
+/// **격자 데이터 — 불변식을 생성자만 세운다.**
+///
+/// 필드가 비공개인 이유가 이 타입의 존재 이유다. 예전에는 `Shape::Heightfield { heights,
+/// tiles, .. }`가 공개 필드였고, `tiles`는 높이의 **파생물**인데 호스트가 아무 값이나 넣을 수
+/// 있었다. 길이가 맞고 값만 틀린 타일은 가지치기를 통과시켜 **진짜 접촉을 조용히 건너뛴다**
+/// (평지 위 캐스트가 `Ok(None)`, 지형 접촉이 `Some(false)`). 스냅샷 경로에서는 그걸
+/// `tiles_match`로 비트 검증했지만, 라이브 API에는 그 검사가 없었고 O(n)이라 스텝 안의
+/// CCD 핫패스에 넣을 수도 없었다(확인검수 rev_97887d75 BLOCKER).
+///
+/// **검사 대신 구성으로 막는다.** 생성자만이 `tiles`를 채우므로 위조된 타일은 타입 수준에서
+/// 존재할 수 없고, 그러면 어느 경로에서도 재검증이 필요 없다 — 런타임 비용 0이다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeightfieldGrid {
+    heights: Vec<f32>,
+    /// 타일별 (최소, 최대) 높이 — 높이 배열의 파생물이다(캐노니컬 상태 아님).
+    /// 스냅샷에는 넣지 않고 복원에서 다시 만든다.
+    tiles: Vec<(f32, f32)>,
+    nx: u32,
+    nz: u32,
+    cell: f32,
+}
+
+impl HeightfieldGrid {
+    /// 격자를 만든다 — 구조 불변식을 검사하고 타일을 계산한다. 어기면 `None`.
+    ///
+    /// 검사 항목(전부 인덱싱·나눗셈의 전제다): `nx,nz >= 2` · `nx*nz == heights.len()` ·
+    /// 샘플 수 상한 · 높이 유한 · `cell` 유한 양수. **크기 정책**(MAX_SHAPE_EXTENT 등)은
+    /// 여기가 아니라 `Shape::validate`가 본다 — 그쪽은 삽입·복원 경계의 정책 층이다.
+    pub fn new(heights: Vec<f32>, nx: u32, nz: u32, cell: f32) -> Option<Self> {
+        let n = (nx as usize).checked_mul(nz as usize)?;
+        if nx < 2 || nz < 2 || n != heights.len() || n > MAX_HEIGHTFIELD_SAMPLES {
+            return None;
+        }
+        if !cell.is_finite() || cell <= 0.0 || !heights.iter().all(|h| h.is_finite()) {
+            return None;
+        }
+        let tiles = build_tiles(&heights, nx, nz);
+        // `build_tiles`는 할당 실패·불량 입력에 빈 벡터를 낸다. 빈 타일은 `tile_range`가
+        // 보수적으로 답해 정확성은 유지되지만, 여기서는 **만들지 않는 편**이 정직하다.
+        if tiles.is_empty() {
+            return None;
+        }
+        Some(Self {
+            heights,
+            tiles,
+            nx,
+            nz,
+            cell,
+        })
+    }
+
+    pub fn heights(&self) -> &[f32] {
+        &self.heights
+    }
+    pub fn nx(&self) -> u32 {
+        self.nx
+    }
+    pub fn nz(&self) -> u32 {
+        self.nz
+    }
+    pub fn cell(&self) -> f32 {
+        self.cell
+    }
+    pub(crate) fn tiles(&self) -> &[(f32, f32)] {
+        &self.tiles
+    }
+}
+
 /// 격자 하이트필드의 기하 — `Shape::Heightfield`의 계산을 모아 둔 뷰.
 ///
 /// 셰이프가 소유한 데이터를 빌려 쓰기만 한다(복사 없음).
@@ -520,59 +588,17 @@ pub fn overlapping_cell_count(
     n
 }
 
-/// 타일 배열이 **정말 이 높이 배열에서 유도된 것인가** — 값까지 확인한다.
-///
-/// 길이만 보면 안 된다: `Shape::Heightfield`는 공개 필드라 호스트가 직접 만들 수 있고,
-/// 길이만 맞는 엉뚱한 타일(예: 평지에 `[(100,100)]`)을 넣으면 가지치기가 **모든 실제 지형을
-/// 건너뛴다** — 스윕이 `None`을 돌려주고 물체가 지형을 통과한다.
-/// 더 나쁜 것은 스냅샷이다: 타일은 직렬화하지 않으므로 복원 월드는 **올바른** 타일을 갖는다.
-/// 즉 같은 바이트·같은 상태 해시인데 다음 CCD 결과가 달라진다 — L0 결정론과
-/// 입력/복원 대칭이 동시에 깨진다(확인검수 rev_e50670ad BLOCKER).
-///
-/// 할당 없이(재계산해 비교) 검사한다 — `Body::validate`가 커맨드 flush에서도 불린다.
-/// 비교는 **비트 단위**다: 파생값이 조금이라도 다르면 그건 다른 파생이다.
-///
-/// 비용 실측(2026-07-30): **셀당 ~2.7ns** — 4,096셀 10us, 65,536셀 174us, 상한 격자
-/// (1024×1024 ≈ 100만 셀) 약 2.8ms. 호출 지점은 전부 **바디 삽입·스냅샷 복원**이고
-/// 스텝마다 도는 경로는 없다(전수 확인) — 즉 메가바이트짜리 지형을 넣을 때 한 번 내는 값이다.
-pub fn tiles_match(heights: &[f32], nx: u32, nz: u32, tiles: &[(f32, f32)]) -> bool {
-    let Some(samples) = (nx as usize).checked_mul(nz as usize) else {
-        return false;
-    };
-    if nx < 2 || nz < 2 || samples != heights.len() {
-        return false;
-    }
-    let (ncx, ncz) = (nx - 1, nz - 1);
-    let (ntx, ntz) = (
-        ncx.div_ceil(HEIGHTFIELD_TILE),
-        ncz.div_ceil(HEIGHTFIELD_TILE),
-    );
-    let Some(tile_count) = (ntx as usize).checked_mul(ntz as usize) else {
-        return false;
-    };
-    if tiles.len() != tile_count {
-        return false;
-    }
-    for tz in 0..ntz {
-        for tx in 0..ntx {
-            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-            let x1 = ((tx + 1) * HEIGHTFIELD_TILE).min(ncx);
-            let z1 = ((tz + 1) * HEIGHTFIELD_TILE).min(ncz);
-            for iz in (tz * HEIGHTFIELD_TILE)..=z1 {
-                for ix in (tx * HEIGHTFIELD_TILE)..=x1 {
-                    let h = heights[(iz * nx + ix) as usize];
-                    lo = lo.min(h);
-                    hi = hi.max(h);
-                }
-            }
-            let got = tiles[(tz * ntx + tx) as usize];
-            if got.0.to_bits() != lo.to_bits() || got.1.to_bits() != hi.to_bits() {
-                return false;
-            }
-        }
-    }
-    true
-}
+// **`tiles_match`는 삭제됐다** (2026-07-30).
+//
+// 그 함수는 "타일 배열이 정말 이 높이에서 유도된 것인가"를 비트 단위로 재계산해 확인했다.
+// 필요했던 이유는 `Shape::Heightfield`의 `tiles`가 공개 필드였기 때문이다 — 길이만 맞는
+// 엉뚱한 타일(평지에 `[(100,100)]`)을 넣으면 가지치기가 모든 지형을 건너뛰고, 스냅샷은 타일을
+// 저장하지 않으므로 복원 월드만 올바른 타일을 가져 **같은 바이트·다른 미래**가 됐다
+// (rev_e50670ad BLOCKER). 그런데 그 검사는 셀당 ~2.7ns의 O(n)이라 삽입·복원 경계에만 걸 수
+// 있었고, 라이브 질의(스텝 안의 CCD가 후보마다 부른다)에는 구멍이 남았다(rev_97887d75 BLOCKER).
+//
+// 지금은 `HeightfieldGrid`의 생성자만이 타일을 채우므로 **위조된 상태가 타입 수준에서
+// 존재하지 않는다**. 검사할 대상이 없어졌으니 검사도 없앴다 — 재검증 비용 0이 그 설계의 값이다.
 
 /// 로컬 공간 AABB를 포즈로 되돌린 것 — 월드 AABB를 하이트필드 로컬로 옮긴다.
 pub fn world_aabb_to_local(aabb: Aabb, pose: &Pose) -> Aabb {
