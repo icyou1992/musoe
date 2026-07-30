@@ -174,8 +174,14 @@ fn effective_mass(
 /// (`Vec3x4::cross`·`Mat3x4::mul_vec`·`Vec3x4::dot`이 스칼라판과 같은 결합 순서이고
 /// FMA에 의존하지 않는다 — 설계 §8 L0). 두 곳만 스칼라와 표현이 다르고, 둘 다 값이 같다:
 /// - `if k > 0.0` 분기 → `cmp_gt` + `blend`. NaN에서 둘 다 거짓이라 0.0으로 같다.
-/// - 나눗셈 전에 k를 1.0으로 **치환**한다. 0으로 나눠 inf를 만든 뒤 가리면 스칼라가
-///   만들지 않는 부동소수 예외 플래그를 남긴다(설계 §8의 fp 환경 규율).
+/// - 나눗셈 전에 k를 1.0으로 **치환**한다.
+///
+/// 치환에 대한 정직한 진술: 이것은 **값으로는 항등**이다. `one / k`로 두어 k≤0에서 inf가
+/// 나와도 blend가 그 레인을 0.0으로 덮으므로 결과 비트는 같고, 그래서 **값 기반 테스트로는
+/// 이 줄을 지킬 수 없다**(뮤테이션으로 확인했다 — 지우면 테스트가 통과한다). 남겨 두는 이유는
+/// 0 나눗셈이 스칼라 경로가 만들지 않는 DZ 상태 플래그를 세우기 때문이고, 설계 §8의 FP 계약이
+/// 규율하는 것은 FTZ/DAZ·라운딩이지 **예외 마스킹이 아니라서** 예외를 언마스크한 호스트에서는
+/// 그 차이가 트랩으로 관측될 수 있다. 값이 같으니 "단순화"하고 싶어지는 줄이라 근거를 여기 남긴다.
 #[inline]
 fn effective_mass_x3(
     inv_m_sum: f32x4,
@@ -477,17 +483,29 @@ pub fn prepare_into(
     // 게이트가 얼마나 자주 매칭을 끊는지 보이지 않는다 — 지표가 거짓이면 회귀 테스트도 거짓이다.
     let mut warm_matched = 0u32;
     let (ia, ib) = (ba.inv_inertia_world(), bb.inv_inertia_world());
-    // 유효질량 4-wide 셋업 — **페어당 1회**. 관성텐서와 방향은 접점마다 같으므로
-    // 접점 루프 밖에 있어야 한다(안에 두면 splat 비용이 이득을 먹는다).
-    let ia4 = Mat3x4::splat(ia);
-    let ib4 = Mat3x4::splat(ib);
-    let inv_m_sum = f32x4::splat(ba.inv_mass + bb.inv_mass);
-    let dirs = Vec3x4::from_array([n, tangents[0], tangents[1], n]);
     let scalar_mass = scalar_effective_mass_path();
     points.clear();
     if points.try_reserve(m.points().len()).is_err() {
         return Err(crate::world::ApiError::ResourceLimit);
     }
+    // 유효질량 4-wide 셋업 — **페어당 1회**(접점마다 같은 값이라 접점 루프 밖이어야 한다).
+    //
+    // **조건부인 것이 A/B의 정확성 조건이다** (교차검수 rev_4976e200 BLOCKER). 무조건 셋업하면
+    // 스칼라 팔이 *옛 경로 + 쓰지도 않는 셋업*이 되어 기준선이 부풀고, SIMD 순이득을 그만큼
+    // 과대평가한다 — 컴파일러가 이 순수 계산을 분기 안으로 sink해 주기를 **기대하면 안 된다**
+    // (클로저 경계를 넘고, 분기 조건이 런타임 값이다). 실제로 1차 측정이 그 상태였고,
+    // 보고한 이득이 1~2%뿐이라 결론이 뒤집힐 수 있는 크기였다.
+    // 접점 0개 매니폴드에서 셋업하지 않는 것도 같은 이유다(할 일이 없는데 값을 치른다).
+    let simd_setup = if scalar_mass || m.is_empty() {
+        None
+    } else {
+        Some((
+            f32x4::splat(ba.inv_mass + bb.inv_mass),
+            Mat3x4::splat(ia),
+            Mat3x4::splat(ib),
+            Vec3x4::from_array([n, tangents[0], tangents[1], n]),
+        ))
+    };
     points.extend(m.points().iter().map(|p| {
         let ra = p.position - ba.pose.pos;
         let rb = p.position - bb.pose.pos;
@@ -538,7 +556,10 @@ pub fn prepare_into(
                 0.0,
             ]
         } else {
-            effective_mass_x3(inv_m_sum, &ia4, &ib4, ra, rb, dirs)
+            let (inv_m_sum, ia4, ib4, dirs) = simd_setup
+                .as_ref()
+                .expect("접점이 있는 SIMD 경로에는 셋업이 있다");
+            effective_mass_x3(*inv_m_sum, ia4, ib4, ra, rb, *dirs)
         };
         ContactPointConstraint {
             feature: p.feature,
@@ -1512,6 +1533,74 @@ mod tests {
             }
             // 넷째 레인은 법선을 다시 실은 것이므로 0번과 같아야 한다(셋업이 어긋나면 여기가 깨진다).
             assert_eq!(simd[3].to_bits(), scalar[0].to_bits());
+        }
+    }
+
+    /// `if k > 0.0` 분기와 안전 분모가 **모든 경계 입력**에서 스칼라와 같은지.
+    ///
+    /// 위 테스트는 k>0 두 건과 k=0 한 건뿐이라 `k<0`·NaN·비정규수·±inf·−0.0을 하나도 밟지
+    /// 않았다(교차검수 rev_4976e200 MAJOR). 그 상태면 NaN 마스크를 반대로 고르거나 음수
+    /// 레인에서 원래 k로 나누는 회귀가 들어와도 전부 통과한다 — 즉 **실패할 수 없는 테스트**였다.
+    /// 관성을 0으로 두면 k = inv_m_a가 되어 분기 입력을 직접 지정할 수 있다.
+    #[test]
+    fn effective_mass_x3_matches_scalar_at_branch_edges() {
+        let zero_i = Mat3::from_diagonal(Vec3::ZERO);
+        let zero_i4 = Mat3x4::splat(zero_i);
+        let dir = Vec3::new(1.0, 0.0, 0.0);
+        let dirs = Vec3x4::from_array([dir; 4]);
+
+        for inv_m_a in [
+            -1.0,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x8000_0001), // 음의 최소 비정규수
+            -0.0,
+            0.0,
+            f32::from_bits(0x0000_0001), // 양의 최소 비정규수
+            f32::MIN_POSITIVE,
+            f32::INFINITY,
+            f32::from_bits(0x7fc0_1234), // qNaN
+        ] {
+            let scalar =
+                effective_mass(inv_m_a, &zero_i, Vec3::ZERO, 0.0, &zero_i, Vec3::ZERO, dir);
+            let simd = effective_mass_x3(
+                f32x4::splat(inv_m_a + 0.0),
+                &zero_i4,
+                &zero_i4,
+                Vec3::ZERO,
+                Vec3::ZERO,
+                dirs,
+            );
+            for (lane, got) in simd.iter().enumerate() {
+                assert_eq!(
+                    scalar.to_bits(),
+                    got.to_bits(),
+                    "k={inv_m_a:?} lane={lane}: 스칼라 {scalar:?} vs SIMD {got:?}"
+                );
+            }
+        }
+
+        // 합산이 실제로 **좌결합**인지 — 재결합하면 값이 달라지는 입력으로 잠근다.
+        // ((2^24 + −2^24) + 1) = 1 이지만 2^24 + (−2^24 + 1)도 1이라 그 짝은 판별력이 없다;
+        // 판별력은 dotA가 흡수되는 쪽에서 나온다: (2^24 + 1) + (−2^24) = 0 ≠ 1.
+        let ia = Mat3::from_diagonal(Vec3::new(0.0, 0.0, 1.0));
+        let ra = Vec3::new(0.0, 1.0, 0.0);
+        let (inv_m_a, inv_m_b) = (16_777_216.0f32, -16_777_216.0f32);
+        let scalar = effective_mass(inv_m_a, &ia, ra, inv_m_b, &zero_i, Vec3::ZERO, dir);
+        assert_eq!(
+            scalar.to_bits(),
+            1.0f32.to_bits(),
+            "좌결합이면 k=1이라 유효질량도 1이다"
+        );
+        let simd = effective_mass_x3(
+            f32x4::splat(inv_m_a + inv_m_b),
+            &Mat3x4::splat(ia),
+            &zero_i4,
+            ra,
+            Vec3::ZERO,
+            dirs,
+        );
+        for (lane, got) in simd.iter().enumerate() {
+            assert_eq!(scalar.to_bits(), got.to_bits(), "좌결합 lane={lane}");
         }
     }
 

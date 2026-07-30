@@ -24,6 +24,14 @@ cargo run --release --target wasm32-wasip1 -p maru-bench --bin maru-bench
 if command -v cc >/dev/null 2>&1; then
   echo "== test (native) =="
   cargo test
+  echo "== 유효질량 비트 계약 (SIMD 경로 = 스칼라 경로) =="
+  cargo test --release -p maru-dynamics effective_mass_x3
+  # 측정 노브(`MARU_SCALAR_EFFMASS`)의 **스칼라 팔도 게이트를 지나야** 한다. 노브는
+  # 프로세스당 1회 캐시되므로 기본 팔과 같은 프로세스에서는 절대 실행되지 않는다 —
+  # 별도 프로세스가 아니면 "두 팔 모두 결정적"이라는 주장에 증거가 없다
+  # (교차검수 rev_4976e200 MAJOR).
+  echo "== 결정성 (스칼라 팔, 별도 프로세스) =="
+  MARU_SCALAR_EFFMASS=1 cargo test --release -p maru-dynamics -- --ignored thread_determinism
   echo "== bench (native) =="
   cargo run --release -p maru-bench --bin maru-bench
   # 설계 §6 "스텝 중 힙 할당 0" 래칫. 계약은 아직 0이 아니므로(README '알려진 한계')
