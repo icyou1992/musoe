@@ -214,21 +214,81 @@ fn effective_mass_x3(
 /// 무작위 접근하게 된다. 실제로 점당 73ns가 나왔는데 산술은 40 flops 남짓이었다 —
 /// 비용은 계산이 아니라 **메모리**였다. 솔버가 실제로 읽고 쓰는 6개 배열만 뽑아
 /// 연속 메모리에 두고, 서브스텝 루프가 끝난 뒤 한 번만 바디로 되쓴다.
-/// 월드 역관성에 **회전 잠금**을 건다 — 잠긴 축의 행·열을 0으로 만든다(`P·I⁻¹·P`).
+/// 월드 역관성에 **회전 잠금**을 건다 — 잠긴 축으로는 각속도가 생기지 않는 유효 mobility.
+///
+/// 잠금은 "그 월드 축 각속도를 0으로 묶는다"는 **이상적 구속**이다. 각임펄스 `L`을 주면
+/// 구속력 `Cᵀλ`가 함께 들어와 `I Δω = L + Cᵀλ`, `C Δω = 0`을 만족한다(`C` = 잠긴 축 선택).
+/// 풀면 유효 역관성이 나온다:
+///
+/// ```text
+///   M_eff = M − M Cᵀ (C M Cᵀ)⁻¹ C M        (M = I⁻¹)
+/// ```
+///
+/// **`P·I⁻¹·P`(잠긴 행·열을 0으로)는 틀린 답이다** (교차검수 rev_bb593ab5 BLOCKER).
+/// 그건 관성 주축이 월드 잠금축과 나란할 때만 우연히 같다. 회전한 이방성 바디에서는
+/// 크게 벗어난다 — 반크기 (1, 0.1, 0.1) 막대를 Z로 45° 돌리고 Y·Z를 잠근 뒤 X 각임펄스를
+/// 주면 `P·I⁻¹·P`는 76.49를 주는데 정답은 5.83이다(**13.13배 과대**). 같은 오차가 접촉·
+/// 조인트의 유효질량에도 들어가 충돌 반응과 모터 힘을 왜곡한다.
+///
+/// `C`는 좌표축 선택이라 `M Cᵀ`는 `M`의 잠긴 **열**이고 `C M Cᵀ`는 그 잠긴 부분행렬이다.
+/// `M`이 대칭이므로 `C M`은 그 열들의 전치다. 그래서 전체 역변환 없이 1×1·2×2만 푼다.
 ///
 /// 잠금이 없으면(`mask == 0`) 원본을 그대로 돌려준다 — 그 경우 비용이 0이어야 한다.
-/// 행과 열을 **둘 다** 지우는 이유: 열만 지우면 그 축의 토크가 다른 축 각속도를 만들고,
-/// 행만 지우면 다른 축 토크가 잠긴 축을 돌린다. 대칭을 유지해야 에너지가 새지 않는다.
 #[inline]
 pub fn mask_locked_rotation(m: Mat3, mask: u8) -> Mat3 {
     if mask == 0 {
         return m;
     }
-    let k = |b: u8| if mask & b != 0 { 0.0 } else { 1.0 };
-    let (sx, sy, sz) = (k(1), k(2), k(4));
-    let col = |c: Vec3, s: f32| Vec3::new(c.x * sx * s, c.y * sy * s, c.z * sz * s);
-    Mat3 {
-        c: [col(m.c[0], sx), col(m.c[1], sy), col(m.c[2], sz)],
+    if mask & 0b111 == 0b111 {
+        // 전 축 잠금 — 어떤 각임펄스도 각속도를 만들지 못한다.
+        return Mat3::from_diagonal(Vec3::ZERO);
+    }
+    let col = |k: usize| m.c[k];
+    let at = |r: usize, c: usize| -> f32 {
+        let v = m.c[c];
+        [v.x, v.y, v.z][r]
+    };
+    let outer = |a: Vec3, b: Vec3, s: f32| Mat3 {
+        // (a bᵀ) * s — 열 c는 a * b[c] * s
+        c: [a * (b.x * s), a * (b.y * s), a * (b.z * s)],
+    };
+    let sub = |x: Mat3, y: Mat3| Mat3 {
+        c: [x.c[0] - y.c[0], x.c[1] - y.c[1], x.c[2] - y.c[2]],
+    };
+    let locked: Vec<usize> = (0..3).filter(|k| mask & (1 << k) != 0).collect();
+    match locked.len() {
+        1 => {
+            let i = locked[0];
+            let d = at(i, i);
+            if d <= 0.0 {
+                // 그 축 응답이 이미 0이다(정적·퇴화) — 묶을 것이 없다.
+                return m;
+            }
+            sub(m, outer(col(i), col(i), 1.0 / d))
+        }
+        2 => {
+            let (i, j) = (locked[0], locked[1]);
+            let (a, b, c2) = (at(i, i), at(i, j), at(j, j));
+            let det = a * c2 - b * b;
+            if det <= 0.0 {
+                return m;
+            }
+            let inv = 1.0 / det;
+            // M[:,L] S⁻¹ M[L,:] = inv * ( c2·ci ciᵀ − b·(ci cjᵀ + cj ciᵀ) + a·cj cjᵀ )
+            let (ci, cj) = (col(i), col(j));
+            let t = Mat3 {
+                c: [
+                    ci * (ci.x * c2 * inv) - ci * (cj.x * b * inv) - cj * (ci.x * b * inv)
+                        + cj * (cj.x * a * inv),
+                    ci * (ci.y * c2 * inv) - ci * (cj.y * b * inv) - cj * (ci.y * b * inv)
+                        + cj * (cj.y * a * inv),
+                    ci * (ci.z * c2 * inv) - ci * (cj.z * b * inv) - cj * (ci.z * b * inv)
+                        + cj * (cj.z * a * inv),
+                ],
+            };
+            sub(m, t)
+        }
+        _ => m,
     }
 }
 

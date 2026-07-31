@@ -1164,7 +1164,7 @@ impl World {
         let i = self.accept_force(h)?;
         let dw = self.bodies[i].inv_inertia_world().mul_vec(impulse);
         let (sat, clipped) = Self::saturate_derived(self.bodies[i].angvel + dw);
-        self.bodies[i].angvel = sat;
+        self.bodies[i].angvel = self.bodies[i].project_locked_angvel(sat);
         if clipped {
             return Err(ApiError::StateOverflow);
         }
@@ -1191,7 +1191,7 @@ impl World {
         let (sv, cv) = Self::saturate_derived(self.bodies[i].linvel + dv);
         let (sw, cw) = Self::saturate_derived(self.bodies[i].angvel + dw);
         self.bodies[i].linvel = sv;
-        self.bodies[i].angvel = sw;
+        self.bodies[i].angvel = self.bodies[i].project_locked_angvel(sw);
         if cv || cw {
             return Err(ApiError::StateOverflow);
         }
@@ -1712,7 +1712,10 @@ impl World {
             return Err(ApiError::InvalidValue);
         }
         let i = self.mutate(h)?;
-        self.bodies[i].angvel = v;
+        // **잠긴 축 성분은 버린다.** 호스트가 직접 넣어도 솔버는 그걸 없앨 수단이 없고
+        // (역관성이 0이라 임펄스가 안 먹는다) 위치 적분이 그대로 돌린다 —
+        // 잠금이라는 API 약속이 우회된다(교차검수 rev_bb593ab5 BLOCKER).
+        self.bodies[i].angvel = self.bodies[i].project_locked_angvel(v);
         Ok(())
     }
 

@@ -171,7 +171,28 @@ impl Body {
     /// 정적·kinematic 바디는 애초에 역관성이 0이라 영향이 없다.
     pub fn with_locked_rotation(mut self, x: bool, y: bool, z: bool) -> Self {
         self.locked_rot = (x as u8) | ((y as u8) << 1) | ((z as u8) << 2);
+        // 이미 들어 있던 각속도도 즉시 투영한다 — 회전 중인 바디를 clone해 잠금을 붙여
+        // 재삽입하는 경로가 잠긴 축 각속도를 들여오지 못하게.
+        self.angvel = self.project_locked_angvel(self.angvel);
         self
+    }
+
+    /// 잠긴 축 성분을 **0으로 투영한** 각속도.
+    ///
+    /// 유효 역관성을 0으로 만드는 것만으로는 부족하다 — 호스트가 `set_angular_velocity`나
+    /// 스냅샷으로 잠긴 축에 값을 **직접** 넣으면 솔버는 그걸 없앨 수단이 없고(역관성이 0이라
+    /// 임펄스가 안 먹는다) 위치 적분이 그대로 그 축으로 돌린다. 게다가 그 가짜 각속도가
+    /// 접점 상대속도에도 들어간다(교차검수 rev_bb593ab5 BLOCKER).
+    /// 그래서 캐노니컬 진입점마다 이 투영을 건다.
+    pub(crate) fn project_locked_angvel(&self, w: Vec3) -> Vec3 {
+        if self.locked_rot == 0 {
+            return w;
+        }
+        Vec3::new(
+            if self.locked_rot & 1 != 0 { 0.0 } else { w.x },
+            if self.locked_rot & 2 != 0 { 0.0 } else { w.y },
+            if self.locked_rot & 4 != 0 { 0.0 } else { w.z },
+        )
     }
 
     /// 회전 잠금 마스크 (비트 0/1/2 = 월드 X/Y/Z).
@@ -228,6 +249,16 @@ impl Body {
     pub(crate) fn validate(&self) -> Result<(), crate::world::ApiError> {
         use crate::world::ApiError;
         self.shape.validate().map_err(|_| ApiError::InvalidValue)?;
+        // **회전 잠금의 예약 비트는 0이어야 한다** (교차검수 rev_bb593ab5 MINOR).
+        // 안 막으면 상위 비트가 켜진 스냅샷이 복원·재직렬화되면서 물리적으로 같은
+        // 무잠금 상태가 서로 다른 바이트와 상태 해시를 갖는다(비정규 상태 고착).
+        if self.locked_rot & !0b111 != 0 {
+            return Err(ApiError::InvalidValue);
+        }
+        // 잠긴 축 각속도는 0이어야 한다 — 복원 경계에서도 같은 규칙이다(입력·복원 대칭).
+        if self.project_locked_angvel(self.angvel) != self.angvel {
+            return Err(ApiError::InvalidValue);
+        }
         // **하이트필드는 static 전용**이다. 복원 경계(`validate_structure`)에서만 막고
         // 라이브 생성에서 빠뜨리면 `restore(snapshot())`가 자기 스냅샷을 거부한다 —
         // 입력·복원 정책 비대칭은 이 저장소가 네 번 재발로 배운 계열이다

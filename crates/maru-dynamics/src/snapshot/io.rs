@@ -48,9 +48,9 @@ pub(crate) mod min_bytes {
     pub(crate) const SHAPE: usize = 5;
     /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4
     /// + offset12 + force12 + torque12 + membership4 + filter4 + sensor1 + ccd1(v11)
-    /// + weld1(v12) + damp8
+    /// + weld1(v12) + lock1(v17) + damp8
     pub(crate) const BODY_CORE: usize =
-        1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + 1 + 1 + 8 + SHAPE;
+        1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + 1 + 1 + 1 + 8 + SHAPE;
     /// 슬롯 레코드: alive1 + oob1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
     pub const SLOT: usize = 1 + 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
     /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang12 + limit4 + motor4
