@@ -35,10 +35,13 @@ if command -v cc >/dev/null 2>&1; then
   echo "== bench (native) =="
   cargo run --release -p maru-bench --bin maru-bench
   # 설계 §6 "스텝 중 힙 할당 0" 래칫. 계약은 아직 0이 아니므로(README '알려진 한계')
-  # 게이트가 잠그는 것은 **지금보다 나빠지지 않는다**다. 상한 740은 실측 673 + ~10% 여유.
+  # 게이트가 잠그는 것은 **지금보다 나빠지지 않는다**다.
+  # PCM 캐시를 자리에서 채우게 바꾼 뒤 673 → 84로 떨어졌다 — **래칫도 같이 조인다**.
+  # 안 조이면 래칫이 옛 수준까지 8배 퇴행을 통과시킨다(래칫의 값은 현재 수준에 붙어 있을 때 난다).
+  # 상한 95는 실측 84 + ~13% 여유.
   # 스레드는 1로 못는다 — 참여자별 풀이 늘면 수치가 흔들려 래칫이 잡음을 잡는다.
   echo "== 할당 계약 래칫 (native) =="
-  MARU_THREADS=1 cargo run --release -p maru-bench --bin allocs -- pyramid 20 40 20 nosleep 740
+  MARU_THREADS=1 cargo run --release -p maru-bench --bin allocs -- pyramid 20 40 20 nosleep 95
 else
   echo "!! native 레그 생략: C 링커(cc) 없음 — sudo apt-get install -y build-essential 후 재실행"
 fi

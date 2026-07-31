@@ -4522,48 +4522,70 @@ impl World {
         // feature가 자식쌍 네임스페이스로 유일하므로 병합 목록 안에서 충돌하지 않는다.
         let mut cache_written: IntSet<(u32, u32)> = IntSet::default();
         for (c, key) in constraints.iter().zip(&constraint_keys) {
-            let entry: Vec<(FeatureId, CachedImpulse)> = c
-                .points
-                .iter()
-                .map(|p| {
-                    use maru_collide::{saturate_state, saturate_state_vec};
-                    let mut sat = |v: f32| -> f32 {
-                        let (v, changed) = saturate_state(v);
-                        cache_sat_hits += changed as usize;
-                        v
-                    };
-                    let normal = sat(p.normal_impulse);
-                    let tangent = [sat(p.tangent_impulse[0]), sat(p.tangent_impulse[1])];
-                    let tw =
-                        c.tangents[0] * p.tangent_impulse[0] + c.tangents[1] * p.tangent_impulse[1];
-                    let (tangent_world, tw_hit) = saturate_state_vec(tw);
-                    let (position, pos_hit) = saturate_state_vec(p.position);
-                    cache_sat_hits += tw_hit as usize + pos_hit as usize;
-                    // 직렬화되는 필드는 하나도 빠뜨리지 않는다(리뷰 MAJOR): contact_normal이
-                    // NaN이면 restore가 실패한다. 단위 벡터라 포화가 아니라 정규화 실패 시
-                    // 0으로 되돌린다(매칭 게이트가 자연히 끊긴다).
-                    let contact_normal = if c.normal.try_normalize().is_none() {
-                        cache_sat_hits += 1;
-                        Vec3::ZERO
-                    } else {
-                        c.normal
-                    };
-                    (
-                        p.feature,
-                        CachedImpulse {
-                            normal,
-                            tangent,
-                            tangent_world,
-                            position,
-                            contact_normal,
-                        },
-                    )
-                })
-                .collect();
-            if cache_written.insert(*key) {
-                self.contact_cache.insert(*key, entry);
-            } else if let Some(existing) = self.contact_cache.get_mut(key) {
-                existing.extend(entry);
+            let first = cache_written.insert(*key);
+            // 접점 → 캐시 엔트리 변환. **자리에서 채우기 위해** 클로저로 뽑아 뒀다:
+            // 예전에는 `collect()`로 새 `Vec`을 만들어 `insert`했는데, 그러면 직전 스텝의
+            // 엔트리가 통째로 해제되고 다음 스텝이 다시 할당한다 — 접촉 하나당 한 번,
+            // 40단 피라미드에서 스텝당 2,387회다(설계 §6 "스텝 중 할당 0" 위반의 잔여분,
+            // 할당 계측기가 ≤256B 버킷으로 지목했다). 살아남은 키의 `Vec`을 `clear` 후
+            // 다시 채우면 정상 상태에서 할당이 사라진다.
+            let mut make = |p: &solver::ContactPointConstraint| {
+                use maru_collide::{saturate_state, saturate_state_vec};
+                let mut sat = |v: f32| -> f32 {
+                    let (v, changed) = saturate_state(v);
+                    cache_sat_hits += changed as usize;
+                    v
+                };
+                let normal = sat(p.normal_impulse);
+                let tangent = [sat(p.tangent_impulse[0]), sat(p.tangent_impulse[1])];
+                let tw =
+                    c.tangents[0] * p.tangent_impulse[0] + c.tangents[1] * p.tangent_impulse[1];
+                let (tangent_world, tw_hit) = saturate_state_vec(tw);
+                let (position, pos_hit) = saturate_state_vec(p.position);
+                cache_sat_hits += tw_hit as usize + pos_hit as usize;
+                // 직렬화되는 필드는 하나도 빠뜨리지 않는다(리뷰 MAJOR): contact_normal이
+                // NaN이면 restore가 실패한다. 단위 벡터라 포화가 아니라 정규화 실패 시
+                // 0으로 되돌린다(매칭 게이트가 자연히 끊긴다).
+                let contact_normal = if c.normal.try_normalize().is_none() {
+                    cache_sat_hits += 1;
+                    Vec3::ZERO
+                } else {
+                    c.normal
+                };
+                (
+                    p.feature,
+                    CachedImpulse {
+                        normal,
+                        tangent,
+                        tangent_world,
+                        position,
+                        contact_normal,
+                    },
+                )
+            };
+            match self.contact_cache.get_mut(key) {
+                // 살아남은 키 — 용량을 그대로 재사용한다. 같은 키의 첫 제약만 비우고,
+                // 복합 페어의 나머지 제약은 **덧붙인다**(insert로 덮으면 앞 자식의
+                // warm start가 소실된다 — 위 주석).
+                Some(existing) => {
+                    if first {
+                        existing.clear();
+                    }
+                    existing.extend(c.points.iter().map(&mut make));
+                }
+                // 새 키에서만 할당한다(이번 스텝에 새로 생긴 접촉).
+                None => {
+                    // `first == false`면 이번 스텝에 이미 이 키를 썼다는 뜻이라 맵에 있어야
+                    // 한다 — 여기 오면 앞 제약의 엔트리를 **덮어써 warm start를 잃는다**.
+                    // 도달 불가 논증을 검사로 바꿔 둔다(복합 페어의 병합 순서가 이 전제다).
+                    debug_assert!(
+                        first,
+                        "같은 키를 이번 스텝에 이미 썼는데 캐시에 없다 — 병합이 깨진다"
+                    );
+                    let entry: Vec<(FeatureId, CachedImpulse)> =
+                        c.points.iter().map(&mut make).collect();
+                    self.contact_cache.insert(*key, entry);
+                }
             }
         }
         self.diag.post_ns[2] = _t_pcm.ns();
