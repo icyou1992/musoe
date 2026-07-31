@@ -2913,6 +2913,7 @@ impl World {
         // 64배 틀린다). 아래에서 실제 페어 목록으로 **정확한** 제약 상한을 구해 다시 잰다.
         let per_pair_bytes = core::mem::size_of::<(u32, u32)>()          // pairs
             + core::mem::size_of::<(u32, u32)>()                         // NarrowOut.live
+            + 2 * core::mem::size_of::<(u32, u32)>()                     // cache_written(해시 여유)
             + core::mem::size_of::<(u32, u32)>()                         // started (≤ 이번 스텝 페어 수)
             + core::mem::size_of::<ContactEvent>()                       // started 쪽 출력
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
@@ -2958,6 +2959,8 @@ impl World {
             + core::mem::size_of::<u64>()
             + core::mem::size_of::<bool>()                                // 컬러 body_color/conflict
             + core::mem::size_of::<bool>()                                // sleep_bak
+            + core::mem::size_of::<usize>()                              // island_min 키
+            + 2 * core::mem::size_of::<f32>()                            // island_min 값 + 해시 여유
             + core::mem::size_of::<f32>(); // sleep_timer_bak
         let fixed_body_bytes = self.bodies.len().saturating_mul(per_body_bytes);
         // 조인트 비례 스크래치: joint_pairs·active_joints·excluded. **조인트 수는 pairs·bodies의
@@ -3215,6 +3218,19 @@ impl World {
         let mut joint_pairs: Vec<(usize, usize)> = Vec::new();
         let mut active_joints: Vec<usize> = Vec::new();
         let mut excluded: IntSet<(u32, u32)> = IntSet::default();
+        // **선점 없이 자라던 두 집합**(2026-07-31 실측). 매 스텝 새로 만들어 `insert`로 채우면
+        // 용량이 0에서 시작해 log2(n)번 **실패 불가능하게** 재할당한다 — 40단에서 스텝당
+        // realloc 54회의 정체가 이것이었다(계측기 히스토그램이 규모 비례로 지목했다).
+        // 다른 스크래치와 같이 wake 이전 fallible 블록에서 선점한다.
+        let mut cache_written: IntSet<(u32, u32)> = IntSet::default();
+        let mut island_min: IntMap<usize, f32> = IntMap::default();
+        // **`collect()`로 만들면 필터 이터레이터의 size_hint 하한이 0이라 용량이 0에서
+        // 시작해 log2(n)번 실패 불가능하게 재할당한다.** 40단(821바디)에서 세 벡터가
+        // 스텝당 realloc 30여 회를 낸다 — 계측기가 "realloc이 규모에 비례"로 지목했다.
+        // 미리 선점하고 `extend`로 채운다(용량이 충분하면 재할당 없음).
+        let mut active: Vec<u32> = Vec::new();
+        let mut grav_active: Vec<u32> = Vec::new();
+        let mut ccd_list: Vec<u32> = Vec::new();
         let mut order: Vec<u32> = Vec::new();
         let mut conflict: Vec<bool> = Vec::new();
         let mut endpoints: Vec<(u32, u32)> = Vec::new();
@@ -3272,6 +3288,15 @@ impl World {
                 .is_err()
             || (n_par > 1 && constraint_keys.try_reserve(constraint_cap).is_err())
             || live_keys.try_reserve(ncap).is_err()
+            // 상한: `cache_written`은 **키**를 담고 키는 페어당 하나다(복합은 같은 키의 제약이
+            // 여러 개라 제약 수로 잡으면 과대 선점이 된다 — 32비트 wasm 스트레스 테스트가
+            // 그 과대분으로 메모리 한계에 닿았다). 아일랜드 루트는 바디당 하나다.
+            || cache_written.try_reserve(ncap).is_err()
+            || island_min.try_reserve(nbody).is_err()
+            // 셋 다 상한이 바디 수다(활성 ⊆ 전체, 중력·CCD 대상 ⊆ 활성).
+            || active.try_reserve(nbody).is_err()
+            || grav_active.try_reserve(nbody).is_err()
+            || ccd_list.try_reserve(nbody).is_err()
             || joint_pairs.try_reserve(njoint).is_err()
             || active_joints.try_reserve(njoint).is_err()
             || excluded.try_reserve(njoint).is_err()
@@ -3929,15 +3954,11 @@ impl World {
         // **활성 바디만 훑는다.** 전원이 잠든 40단에서도 서브스텝 루프가 8회 × O(바디)
         // 패스를 그대로 돌고 있었다(중력·역관성 갱신·속도 클램프·위치 적분) — 820 바디면
         // 수만 번의 무의미한 순회다. 압축 인덱스 목록을 만들어 그것만 순회한다.
-        let active: Vec<u32> = (0..n_bodies)
-            .filter(|&i| integrate[i])
-            .map(|i| i as u32)
-            .collect();
-        let grav_active: Vec<u32> = active
-            .iter()
-            .copied()
-            .filter(|&i| gravity_on[i as usize])
-            .collect();
+        // 용량은 스텝 시작에 선점됐다 — `clear` 뒤 `extend`는 재할당하지 않는다.
+        active.clear();
+        active.extend((0..n_bodies).filter(|&i| integrate[i]).map(|i| i as u32));
+        grav_active.clear();
+        grav_active.extend(active.iter().copied().filter(|&i| gravity_on[i as usize]));
         // === CCD linear cast 준비 (설계 §4 CCD 계약 v0.5 — 대상 static 한정, opt-in) ===
         // 활성 CCD 바디마다: 서브스텝 적분에서 이동 경로를 static 트리에 캐스트해 TOI에서
         // 절단하고, 이번 스텝의 잔여 서브스텝 동안 **단방향 평면 클램프**(침투 방향 이동
@@ -3945,16 +3966,13 @@ impl World {
         // 이동 종료(구석 퇴화 — 결정적·안전). 속도는 절대 건드리지 않는다: 정지 위치가
         // 표면(speculative skin 안)이라 다음 스텝의 일반 접촉 파이프라인이 실제 접근
         // 속도로 반발·정지를 해석한다.
-        let ccd_list: Vec<u32> = active
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let b = &self.bodies[i as usize];
-                // 센서는 절대 위치 절단 대상이 아니다(교차검수 rev_e4075e85 MAJOR) —
-                // "이벤트만 내고 밀지 않는다" 계약과 정반대가 된다. swept trigger는 미래 확장.
-                b.ccd && b.body_type == BodyType::Dynamic && !b.sensor
-            })
-            .collect();
+        ccd_list.clear();
+        ccd_list.extend(active.iter().copied().filter(|&i| {
+            let b = &self.bodies[i as usize];
+            // 센서는 절대 위치 절단 대상이 아니다(교차검수 rev_e4075e85 MAJOR) —
+            // "이벤트만 내고 밀지 않는다" 계약과 정반대가 된다. swept trigger는 미래 확장.
+            b.ccd && b.body_type == BodyType::Dynamic && !b.sensor
+        }));
         let mut ccd_index: Vec<u32> = Vec::new();
         let mut ccd_planes: Vec<[Vec3; 4]> = Vec::new();
         let mut ccd_plane_count: Vec<u8> = Vec::new();
@@ -4539,7 +4557,8 @@ impl World {
         // **복합 페어는 같은 키의 제약이 여러 개다** — 첫 제약이 엔트리를 새로 만들고
         // 나머지는 append 병합한다(insert로 덮으면 앞 자식의 warm start가 소실된다).
         // feature가 자식쌍 네임스페이스로 유일하므로 병합 목록 안에서 충돌하지 않는다.
-        let mut cache_written: IntSet<(u32, u32)> = IntSet::default();
+        // 용량은 스텝 시작에 선점됐다 — `clear` 뒤 `insert`는 재할당하지 않는다.
+        cache_written.clear();
         for (c, key) in constraints.iter().zip(&constraint_keys) {
             let first = cache_written.insert(*key);
             // 접점 → 캐시 엔트리 변환. **자리에서 채우기 위해** 클로저로 뽑아 뒀다:
@@ -4679,7 +4698,8 @@ impl World {
             }
         }
         // island 전원이 임계 시간을 넘겨야 일괄 sleep (부분 sleep 금지)
-        let mut island_min: IntMap<usize, f32> = IntMap::default();
+        // 용량은 스텝 시작에 선점됐다 — `clear` 뒤 `entry`는 재할당하지 않는다.
+        island_min.clear();
         for i in 0..n {
             if self.alive[i] && self.bodies[i].is_dynamic() && !self.asleep[i] && !self.oob[i] {
                 let root = find(&mut parent, i);
