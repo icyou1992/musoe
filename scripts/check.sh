@@ -43,6 +43,13 @@ if command -v cc >/dev/null 2>&1; then
   # 스레드는 1로 못는다 — 참여자별 풀이 늘면 수치가 흔들려 래칫이 잡음을 잡는다.
   echo "== 할당 계약 래칫 (native) =="
   MARU_THREADS=1 cargo run --release -p maru-bench --bin allocs -- pyramid 20 40 20 nosleep 68
+  # **정착 장면은 래칫이 아니라 0이다** — 여기는 계약이 이미 만족돼 있으므로 상한이 아니라
+  # 계약 그대로 잠근다. 위의 nosleep 래칫과 **다른 경로**를 지킨다: 페어 캐시 hit·전원 휴면
+  # fast path는 nosleep에서 아예 안 밟힌다. 실제로 브로드페이즈 목록 선점을 캐시 판정보다
+  # **앞에** 두었을 때 nosleep 래칫은 59.1로 멀쩡한데 정착만 0 → 2로 퇴행했고, 그 회귀는
+  # 교차검수(rev_74d7e4ff BLOCKER)가 잡았다. 게이트가 없어서 놓친 것이므로 여기 붙인다.
+  echo "== 할당 계약: 정착 장면은 스텝당 0 (native) =="
+  MARU_THREADS=1 cargo run --release -p maru-bench --bin allocs -- pyramid 12 600 40 sleep 0
 else
   echo "!! native 레그 생략: C 링커(cc) 없음 — sudo apt-get install -y build-essential 후 재실행"
 fi

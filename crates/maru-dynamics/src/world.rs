@@ -2786,29 +2786,9 @@ impl World {
 
         // 1) 브로드페이즈 — canonical 페어 (트리 비의존 계약은 maru-collide가 보장)
         let _t_aabb = Stopwatch::start();
-        // **선점한다 — `push`로 자라면 log2(n)번 실패 불가능하게 재할당한다**
-        // (계측기 트레이스가 `RawVec<(u32, Aabb)>::grow_one`으로 지목했다).
-        // 상한은 **정확히** 센다: 두 목록은 살아있는 비-OOB 바디를 static/그 외로 **분할**하므로
-        // 각각 `bodies.len()`을 잡으면 두 배 과대 선점이 된다(과대 선점이 32비트 wasm 스트레스
-        // 테스트를 죽인 전례가 이 세션에 있다). 세는 비용은 O(n) 한 패스이고, 바로 뒤에 오는
-        // AABB 계산(바디당 회전 3회)에 비하면 무시할 만하다.
-        let (mut n_static, mut n_dyn) = (0usize, 0usize);
-        for i in 0..self.bodies.len() {
-            if !self.alive[i] || self.oob[i] {
-                continue;
-            }
-            if self.bodies[i].body_type == BodyType::Static {
-                n_static += 1;
-            } else {
-                n_dyn += 1;
-            }
-        }
         let mut dyn_items: Vec<(u32, Aabb)> = Vec::new();
         let mut static_items: Vec<(u32, Aabb)> = Vec::new();
-        if dyn_items.try_reserve(n_dyn).is_err() || static_items.try_reserve(n_static).is_err() {
-            self.resource_limit = true;
-            return;
-        }
+        // 선점은 **채울 게 정해진 뒤에** 한다 — 아래 `incremental`·`bp_cache_hit` 판정 참조.
         // **캐시를 쓸 스텝이면 AABB를 아예 만들지 않는다.** 페어 캐시가 유효하면 아래에서
         // `Broadphase::build(dyn_items, static_items)`를 부르지 않으므로 이 목록은 만들어서
         // 버려진다 — 전원 수면 pile-3k에서 스텝의 12%가 그 낭비였다(93us/step).
@@ -2866,6 +2846,39 @@ impl World {
             Vec::new()
         };
         let incremental = can_incr && moved_ids.len() <= self.bodies.len() / 2;
+        // **선점한다 — `push`로 자라면 log2(n)번 실패 불가능하게 재할당한다**
+        // (계측기 트레이스가 `RawVec<(u32, Aabb)>::grow_one`으로 지목했다).
+        //
+        // **조건은 아래 채우기 루프의 `take()`와 같아야 한다.** 처음엔 이 선점을 위(브로드페이즈
+        // 진입부)에 무조건 두었는데, 그러면 목록을 **전혀 채우지 않는** 경로(페어 캐시 hit·증분)
+        // 에서도 매 스텝 할당이 나고, 메모리 압박 시에는 AABB 목록이 필요 없는 항등 스텝이
+        // `ResourceLimit`으로 실패한다. 실측으로 정착 피라미드가 스텝당 0회 → **2회**로
+        // 퇴행해 있었다(교차검수 rev_74d7e4ff BLOCKER). 여기(판정 뒤)가 제자리다.
+        //
+        // 상한은 **정확히** 센다: 두 목록은 살아있는 비-OOB 바디를 static/그 외로 **분할**하므로
+        // 각각 `bodies.len()`을 잡으면 두 배 과대 선점이 된다(과대 선점이 32비트 wasm 스트레스
+        // 테스트를 죽인 전례가 이 세션에 있다). 세는 비용은 O(n) 한 패스이고, 바로 뒤에 오는
+        // AABB 계산(바디당 회전 3회)에 비하면 무시할 만하다.
+        // (바이트 회계 `per_body_bytes`는 이 조건과 무관하게 **전체 재빌드 기준**으로 문다 —
+        //  예산은 최악 스텝에서 성립해야 하므로 조건부로 깎으면 안 된다.)
+        if !bp_cache_hit && !incremental {
+            let (mut n_static, mut n_dyn) = (0usize, 0usize);
+            for i in 0..self.bodies.len() {
+                if !self.alive[i] || self.oob[i] {
+                    continue;
+                }
+                if self.bodies[i].body_type == BodyType::Static {
+                    n_static += 1;
+                } else {
+                    n_dyn += 1;
+                }
+            }
+            if dyn_items.try_reserve(n_dyn).is_err() || static_items.try_reserve(n_static).is_err()
+            {
+                self.resource_limit = true;
+                return;
+            }
+        }
         for (i, b) in self
             .bodies
             .iter()

@@ -8032,11 +8032,21 @@ mod tests {
             "예상 밖 오류: {r:?}"
         );
         let d = w.diagnostics();
-        let per_pair = core::mem::size_of::<(u32, u32)>() * 2 + 48;
+        // **바이트 상한이 실제로 묶었는지**를 본다. 원래 단언은 `budget * per_pair <=
+        // MAX_STEP_SCRATCH_BYTES * 2`였는데 그건 **바이트 상한을 통째로 지워도 통과한다**:
+        // 계수형 예산(4096×바디+1024)에 per_pair를 곱해도 두 레그 모두 256 MiB에 한참 못 미친다
+        // (native 78 MiB · wasm 31 MiB). 즉 회귀를 못 잡는 녹색 테스트였다
+        // (교차검수 rev_74d7e4ff MAJOR — wasm 축소로 드러났지만 native도 같은 구멍이었다).
+        // 진짜 수용 기준은 "계수형 상한보다 **더 낮게** 잘렸다"이다.
+        let coefficient_cap = 4096usize
+            .saturating_mul(n_stress)
+            .saturating_add(1024)
+            .min(maru_collide::MAX_PAIRS);
         assert!(
-            d.pair_budget.saturating_mul(per_pair) <= crate::world::MAX_STEP_SCRATCH_BYTES * 2,
-            "페어 예산이 바이트 상한과 무관하다: {} 페어",
-            d.pair_budget
+            d.pair_budget < coefficient_cap,
+            "바이트 상한이 페어 예산을 묶지 못했다: budget={} / 계수형 상한={}",
+            d.pair_budget,
+            coefficient_cap
         );
         // 상태는 손상되지 않고 스냅샷도 유효하다
         assert!(w.restore(&w.snapshot()).is_ok());
