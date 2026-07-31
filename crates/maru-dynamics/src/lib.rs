@@ -6,6 +6,7 @@ mod body;
 mod character;
 mod command;
 mod joint;
+mod lane;
 mod snapshot;
 mod solver;
 mod solver_block;

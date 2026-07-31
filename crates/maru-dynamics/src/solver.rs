@@ -880,18 +880,11 @@ pub fn solve(
         let max_f = c.friction * p.normal_impulse;
         let dv = ba.vel_at(ra) - bb.vel_at(rb);
         let (vt0, vt1) = (c.tangents[0].dot(dv), c.tangents[1].dot(dv));
-        let n0 = p.tangent_impulse[0] - p.tangent_mass[0] * vt0;
-        let n1 = p.tangent_impulse[1] - p.tangent_mass[1] * vt1;
-        let mag2 = n0 * n0 + n1 * n1;
-        let (n0, n1) = if mag2 > max_f * max_f && mag2 > 0.0 {
-            let scale = max_f / mag2.sqrt();
-            (n0 * scale, n1 * scale)
-        } else {
-            (n0, n1)
-        };
-        let d0 = n0 - p.tangent_impulse[0];
-        let d1 = n1 - p.tangent_impulse[1];
-        p.tangent_impulse = [n0, n1];
+        // 핵심 산술은 `lane::friction_disc` 하나다 — 블록 경로와 **같은 코드**를 쓴다.
+        let (acc, d) =
+            crate::lane::friction_disc(p.tangent_impulse, p.tangent_mass, [vt0, vt1], max_f);
+        let (d0, d1) = (d[0], d[1]);
+        p.tangent_impulse = acc;
         let imp = c.tangents[0] * d0 + c.tangents[1] * d1;
         ba.apply(imp, ra);
         bb.apply(-imp, rb);
