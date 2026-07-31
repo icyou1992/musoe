@@ -159,10 +159,29 @@ impl Writer {
 }
 
 pub struct Reader<'a> {
-    pub(crate) b: &'a [u8],
-    pub(crate) at: usize,
+    b: &'a [u8],
+    at: usize,
     /// 지금까지 과금된 디코딩 후 힙 바이트.
-    pub(crate) decoded: usize,
+    decoded: usize,
+}
+
+impl<'a> Reader<'a> {
+    /// 바이트 슬라이스로 리더를 연다.
+    ///
+    /// 필드를 직접 구성하지 못하게 막는다 — `at`·`decoded`는 경계 검사와 디코딩 예산의
+    /// 상태라 밖에서 임의로 세팅되면 그 계약이 무너진다(교차검수 rev_819c41cd 지적).
+    /// 남은 바이트가 없는가 — "뒤에 쓰레기가 붙어 있지 않다"를 확인하는 자리다.
+    pub(crate) fn finished(&self) -> bool {
+        self.at == self.b.len()
+    }
+
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            b: bytes,
+            at: 0,
+            decoded: 0,
+        }
+    }
 }
 
 impl Reader<'_> {

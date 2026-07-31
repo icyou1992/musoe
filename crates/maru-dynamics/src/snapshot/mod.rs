@@ -150,11 +150,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(SnapshotError::CountTooLarge);
     }
-    let mut r = Reader {
-        b: bytes,
-        at: 0,
-        decoded: 0,
-    };
+    let mut r = Reader::new(bytes);
     if r.u32()? != MAGIC {
         return Err(SnapshotError::BadMagic);
     }
@@ -311,7 +307,7 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
         touching.insert((r.u32()?, r.u32()?));
     }
 
-    if r.at != bytes.len() {
+    if !r.finished() {
         return Err(SnapshotError::TrailingBytes);
     }
 
