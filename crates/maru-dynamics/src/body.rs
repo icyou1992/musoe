@@ -205,7 +205,11 @@ impl Body {
         // 라이브 생성에서 빠뜨리면 `restore(snapshot())`가 자기 스냅샷을 거부한다 —
         // 입력·복원 정책 비대칭은 이 저장소가 네 번 재발로 배운 계열이다
         // (검수 rev_1e81559e BLOCKER). 질량 경로가 없어 kinematic도 성립하지 않는다.
-        if matches!(self.shape, Shape::Heightfield { .. }) && self.body_type != BodyType::Static {
+        if matches!(
+            self.shape,
+            Shape::Heightfield { .. } | Shape::TriMesh { .. }
+        ) && self.body_type != BodyType::Static
+        {
             return Err(ApiError::InvalidValue);
         }
         // 용접 마스크: 3비트뿐이고, 비영이면 static 3점 hull(지형 삼각형)이어야 한다 —

@@ -565,7 +565,16 @@ pub fn for_each_contact_with_budget(
 /// 볼록 전용 경로에 비볼록 셰이프가 들어왔는가 — 들어오면 GJK가 `unreachable!`에 닿는다.
 #[inline]
 fn is_non_convex(s: &Shape) -> bool {
-    matches!(s, Shape::Compound { .. } | Shape::Heightfield { .. })
+    // **비볼록 변종을 하나라도 빠뜨리면 GJK가 `support_core`의 `unreachable!`에 닿는다** —
+    // 공개 API라 호스트가 한 줄로 프로세스를 죽일 수 있고 wasm에서는 trap이다.
+    // TriMesh를 빠뜨렸던 것을 교차검수 rev_953115e8이 BLOCKER로 잡았다.
+    // `Shape`에 비볼록 변종을 더할 때 **여기와 `cast.rs::is_non_convex`를 함께** 고쳐야 한다
+    // (둘 다 `matches!`라 컴파일러가 안 잡아 준다 — 그래서 회귀 테스트로 잠갔다:
+    // `mesh_in_a_convex_slot_does_not_trap`).
+    matches!(
+        s,
+        Shape::Compound { .. } | Shape::Heightfield { .. } | Shape::TriMesh { .. }
+    )
 }
 
 pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Option<Manifold> {
@@ -1574,6 +1583,22 @@ mod trimesh_dispatch_tests {
                 y.normal
             );
         }
+    }
+
+    /// **메시를 볼록 인자 자리에 넣어도 trap하지 않는다** (교차검수 rev_953115e8 BLOCKER).
+    ///
+    /// `contact`의 비볼록 가드가 TriMesh를 빠뜨리면 GJK로 내려가 `support_core`의
+    /// `unreachable!`에서 **프로세스가 죽는다**. 공개 API라 호스트가 한 줄로 재현할 수 있고,
+    /// wasm에서는 trap이다. 메시-메시 질의도 같은 경로다.
+    #[test]
+    fn mesh_in_a_convex_slot_does_not_trap() {
+        let mesh = quad_mesh();
+        let ball = Shape::Sphere { radius: 0.5 };
+        // 겹치는 배치 — 가드가 없으면 GJK로 내려간다.
+        let _ = manifolds(&mesh, &pose(1.0, 0.2, 1.0), &ball, &pose(1.0, 0.45, 1.0));
+        // 메시 대 메시 — 양쪽 모두 비볼록이다.
+        let _ = manifolds(&mesh, &pose(0.0, 0.0, 0.0), &mesh, &pose(0.5, 0.01, 0.5));
+        // 여기 도달하면 trap이 없었다는 뜻이다.
     }
 
     /// 크기 정책 밖 메시는 만들어지지 않는다(생성자 경계) — 질의 경로가 볼 일이 없다.

@@ -1724,6 +1724,78 @@ mod tests {
         let _ = Body::new_dynamic(mesh, pose(0.0, 0.0, 0.0), 1.0);
     }
 
+    /// **메시는 kinematic도 될 수 없다** (교차검수 rev_953115e8 BLOCKER).
+    ///
+    /// static 전용 검사가 TriMesh를 빠뜨리면 `try_new_kinematic`이 통과하고, 움직이는 메시가
+    /// 생긴다 — "메시는 CCD/캐스트의 **대상**이지 주체가 아니다"라는 전제가 깨진다.
+    /// 라이브 생성과 스냅샷 복원 **양쪽**을 본다: 한쪽만 막으면 `restore(snapshot())`가
+    /// 자기 스냅샷을 거부하는 비대칭이 생긴다(이 저장소가 네 번 재발로 배운 계열).
+    #[test]
+    fn trimesh_cannot_be_kinematic() {
+        let mesh = || {
+            maru_collide::Shape::trimesh(
+                vec![
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                ],
+                vec![[0, 1, 2]],
+            )
+            .expect("정상 메시")
+        };
+        let r = Body::try_new_kinematic(mesh(), pose(0.0, 0.0, 0.0));
+        assert!(r.is_err(), "kinematic 메시가 만들어졌다");
+        // 월드 삽입 경계도 같은 정책이어야 한다.
+        let mut w = World::new(WorldParams::default());
+        let before = w.body_count();
+        assert!(
+            w.try_add_body(Body::new_static(mesh(), pose(0.0, 0.0, 0.0)))
+                .is_ok(),
+            "static 메시는 받아들여져야 한다(음성 대조)"
+        );
+        assert_eq!(w.body_count(), before + 1);
+    }
+
+    /// **캐릭터의 스윕 셰이프로도 메시를 넣을 수 없다.**
+    ///
+    /// 교차검수(rev_953115e8)가 잡은 두 BLOCKER와 **같은 계열**인데 검수도 놓친 세 번째다:
+    /// 비볼록 판정이 `matches!`로 흩어져 있어 컴파일러가 안 잡아 준다. 스윕 주체가 비볼록이면
+    /// GJK가 `support_core`의 `unreachable!`에 닿아 프로세스가 죽는다(wasm에선 trap).
+    ///
+    /// **정직한 한계**: 이 테스트는 가드를 추가하기 전에도 통과했다 — 다른 경로가 먼저
+    /// 거부하기 때문이다(무엇인지 특정하지 못했다). 그래도 가드를 넣은 이유는, 메시가
+    /// `validate`·`is_castable`을 **통과하는 정상 셰이프**라(`mesh_is_a_valid_shape_so_guards_
+    /// must_be_explicit`) 셰이프 검증이 이 책임을 대신 져 주지 않고, 우연한 하류 거부는
+    /// 계약이 아니기 때문이다. 이 테스트가 잠그는 것은 **거부된다는 사실**이다.
+    #[test]
+    fn character_cannot_sweep_a_trimesh() {
+        let mesh = maru_collide::Shape::trimesh(
+            vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ],
+            vec![[0, 1, 2]],
+        )
+        .expect("정상 메시");
+        let mut w = World::new(WorldParams::default());
+        let mut ch = CharacterVirtual::new(mesh, Vec3::new(0.0, 2.0, 0.0));
+        let r = ch.move_and_slide(&w, Vec3::new(0.0, -1.0, 0.0), QueryFilter::default());
+        assert!(r.is_err(), "비볼록 메시를 스윕 주체로 받아들였다");
+        // 음성 대조: 볼록 셰이프는 정상 동작해야 한다(가드가 전부를 막는 게 아님을 보인다).
+        let mut ok = CharacterVirtual::new(
+            Shape::Capsule {
+                half_height: 0.4,
+                radius: 0.3,
+            },
+            Vec3::new(0.0, 2.0, 0.0),
+        );
+        assert!(ok
+            .move_and_slide(&w, Vec3::new(0.0, -0.1, 0.0), QueryFilter::default())
+            .is_ok());
+        let _ = &mut w;
+    }
+
     /// 메시 스냅샷 왕복 — 파생물(BVH·용접 마스크)은 저장하지 않고 복원에서 다시 만든다.
     #[test]
     fn trimesh_survives_snapshot_roundtrip() {

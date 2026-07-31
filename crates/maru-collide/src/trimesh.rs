@@ -259,6 +259,7 @@ fn build_weld_masks(verts: &[Vec3], tris: &[[u32; 3]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Shape;
 
     /// 두 삼각형이 대각 에지를 공유하는 평면 사각형.
     fn quad() -> (Vec<Vec3>, Vec<[u32; 3]>) {
@@ -445,6 +446,18 @@ mod tests {
         );
         assert!(ok, "스택이 포화됐다 — 고정 깊이 상한이 부족하다");
         assert_eq!(seen, count, "전체를 덮는 질의가 삼각형을 빠뜨렸다");
+    }
+
+    /// 메시는 `validate`·`is_castable`을 **통과한다** — 정상 셰이프이기 때문이다.
+    /// 그래서 "스윕 주체로 쓰면 안 된다"는 **각 진입점의 비볼록 가드**가 져야 하는 책임이지
+    /// 셰이프 검증이 대신 져 주지 않는다(캐릭터 가드가 그것을 빠뜨렸던 이유).
+    #[test]
+    fn mesh_is_a_valid_shape_so_guards_must_be_explicit() {
+        let (v, t) = quad();
+        let m = Shape::trimesh(v, t).expect("정상 메시");
+        assert!(m.validate().is_ok(), "메시는 정상 셰이프다");
+        assert!(m.is_castable(), "메시는 캐스트 대상으로 유효하다");
+        assert_eq!(m.radius(), 0.0);
     }
 
     #[test]

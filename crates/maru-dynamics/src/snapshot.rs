@@ -1233,8 +1233,12 @@ fn validate_structure(
         // **하이트필드는 static 전용**이다 — 질량·관성 경로가 없고(0을 돌려준다) 솔버가
         // 임펄스를 주면 무한 가속이 된다. 라이브 생성이 이미 거부하므로 복원도 거부한다
         // (입력 경계와 복원 경계의 정책 대칭 — 이 저장소가 네 번 재발로 배운 것).
-        if matches!(bodies[i].shape, maru_collide::Shape::Heightfield { .. })
-            && bodies[i].body_type != BodyType::Static
+        // 라이브 생성(`Body::validate`)과 **같은 정책**이어야 한다 — 한쪽만 막으면
+        // `restore(snapshot())`가 자기 스냅샷을 거부한다(입력·복원 비대칭 계열).
+        if matches!(
+            bodies[i].shape,
+            maru_collide::Shape::Heightfield { .. } | maru_collide::Shape::TriMesh { .. }
+        ) && bodies[i].body_type != BodyType::Static
         {
             return Err(SnapshotError::InconsistentState);
         }

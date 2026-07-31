@@ -134,9 +134,14 @@ impl CharacterVirtual {
             || !maru_collide::vec_in_range(self.position)
             || self.shape.validate().is_err()
             // 스윕 주체는 볼록이어야 한다 — 비볼록을 넣으면 GJK가 trap이다.
+            // **비볼록 변종을 여기 빠뜨리면 안 된다.** 메시는 `validate`·`is_castable`을
+            // 통과하는 정상 셰이프라(그건 "대상으로 유효"라는 뜻이다) 셰이프 검증이 이 책임을
+            // 대신 져 주지 않는다. TriMesh가 빠져 있었고, 지금은 다른 경로가 우연히 먼저
+            // 거부하지만 그건 계약이 아니다 — 같은 계열 누락 셋을 교차검수 rev_953115e8과
+            // 그 후속 전수 점검에서 잡았다(`manifold::is_non_convex`·`Body::validate`·여기).
             || matches!(
                 self.shape,
-                Shape::Heightfield { .. } | Shape::Compound { .. }
+                Shape::Heightfield { .. } | Shape::TriMesh { .. } | Shape::Compound { .. }
             )
             || !(0.0..=1.0).contains(&self.max_slope_cos)
             || !(self.skin.is_finite() && self.skin >= 0.0)
