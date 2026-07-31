@@ -22,6 +22,10 @@ enum Child {
     None,
 }
 
+/// `Clone`/`Debug`는 **메시가 트리를 소유하기 때문에** 필요하다(`TriMeshData` → `Shape` →
+/// 바디 삽입에서 셰이프가 복제된다). 트리는 파생물이지만 복제 때 다시 빌드하면 큰 메시에서
+/// 삽입이 O(n log n)이 되므로 그냥 복사한다.
+#[derive(Clone, Debug)]
 pub struct Tree {
     /// 노드별 자식 4개의 바운드(SoA). 빈 레인은 반전 AABB(항상 불일치).
     bounds: Vec<soa_bounds::AabbLanes>,
