@@ -8007,7 +8007,18 @@ mod tests {
             max_pairs_per_body: 4096,
             ..Default::default()
         });
-        for _ in 0..300 {
+        // **wasm 레그에서는 규모를 줄인다.** 이 테스트는 바이트 상한이 페어를 묶는지를 보는
+        // 것이라 바디 수는 "최대 밀집이면 충분"하고, 절대 수가 본질이 아니다. wasm 스위트는
+        // 전체가 **하나의 인스턴스**에서 순차로 돌고 선형 메모리는 줄지 않으므로, 알파벳
+        // 순서상 뒤쪽인 이 테스트가 앞선 테스트들이 키워 놓은 힙 위에서 돈다 —
+        // 이 세션에 스위트가 커지면서 결국 한계에 닿았다(격리 실행은 통과).
+        // native에서는 그대로 300으로 둔다(더 센 조건).
+        let n_stress = if cfg!(target_arch = "wasm32") {
+            120
+        } else {
+            300
+        };
+        for _ in 0..n_stress {
             w.add_body(Body::new_dynamic(
                 Shape::Sphere { radius: 0.5 },
                 pose(0.0, 1.0, 0.0), // 전부 같은 자리 → 최대 밀집

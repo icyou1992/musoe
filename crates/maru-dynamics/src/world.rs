@@ -2786,8 +2786,29 @@ impl World {
 
         // 1) 브로드페이즈 — canonical 페어 (트리 비의존 계약은 maru-collide가 보장)
         let _t_aabb = Stopwatch::start();
+        // **선점한다 — `push`로 자라면 log2(n)번 실패 불가능하게 재할당한다**
+        // (계측기 트레이스가 `RawVec<(u32, Aabb)>::grow_one`으로 지목했다).
+        // 상한은 **정확히** 센다: 두 목록은 살아있는 비-OOB 바디를 static/그 외로 **분할**하므로
+        // 각각 `bodies.len()`을 잡으면 두 배 과대 선점이 된다(과대 선점이 32비트 wasm 스트레스
+        // 테스트를 죽인 전례가 이 세션에 있다). 세는 비용은 O(n) 한 패스이고, 바로 뒤에 오는
+        // AABB 계산(바디당 회전 3회)에 비하면 무시할 만하다.
+        let (mut n_static, mut n_dyn) = (0usize, 0usize);
+        for i in 0..self.bodies.len() {
+            if !self.alive[i] || self.oob[i] {
+                continue;
+            }
+            if self.bodies[i].body_type == BodyType::Static {
+                n_static += 1;
+            } else {
+                n_dyn += 1;
+            }
+        }
         let mut dyn_items: Vec<(u32, Aabb)> = Vec::new();
         let mut static_items: Vec<(u32, Aabb)> = Vec::new();
+        if dyn_items.try_reserve(n_dyn).is_err() || static_items.try_reserve(n_static).is_err() {
+            self.resource_limit = true;
+            return;
+        }
         // **캐시를 쓸 스텝이면 AABB를 아예 만들지 않는다.** 페어 캐시가 유효하면 아래에서
         // `Broadphase::build(dyn_items, static_items)`를 부르지 않으므로 이 목록은 만들어서
         // 버려진다 — 전원 수면 pile-3k에서 스텝의 12%가 그 낭비였다(93us/step).
@@ -2882,6 +2903,11 @@ impl World {
         // 증분 경로의 갱신 목록 — 위 전체 루프와 **같은 AABB 정의**(body_aabb + sweep).
         let mut bp_updates: Vec<(u32, Aabb)> = Vec::new();
         if incremental {
+            // 상한 = 이번 스텝에 움직인 집합. 여기도 `push`로 자라던 자리다.
+            if bp_updates.try_reserve(moved_ids.len()).is_err() {
+                self.resource_limit = true;
+                return;
+            }
             for &r in &moved_ids {
                 let i = r as usize;
                 // R 원소는 직전 스텝에 적분됐고(alive·비OOB·비static), 그 뒤의 구조 변경은
@@ -2960,6 +2986,7 @@ impl World {
             + core::mem::size_of::<bool>()                                // 컬러 body_color/conflict
             + core::mem::size_of::<bool>()                                // sleep_bak
             + 3 * core::mem::size_of::<u32>()                            // active·grav_active·ccd_list
+            + 2 * core::mem::size_of::<(u32, Aabb)>()                    // dyn/static 목록(분할) + bp_updates
             + core::mem::size_of::<usize>()                              // island_min 키
             + 2 * core::mem::size_of::<f32>()                            // island_min 값 + 해시 여유
             + core::mem::size_of::<f32>(); // sleep_timer_bak
