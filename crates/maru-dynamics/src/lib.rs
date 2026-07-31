@@ -2039,6 +2039,178 @@ mod tests {
         assert!(b.linvel.length() < 0.05, "미끄럼 지속: {:?}", b.linvel);
     }
 
+    // ── 마찰 품질 게이트 ────────────────────────────────────────────────────────
+    //
+    // 위 `friction_stops_sliding_box`는 "마찰이 **있다**"만 잠근다 — mu를 10배로 키워도
+    // 통과한다. 마찰 솔버를 **바꾸려면**(마찰 2축을 2x2 블록으로 동시에 푸는 안) 크기·
+    // 방향·임계까지 잠근 기준선이 필요하다. 아래 넷이 그 기준선이고, 숫자는 계측기
+    // (`cargo run --release -p maru-bench --bin friction`)로 뽑은 실측에서 왔다.
+
+    /// 경사면 위 물체의 정지 조건은 `tan(theta) <= mu`다 (mu=0.6 → 임계 30.96도).
+    ///
+    /// **양 끝을 본다.** 정지 쪽만 보면 "마찰이 무한대"인 버그가 통과하고, 미끄럼 쪽만
+    /// 보면 "마찰이 0"인 버그가 통과한다. 구간 불변식은 두 끝을 다 관측해야 성립한다.
+    /// 실측 임계는 29도(정지)와 30.5도(미끄럼 시작) 사이 — 이론에서 1.5도 안쪽이다.
+    #[test]
+    fn friction_slope_threshold_brackets_atan_mu() {
+        // 임계 아래: 3초 동안 사실상 제자리
+        let d = slope_slide_distance(29.0, 180);
+        assert!(
+            d.abs() < 0.01,
+            "임계 아래(29도)인데 미끄러졌다: {d:.4} m (이론 임계 30.96도)"
+        );
+        // 임계 위: 뚜렷하게 미끄러진다
+        let d = slope_slide_distance(31.5, 180);
+        assert!(
+            d > 0.1,
+            "임계 위(31.5도)인데 안 미끄러졌다: {d:.4} m (이론 임계 30.96도)"
+        );
+    }
+
+    /// 미끄러질 때의 가속도는 `g(sin θ − mu cos θ)`여야 한다 — 마찰의 **크기**를 잠근다.
+    /// 정지 임계만 보면 mu가 맞아도 미끄럼 중 마찰이 틀릴 수 있다(정지 임계는 부등식이라
+    /// 한쪽만 규정한다).
+    #[test]
+    fn sliding_acceleration_matches_coulomb_theory() {
+        for deg in [37.0f32, 40.0] {
+            let th = deg.to_radians();
+            let a_theory = 9.81 * (th.sin() - 0.6 * th.cos());
+            // 접촉 안정화 20스텝을 버리고 그 뒤 1초의 평균 가속도를 본다.
+            let v0 = slope_slide_velocity(deg, 20);
+            let v1 = slope_slide_velocity(deg, 80);
+            let a = (v1 - v0) / (60.0 * DT);
+            let ratio = a / a_theory;
+            assert!(
+                (0.85..=1.15).contains(&ratio),
+                "{deg}도 미끄럼 가속도가 이론과 어긋난다: 실측 {a:.4} / 이론 {a_theory:.4} = {ratio:.3}"
+            );
+        }
+    }
+
+    /// 마찰은 접선면에서 **방향에 무관**해야 한다. 지금 솔버는 축0 → 축1 순차
+    /// Gauss-Seidel이라 원리적으로 비등방이고, 실측 폭이 6.85%다(축 정렬 0.7584 m 대
+    /// 직교 0.8104 m). 이 테스트는 그 수준을 **상한으로 못박아** 더 나빠지는 것을 막는다.
+    ///
+    /// 마찰 2x2 블록화는 바로 이 비등방을 줄이는 변경이다 — 그때 이 상한을 조인다.
+    ///
+    /// **뮤테이션 기록**: 기본 마찰을 5.0으로 키우면 발화한다. 그러나 **0.0으로 만들면
+    /// 발화하지 않는다** — 마찰이 없으면 모든 방향이 똑같이 멀리 미끄러져 "완벽하게
+    /// 등방"이기 때문이다. 이 테스트가 재는 것은 방향 의존성뿐이고, 마찰의 **크기**는
+    /// `sliding_acceleration_matches_coulomb_theory`와
+    /// `friction_slope_threshold_brackets_atan_mu`가 잠근다(둘 다 mu=0에서 발화한다).
+    #[test]
+    fn tangent_plane_friction_is_nearly_isotropic() {
+        let mut dists = Vec::new();
+        for k in 0..8 {
+            let ang = k as f32 * core::f32::consts::TAU / 8.0;
+            let mut w = World::new(no_sleep_params());
+            ground(&mut w);
+            let h = w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.5, 0.5),
+                    radius: 0.0,
+                },
+                pose(0.0, 0.5, 0.0),
+                1.0,
+            ));
+            w.set_linear_velocity(h, Vec3::new(ang.cos() * 3.0, 0.0, ang.sin() * 3.0))
+                .unwrap();
+            for _ in 0..300 {
+                w.step(DT);
+            }
+            dists.push((w.body(h).pose().pos - Vec3::new(0.0, 0.5, 0.0)).length());
+        }
+        let dmin = dists.iter().cloned().fold(f32::MAX, f32::min);
+        let dmax = dists.iter().cloned().fold(0.0f32, f32::max);
+        // 이동 자체가 없으면 비율이 무의미하다 — 분모가 살아 있는지 먼저 본다.
+        assert!(
+            dmin > 0.3,
+            "8방향 모두에서 충분히 미끄러져야 한다: min {dmin:.4} m"
+        );
+        let spread = dmax / dmin - 1.0;
+        assert!(
+            spread < 0.08,
+            "접선 마찰 비등방이 커졌다: {:.2}% (기준선 6.85%, 상한 8%) · min {dmin:.4} max {dmax:.4}",
+            100.0 * spread
+        );
+    }
+
+    /// 제자리 회전(스핀)도 마찰이 죽여야 한다 — 접선 임펄스가 레버암을 통해 토크로 간다.
+    /// 마찰을 0으로 만들면 스핀이 남으므로 이 단언은 실제로 실패할 수 있다.
+    #[test]
+    fn spin_is_damped_by_contact_friction() {
+        let mut w = World::new(no_sleep_params());
+        ground(&mut w);
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.5, 0.0),
+            1.0,
+        ));
+        w.set_angular_velocity(h, Vec3::new(0.0, 5.0, 0.0)).unwrap();
+        for _ in 0..30 {
+            w.step(DT);
+        }
+        let wy = w.body(h).angvel().y.abs();
+        assert!(wy < 0.1, "0.5초 뒤에도 스핀이 남았다: {wy:.4} rad/s");
+    }
+
+    fn no_sleep_params() -> WorldParams {
+        WorldParams {
+            // 수면이 켜져 있으면 "멈췄다"가 마찰 때문인지 잠들어서인지 갈리지 않는다.
+            time_to_sleep: maru_collide::MAX_INPUT,
+            ..WorldParams::default()
+        }
+    }
+
+    /// theta(도)로 기울인 바닥 + 그 위에 같은 자세로 놓인 상자. `steps` 뒤의 내리막 변위.
+    fn slope_slide_distance(theta_deg: f32, steps: usize) -> f32 {
+        let (mut w, h, down) = slope_scene(theta_deg);
+        let p0 = w.body(h).pose().pos;
+        for _ in 0..steps {
+            w.step(DT);
+        }
+        (w.body(h).pose().pos - p0).dot(down)
+    }
+
+    /// 같은 장면의 `steps` 뒤 내리막 속도.
+    fn slope_slide_velocity(theta_deg: f32, steps: usize) -> f32 {
+        let (mut w, h, down) = slope_scene(theta_deg);
+        for _ in 0..steps {
+            w.step(DT);
+        }
+        w.body(h).linvel().dot(down)
+    }
+
+    fn slope_scene(theta_deg: f32) -> (World, BodyHandle, Vec3) {
+        let theta = theta_deg.to_radians();
+        let rot = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), theta);
+        let mut w = World::new(no_sleep_params());
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(50.0, 1.0, 50.0),
+                radius: 0.0,
+            },
+            Pose {
+                pos: Vec3::ZERO,
+                rot,
+            },
+        ));
+        // 바닥 윗면은 로컬 +y=1 — 법선 방향으로 1(반두께) + 0.5(상자 반두께)만큼 띄운다.
+        let n = rot.rotate(Vec3::new(0.0, 1.0, 0.0));
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            Pose { pos: n * 1.5, rot },
+            1.0,
+        ));
+        (w, h, rot.rotate(Vec3::new(-1.0, 0.0, 0.0)))
+    }
+
     /// 슬리핑: 정착한 스택은 잠들고, 새 충돌체 도착 시 level-trigger로 깨어난다 (설계 §4.6)
     #[test]
     fn stack_sleeps_then_wakes_on_impact() {
