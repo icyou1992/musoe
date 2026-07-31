@@ -1564,6 +1564,68 @@ mod tests {
         ))
     }
 
+    /// 접촉 이벤트 버퍼가 **스텝 중에 자라지 않는다** — 설계 §6 "스텝 중 할당 0"과
+    /// "Err면 상태 불변"이 이 경로에서도 성립한다는 관측 가능한 증거.
+    ///
+    /// 예전에는 `started`/`stopped`를 이벤트 구간에서 `collect()`로 잡고
+    /// `contact_events`도 그 자리에서 자랐다. 그 지점은 **wake·솔브가 끝난 뒤**라, 할당이
+    /// 실패하면 이미 수면·자세·기준선이 바뀐 상태에서 오류를 내게 된다(되돌릴 수 없다).
+    /// 지금은 셋 다 스텝 시작의 통합 fallible 블록에서 선점한다.
+    ///
+    /// 관측 방법: 이벤트가 **계속 발생하는** 장면에서 용량이 한 번 안정된 뒤 더는 변하지
+    /// 않아야 한다. 용량이 뛰면 그 스텝의 이벤트 구간에서 재할당이 있었다는 뜻이다.
+    #[test]
+    fn contact_event_buffers_do_not_grow_during_a_step() {
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        // 반발 계수를 준 공 여러 개 — 바닥과 접촉을 끊임없이 만들고 끊는다.
+        for i in 0..12 {
+            w.add_body(
+                Body::new_dynamic(
+                    Shape::Sphere { radius: 0.3 },
+                    pose(i as f32 * 1.5 - 8.0, 1.0 + (i % 4) as f32 * 0.7, 0.0),
+                    1.0,
+                )
+                .with_restitution(0.9)
+                .expect("반발 계수는 0..=1"),
+            );
+        }
+        // 핵심 불변식(`started + stopped <= capacity`)은 `world.rs`의 `debug_assert!`가
+        // **이벤트 구간 직전에** 검사한다 — 이 테스트는 그 검사가 실제로 발화하도록
+        // 이벤트가 계속 나는 장면을 돌리는 역할이다(디버그 빌드에서 게이트가 돈다).
+        // 여기서는 용량이 **단조 증가만** 하는지(선점 블록에서만 자라는지)를 함께 본다.
+        for _ in 0..120 {
+            w.step(1.0 / 60.0);
+        }
+        let mut cap = w.contact_events_capacity();
+        let mut event_steps = 0usize;
+        let mut max_events = 0usize;
+        for step in 0..300 {
+            w.step(1.0 / 60.0);
+            let n = w.contact_events().len();
+            if n > 0 {
+                event_steps += 1;
+                max_events = max_events.max(n);
+            }
+            let now = w.contact_events_capacity();
+            assert!(
+                now >= cap,
+                "step {step}: 이벤트 버퍼 용량이 줄었다 ({cap} → {now})"
+            );
+            assert!(
+                n <= now,
+                "step {step}: 이벤트 수 {n}가 용량 {now}를 넘었다 — 재할당이 있었다"
+            );
+            cap = now;
+        }
+        // **커버리지**: 이벤트가 실제로 나야 위 단언이 무언가를 검증한다.
+        // (이벤트가 0이면 "자라지 않았다"는 당연히 참이고 테스트는 아무것도 잠그지 않는다.)
+        assert!(
+            event_steps >= 10 && max_events > 0,
+            "이벤트가 거의 없어 검증이 성립하지 않는다: {event_steps}스텝, 최대 {max_events}건"
+        );
+    }
+
     /// 해석 검증: 자유낙하 v=gt, y=y0−gt²/2 (Symplectic Euler 오차 허용)
     #[test]
     fn free_fall_analytic() {

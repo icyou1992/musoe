@@ -1764,6 +1764,13 @@ impl World {
     }
 
     /// 살아있는 바디 수 (제거된 슬롯 제외).
+    /// 접촉 이벤트 출력 버퍼의 보유 용량 — **스텝 중 재할당이 없었는지** 관측하는 창이다.
+    /// (테스트 전용. 용량이 스텝 사이에 늘지 않으면 이벤트 구간에서 할당이 없었다는 뜻이다.)
+    #[cfg(test)]
+    pub fn contact_events_capacity(&self) -> usize {
+        self.contact_events.capacity()
+    }
+
     /// 바디가 속한 아일랜드 id (`u32::MAX` = 아일랜드 밖 = static·무접촉·수면).
     ///
     /// 테스트 전용 창이다. **병렬 솔버 전략을 아일랜드 위에 세울 수 있는지**가 이 분포에
@@ -2851,6 +2858,9 @@ impl World {
         // 64배 틀린다). 아래에서 실제 페어 목록으로 **정확한** 제약 상한을 구해 다시 잰다.
         let per_pair_bytes = core::mem::size_of::<(u32, u32)>()          // pairs
             + core::mem::size_of::<(u32, u32)>()                         // NarrowOut.live
+            + core::mem::size_of::<(u32, u32)>()                         // started (≤ 페어 수)
+            + core::mem::size_of::<(u32, u32)>()                         // stopped (≤ 직전 기준선 ≤ 페어 수)
+            + 2 * core::mem::size_of::<ContactEvent>()                   // contact_events (두 델타의 합)
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
         let per_constraint_bytes = core::mem::size_of::<ContactConstraint>() // constraints
             + maru_collide::MAX_MANIFOLD_POINTS
@@ -3132,6 +3142,13 @@ impl World {
         let mut grouped: Vec<u32> = Vec::new();
         let mut c_tmp: Vec<Option<ContactConstraint>> = Vec::new();
         let mut new_keys: Vec<(u32, u32)> = Vec::new();
+        // 접촉 이벤트 델타 버퍼. **스텝 시작의 통합 fallible 블록에서 선점한다** — 예전에는
+        // 이벤트 구간에서 `collect()`로 잡았고(무한 실패 불가), 그 지점은 wake·솔브가 이미
+        // 끝난 뒤라 할당이 실패하면 "Err면 상태 불변"도 "스텝 중 할당 0"도 성립하지 않았다
+        // (README '알려진 한계', 교차검수 rev_51f69fbd). 상한은 wake 이전에 확정된다:
+        // started ≤ 이번 스텝 페어 수, stopped ≤ 직전 기준선 크기.
+        let mut started: Vec<(u32, u32)> = Vec::new();
+        let mut stopped: Vec<(u32, u32)> = Vec::new();
         // 직전 접촉 기준선을 **정렬된 벡터**로 — dormant 페어 보존을 페어 순회와 병합하려고 둔다
         // (아래 narrow 루프 주석). 크기는 직전 스텝 접촉 수이므로 wake 이전에 확정된다.
         let mut touch_sorted: Vec<(u32, u32)> = Vec::new();
@@ -3186,6 +3203,21 @@ impl World {
             || c_tmp.try_reserve(constraint_cap).is_err()
             || new_keys.try_reserve(constraint_cap).is_err()
             || touch_sorted.try_reserve(self.touching.len()).is_err()
+            // 이벤트 델타와 출력 버퍼 — 상한은 wake 이전 값으로 정한다.
+            // 출력은 두 델타의 합이 상한이다(같은 키가 양쪽에 동시에 들지 않는다).
+            || started.try_reserve(ncap).is_err()
+            || stopped.try_reserve(self.touching.len()).is_err()
+            // `try_reserve(additional)`는 **`len + additional`**을 보장한다 — 목표에서
+            // `capacity`를 빼서 넘기면 용량이 목표에 못 미친다(첫 스텝에만 우연히 맞는다).
+            // 이벤트 버퍼는 스텝 시작에 비워지므로 `len`은 0이고, 목표를 그대로 넘기면
+            // 이미 충분할 때 무연산이다. (이 실수를 아래 `debug_assert!`가 즉시 잡았다.)
+            || self
+                .contact_events
+                .try_reserve(
+                    ncap.saturating_add(self.touching.len())
+                        .saturating_sub(self.contact_events.len()),
+                )
+                .is_err()
             || self.solver_state.reserve_for(nbody).is_err()
             || self.inv_inertia_local
                 .try_reserve(nbody.saturating_sub(self.inv_inertia_local.len()))
@@ -4323,34 +4355,30 @@ impl World {
         // Stopped 후보는 touch_sorted(R접촉 기준선 키)뿐이다. 기준선도 통째 재구축 대신
         // 그 델타만 반영한다. 전체 경로와의 등가는 락스텝 궤적 테스트가 이벤트까지 잠근다.
         {
-            type KeyVec = Vec<(u32, u32)>;
-            let (mut started, mut stopped): (KeyVec, KeyVec) = if narrow_restricted {
-                (
-                    live_keys
-                        .iter()
-                        .filter(|k| !self.touching.contains(*k))
-                        .copied()
-                        .collect(),
+            // 용량은 스텝 시작에 선점됐다 — `clear` 뒤 `extend`는 재할당하지 않는다.
+            started.clear();
+            stopped.clear();
+            started.extend(
+                live_keys
+                    .iter()
+                    .filter(|k| !self.touching.contains(*k))
+                    .copied(),
+            );
+            if narrow_restricted {
+                stopped.extend(
                     touch_sorted
                         .iter()
                         .filter(|k| !live_keys.contains(*k))
-                        .copied()
-                        .collect(),
-                )
+                        .copied(),
+                );
             } else {
-                (
-                    live_keys
-                        .iter()
-                        .filter(|k| !self.touching.contains(*k))
-                        .copied()
-                        .collect(),
+                stopped.extend(
                     self.touching
                         .iter()
                         .filter(|k| !live_keys.contains(*k))
-                        .copied()
-                        .collect(),
-                )
-            };
+                        .copied(),
+                );
+            }
             started.sort_unstable();
             stopped.sort_unstable();
             // 기준선 갱신 — 다음 스텝의 이벤트가 이 집합과의 차집합이다.
@@ -4365,10 +4393,22 @@ impl World {
                 // 전체 경로: live_keys가 곧 새 기준선 — 수천 키 재삽입 대신 스왑.
                 std::mem::swap(&mut self.touching, &mut live_keys);
             }
+            // **이 루프는 절대 재할당하지 않는다** — 용량은 스텝 시작의 fallible 블록에서
+            // `ncap + touching.len()`으로 잡았고, 두 델타의 합은 그 상한을 넘을 수 없다
+            // (같은 키가 started와 stopped에 동시에 들어가지 않는다: 하나는 live∖touching,
+            // 다른 하나는 touching∖live다). 이 단언이 그 논증을 검사로 바꾼다 —
+            // 넘으면 이벤트 구간에서 할당이 나고, 그건 wake 뒤라 되돌릴 수 없다.
+            debug_assert!(
+                started.len() + stopped.len() <= self.contact_events.capacity(),
+                "이벤트 출력 용량 부족: started {} + stopped {} > cap {}",
+                started.len(),
+                stopped.len(),
+                self.contact_events.capacity()
+            );
             for (k, kind) in started
-                .into_iter()
+                .drain(..)
                 .map(|k| (k, ContactEventKind::Started))
-                .chain(stopped.into_iter().map(|k| (k, ContactEventKind::Stopped)))
+                .chain(stopped.drain(..).map(|k| (k, ContactEventKind::Stopped)))
             {
                 let (ai, bi) = (k.0 as usize, (k.1 & !STATIC_BIT) as usize);
                 if ai >= self.bodies.len() || bi >= self.bodies.len() {

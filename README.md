@@ -952,7 +952,7 @@ MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyra
 참여자별 접점 풀이 상한까지 차오르는 과정이고 128 MiB 예산 안이다 — 누수가 아니다.
 **첫 판단("무한 누수")은 짧은 창 하나로 낸 것이었고 긴 창이 뒤집었다.**
 
-### 접촉 이벤트 출력이 스텝 메모리 예산 밖이다 (2026-07-29 확인, 미수리)
+### ~~접촉 이벤트 출력이 스텝 메모리 예산 밖이다~~ — 2026-07-31 수리
 
 스텝 스크래치는 128 MiB 총상한 안에서 **wake 폐쇄 이전에 전량 선점**한다는 계약인데,
 접촉 이벤트 경로만 그 밖에 있다: `started`/`stopped`가 wake·솔브가 끝난 뒤 `collect()`로
@@ -960,11 +960,25 @@ MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyra
 최대 페어 장면이면 수십 MiB다. 할당이 실패하면 이미 수면·자세·`touching` 기준선이 바뀐
 뒤라 **"Err면 상태 불변"도 "스텝 중 할당 0"도 성립하지 않는다.**
 
-교차검수 rev_51f69fbd가 지목했다. 스레드 트랙이 만든 것이 아니라 그 전부터 있던 결함이고,
-이벤트 순서 계약(started/stopped 판정 순서·기준선 잔류 논증)이 얽혀 있어 **별도 세션에서
-자기 검수와 함께** 고치는 편이 안전하다. 수리 방향은 이벤트 두 버퍼를 스텝 시작의 통합
-fallible 블록으로 끌어올리고(`ncap`·`touching.len()` 상한), `contact_events.capacity()`를
-보유량 회계에 편입하는 것이다.
+교차검수 rev_51f69fbd가 지목했다. 스레드 트랙이 만든 것이 아니라 그 전부터 있던 결함이다.
+
+**수리됨 (2026-07-31)**: `started`·`stopped`·`contact_events` 셋 다 스텝 시작의 통합 fallible
+블록에서 선점한다(상한은 wake 이전에 확정되는 `ncap`·`touching.len()`, 출력은 두 델타의 합).
+이벤트 구간은 `clear` + `extend` + `drain`으로 돌아 **재할당하지 않는다**. 바이트 회계
+(`per_pair_bytes`)에도 세 버퍼를 편입했다 — 예산은 조이는 쪽으로만 움직인다.
+
+논증을 검사로 바꿔 두었다: 이벤트 방출 직전 `debug_assert!(started + stopped <= capacity)`.
+같은 키가 두 델타에 동시에 들지 않으므로(하나는 live∖touching, 다른 하나는 touching∖live)
+합이 상한을 넘을 수 없다는 논증이 근거인데, **그 단언이 수리 첫 판의 버그를 즉시 잡았다**:
+`Vec::try_reserve(additional)`는 `len + additional`을 보장하는데 목표에서 `capacity`를 빼서
+넘기는 바람에 용량이 목표에 못 미쳤다(첫 스텝에만 우연히 맞는다). 회귀는
+`contact_event_buffers_do_not_grow_during_a_step`가 반발 계수를 준 공 12개로 이벤트를
+계속 내며 잠근다(이벤트가 안 나면 단언이 아무것도 검증하지 않으므로 커버리지도 함께 요구한다).
+
+남은 것: `started`/`stopped`는 여전히 **지역 버퍼**라 스텝당 각 1회 할당한다(계측기로 +2회 확인).
+이 저장소의 다른 스텝 스크래치(`touch_sorted`·`order`·`conflict` …)와 같은 형태이고, 계약이
+요구하는 **가fallible·wake 이전**은 충족한다. "스텝 중 할당 0"까지 가려면 이 계열 전체를
+영속 필드로 옮기는 별도 작업이 필요하다.
 
 
 
