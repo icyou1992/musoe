@@ -286,7 +286,7 @@ pub struct World {
     reserved: Vec<bool>,
     generations: Vec<u32>,
     /// PCM 임펄스 캐시: canonical 페어 → (feature, 임펄스). 스텝 간 warm start (설계 §3).
-    contact_cache: IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+    contact_cache: PcmCache,
     sleep_timer: Vec<f32>,
     asleep: Vec<bool>,
     /// 직전 스텝의 아일랜드 대표(설계 §4.6): wake는 **아일랜드 단위**여야 한다.
@@ -2496,7 +2496,7 @@ impl World {
         &Vec<bool>,
         &Vec<u32>,
         &Vec<Joint>,
-        &IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+        &PcmCache,
         &Vec<PendingCommand>,
         CommandReport,
     ) {
@@ -2530,7 +2530,7 @@ impl World {
         asleep: Vec<bool>,
         island: Vec<u32>,
         joints: Vec<Joint>,
-        cache: IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+        cache: PcmCache,
         commands: Vec<PendingCommand>,
         last_report: CommandReport,
     ) {
@@ -4953,13 +4953,24 @@ fn reserve_narrow_bufs(
 ///
 /// **실측 결론 (2026-07-31, 피라미드 40단·수면 OFF·1스레드, 각 팔 12회 교차실행):**
 /// - `1 − 2`(해시맵 프로브만) = narrow의 **1.51%**, 쌍대 우세 77%
-/// - `3 − 2`(프로브 + 찾은 Vec 역참조) = narrow의 **2.17%**, 쌍대 우세 89%
+/// - `3 − 2`(프로브 + Vec 페이로드 로드) = narrow의 **3.17%**, 쌍대 우세 **144/144**
+///
+/// 3의 첫 측정은 2.17%였는데 그건 **과소 측정**이었다: `black_box(e)`가 참조를 넘겨
+/// 포인터만 가려서, 옵티마이저가 페이로드를 한 번도 로드하지 않아도 됐다. `*e`로 값을
+/// 복사해 넘기자 3.17%로 올랐고 두 팔이 완전히 분리됐다(교차검수 rev_1e72bc07 MAJOR).
 ///
 /// narrow는 이 장면에서 스텝의 ~42%이므로, PCM 캐시 접근을 **완전히 공짜로 만들어도**
-/// 스텝은 1% 남짓 줄어든다. 큰 피라미드의 열세는 rapier 대비 1.6~2.3배(38~56% 감축 필요)라
+/// 스텝은 ~1.3% 줄어든다. 큰 피라미드의 열세는 rapier 대비 1.6~2.3배(38~56% 감축 필요)라
 /// **해시맵→정렬배열 순차 병합 구조 변경으로는 닿지 않는다** — 짓기 전에 재서 기각했다.
-/// 잡음이 커서(sd ~0.02) 크기보다 부호를 먼저 봤고, 대조군은 solve(이 팔들이 안 건드리는
-/// 단계)로 두어 머신 드리프트를 나눴다.
+/// 대조군은 solve(이 팔들이 안 건드리는 단계)로 두어 머신 드리프트를 나눴고, 크기보다
+/// 부호(쌍대 비교)를 먼저 봤다.
+/// **프로덕션 빌드에는 아예 컴파일되지 않는다** (`pcm-probe` 피처, 기본 off — 교차검수
+/// rev_1e72bc07 MAJOR). 이전에는 일반 빌드에도 들어가 있어서, 환경에 변수가 남아 있으면
+/// API 오류 하나 없이 warm start만 꺼진 채 돌 수 있었다. stderr 경고는 로그가 수집되지
+/// 않으면 아무것도 막지 못한다 — 컴파일에서 빼는 것이 유일하게 확실한 차단이다.
+/// 지원하지 않는 값도 조용히 뭉개지 않고 즉시 죽는다(예전 `.min(3)`은 오타 `4`를 3으로
+/// 받아들여 물리를 바꿨다).
+#[cfg(feature = "pcm-probe")]
 fn pcm_probe_mode() -> u8 {
     use std::sync::atomic::{AtomicU8, Ordering};
     static CACHED: AtomicU8 = AtomicU8::new(u8::MAX);
@@ -4967,13 +4978,11 @@ fn pcm_probe_mode() -> u8 {
     if v != u8::MAX {
         return v;
     }
-    let m = std::env::var("MARU_PCM_PROBE")
-        .ok()
-        .and_then(|v| v.parse::<u8>().ok())
-        .unwrap_or(0)
-        .min(3);
-    // **켜져 있으면 조용히 지나가지 않는다.** 팔 1~3은 warm start를 꺼서 물리를 바꾼다 —
-    // 환경변수가 남아 있는 채로 돌면 "솔버가 갑자기 나빠졌다"로 나타난다. 프로세스당 1회.
+    let raw = std::env::var("MARU_PCM_PROBE").unwrap_or_else(|_| "0".into());
+    let m = match raw.trim().parse::<u8>() {
+        Ok(m @ 0..=3) => m,
+        _ => panic!("MARU_PCM_PROBE={raw:?} — 지원하는 값은 0·1·2·3뿐이다"),
+    };
     if m != 0 {
         eprintln!("!! MARU_PCM_PROBE={m} — 계측 전용 팔이다. warm start가 꺼져 물리가 달라진다.");
     }
@@ -4985,6 +4994,7 @@ fn pcm_probe_mode() -> u8 {
 type PcmCache = IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>;
 
 /// 계측 팔 `2`가 조회할 빈 캐시. 프로세스당 하나, 절대 채우지 않는다.
+#[cfg(feature = "pcm-probe")]
 fn pcm_probe_empty_cache() -> &'static PcmCache {
     static EMPTY: std::sync::OnceLock<PcmCache> = std::sync::OnceLock::new();
     EMPTY.get_or_init(PcmCache::default)
@@ -4994,7 +5004,7 @@ struct NarrowCtx<'a> {
     bodies: &'a [Body],
     asleep: &'a [bool],
     oob: &'a [bool],
-    cache: &'a IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>,
+    cache: &'a PcmCache,
     touching: &'a IntSet<(u32, u32)>,
     touch_sorted: &'a [(u32, u32)],
     excluded: &'a IntSet<(u32, u32)>,
@@ -5251,8 +5261,11 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
                 if is_compound {
                     m.namespace_features(ca as u32 * 8 + cb as u32 + 1);
                 }
+                #[cfg(not(feature = "pcm-probe"))]
+                let cached = cx.cache.get(&key).unwrap_or(&empty);
+                #[cfg(feature = "pcm-probe")]
                 let cached = match pcm_probe_mode() {
-                    // 0 = 정상. 아래 1·2는 **상한 계측 전용 팔**이다(기본 경로 아님).
+                    // 0 = 정상. 아래 1~3은 **상한 계측 전용 팔**이다(기본 경로 아님).
                     0 => cx.cache.get(&key).unwrap_or(&empty),
                     // 1 = 실제 캐시를 조회하되 **결과를 버리고** warm start를 끈다.
                     1 => {
@@ -5264,11 +5277,18 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
                         core::hint::black_box(pcm_probe_empty_cache().get(&key));
                         &empty
                     }
-                    // 3 = 1에 더해 **찾은 Vec의 내용까지 만진다**(힙 간접참조 비용 포함).
+                    // 3 = 1에 더해 **찾은 Vec의 원소를 값으로 읽는다**(힙 간접참조 비용 포함).
+                    //
+                    // `black_box(e)`(**참조**)로는 부족하다 — 옵티마이저가 가려야 하는 값이
+                    // 포인터뿐이라 포인터만 증가시키고 페이로드를 **한 번도 로드하지 않아도**
+                    // 성립한다(교차검수 rev_1e72bc07 MAJOR). 정상 경로의
+                    // `cache.iter().find(..)`는 feature·임펄스를 실제로 읽으므로,
+                    // 여기서도 `*e`로 **복사**해 넘겨 로드를 강제한다
+                    // (`FeatureId`·`CachedImpulse` 모두 `Copy`).
                     _ => {
                         if let Some(v) = cx.cache.get(&key) {
                             for e in v.iter() {
-                                core::hint::black_box(e);
+                                core::hint::black_box(*e);
                             }
                         }
                         &empty
