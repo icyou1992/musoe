@@ -5133,8 +5133,14 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
                 // 접점 Vec 할당(≤4점) 실패는 극단 OOM — bail로 모아 호출부에서 처리.
                 // 페어당 계측은 두지 않는다 — `Instant::now()` 두 번이 페어당
                 // 실제 작업의 몇 %가 되어 계측기가 대상을 왜곡한다(2026-07-29 실측:
-                // 40단에서 스텝당 ~0.2ms). 내역이 필요하면 `maru-bench --bin boxsplit`
-                // (매니폴드 생성)과 `narrow` 총계의 차로 귀속한다.
+                // 40단에서 스텝당 ~0.2ms).
+                //
+                // **내역은 `boxsplit`과의 차로 귀속하지 마라 — 42% 틀린다**(2026-07-31 실측).
+                // `boxsplit`은 미리 뽑아 둔 배열을 도는 마이크로벤치라 캐시가 계속 데워져 있고,
+                // 실제 루프는 호출 사이에 뚱뚱한 `Body`·PCM 캐시·제약 버퍼를 훑어 그 캐시를
+                // 밀어낸다. 같은 세션에서 boxsplit 1,402 us vs **실루프 1,988 us**였다.
+                // 올바른 방법은 **한계비용**이다: 같은 호출을 한 번 더 돌리고 결과를 버린 뒤
+                // `narrow` 증가분을 읽는다(대조군 solve가 ±1% 안일 때만 유효).
                 let buf = out.point_pool.pop().unwrap_or_default();
                 let Ok(c) = solver::prepare_into(cx.bodies, a_id, b_id, &m, cached, cx.dt, buf)
                 else {
