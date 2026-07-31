@@ -2959,6 +2959,7 @@ impl World {
             + core::mem::size_of::<u64>()
             + core::mem::size_of::<bool>()                                // 컬러 body_color/conflict
             + core::mem::size_of::<bool>()                                // sleep_bak
+            + 3 * core::mem::size_of::<u32>()                            // active·grav_active·ccd_list
             + core::mem::size_of::<usize>()                              // island_min 키
             + 2 * core::mem::size_of::<f32>()                            // island_min 값 + 해시 여유
             + core::mem::size_of::<f32>(); // sleep_timer_bak
@@ -3287,6 +3288,11 @@ impl World {
                 .try_reserve(solver::COLOR_OVERFLOW as usize + 1)
                 .is_err()
             || (n_par > 1 && constraint_keys.try_reserve(constraint_cap).is_err())
+            // ⚠ **여기에 버퍼를 추가하면 위 `per_*_bytes` 회계에도 반드시 더한다.**
+            // 안 더하면 총 128 MiB 상한이 실제 선점보다 낮게 계산돼, 거절해야 할 입력이
+            // allocator 실패(wasm abort)로 끝난다. 이 세션에만 **세 번** 빠뜨렸다:
+            // `contact_events`(rev_18633fde) · 기준선 비례분(rev_18633fde) ·
+            // `active`/`grav_active`/`ccd_list`(rev_ce7e4b1c). 전부 교차검수가 잡았다.
             || live_keys.try_reserve(ncap).is_err()
             // 상한: `cache_written`은 **키**를 담고 키는 페어당 하나다(복합은 같은 키의 제약이
             // 여러 개라 제약 수로 잡으면 과대 선점이 된다 — 32비트 wasm 스트레스 테스트가
