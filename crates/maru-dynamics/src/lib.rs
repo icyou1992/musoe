@@ -2100,26 +2100,43 @@ mod tests {
     /// `friction_slope_threshold_brackets_atan_mu`가 잠근다(둘 다 mu=0에서 발화한다).
     #[test]
     fn tangent_plane_friction_is_nearly_isotropic() {
-        let mut dists = Vec::new();
+        // **한 월드에 8개를 나란히 놓는다.** 처음엔 방향마다 월드를 따로 만들었는데,
+        // 그러면 접촉 제약이 스텝당 하나뿐이라 컬러링이 블록을 만들지 못해 **SIMD 블록
+        // 경로(`solver_block::solve_block`)를 한 번도 안 탄다** — 마찰 2x2 변경은 스칼라와
+        // 블록 **양쪽**에 들어가는데 게이트가 스칼라만 덮고 있었다(블록 경로에 panic을 심어
+        // 확인함: 이 파일의 마찰 게이트 중 스택 테스트만 도달했다).
+        // 상자끼리 바닥을 공유하면 색이 갈리므로 **바닥도 각자 따로** 둔다.
+        let mut w = World::new(no_sleep_params());
+        let mut hs = Vec::new();
         for k in 0..8 {
             let ang = k as f32 * core::f32::consts::TAU / 8.0;
-            let mut w = World::new(no_sleep_params());
-            ground(&mut w);
+            let cx = k as f32 * 100.0; // 서로 접촉·브로드페이즈 간섭이 없을 만큼 멀리
+            w.add_body(Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(20.0, 1.0, 20.0),
+                    radius: 0.0,
+                },
+                pose(cx, -1.0, 0.0),
+            ));
             let h = w.add_body(Body::new_dynamic(
                 Shape::Box {
                     half: Vec3::new(0.5, 0.5, 0.5),
                     radius: 0.0,
                 },
-                pose(0.0, 0.5, 0.0),
+                pose(cx, 0.5, 0.0),
                 1.0,
             ));
             w.set_linear_velocity(h, Vec3::new(ang.cos() * 3.0, 0.0, ang.sin() * 3.0))
                 .unwrap();
-            for _ in 0..300 {
-                w.step(DT);
-            }
-            dists.push((w.body(h).pose().pos - Vec3::new(0.0, 0.5, 0.0)).length());
+            hs.push((h, Vec3::new(cx, 0.5, 0.0)));
         }
+        for _ in 0..300 {
+            w.step(DT);
+        }
+        let dists: Vec<f32> = hs
+            .iter()
+            .map(|&(h, p0)| (w.body(h).pose().pos - p0).length())
+            .collect();
         let dmin = dists.iter().cloned().fold(f32::MAX, f32::min);
         let dmax = dists.iter().cloned().fold(0.0f32, f32::max);
         // 이동 자체가 없으면 비율이 무의미하다 — 분모가 살아 있는지 먼저 본다.
@@ -2135,26 +2152,193 @@ mod tests {
         );
     }
 
-    /// 제자리 회전(스핀)도 마찰이 죽여야 한다 — 접선 임펄스가 레버암을 통해 토크로 간다.
-    /// 마찰을 0으로 만들면 스핀이 남으므로 이 단언은 실제로 실패할 수 있다.
+    /// 제자리 회전(스핀)은 마찰이 죽여야 한다 — 접선 임펄스가 레버암을 통해 토크로 간다.
+    ///
+    /// **양 끝을 본다** (교차검수 rev_ac00206f MAJOR). 처음엔 "0.5초 뒤 0.1 아래"라는
+    /// **상한만** 뒀는데, 그러면 마찰 토크가 **지나치게 큰** 회귀가 통과한다: 2x2 역행렬의
+    /// 교차항 부호·배율이 틀려 선형 임펄스는 상쇄되고 토크만 배로 커지면 5 rad/s가 첫 스텝에
+    /// 0으로 스냅되는데, 경사·이동거리 테스트는 그대로 통과한다. 그래서 넷을 함께 잠근다:
+    /// 이른 시점의 **하한**, 늦은 시점의 **상한**, 부호 역전 금지, 각속력 증가(에너지 주입) 금지.
+    ///
+    /// 기준선(계측기 실측): 스텝당 약 0.408 rad/s씩 선형 감소해 12~13스텝에 소멸.
+    /// 5스텝 2.966 · 12스텝 0.106 · 20스텝 −0.00001(부호 역전 아님, 수치 잔여).
     #[test]
-    fn spin_is_damped_by_contact_friction() {
+    fn spin_decays_gradually_without_overshoot() {
+        // 등방성 게이트와 같은 이유로 **4개를 나란히** 놓아 SIMD 블록 경로까지 덮는다
+        // (하나만 두면 제약이 1개라 스칼라 경로만 돈다 — 검수가 든 "토크만 2배" 시나리오는
+        //  블록 경로에 심었을 때 하나짜리 씬을 그대로 통과했다).
+        let mut w = World::new(no_sleep_params());
+        let mut hs = Vec::new();
+        for k in 0..4 {
+            let cx = k as f32 * 100.0;
+            w.add_body(Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(20.0, 1.0, 20.0),
+                    radius: 0.0,
+                },
+                pose(cx, -1.0, 0.0),
+            ));
+            let h = w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.5, 0.5),
+                    radius: 0.0,
+                },
+                pose(cx, 0.5, 0.0),
+                1.0,
+            ));
+            hs.push(h);
+        }
+        const W0: f32 = 5.0;
+        for &h in &hs {
+            w.set_angular_velocity(h, Vec3::new(0.0, W0, 0.0)).unwrap();
+        }
+        let mut at5 = vec![f32::NAN; hs.len()];
+        for i in 0..30 {
+            w.step(DT);
+            for (k, &h) in hs.iter().enumerate() {
+                let wy = w.body(h).angvel().y;
+                // 에너지 주입 금지 — 마찰은 각속력을 키울 수 없다.
+                assert!(
+                    wy.abs() <= W0 + 1e-3,
+                    "바디 {k}, {}스텝에서 각속력이 초기값을 넘었다: {wy:.5} > {W0}",
+                    i + 1
+                );
+                // 부호 역전 금지 — 마찰이 스핀을 반대로 돌리면 안 된다.
+                assert!(
+                    wy > -0.05,
+                    "바디 {k}, {}스텝에서 스핀이 뒤집혔다: {wy:.5}",
+                    i + 1
+                );
+                if i == 4 {
+                    at5[k] = wy;
+                }
+            }
+        }
+        for (k, &v) in at5.iter().enumerate() {
+            // 이른 시점 **하한**: 너무 빨리 죽으면 마찰 토크가 과하다는 뜻이다(기준선 2.966).
+            assert!(
+                v > 2.0,
+                "바디 {k}: 5스텝 만에 스핀이 과하게 꺾였다: {v:.5} rad/s (기준선 2.97) — 마찰 토크 과다"
+            );
+        }
+        for (k, &h) in hs.iter().enumerate() {
+            // 늦은 시점 **상한**: 남아 있으면 마찰 토크가 부족하다.
+            let wy = w.body(h).angvel().y.abs();
+            assert!(
+                wy < 0.01,
+                "바디 {k}: 0.5초 뒤에도 스핀이 남았다: {wy:.5} rad/s"
+            );
+        }
+    }
+
+    /// **비등방 관성 + 모서리 접촉** — 2x2 접선 유효질량의 교차항이 크고 조건수가 높은 영역
+    /// (교차검수 rev_ac00206f MAJOR: 기존 넷은 전부 질량 1의 정육면체 면접촉이라 이 영역을
+    /// 건드리지 않았다). 길쭉한 막대를 기울여 떨어뜨리면 한쪽 끝(모서리)으로 먼저 닿고,
+    /// 관성비가 극단적이라 레버암이 길다 — 행렬식이 작아지는 조건이다.
+    ///
+    /// 여기서 `det` 근0 처리나 역행렬 식이 틀리면 NaN이나 거대 임펄스로 나타난다.
+    /// 기준선: 최종 정지(|v|=0.00000), 최대 침투 0.02823 m, 최대 |v| 5.4275(낙하 가속 포함).
+    #[test]
+    fn anisotropic_rod_on_edge_contact_stays_finite_and_settles() {
         let mut w = World::new(no_sleep_params());
         ground(&mut w);
+        let rot = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 15f32.to_radians());
         let h = w.add_body(Body::new_dynamic(
             Shape::Box {
-                half: Vec3::new(0.5, 0.5, 0.5),
+                half: Vec3::new(0.1, 0.1, 2.0),
                 radius: 0.0,
             },
-            pose(0.0, 0.5, 0.0),
+            Pose {
+                pos: Vec3::new(0.0, 1.2, 0.0),
+                rot,
+            },
             1.0,
         ));
-        w.set_angular_velocity(h, Vec3::new(0.0, 5.0, 0.0)).unwrap();
-        for _ in 0..30 {
+        w.set_linear_velocity(h, Vec3::new(2.5, 0.0, 1.5)).unwrap();
+        let (mut max_pen, mut max_v) = (0.0f32, 0.0f32);
+        for _ in 0..400 {
             w.step(DT);
+            max_pen = max_pen.max(w.diagnostics().max_penetration);
+            max_v = max_v.max(w.body(h).linvel().length());
+            assert!(
+                w.body(h).pose().pos.y.is_finite() && w.body(h).linvel().length().is_finite(),
+                "막대 상태가 유한하지 않다 — 접선 행렬이 터졌다"
+            );
         }
-        let wy = w.body(h).angvel().y.abs();
-        assert!(wy < 0.1, "0.5초 뒤에도 스핀이 남았다: {wy:.4} rad/s");
+        assert!(
+            max_v < 8.0,
+            "속도가 튀었다: 최대 |v| {max_v:.4} (기준선 5.43) — 거대 임펄스 신호"
+        );
+        assert!(
+            max_pen < 0.05,
+            "침투가 커졌다: {max_pen:.5} m (기준선 0.02823)"
+        );
+        let b = w.body(h);
+        assert!(
+            b.linvel().length() < 0.02 && b.angvel().length() < 0.02,
+            "막대가 정지하지 않았다: |v|={:.5} |w|={:.5}",
+            b.linvel().length(),
+            b.angvel().length()
+        );
+    }
+
+    /// **작은 스택의 수면 도달** — 접선 잔차가 남으면 스택이 영영 안 잔다
+    /// (교차검수 rev_ac00206f MAJOR: 상시 게이트에 수면 항목이 없었고, 전원 수면을 요구하는
+    /// 40단 테스트는 `#[ignore]`라 일반 실행에서 안 돈다). 단일 상자는 멈추는데 스택만
+    /// 못 자는 회귀는 이 게이트로만 잡힌다 — 그리고 못 자면 정착 장면이 활성 비용을 계속 내
+    /// **성능 회귀로 직결**된다.
+    ///
+    /// 기준선: 21바디가 30스텝(=time_to_sleep 0.5초)에 전원 수면, 최대 침투 0.00152 m,
+    /// COM 옆흐름 dx −0.0012 m. 여기서는 3배 여유를 둔다.
+    #[test]
+    fn small_stack_falls_asleep_without_lateral_drift() {
+        // 이 테스트는 수면이 본체라 기본 파라미터(수면 ON)를 쓴다.
+        let mut w = World::new(WorldParams::default());
+        ground(&mut w);
+        let mut hs = Vec::new();
+        let mut com0 = Vec3::ZERO;
+        for tier in 0..6usize {
+            let count = 6 - tier;
+            for i in 0..count {
+                let x = (i as f32 - (count as f32 - 1.0) * 0.5) * 1.02;
+                let p = Vec3::new(x, 0.5 + tier as f32, 0.0);
+                hs.push(w.add_body(Body::new_dynamic(
+                    Shape::Box {
+                        half: Vec3::new(0.5, 0.5, 0.5),
+                        radius: 0.0,
+                    },
+                    Pose {
+                        pos: p,
+                        rot: Quat::IDENTITY,
+                    },
+                    1.0,
+                )));
+                com0 += p;
+            }
+        }
+        com0 = com0 * (1.0 / hs.len() as f32);
+        let mut asleep_at = None;
+        let mut max_pen = 0.0f32;
+        for i in 0..300 {
+            w.step(DT);
+            max_pen = max_pen.max(w.diagnostics().max_penetration);
+            if asleep_at.is_none() && hs.iter().all(|&h| w.is_asleep(h)) {
+                asleep_at = Some(i + 1);
+            }
+        }
+        let at = asleep_at.expect("300스텝(5초) 안에 스택 전원이 잠들지 않았다 — 접선 잔차 의심");
+        assert!(at <= 90, "수면 도달이 늦어졌다: {at}스텝 (기준선 30)");
+        assert!(
+            max_pen < 0.01,
+            "침투가 커졌다: {max_pen:.5} m (기준선 0.00152)"
+        );
+        let com: Vec3 =
+            hs.iter().fold(Vec3::ZERO, |a, &h| a + w.body(h).pose().pos) * (1.0 / hs.len() as f32);
+        let drift = ((com.x - com0.x).powi(2) + (com.z - com0.z).powi(2)).sqrt();
+        assert!(
+            drift < 0.02,
+            "스택이 옆으로 흘렀다: {drift:.5} m (기준선 0.0012)"
+        );
     }
 
     fn no_sleep_params() -> WorldParams {

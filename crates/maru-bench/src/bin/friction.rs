@@ -193,4 +193,139 @@ fn main() {
     for (i, wy) in marks {
         println!("  {i:>3}스텝 후 angvel.y = {wy:.4} rad/s");
     }
+    probe_extra();
+}
+
+// ── 검수 rev_ac00206f 보강분 계측 ───────────────────────────────────────────────
+// 아래 셋은 "2x2 블록화에서 가장 위험한 축"인데 기존 4종이 못 잡던 것들이다:
+// [5] 스핀 감쇠 **곡선**(상한만 보면 토크 2배 오류가 통과한다 — 양 끝이 필요)
+// [6] 비등방 관성 + 한 점/모서리 접촉(교차항이 크고 조건수가 높은 영역)
+// [7] 작은 스택의 **수면 도달**과 옆흐름(접선 잔차가 남으면 영영 안 잔다)
+
+fn ground_flat(w: &mut World) {
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(50.0, 1.0, 50.0),
+            radius: 0.0,
+        },
+        Pose {
+            pos: Vec3::new(0.0, -1.0, 0.0),
+            rot: Quat::IDENTITY,
+        },
+    ));
+}
+
+fn probe_extra() {
+    println!("\n[5] 스핀 감쇠 곡선 (5 rad/s 시작, 스텝별 angvel.y)");
+    let mut w = World::new(params());
+    ground_flat(&mut w);
+    let h = w.add_body(Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(0.5, 0.5, 0.5),
+            radius: 0.0,
+        },
+        Pose {
+            pos: Vec3::new(0.0, 0.5, 0.0),
+            rot: Quat::IDENTITY,
+        },
+        1.0,
+    ));
+    w.set_angular_velocity(h, Vec3::new(0.0, 5.0, 0.0)).unwrap();
+    let mut prev = 5.0f32;
+    let mut max_seen = 5.0f32;
+    for i in 0..40 {
+        w.step(DT);
+        let wy = w.body(h).angvel().y;
+        max_seen = max_seen.max(wy.abs());
+        if i < 12 || i == 19 || i == 29 || i == 39 {
+            println!(
+                "  {:>2}스텝: {wy:>9.5} rad/s  (부호 {})",
+                i + 1,
+                if wy < -1e-4 { "역전!" } else { "유지" }
+            );
+        }
+        prev = wy;
+    }
+    let _ = prev;
+    println!("  최대 각속력(초기 포함) = {max_seen:.5} — 초기 5.0을 넘으면 에너지 주입이다");
+
+    println!("\n[6] 비등방 관성 + 모서리 접촉 (길쭉한 막대 0.1x0.1x2.0, 15도 기울여 떨어뜨림)");
+    let mut w = World::new(params());
+    ground_flat(&mut w);
+    let rot = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 15f32.to_radians());
+    let h = w.add_body(Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(0.1, 0.1, 2.0),
+            radius: 0.0,
+        },
+        Pose {
+            pos: Vec3::new(0.0, 1.2, 0.0),
+            rot,
+        },
+        1.0,
+    ));
+    w.set_linear_velocity(h, Vec3::new(2.5, 0.0, 1.5)).unwrap();
+    let mut max_pen = 0.0f32;
+    let mut max_v = 0.0f32;
+    for _ in 0..400 {
+        w.step(DT);
+        max_pen = max_pen.max(w.diagnostics().max_penetration);
+        max_v = max_v.max(w.body(h).linvel().length());
+    }
+    let b = w.body(h);
+    println!(
+        "  최종 pos={:?}\n  최종 |v|={:.5} |w|={:.5} · 최대 침투 {max_pen:.5} m · 최대 |v| {max_v:.4} (시작 2.92)",
+        b.pose().pos, b.linvel().length(), b.angvel().length()
+    );
+    println!(
+        "  finite = {}",
+        b.pose().pos.y.is_finite() && b.linvel().length().is_finite()
+    );
+
+    println!("\n[7] 작은 스택(6단 피라미드)의 수면 도달 + 옆흐름");
+    let mut w = World::new(WorldParams::default()); // 수면 ON — 이 항목은 수면이 본체다
+    ground_flat(&mut w);
+    let mut hs = Vec::new();
+    let mut com0 = Vec3::ZERO;
+    for tier in 0..6usize {
+        let count = 6 - tier;
+        for i in 0..count {
+            let x = (i as f32 - (count as f32 - 1.0) * 0.5) * 1.02;
+            hs.push(w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.5, 0.5),
+                    radius: 0.0,
+                },
+                Pose {
+                    pos: Vec3::new(x, 0.5 + tier as f32, 0.0),
+                    rot: Quat::IDENTITY,
+                },
+                1.0,
+            )));
+            com0 += Vec3::new(x, 0.5 + tier as f32, 0.0);
+        }
+    }
+    com0 = com0 * (1.0 / hs.len() as f32);
+    let mut all_asleep_at = None;
+    let mut max_pen = 0.0f32;
+    for i in 0..600 {
+        w.step(DT);
+        max_pen = max_pen.max(w.diagnostics().max_penetration);
+        if all_asleep_at.is_none() && hs.iter().all(|&h| w.is_asleep(h)) {
+            all_asleep_at = Some(i + 1);
+        }
+    }
+    let com: Vec3 =
+        hs.iter().fold(Vec3::ZERO, |a, &h| a + w.body(h).pose().pos) * (1.0 / hs.len() as f32);
+    println!(
+        "  바디 {} · 전원 수면 도달 = {:?} 스텝 (600 안) · 최대 침투 {max_pen:.5} m",
+        hs.len(),
+        all_asleep_at
+    );
+    println!(
+        "  COM 옆흐름 dx={:.5} dz={:.5} · dy={:.5}",
+        com.x - com0.x,
+        com.z - com0.z,
+        com.y - com0.y
+    );
 }
