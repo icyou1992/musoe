@@ -767,10 +767,7 @@ pub fn solve_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::{
-        solve_batched, warm_start_batched, ContactPointConstraint, Softness, SolverState,
-        COLOR_OVERFLOW,
-    };
+    use crate::solver::{ContactPointConstraint, Softness, SolverState, COLOR_OVERFLOW};
     use maru_collide::{FeatureId, FEATURE_GENERIC};
     use maru_math::{Mat3, Quat};
 
@@ -832,12 +829,17 @@ mod tests {
         let mut k = 0usize;
         for (ci, &cnt) in counts.iter().enumerate() {
             for j in 0..cnt {
-                let a = k % 11;
-                let b = (k * 3 + 5) % 11;
+                // **색 안에서는 바디가 겹치지 않아야 한다** — 그것이 컬러링 계약이고,
+                // 그래야 색 안의 처리 순서가 결과를 안 바꾼다(SIMD 4-wide는 그 전제에서만
+                // 스칼라와 같다: 겹치면 4-wide는 Jacobi, 스칼라는 Gauss-Seidel이 되어 갈린다).
+                // 예전 픽스처는 `a = k % 11`로 색 안에서 바디를 공유해 **프로덕션에 없는
+                // 상황**을 시험하고 있었다. 색마다 바디 풀을 갈라 준다.
+                let a = 2 * j;
+                let b = 2 * j + 1;
                 let npts = 1 + (k % 4);
                 cs.push(ContactConstraint {
                     a,
-                    b: if b == a { (b + 1) % 11 } else { b },
+                    b,
                     normal: Vec3::new(0.0, 1.0, 0.0),
                     tangents: [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)],
                     friction: 0.4 + 0.05 * ci as f32,
@@ -848,7 +850,6 @@ mod tests {
                     warm_matched: 0,
                 });
                 k += 1;
-                let _ = j;
             }
         }
         // 색 범위: 0..6, 6..10, 그리고 오버플로 색 인덱스까지 빈 색으로 채운다.
@@ -859,6 +860,39 @@ mod tests {
         }
         ranges.push((10, 13)); // 색 63 = 오버플로
         (cs, ranges)
+    }
+
+    /// **스칼라 직접 참조** — 색 순서대로, 색 안에서는 인덱스 순서대로 하나씩 푼다.
+    /// 색 안의 제약은 동적 바디가 겹치지 않으므로(컬러링 계약) 처리 순서가 결과를 바꾸지
+    /// 않는다 — 그래서 4청크로 묶든 하나씩 풀든 비트 동일이다.
+    fn serial_solve(
+        st: &mut SolverState,
+        cs: &mut [ContactConstraint],
+        ranges: &[(u32, u32)],
+        p: &BatchSolveParams,
+    ) {
+        for &(start, end) in ranges {
+            for c in cs[start as usize..end as usize].iter_mut() {
+                let soft = if p.relax {
+                    None
+                } else if st.dynamic[c.a] && st.dynamic[c.b] {
+                    Some((&p.soft, p.max_bias))
+                } else {
+                    Some((&p.static_soft, p.max_bias))
+                };
+                let v = SolveView::new(st);
+                solve_scalar(&v, c, p.inv_h, soft);
+            }
+        }
+    }
+
+    fn serial_warm_start(st: &mut SolverState, cs: &[ContactConstraint], ranges: &[(u32, u32)]) {
+        for &(start, end) in ranges {
+            for c in cs[start as usize..end as usize].iter() {
+                let v = SolveView::new(st);
+                warm_start_scalar(&v, c);
+            }
+        }
     }
 
     fn params(relax: bool) -> BatchSolveParams {
@@ -1039,13 +1073,13 @@ mod tests {
     }
 
     #[test]
-    fn block_path_matches_x4_path_bit_for_bit() {
+    fn block_path_matches_scalar_bit_for_bit() {
         let (mut cs_ref, ranges) = mk_constraints();
         let mut cs_blk = cs_ref.clone();
-        let mut st_ref = mk_state(11);
-        let mut st_blk = mk_state(11);
+        let mut st_ref = mk_state(12);
+        let mut st_blk = mk_state(12);
 
-        // 기준: 기존 x4 배치 경로 (색 순서대로 4청크 → 꼬리)
+        // 기준: **스칼라 직접 참조** (색 순서대로 하나씩)
         for _ in 0..3 {
             {
                 let v = SolveView::new(&mut st_ref);
@@ -1053,9 +1087,9 @@ mod tests {
                     crate::solver::refresh_anchors(&v, c);
                 }
             }
-            warm_start_batched(&mut st_ref, &cs_ref, &ranges);
-            solve_batched(&mut st_ref, &mut cs_ref, &ranges, &params(false));
-            solve_batched(&mut st_ref, &mut cs_ref, &ranges, &params(true));
+            serial_warm_start(&mut st_ref, &cs_ref, &ranges);
+            serial_solve(&mut st_ref, &mut cs_ref, &ranges, &params(false));
+            serial_solve(&mut st_ref, &mut cs_ref, &ranges, &params(true));
         }
 
         // 대상: SoA 블록 경로
