@@ -214,82 +214,104 @@ fn effective_mass_x3(
 /// 무작위 접근하게 된다. 실제로 점당 73ns가 나왔는데 산술은 40 flops 남짓이었다 —
 /// 비용은 계산이 아니라 **메모리**였다. 솔버가 실제로 읽고 쓰는 6개 배열만 뽑아
 /// 연속 메모리에 두고, 서브스텝 루프가 끝난 뒤 한 번만 바디로 되쓴다.
-/// 월드 역관성에 **회전 잠금**을 건다 — 잠긴 축으로는 각속도가 생기지 않는 유효 mobility.
+/// 회전 잠금이 걸린 바디의 **월드 유효 역관성**.
 ///
-/// 잠금은 "그 월드 축 각속도를 0으로 묶는다"는 **이상적 구속**이다. 각임펄스 `L`을 주면
-/// 구속력 `Cᵀλ`가 함께 들어와 `I Δω = L + Cᵀλ`, `C Δω = 0`을 만족한다(`C` = 잠긴 축 선택).
-/// 풀면 유효 역관성이 나온다:
+/// 잠금은 "그 월드 축 각속도를 0으로 묶는다"는 이상적 구속이다. 허용축 기저를 `A`(3×k)라
+/// 하면 유효 mobility는 `A(AᵀIA)⁻¹Aᵀ`다 — 잠긴 축에는 어떤 각임펄스도 각속도를 못 만들고,
+/// 허용축 안에서는 **구속된 관성**으로 돈다.
 ///
-/// ```text
-///   M_eff = M − M Cᵀ (C M Cᵀ)⁻¹ C M        (M = I⁻¹)
-/// ```
+/// # 왜 역관성에서 빼지 않는가 (교차검수 rev_92044d5d BLOCKER ×2)
 ///
-/// **`P·I⁻¹·P`(잠긴 행·열을 0으로)는 틀린 답이다** (교차검수 rev_bb593ab5 BLOCKER).
-/// 그건 관성 주축이 월드 잠금축과 나란할 때만 우연히 같다. 회전한 이방성 바디에서는
-/// 크게 벗어난다 — 반크기 (1, 0.1, 0.1) 막대를 Z로 45° 돌리고 Y·Z를 잠근 뒤 X 각임펄스를
-/// 주면 `P·I⁻¹·P`는 76.49를 주는데 정답은 5.83이다(**13.13배 과대**). 같은 오차가 접촉·
-/// 조인트의 유효질량에도 들어가 충돌 반응과 모터 힘을 왜곡한다.
+/// 수학적으로는 `M − M Cᵀ(C M Cᵀ)⁻¹ C M`(M = I⁻¹)도 같은 답이다. 그런데 f32에서 그렇게
+/// 계산하면 **큰 항끼리 빼서 작은 값을 복원**하게 되어 고종횡비 바디에서 무너진다:
+/// 결과의 잠긴 행에 0이 아닌 잔차가 남거나(자세가 잠긴 축으로 돈다), 허용축 블록에 음의
+/// 고유값이 생긴다(임펄스가 토크 반대로 돈다). determinant가 소실되면 폴백이 잠금을 통째로
+/// 푸는 **fail-open**이 되는 것도 문제였다.
 ///
-/// `C`는 좌표축 선택이라 `M Cᵀ`는 `M`의 잠긴 **열**이고 `C M Cᵀ`는 그 잠긴 부분행렬이다.
-/// `M`이 대칭이므로 `C M`은 그 열들의 전치다. 그래서 전체 역변환 없이 1×1·2×2만 푼다.
+/// 그래서 **정방향 관성에서, 몸체 프레임으로 내려서** 계산한다. `B = RᵀA`라 두면
+/// `AᵀIA = Bᵀ diag(I_주축) B`이고 각 성분이 **양수 항의 합**이다. 2×2 행렬식도
+/// Cauchy–Binet으로 `Σ_{p<q} I_p I_q (B_p1 B_q2 − B_q1 B_p2)²` — 역시 양수 항의 합이라
+/// 뺄셈 상쇄가 없다. 잠긴 행·열은 채우지 않으므로 **구성상 정확히 0**이다.
 ///
-/// 잠금이 없으면(`mask == 0`) 원본을 그대로 돌려준다 — 그 경우 비용이 0이어야 한다.
+/// 잠금이 없으면(`mask == 0`) 기존 경로 그대로다 — 그 경우 비용이 0이어야 한다.
+/// 퇴화(주축 관성이 유한 양수가 아님)는 **fail-closed**로 0 행렬을 준다: 잠금이 풀리는 것보다
+/// 안 도는 편이 안전하다.
 #[inline]
-pub fn mask_locked_rotation(m: Mat3, mask: u8) -> Mat3 {
+pub fn locked_inv_inertia_world(inv_local: Vec3, rot: Quat, mask: u8) -> Mat3 {
     if mask == 0 {
-        return m;
+        return Mat3::rotate_inertia(inv_local, rot);
     }
+    let zero = Mat3::from_diagonal(Vec3::ZERO);
     if mask & 0b111 == 0b111 {
-        // 전 축 잠금 — 어떤 각임펄스도 각속도를 만들지 못한다.
-        return Mat3::from_diagonal(Vec3::ZERO);
+        return zero;
     }
-    let col = |k: usize| m.c[k];
-    let at = |r: usize, c: usize| -> f32 {
-        let v = m.c[c];
-        [v.x, v.y, v.z][r]
+    // 주축 관성(정방향). 역수가 유한 양수가 아니면 회전을 허용하지 않는다.
+    let il = [inv_local.x, inv_local.y, inv_local.z];
+    if il.iter().any(|v| !(v.is_finite() && *v > 0.0)) {
+        return zero;
+    }
+    let ip = [1.0 / il[0], 1.0 / il[1], 1.0 / il[2]];
+    // `B = RᵀA`의 열은 `Rᵀ`의 허용축 열 = `R`의 허용축 **행**.
+    let r = Mat3::from_quat(rot);
+    let row = |a: usize| {
+        let c = |k: usize| {
+            let v = r.c[k];
+            [v.x, v.y, v.z][a]
+        };
+        [c(0), c(1), c(2)]
     };
-    let outer = |a: Vec3, b: Vec3, s: f32| Mat3 {
-        // (a bᵀ) * s — 열 c는 a * b[c] * s
-        c: [a * (b.x * s), a * (b.y * s), a * (b.z * s)],
+    let allowed: [usize; 3] = [0, 1, 2];
+    let mut ax = [0usize; 3];
+    let mut na = 0usize;
+    for a in allowed {
+        if mask & (1 << a) == 0 {
+            ax[na] = a;
+            na += 1;
+        }
+    }
+    let mut out = zero;
+    let set = |m: &mut Mat3, r_: usize, c_: usize, v: f32| {
+        let col = &mut m.c[c_];
+        match r_ {
+            0 => col.x = v,
+            1 => col.y = v,
+            _ => col.z = v,
+        }
     };
-    let sub = |x: Mat3, y: Mat3| Mat3 {
-        c: [x.c[0] - y.c[0], x.c[1] - y.c[1], x.c[2] - y.c[2]],
-    };
-    let locked: Vec<usize> = (0..3).filter(|k| mask & (1 << k) != 0).collect();
-    match locked.len() {
+    match na {
         1 => {
-            let i = locked[0];
-            let d = at(i, i);
-            if d <= 0.0 {
-                // 그 축 응답이 이미 0이다(정적·퇴화) — 묶을 것이 없다.
-                return m;
+            let b = row(ax[0]);
+            // s = Σ I_p b_p²  — 양수 항의 합
+            let s = ip[0] * b[0] * b[0] + ip[1] * b[1] * b[1] + ip[2] * b[2] * b[2];
+            if !(s.is_finite() && s > 0.0) {
+                return zero;
             }
-            sub(m, outer(col(i), col(i), 1.0 / d))
+            set(&mut out, ax[0], ax[0], 1.0 / s);
         }
         2 => {
-            let (i, j) = (locked[0], locked[1]);
-            let (a, b, c2) = (at(i, i), at(i, j), at(j, j));
-            let det = a * c2 - b * b;
-            if det <= 0.0 {
-                return m;
+            let (b0, b1) = (row(ax[0]), row(ax[1]));
+            let s11 = ip[0] * b0[0] * b0[0] + ip[1] * b0[1] * b0[1] + ip[2] * b0[2] * b0[2];
+            let s12 = ip[0] * b0[0] * b1[0] + ip[1] * b0[1] * b1[1] + ip[2] * b0[2] * b1[2];
+            let s22 = ip[0] * b1[0] * b1[0] + ip[1] * b1[1] * b1[1] + ip[2] * b1[2] * b1[2];
+            // Cauchy–Binet: det = Σ_{p<q} I_p I_q (b0_p b1_q − b0_q b1_p)²  — 양수 항의 합
+            let minor = |p: usize, q: usize| b0[p] * b1[q] - b0[q] * b1[p];
+            let m01 = minor(0, 1);
+            let m02 = minor(0, 2);
+            let m12 = minor(1, 2);
+            let det =
+                ip[0] * ip[1] * m01 * m01 + ip[0] * ip[2] * m02 * m02 + ip[1] * ip[2] * m12 * m12;
+            if !(det.is_finite() && det > 0.0) {
+                return zero;
             }
             let inv = 1.0 / det;
-            // M[:,L] S⁻¹ M[L,:] = inv * ( c2·ci ciᵀ − b·(ci cjᵀ + cj ciᵀ) + a·cj cjᵀ )
-            let (ci, cj) = (col(i), col(j));
-            let t = Mat3 {
-                c: [
-                    ci * (ci.x * c2 * inv) - ci * (cj.x * b * inv) - cj * (ci.x * b * inv)
-                        + cj * (cj.x * a * inv),
-                    ci * (ci.y * c2 * inv) - ci * (cj.y * b * inv) - cj * (ci.y * b * inv)
-                        + cj * (cj.y * a * inv),
-                    ci * (ci.z * c2 * inv) - ci * (cj.z * b * inv) - cj * (ci.z * b * inv)
-                        + cj * (cj.z * a * inv),
-                ],
-            };
-            sub(m, t)
+            set(&mut out, ax[0], ax[0], s22 * inv);
+            set(&mut out, ax[0], ax[1], -s12 * inv);
+            set(&mut out, ax[1], ax[0], -s12 * inv);
+            set(&mut out, ax[1], ax[1], s11 * inv);
         }
-        _ => m,
+        _ => unreachable!("mask는 0·7을 이미 걸렀다"),
     }
+    out
 }
 
 #[derive(Default, Clone)]
@@ -424,7 +446,11 @@ impl SolverState {
         for i in 0..bodies.len() {
             if alive[i] {
                 bodies[i].linvel = self.lin[i];
-                bodies[i].angvel = self.ang[i];
+                // **잠긴 축은 여기서도 투영한다.** 유효 관성이 그 축을 0으로 만들지만
+                // f32 잔차가 남을 수 있고, 그 잔차는 `Body::validate`의 "잠긴 축 = 정확히 0"
+                // 계약에 걸려 **엔진이 만든 스냅샷을 자기가 복원 못 하는** 상태가 된다
+                // (교차검수 rev_92044d5d). 캐노니컬 상태로 나가는 문에서 한 번 더 닫는다.
+                bodies[i].angvel = bodies[i].project_locked_angvel(self.ang[i]);
                 bodies[i].pose.pos = self.pos[i];
                 bodies[i].pose.rot = self.rot[i];
             }
@@ -465,8 +491,9 @@ impl SolverState {
         for &i in active {
             let i = i as usize;
             if self.dynamic[i] {
-                self.inv_i[i] = mask_locked_rotation(
-                    Mat3::rotate_inertia(local[i], self.rot[i]),
+                self.inv_i[i] = locked_inv_inertia_world(
+                    local[i],
+                    self.rot[i],
                     self.locked_rot.get(i).copied().unwrap_or(0),
                 );
             }
@@ -1073,6 +1100,55 @@ pub fn color_constraints(
 
 #[cfg(test)]
 mod tests {
+
+    /// **극단 종횡비의 유효 관성** — 유효 mobility 함수를 직접 시험한다.
+    ///
+    /// 월드 좌표에서 감싼 테스트(임펄스를 주고 각속도를 본다)로는 이 결함을 못 잡는다:
+    /// 진입점 투영이 잠긴 축을 어차피 0으로 지워 **결함을 가린다**. 그래서 함수 자체를 본다.
+    ///
+    /// 반크기 (16, 0.001, 0.001)은 주축 관성비가 1.28e8이다. 역관성에서 Schur 보정을 f32로
+    /// 하면 `det = a·c − b²`가 **정확히 0**이 되어(세 항이 모두 7.5e5) 폴백이 잠금을 통째로
+    /// 푼다(fail-open). 정방향 관성을 몸체 프레임으로 내려 Cauchy–Binet으로 계산하면
+    /// 양수 항의 합이라 상쇄가 없다. 정답은 `1/(e_zᵀ I e_z) = 1/Iz = 0.0117`이다.
+    #[test]
+    fn locked_inv_inertia_is_stable_at_extreme_aspect_ratio() {
+        let (hx, hy, hz) = (16.0f32, 0.001, 0.001);
+        let (ix, iy, iz) = (
+            (hy * hy + hz * hz) / 3.0,
+            (hx * hx + hz * hz) / 3.0,
+            (hx * hx + hy * hy) / 3.0,
+        );
+        let inv_local = Vec3::new(1.0 / ix, 1.0 / iy, 1.0 / iz);
+        let rot = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 45f32.to_radians());
+        // X·Y 잠금 → 허용축 Z
+        let m = locked_inv_inertia_world(inv_local, rot, 0b011);
+        let at = |r: usize, c: usize| {
+            let v = m.c[c];
+            [v.x, v.y, v.z][r]
+        };
+        for r in 0..2 {
+            for c in 0..3 {
+                assert_eq!(
+                    at(r, c),
+                    0.0,
+                    "잠긴 행 {r}열 {c}이 0이 아니다: {}",
+                    at(r, c)
+                );
+                assert_eq!(
+                    at(c, r),
+                    0.0,
+                    "잠긴 열 {r}행 {c}이 0이 아니다: {}",
+                    at(c, r)
+                );
+            }
+        }
+        let want = 1.0 / iz;
+        assert!(
+            (at(2, 2) - want).abs() < want * 1e-3,
+            "허용축 유효 역관성이 틀렸다: {} / 정답 {want}",
+            at(2, 2)
+        );
+    }
     use super::*;
     use crate::body::Body;
     use maru_collide::{ContactPoint, FeatureId, Manifold, Pose, Shape, FEATURE_GENERIC};

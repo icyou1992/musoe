@@ -818,3 +818,64 @@ fn locked_rotation_reserved_bits_are_rejected() {
     b.locked_rot = 0b111;
     assert!(b.validate().is_ok(), "정상 마스크가 거부됐다");
 }
+
+/// **극단 종횡비에서도 잠금이 유지된다** (교차검수 rev_92044d5d BLOCKER).
+///
+/// 역관성에서 Schur 보정을 f32로 하면 큰 항끼리 빼서 작은 값을 복원하게 되어,
+/// 고종횡비 바디에서 determinant가 소실되고 폴백이 **잠금을 통째로 푼다**(fail-open).
+/// 정방향 관성을 몸체 프레임으로 내려 계산하면(양수 항의 합 + Cauchy–Binet) 상쇄가 없다.
+///
+/// 반크기 (16, 0.001, 0.001)은 주축 관성비가 약 1.28e8이다. 검수가 지목한 그 구성이다.
+#[test]
+fn locked_rotation_survives_extreme_aspect_ratio() {
+    let (hx, hy, hz) = (16.0f32, 0.001, 0.001);
+    let density = 1.0 / (8.0 * hx * hy * hz); // 질량 1
+    let mut w = World::new(WorldParams {
+        gravity: Vec3::ZERO,
+        ..no_sleep_params()
+    });
+    let h = w.add_body(
+        Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(hx, hy, hz),
+                radius: 0.0,
+            },
+            Pose {
+                pos: Vec3::ZERO,
+                rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 45f32.to_radians()),
+            },
+            density,
+        )
+        .with_locked_rotation(true, true, false),
+    );
+    let r0 = w.body(h).pose().rot;
+    // 세 축 모두에 각임펄스 — 잠긴 X·Y는 반응이 없어야 한다.
+    w.apply_angular_impulse(h, Vec3::new(1.0, 1.0, 1.0))
+        .unwrap();
+    let a = w.body(h).angvel();
+    assert_eq!(
+        (a.x, a.y),
+        (0.0, 0.0),
+        "극단 종횡비에서 잠금이 풀렸다: {a:?}"
+    );
+    assert!(a.z.abs() > 0.0, "허용축이 안 돌았다: {a:?}");
+    assert!(
+        a.z > 0.0,
+        "허용축이 토크 반대로 돌았다(음의 mobility): {a:?}"
+    );
+    for _ in 0..60 {
+        w.step(DT);
+    }
+    let r1 = w.body(h).pose().rot;
+    assert!(
+        (r1.x - r0.x).abs() < 1e-6 && (r1.y - r0.y).abs() < 1e-6,
+        "잠긴 축으로 자세가 돌았다: {r0:?} → {r1:?}"
+    );
+    // 자기 스냅샷을 자기가 복원할 수 있어야 한다(잠긴 축 잔차가 validate에 걸리면 실패한다).
+    let snap = w.snapshot();
+    let mut w2 = World::new(no_sleep_params());
+    assert!(
+        w2.restore(&snap).is_ok(),
+        "엔진이 만든 스냅샷을 복원 못 했다"
+    );
+}

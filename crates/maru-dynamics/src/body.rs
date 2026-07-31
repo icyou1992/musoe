@@ -641,8 +641,9 @@ impl Body {
     #[inline]
     pub fn inv_inertia_world(&self) -> Mat3 {
         if self.is_dynamic() {
-            crate::solver::mask_locked_rotation(
-                Mat3::rotate_inertia(self.inv_inertia_local, self.pose.rot),
+            crate::solver::locked_inv_inertia_world(
+                self.inv_inertia_local,
+                self.pose.rot,
                 self.locked_rot,
             )
         } else {
