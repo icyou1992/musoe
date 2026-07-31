@@ -47,23 +47,55 @@ fn main() {
         },
     ));
     let half = 0.5f32;
+    // 자연 순서(층별·왼쪽부터)로 놓을 자리 목록을 먼저 만든다.
+    let mut slots: Vec<Vec3> = Vec::new();
     for tier in 0..tiers {
         let count = tiers - tier;
         let y = half + tier as f32 * 2.0 * half;
         let x0 = -(count as f32 - 1.0) * half;
         for i in 0..count {
-            w.add_body(Body::new_dynamic(
-                Shape::Box {
-                    half: Vec3::new(half, half, half),
-                    radius: 0.0,
-                },
-                Pose {
-                    pos: Vec3::new(x0 + i as f32 * 2.0 * half, y, 0.0),
-                    rot: Quat::IDENTITY,
-                },
-                1.0,
-            ));
+            slots.push(Vec3::new(x0 + i as f32 * 2.0 * half, y, 0.0));
         }
+    }
+    // **배치 지역성 A/B** (`MARU_SHUFFLE_BODIES=1`) — 장면은 그대로 두고 **삽입 순서만** 섞는다.
+    //
+    // 재려는 것: 솔버·내로우가 만지는 바디들이 메모리에서 가까운가가 얼마나 중요한가.
+    // 자연 순서는 접촉하는 이웃이 대체로 인접 인덱스에 놓이는 **이미 좋은 배치**이고,
+    // 섞으면 같은 장면·같은 접촉 수인데 배치만 최악이 된다. 두 팔의 차가 곧 "배치가
+    // 만들어낼 수 있는 폭"이고, 그것이 인덱스 재정렬류 최적화의 **상한**이다
+    // (교차검수 rev_be09acdc: BodyRegs 게더 하나만 재고 재정렬 전체를 기각한 건 과했다 —
+    //  pos/rot 게더·스토어·warm·refresh가 전부 배치의 영향을 받는다. 이 팔은 그 전부를 포함한다).
+    //
+    // 물리는 갈라진다(인덱스가 바뀌면 컬러링·GS 순서가 바뀐다) — 그래서 **속도만** 비교하고
+    // 안정성 판정(vmax·finite)을 함께 본다. 일감(바디 수·접촉 수)은 같다.
+    // 셔플은 고정 시드 LCG다 — 실행마다 같은 순열이어야 A/B가 성립한다.
+    if std::env::var("MARU_SHUFFLE_BODIES")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        for i in (1..slots.len()).rev() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            slots.swap(i, ((s >> 33) as usize) % (i + 1));
+        }
+        println!(
+            "!! MARU_SHUFFLE_BODIES=1 — 삽입 순서를 섞었다(배치 지역성 A/B). 물리가 갈라진다."
+        );
+    }
+    for p in slots {
+        w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(half, half, half),
+                radius: 0.0,
+            },
+            Pose {
+                pos: p,
+                rot: Quat::IDENTITY,
+            },
+            1.0,
+        ));
     }
     // 스레드 수 오버라이드 — 병렬 A/B용. 기본은 엔진의 자동 감지 값이다.
     if let Some(n) = std::env::var("MARU_THREADS")
