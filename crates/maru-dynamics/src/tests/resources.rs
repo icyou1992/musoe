@@ -568,3 +568,21 @@ fn resource_failure_never_destroys_canonical_state() {
     });
     assert_eq!(w.try_step(DT), Ok(()));
 }
+
+/// MAJOR: 포화는 **관측 가능**해야 한다. 서로 다른 초과 상태가 같은 값으로 합쳐지므로
+/// 상태 해시만으로는 물리 오류가 숨는다.
+#[test]
+fn state_saturation_is_observable_and_reported() {
+    let mut w = World::new(WorldParams::default());
+    ground(&mut w);
+    let h = dyn_box(&mut w, 0.0, 3.0);
+    w.step(DT);
+    assert_eq!(
+        w.diagnostics().state_saturations,
+        0,
+        "정상 장면에서 포화 발생"
+    );
+    // 지원 범위 안에서는 StateOverflow가 나지 않는다
+    assert_eq!(w.try_step(DT), Ok(()));
+    assert!(w.body(h).pose().pos.y.is_finite());
+}

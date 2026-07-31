@@ -19,7 +19,6 @@ mod events;
 mod friction;
 mod island;
 mod joints;
-mod misc;
 mod queries;
 mod resources;
 mod shapes;
@@ -42,23 +41,6 @@ fn unit_sphere_world() -> (World, BodyHandle) {
         2.0,
     ));
     (w, h)
-}
-
-fn query_world() -> (World, Vec<BodyHandle>) {
-    let mut w = World::new(WorldParams::default());
-    let mut hs = Vec::new();
-    // x = 0, 5, 10 에 반지름 1 구 세 개
-    for k in 0..3 {
-        hs.push(w.add_body(Body::new_dynamic(
-            maru_collide::Shape::Sphere { radius: 1.0 },
-            maru_collide::Pose {
-                pos: maru_math::Vec3::new(k as f32 * 5.0, 0.0, 0.0),
-                rot: maru_math::Quat::IDENTITY,
-            },
-            1.0,
-        )));
-    }
-    (w, hs)
 }
 
 /// 앵커 하나로 매단 두 바디를 만든다 (A는 static, B는 dynamic).
@@ -85,8 +67,6 @@ fn hung_pair(w: &mut World, offset: maru_math::Vec3) -> (BodyHandle, BodyHandle)
 }
 
 const DT: f32 = 1.0 / 60.0;
-/// 스냅샷 헤더 = magic4 + version4 + WorldParams60. 슬롯 카운트는 그 뒤에 온다.
-const HDR: usize = 4 + 4 + 60;
 
 fn pose(x: f32, y: f32, z: f32) -> Pose {
     Pose {
@@ -113,52 +93,6 @@ fn no_sleep_params() -> WorldParams {
     }
 }
 
-/// theta(도)로 기울인 바닥 + 그 위에 같은 자세로 놓인 상자. `steps` 뒤의 내리막 변위.
-fn slope_slide_distance(theta_deg: f32, steps: usize) -> f32 {
-    let (mut w, h, down) = slope_scene(theta_deg);
-    let p0 = w.body(h).pose().pos;
-    for _ in 0..steps {
-        w.step(DT);
-    }
-    (w.body(h).pose().pos - p0).dot(down)
-}
-
-/// 같은 장면의 `steps` 뒤 내리막 속도.
-fn slope_slide_velocity(theta_deg: f32, steps: usize) -> f32 {
-    let (mut w, h, down) = slope_scene(theta_deg);
-    for _ in 0..steps {
-        w.step(DT);
-    }
-    w.body(h).linvel().dot(down)
-}
-
-fn slope_scene(theta_deg: f32) -> (World, BodyHandle, Vec3) {
-    let theta = theta_deg.to_radians();
-    let rot = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), theta);
-    let mut w = World::new(no_sleep_params());
-    w.add_body(Body::new_static(
-        Shape::Box {
-            half: Vec3::new(50.0, 1.0, 50.0),
-            radius: 0.0,
-        },
-        Pose {
-            pos: Vec3::ZERO,
-            rot,
-        },
-    ));
-    // 바닥 윗면은 로컬 +y=1 — 법선 방향으로 1(반두께) + 0.5(상자 반두께)만큼 띄운다.
-    let n = rot.rotate(Vec3::new(0.0, 1.0, 0.0));
-    let h = w.add_body(Body::new_dynamic(
-        Shape::Box {
-            half: Vec3::new(0.5, 0.5, 0.5),
-            radius: 0.0,
-        },
-        Pose { pos: n * 1.5, rot },
-        1.0,
-    ));
-    (w, h, rot.rotate(Vec3::new(-1.0, 0.0, 0.0)))
-}
-
 fn pyramid(w: &mut World, tiers: usize) -> Vec<BodyHandle> {
     let mut hs = Vec::new();
     let half = 0.5f32;
@@ -178,25 +112,6 @@ fn pyramid(w: &mut World, tiers: usize) -> Vec<BodyHandle> {
         }
     }
     hs
-}
-
-/// 붕괴 판정. **상대 기준**(스택 높이의 1%)을 쓴다 — 절대 임계는 단수가 바뀌면 의미가
-/// 달라진다(톨러런스에서 배운 것과 같은 함정). soft 접촉의 하중 비례 침하는 정상 거동이고,
-/// 판정해야 하는 것은 '형상을 잃었는가'다. 100단 붕괴(4.9% 낙하)는 이 기준에서도 실패한다.
-fn assert_pyramid_stable(w: &World, hs: &[BodyHandle], tiers: usize) {
-    for (idx, h) in hs.iter().enumerate() {
-        let b = w.body(*h);
-        assert!(b.pose.pos.y.is_finite(), "box {idx} 발산");
-        assert!(b.linvel.length() < 0.2, "box {idx} 미정착: {:?}", b.linvel);
-    }
-    let top = w.body(*hs.last().unwrap());
-    let expect_y = 0.5 + (tiers - 1) as f32;
-    let sag = expect_y - top.pose.pos.y;
-    let limit = 0.01 * tiers as f32; // 스택 높이의 1%
-    assert!(
-        sag.abs() < limit,
-        "정상 침하 {sag:.3}m > 허용 {limit:.3}m (높이 {expect_y}) — 붕괴"
-    );
 }
 
 /// **M2 수용 기준 (2026-07-26 서브스텝 재보정)**: 피라미드 40단(820박스) 50초 안정.
@@ -316,17 +231,6 @@ fn char_world() -> World {
     w
 }
 
-/// 평평한 바닥 캐릭터 — 계단 경로를 검증할 때 쓴다(둥근 바닥은 그냥 타고 오른다).
-fn box_char(x: f32, y: f32, z: f32) -> CharacterVirtual {
-    CharacterVirtual::new(
-        Shape::Box {
-            half: Vec3::new(0.3, 0.5, 0.3),
-            radius: 0.0,
-        },
-        Vec3::new(x, y, z),
-    )
-}
-
 fn capsule_char(x: f32, y: f32, z: f32) -> CharacterVirtual {
     CharacterVirtual::new(
         Shape::Capsule {
@@ -354,27 +258,3 @@ fn dyn_box(w: &mut World, x: f32, y: f32) -> BodyHandle {
 // 적대 리뷰(2026-07-27)에서 추가한 재현 테스트. 아래 5건은 **현 구현의 결함을
 // 드러내기 위한 것**이며, 통과하도록 고치기 전까지 실패한다.
 // ==========================================================================
-
-/// 조인트 앵커가 B의 질량중심에서 **떨어져 있어야** 중력이 토크를 만든다.
-/// 기존 조인트 테스트들은 앵커를 B의 COM에 두어 각 제약을 전혀 자극하지 않는다.
-fn hinge_pendulum(w: &mut World) -> (BodyHandle, BodyHandle) {
-    let a = w.add_body(Body::new_static(
-        maru_collide::Shape::Sphere { radius: 0.1 },
-        maru_collide::Pose {
-            pos: maru_math::Vec3::new(0.0, 10.0, 0.0),
-            rot: maru_math::Quat::IDENTITY,
-        },
-    ));
-    let b = w.add_body(Body::new_dynamic(
-        maru_collide::Shape::Box {
-            half: maru_math::Vec3::new(1.0, 0.1, 0.1),
-            radius: 0.0,
-        },
-        maru_collide::Pose {
-            pos: maru_math::Vec3::new(1.0, 10.0, 0.0),
-            rot: maru_math::Quat::IDENTITY,
-        },
-        1.0,
-    ));
-    (a, b)
-}

@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// 스냅샷 헤더 = magic4 + version4 + WorldParams60. 슬롯 카운트는 그 뒤에 온다.
+const HDR: usize = 4 + 4 + 60;
+
 /// 누적 힘은 **캐노니컬 상태**다 — 스냅샷 왕복이 같은 미래를 만들어야 한다.
 #[test]
 fn pending_forces_survive_snapshot_roundtrip() {

@@ -2,6 +2,23 @@
 
 use super::*;
 
+fn query_world() -> (World, Vec<BodyHandle>) {
+    let mut w = World::new(WorldParams::default());
+    let mut hs = Vec::new();
+    // x = 0, 5, 10 에 반지름 1 구 세 개
+    for k in 0..3 {
+        hs.push(w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 1.0 },
+            maru_collide::Pose {
+                pos: maru_math::Vec3::new(k as f32 * 5.0, 0.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        )));
+    }
+    (w, hs)
+}
+
 /// 가장 가까운 물체를 맞히고, 맞은 지점·법선이 일관돼야 한다.
 #[test]
 fn ray_hits_the_nearest_body() {

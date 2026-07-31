@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// 붕괴 판정. **상대 기준**(스택 높이의 1%)을 쓴다 — 절대 임계는 단수가 바뀌면 의미가
+/// 달라진다(톨러런스에서 배운 것과 같은 함정). soft 접촉의 하중 비례 침하는 정상 거동이고,
+/// 판정해야 하는 것은 '형상을 잃었는가'다. 100단 붕괴(4.9% 낙하)는 이 기준에서도 실패한다.
+fn assert_pyramid_stable(w: &World, hs: &[BodyHandle], tiers: usize) {
+    for (idx, h) in hs.iter().enumerate() {
+        let b = w.body(*h);
+        assert!(b.pose.pos.y.is_finite(), "box {idx} 발산");
+        assert!(b.linvel.length() < 0.2, "box {idx} 미정착: {:?}", b.linvel);
+    }
+    let top = w.body(*hs.last().unwrap());
+    let expect_y = 0.5 + (tiers - 1) as f32;
+    let sag = expect_y - top.pose.pos.y;
+    let limit = 0.01 * tiers as f32; // 스택 높이의 1%
+    assert!(
+        sag.abs() < limit,
+        "정상 침하 {sag:.3}m > 허용 {limit:.3}m (높이 {expect_y}) — 붕괴"
+    );
+}
+
 /// 질량중심에서 벗어난 점을 때리면 **회전도** 생긴다.
 #[test]
 fn off_center_impulse_creates_spin() {

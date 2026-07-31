@@ -547,3 +547,60 @@ fn derived_cache_invalidation_is_complete_for_pending_add() {
     }
     assert!(w.is_alive(h));
 }
+
+/// NEW MAJOR: dt 위반은 **wasm trap이 아니라 오류**로 표현돼야 한다.
+/// 고정틱 엔진이므로 큰 dt를 쪼개는 것은 호스트(accumulator) 책임이다.
+#[test]
+fn huge_dt_returns_error_not_trap() {
+    let mut w = World::new(WorldParams::default());
+    ground(&mut w);
+    assert_eq!(w.try_step(8.0), Err(ApiError::InvalidValue));
+    assert_eq!(w.try_step(f32::NAN), Err(ApiError::InvalidValue));
+    assert_eq!(w.try_step(crate::world::MAX_DT), Ok(()), "상한 자체는 합법");
+    // 문서와 구현 통일(리뷰 MAJOR): 0과 음수는 **합법이 아니다**.
+    // 일시정지는 step을 부르지 않는 것으로 표현한다 — "성공했는데 아무 일도 없음"이
+    // 오류와 구분되지 않으면 호스트가 정지 원인을 진단할 수 없다.
+    assert_eq!(w.try_step(0.0), Err(ApiError::InvalidValue));
+    assert_eq!(w.try_step(-DT), Err(ApiError::InvalidValue));
+    assert_eq!(
+        w.try_step(crate::world::MIN_DT * 0.5),
+        Err(ApiError::InvalidValue),
+        "너무 작은 dt는 1/h를 폭발시킨다"
+    );
+}
+
+#[test]
+fn fallible_constructor_returns_error() {
+    assert!(
+        Body::try_new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 0.0, 0.0), 1.0e-10).is_err()
+    );
+    assert!(
+        Body::try_new_dynamic(Shape::Sphere { radius: 1.0 }, pose(1.0e20, 0.0, 0.0), 1.0).is_err()
+    );
+    assert!(Body::try_new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 0.0, 0.0), 1.0).is_ok());
+}
+
+/// MAJOR: 좌표 정밀도와 최소 특징 크기의 정합.
+#[test]
+fn world_extent_matches_float_precision() {
+    // 월드 경계에서의 f32 간격이 최소 특징 크기 이하여야 한다
+    let spacing = {
+        let x = maru_collide::MAX_INPUT;
+        let next = f32::from_bits(x.to_bits() + 1);
+        next - x
+    };
+    assert!(
+        spacing <= maru_collide::MIN_SHAPE_EXTENT,
+        "월드 경계 f32 간격 {spacing} > 최소 특징 크기 {}",
+        maru_collide::MIN_SHAPE_EXTENT
+    );
+    // 최소 크기 미만 셰이프는 거부된다
+    assert!(Body::try_new_dynamic(
+        Shape::Sphere {
+            radius: maru_collide::MIN_SHAPE_EXTENT * 0.5
+        },
+        pose(0.0, 0.0, 0.0),
+        1.0
+    )
+    .is_err());
+}

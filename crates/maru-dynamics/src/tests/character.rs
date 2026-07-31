@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// 평평한 바닥 캐릭터 — 계단 경로를 검증할 때 쓴다(둥근 바닥은 그냥 타고 오른다).
+fn box_char(x: f32, y: f32, z: f32) -> CharacterVirtual {
+    CharacterVirtual::new(
+        Shape::Box {
+            half: Vec3::new(0.3, 0.5, 0.3),
+            radius: 0.0,
+        },
+        Vec3::new(x, y, z),
+    )
+}
+
 /// 빈 공간에서는 원하는 만큼 그대로 간다 — 그리고 바닥 위면 `on_ground`다.
 #[test]
 fn character_moves_freely_and_detects_ground() {

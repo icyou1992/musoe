@@ -2,6 +2,52 @@
 
 use super::*;
 
+/// theta(도)로 기울인 바닥 + 그 위에 같은 자세로 놓인 상자. `steps` 뒤의 내리막 변위.
+fn slope_slide_distance(theta_deg: f32, steps: usize) -> f32 {
+    let (mut w, h, down) = slope_scene(theta_deg);
+    let p0 = w.body(h).pose().pos;
+    for _ in 0..steps {
+        w.step(DT);
+    }
+    (w.body(h).pose().pos - p0).dot(down)
+}
+
+/// 같은 장면의 `steps` 뒤 내리막 속도.
+fn slope_slide_velocity(theta_deg: f32, steps: usize) -> f32 {
+    let (mut w, h, down) = slope_scene(theta_deg);
+    for _ in 0..steps {
+        w.step(DT);
+    }
+    w.body(h).linvel().dot(down)
+}
+
+fn slope_scene(theta_deg: f32) -> (World, BodyHandle, Vec3) {
+    let theta = theta_deg.to_radians();
+    let rot = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), theta);
+    let mut w = World::new(no_sleep_params());
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(50.0, 1.0, 50.0),
+            radius: 0.0,
+        },
+        Pose {
+            pos: Vec3::ZERO,
+            rot,
+        },
+    ));
+    // 바닥 윗면은 로컬 +y=1 — 법선 방향으로 1(반두께) + 0.5(상자 반두께)만큼 띄운다.
+    let n = rot.rotate(Vec3::new(0.0, 1.0, 0.0));
+    let h = w.add_body(Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(0.5, 0.5, 0.5),
+            radius: 0.0,
+        },
+        Pose { pos: n * 1.5, rot },
+        1.0,
+    ));
+    (w, h, rot.rotate(Vec3::new(-1.0, 0.0, 0.0)))
+}
+
 /// 마찰: 기울기 없는 바닥에서 수평 초기속도가 마찰로 감쇠
 #[test]
 fn friction_stops_sliding_box() {

@@ -2,6 +2,30 @@
 
 use super::*;
 
+/// 조인트 앵커가 B의 질량중심에서 **떨어져 있어야** 중력이 토크를 만든다.
+/// 기존 조인트 테스트들은 앵커를 B의 COM에 두어 각 제약을 전혀 자극하지 않는다.
+fn hinge_pendulum(w: &mut World) -> (BodyHandle, BodyHandle) {
+    let a = w.add_body(Body::new_static(
+        maru_collide::Shape::Sphere { radius: 0.1 },
+        maru_collide::Pose {
+            pos: maru_math::Vec3::new(0.0, 10.0, 0.0),
+            rot: maru_math::Quat::IDENTITY,
+        },
+    ));
+    let b = w.add_body(Body::new_dynamic(
+        maru_collide::Shape::Box {
+            half: maru_math::Vec3::new(1.0, 0.1, 0.1),
+            radius: 0.0,
+        },
+        maru_collide::Pose {
+            pos: maru_math::Vec3::new(1.0, 10.0, 0.0),
+            rot: maru_math::Quat::IDENTITY,
+        },
+        1.0,
+    ));
+    (a, b)
+}
+
 /// **고정 조인트는 자세까지 묶는다** — 중력이 걸려도 상대 회전이 안 생겨야 한다.
 ///
 /// 앵커를 B의 **무게중심에서 떨어뜨린다**(레버암). 앵커가 무게중심에 있으면 중력이
@@ -1573,4 +1597,54 @@ fn review_hinge_limit_fires_when_b_is_rotated_about_the_axis() {
         j.limit_impulse != 0.0,
         "축 둘레 90°는 한계 ±0.1을 벗어났는데 한계 임펄스가 0이다 (각이 측정되지 않음)"
     );
+}
+
+/// MAJOR: 앵커 척도는 **바디 원점 기준**이어야 한다 — AABB 크기만 쓰면 원점에서
+/// 떨어진 static hull의 정상 표면 앵커가 거부된다.
+#[test]
+fn anchor_scale_uses_origin_distance_not_size() {
+    let mut w = World::new(WorldParams::default());
+    // local x≈100m에 놓인 1m 크기 static hull (원점에서 멀지만 합법)
+    let far = w.add_body(Body::new_static(
+        Shape::Hull {
+            points: vec![
+                Vec3::new(99.5, -0.5, -0.5),
+                Vec3::new(100.5, -0.5, -0.5),
+                Vec3::new(99.5, 0.5, -0.5),
+                Vec3::new(99.5, -0.5, 0.5),
+                Vec3::new(100.5, 0.5, 0.5),
+            ],
+            radius: 0.0,
+        },
+        pose(0.0, 0.0, 0.0),
+    ));
+    let b = dyn_box(&mut w, 0.0, 3.0);
+    // 그 hull의 실제 표면 앵커
+    assert!(
+        w.try_add_joint(Joint::point(far, b, Vec3::new(100.0, 0.0, 0.0), Vec3::ZERO))
+            .is_ok(),
+        "원점에서 떨어진 셰이프의 정상 앵커가 거부됨"
+    );
+}
+
+/// 로드형 진자(작은 추가 1m 밖에 매달림)는 **정상 구성**이다 —
+/// 축별 결합 같은 과잉 제약으로 막으면 안 된다.
+#[test]
+fn rod_style_pendulum_anchor_is_allowed() {
+    let mut w = World::new(WorldParams::default());
+    let a = w.add_body(Body::new_static(
+        Shape::Sphere { radius: 0.1 },
+        pose(0.0, 5.0, 0.0),
+    ));
+    let bob = w.add_body(Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(0.2, 0.2, 0.2),
+            radius: 0.0,
+        },
+        pose(1.0, 5.0, 0.0),
+        1.0,
+    ));
+    assert!(w
+        .try_add_joint(Joint::point(a, bob, Vec3::ZERO, Vec3::new(-1.0, 0.0, 0.0)))
+        .is_ok());
 }
