@@ -600,3 +600,84 @@ fn sat_tie_break_is_symmetric_under_body_order() {
         "삽입 순서에 따라 결과가 다르다: {a1:?}/{a2:?}, {b1:?}/{b2:?}"
     );
 }
+
+/// **월드 축 회전 잠금** (rapier `LockedAxes`의 회전 절반).
+///
+/// 잠근 축으로는 각속도가 생기지 않고, **안 잠근 축은 그대로 돈다** — 양쪽을 다 봐야
+/// "전부 잠갔다"와 "정확히 그 축만 잠갔다"가 구분된다(한쪽만 보면 마스크가 통째로
+/// 켜져 있어도 통과한다).
+#[test]
+fn locked_rotation_axes_do_not_spin() {
+    for (lx, ly, lz) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        let mut w = World::new(WorldParams {
+            gravity: Vec3::ZERO,
+            ..no_sleep_params()
+        });
+        let h = w.add_body(
+            Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.3, 0.2),
+                    radius: 0.0,
+                },
+                pose(0.0, 0.0, 0.0),
+                1.0,
+            )
+            .with_locked_rotation(lx, ly, lz),
+        );
+        assert_eq!(w.body(h).locked_rotation(), (lx, ly, lz));
+        // 세 축 모두에 각임펄스를 준다 — 잠긴 축만 반응이 없어야 한다.
+        w.apply_angular_impulse(h, Vec3::new(1.0, 1.0, 1.0))
+            .unwrap();
+        w.step(DT);
+        let a = w.body(h).angvel();
+        for (lock, v, name) in [(lx, a.x, "x"), (ly, a.y, "y"), (lz, a.z, "z")] {
+            if lock {
+                assert_eq!(
+                    v, 0.0,
+                    "잠근 {name}축이 돌았다: {a:?} (마스크 {lx}/{ly}/{lz})"
+                );
+            } else {
+                assert!(
+                    v.abs() > 1e-3,
+                    "안 잠근 {name}축이 안 돌았다: {a:?} (마스크 {lx}/{ly}/{lz})"
+                );
+            }
+        }
+    }
+}
+
+/// 회전 잠금은 **스냅샷을 건너 살아남는다** — 복원한 월드가 같은 미래를 만들어야 한다.
+#[test]
+fn locked_rotation_survives_snapshot() {
+    let mut w = World::new(no_sleep_params());
+    ground(&mut w);
+    let h = w.add_body(
+        Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 2.0, 0.0),
+            1.0,
+        )
+        .with_locked_rotation(true, false, true),
+    );
+    w.apply_angular_impulse(h, Vec3::new(2.0, 2.0, 2.0))
+        .unwrap();
+    let snap = w.snapshot();
+    let mut w2 = World::new(no_sleep_params());
+    w2.restore(&snap).expect("복원");
+    assert_eq!(w2.body(h).locked_rotation(), (true, false, true));
+    for _ in 0..30 {
+        w.step(DT);
+        w2.step(DT);
+    }
+    assert_eq!(w.snapshot(), w2.snapshot(), "복원 후 궤적이 갈렸다");
+    let a = w.body(h).angvel();
+    assert_eq!((a.x, a.z), (0.0, 0.0), "잠근 축이 돌았다: {a:?}");
+}

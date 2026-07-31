@@ -246,6 +246,7 @@ pub(crate) fn write_body(w: &mut Writer, b: &Body) {
     w.u8(b.sensor as u8);
     w.u8(b.ccd as u8); // v11: CCD linear cast opt-in
     w.u8(b.weld_edges); // v12: 지형 내부 에지 용접 마스크
+    w.u8(b.locked_rot); // v17: 월드축 회전 잠금 마스크
     w.f32(b.linear_damping);
     w.f32(b.angular_damping);
     write_shape(w, &b.shape);
@@ -294,10 +295,12 @@ pub(crate) fn read_body(r: &mut Reader) -> Result<Body, SnapshotError> {
     };
     // 범위(＜8)·타입 결합(static 3점 hull)은 아래 validate가 한 곳에서 판정한다.
     let weld_edges = r.u8()?;
+    let locked_rot = r.u8()?;
     let linear_damping = r.f32()?;
     let angular_damping = r.f32()?;
     let shape = read_shape(r, true)?;
     let b = Body {
+        locked_rot,
         body_type,
         pose,
         linvel,
@@ -536,7 +539,8 @@ pub(crate) fn shape_size(s: &Shape) -> usize {
 pub(crate) fn body_size(b: &Body) -> usize {
     // 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4 + offset12
     // + force12 + torque12 + 셰이프
-    // + membership4 + filter4 + sensor1 + ccd1(v11) + weld1(v12) + linear_damping4 + angular_damping4
+    // + membership4 + filter4 + sensor1 + ccd1(v11) + weld1(v12) + lock1(v17)
+    // + linear_damping4 + angular_damping4
     1 + 12
         + 16
         + 12
@@ -550,6 +554,7 @@ pub(crate) fn body_size(b: &Body) -> usize {
         + 12
         + 4
         + 4
+        + 1
         + 1
         + 1
         + 1

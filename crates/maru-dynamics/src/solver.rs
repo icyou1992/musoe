@@ -214,6 +214,24 @@ fn effective_mass_x3(
 /// 무작위 접근하게 된다. 실제로 점당 73ns가 나왔는데 산술은 40 flops 남짓이었다 —
 /// 비용은 계산이 아니라 **메모리**였다. 솔버가 실제로 읽고 쓰는 6개 배열만 뽑아
 /// 연속 메모리에 두고, 서브스텝 루프가 끝난 뒤 한 번만 바디로 되쓴다.
+/// 월드 역관성에 **회전 잠금**을 건다 — 잠긴 축의 행·열을 0으로 만든다(`P·I⁻¹·P`).
+///
+/// 잠금이 없으면(`mask == 0`) 원본을 그대로 돌려준다 — 그 경우 비용이 0이어야 한다.
+/// 행과 열을 **둘 다** 지우는 이유: 열만 지우면 그 축의 토크가 다른 축 각속도를 만들고,
+/// 행만 지우면 다른 축 토크가 잠긴 축을 돌린다. 대칭을 유지해야 에너지가 새지 않는다.
+#[inline]
+pub fn mask_locked_rotation(m: Mat3, mask: u8) -> Mat3 {
+    if mask == 0 {
+        return m;
+    }
+    let k = |b: u8| if mask & b != 0 { 0.0 } else { 1.0 };
+    let (sx, sy, sz) = (k(1), k(2), k(4));
+    let col = |c: Vec3, s: f32| Vec3::new(c.x * sx * s, c.y * sy * s, c.z * sz * s);
+    Mat3 {
+        c: [col(m.c[0], sx), col(m.c[1], sy), col(m.c[2], sz)],
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct SolverState {
     pub lin: Vec<Vec3>,
@@ -224,6 +242,8 @@ pub struct SolverState {
     pub inv_i: Vec<Mat3>,
     /// 동적 바디만 임펄스를 받는다 (static/kinematic은 inv_m=0이지만 명시 게이트가 더 싸다).
     pub dynamic: Vec<bool>,
+    /// 슬롯별 회전 잠금 마스크 (비트 0/1/2 = 월드 X/Y/Z).
+    pub locked_rot: Vec<u8>,
 }
 
 impl SolverState {
@@ -248,6 +268,7 @@ impl SolverState {
         res!(self.inv_m);
         res!(self.inv_i);
         res!(self.dynamic);
+        res!(self.locked_rot);
         Ok(())
     }
 
@@ -272,6 +293,7 @@ impl SolverState {
         add!(self.inv_m, f32);
         add!(self.inv_i, Mat3);
         add!(self.dynamic, bool);
+        add!(self.locked_rot, u8);
         bytes
     }
 
@@ -291,6 +313,7 @@ impl SolverState {
         self.inv_m = Vec::new();
         self.inv_i = Vec::new();
         self.dynamic = Vec::new();
+        self.locked_rot = Vec::new();
     }
 
     /// 테스트 전용 — 예약이 목표에 닿았는지 보기 위한 창.
@@ -320,6 +343,7 @@ impl SolverState {
         fit!(self.inv_m, 0.0);
         fit!(self.inv_i, Mat3::from_diagonal(Vec3::ZERO));
         fit!(self.dynamic, false);
+        fit!(self.locked_rot, 0u8);
         for i in 0..n {
             let b = &bodies[i];
             // **OOB는 솔버에서도 비활성**이다(리뷰 BLOCKER: `dynamic`을 타입만 보고 정해서
@@ -331,6 +355,7 @@ impl SolverState {
             self.rot[i] = b.pose.rot;
             self.inv_m[i] = if active { b.inv_mass } else { 0.0 };
             self.dynamic[i] = active && b.is_dynamic();
+            self.locked_rot[i] = b.locked_rot;
         }
     }
 
@@ -380,7 +405,10 @@ impl SolverState {
         for &i in active {
             let i = i as usize;
             if self.dynamic[i] {
-                self.inv_i[i] = Mat3::rotate_inertia(local[i], self.rot[i]);
+                self.inv_i[i] = mask_locked_rotation(
+                    Mat3::rotate_inertia(local[i], self.rot[i]),
+                    self.locked_rot.get(i).copied().unwrap_or(0),
+                );
             }
         }
     }

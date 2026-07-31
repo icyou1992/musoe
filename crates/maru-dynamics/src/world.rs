@@ -3007,6 +3007,7 @@ impl World {
             + core::mem::size_of::<f32>()                                // inv_m
             + core::mem::size_of::<maru_math::Mat3>()                    // inv_i
             + core::mem::size_of::<bool>()                               // dynamic
+            + core::mem::size_of::<u8>()                                 // locked_rot
             + core::mem::size_of::<Vec3>()                               // inv_inertia_local
             + 2 * core::mem::size_of::<Vec3>()                           // ext_force(force,torque)
             + 2 * core::mem::size_of::<f32>()                            // damping(lin,ang)

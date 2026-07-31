@@ -76,6 +76,12 @@ pub struct Body {
     /// 삼각형과 공면 공유 — 접점 법선을 면 법선으로 용접한다, §4.2 ghost edge).
     /// 0 = 용접 없음(일반 바디 전부). 비영은 **static 3점 hull에만** 허용(validate).
     /// 캐노니컬 상태다 — 법선을 바꾸므로 스냅샷에 빠지면 복원 궤적이 갈린다.
+    /// **회전 잠금 마스크** — 비트 0/1/2 = 월드 X/Y/Z 축 회전을 막는다.
+    ///
+    /// rapier의 `LockedAxes` 회전 절반에 해당한다. 직립 캐릭터(전부 잠금)나 문·바퀴처럼
+    /// 한 축만 도는 물체(둘 잠금)에 쓴다. 월드 축 기준이라 몸체가 돌아도 잠긴 축은 그대로다 —
+    /// 그래서 로컬 관성에 구울 수 없고 월드 역관성에 투영으로 건다.
+    pub(crate) locked_rot: u8,
     pub(crate) weld_edges: u8,
     /// CCD linear cast opt-in (설계 §4 CCD 계약 v0.5, 대상 static 한정).
     /// 고속 소형 바디(총알)가 얇은 static을 관통하지 않도록 서브스텝 적분마다
@@ -154,6 +160,27 @@ impl Body {
 
     pub fn ccd(&self) -> bool {
         self.ccd
+    }
+
+    /// **월드 축 회전 잠금** (rapier `LockedAxes`의 회전 절반).
+    ///
+    /// 잠근 축으로는 각속도가 생기지 않는다 — 유효 역관성을 그 축에서 0으로 투영하므로
+    /// 솔버가 "그 방향으로는 무한 관성"으로 보고 임펄스를 계산한다. 속도를 사후에 0으로
+    /// 지우는 방식과 다르다: 그러면 솔버가 매 반복 헛되이 밀어 수렴이 나빠진다.
+    ///
+    /// 정적·kinematic 바디는 애초에 역관성이 0이라 영향이 없다.
+    pub fn with_locked_rotation(mut self, x: bool, y: bool, z: bool) -> Self {
+        self.locked_rot = (x as u8) | ((y as u8) << 1) | ((z as u8) << 2);
+        self
+    }
+
+    /// 회전 잠금 마스크 (비트 0/1/2 = 월드 X/Y/Z).
+    pub fn locked_rotation(&self) -> (bool, bool, bool) {
+        (
+            self.locked_rot & 1 != 0,
+            self.locked_rot & 2 != 0,
+            self.locked_rot & 4 != 0,
+        )
     }
 
     pub fn with_groups(mut self, membership: u32, filter: u32) -> Self {
@@ -362,6 +389,7 @@ impl Body {
             sensor: false,
             ccd: false,
             weld_edges: 0,
+            locked_rot: 0,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -420,6 +448,7 @@ impl Body {
             sensor: false,
             ccd: false,
             weld_edges: 0,
+            locked_rot: 0,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -505,6 +534,7 @@ impl Body {
             sensor: false,
             ccd: false,
             weld_edges: 0,
+            locked_rot: 0,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -545,6 +575,7 @@ impl Body {
             sensor: false,
             ccd: false,
             weld_edges: 0,
+            locked_rot: 0,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -579,7 +610,10 @@ impl Body {
     #[inline]
     pub fn inv_inertia_world(&self) -> Mat3 {
         if self.is_dynamic() {
-            Mat3::rotate_inertia(self.inv_inertia_local, self.pose.rot)
+            crate::solver::mask_locked_rotation(
+                Mat3::rotate_inertia(self.inv_inertia_local, self.pose.rot),
+                self.locked_rot,
+            )
         } else {
             Mat3::from_diagonal(Vec3::ZERO)
         }
