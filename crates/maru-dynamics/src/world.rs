@@ -4037,8 +4037,36 @@ impl World {
         for sub_i in 0..n_sub {
             // 역관성 갱신을 **외력보다 먼저** — 토크는 현재 자세의 월드 역관성을 쓴다
             // (뒤에 두면 첫 서브스텝에서 `inv_i`가 아직 0이라 토크가 통째로 사라진다).
+            //
+            // **두 번째 서브스텝부터는 건너뛴다 — 값이 이미 같다.** `inv_i`는 자세만의
+            // 함수이고, 직전 서브스텝 말(위치 적분·CCD 직후)에 이미 갱신했다. 그 사이에
+            // 도는 것은 relax 솔브·중력·외력·감쇠뿐이고 **전부 속도만 건드린다** —
+            // `st.rot`를 쓰는 곳은 위치 적분(`rot.integrate`)과 CCD뿐인데 둘 다 그 갱신
+            // **앞**에 있다. 그래서 여기서 다시 도는 것은 같은 값을 다시 쓰는 일이다.
+            // 재계산은 활성 바디마다 3x3 곱 두 번이라 공짜가 아니다(스텝의 ~0.5%).
             let _t_ii = Stopwatch::start();
-            st.refresh_inv_i_active(inv_i_local, &active);
+            if sub_i == 0 {
+                st.refresh_inv_i_active(inv_i_local, &active);
+            } else {
+                // 위 논증을 **검사로 바꿔 둔다** — 자세를 바꾸는 경로가 새로 생기면
+                // (예: 서브스텝 사이 자세 보정) 여기서 즉시 터진다. 릴리스에는 컴파일되지 않는다.
+                #[cfg(debug_assertions)]
+                {
+                    let before: Vec<[f32; 9]> = active
+                        .iter()
+                        .map(|&i| flatten_mat3(st.inv_i[i as usize]))
+                        .collect();
+                    st.refresh_inv_i_active(inv_i_local, &active);
+                    for (k, &i) in active.iter().enumerate() {
+                        debug_assert_eq!(
+                            before[k],
+                            flatten_mat3(st.inv_i[i as usize]),
+                            "서브스텝 {sub_i} 시작의 inv_i가 직전 서브스텝 말과 다르다 — \
+                         서브스텝 사이에 자세를 바꾸는 경로가 생겼다(건너뛰기 전제 붕괴)"
+                        );
+                    }
+                }
+            }
             self.diag.solve_ns[0] += _t_ii.ns();
             for &i in &grav_active {
                 let i = i as usize;
@@ -4074,16 +4102,24 @@ impl World {
                 }
             }
 
+            // **두 번째 서브스텝부터는 건너뛴다** — `inv_i`와 같은 논증이다. 레버암 `ra`/`rb`는
+            // 로컬 앵커를 현재 자세로 돌린 값이라 **자세만의 함수**이고, 직전 서브스텝 말
+            // (위치 적분·CCD 직후)에 이미 갱신했다. 그 사이는 relax·중력·외력·감쇠뿐이고
+            // 전부 속도만 건드린다. 첫 서브스텝은 `assemble_into` 직후라 반드시 돌아야 한다.
+            // 전제가 깨지면 위 `inv_i` 단언이 같은 자리에서 잡는다(자세가 바뀌면 둘 다 어긋난다 —
+            // 뮤테이션으로 발화 확인함).
             let _t_ra = Stopwatch::start();
-            solver_block::refresh_anchors_all(
-                &self.pool,
-                self.parallel_solver,
-                &solver::SolveView::new(&mut st),
-                &mut blocks,
-                &mut constraints,
-                &work,
-                &color_work,
-            );
+            if sub_i == 0 {
+                solver_block::refresh_anchors_all(
+                    &self.pool,
+                    self.parallel_solver,
+                    &solver::SolveView::new(&mut st),
+                    &mut blocks,
+                    &mut constraints,
+                    &work,
+                    &color_work,
+                );
+            }
             self.diag.solve_ns[1] += _t_ra.ns();
             // warm start + bias 솔브 (조인트 먼저 — Box2D 순서)
             let _t_jw = Stopwatch::start();
@@ -4988,6 +5024,15 @@ fn pcm_probe_mode() -> u8 {
     }
     CACHED.store(m, Ordering::Relaxed);
     m
+}
+
+/// `Mat3`에 `PartialEq`가 없어 디버그 단언용으로 성분을 편다(디버그 빌드에서만 쓰인다).
+#[cfg(debug_assertions)]
+fn flatten_mat3(m: maru_math::Mat3) -> [f32; 9] {
+    let c = m.c;
+    [
+        c[0].x, c[0].y, c[0].z, c[1].x, c[1].y, c[1].z, c[2].x, c[2].y, c[2].z,
+    ]
 }
 
 /// PCM warm-start 캐시의 타입 — 페어 키 → 그 페어의 (특징 ID, 누적 임펄스) 목록.

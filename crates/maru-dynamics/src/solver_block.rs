@@ -387,8 +387,8 @@ fn solve_probe_mode() -> u8 {
     }
     let raw = std::env::var("MARU_SOLVE_PROBE").unwrap_or_else(|_| "0".into());
     let m = match raw.trim().parse::<u8>() {
-        Ok(m @ 0..=2) => m,
-        _ => panic!("MARU_SOLVE_PROBE={raw:?} — 지원하는 값은 0·1·2뿐이다"),
+        Ok(m @ 0..=3) => m,
+        _ => panic!("MARU_SOLVE_PROBE={raw:?} — 지원하는 값은 0·1·2·3뿐이다"),
     };
     if m != 0 {
         eprintln!("!! MARU_SOLVE_PROBE={m} — 계측 전용 팔이다(추가 게더 1회, 결과는 버린다).");
@@ -404,7 +404,7 @@ pub fn solve_block(v: &SolveView, blk: &mut ContactBlock, p: &BatchSolveParams) 
     {
         // 팔 1·2는 **결과를 버린다** — 물리는 손대지 않는다.
         let m = solve_probe_mode();
-        if m != 0 {
+        if m == 1 || m == 2 {
             let n = v.len();
             // 어긋난 인덱스는 **같은 배열 안**에 있어야 한다(다른 배열을 읽으면 무엇을
             // 재는지 흐려진다). n/2 만큼 밀어 다른 캐시 라인으로 보낸다.
@@ -475,6 +475,19 @@ pub fn solve_block(v: &SolveView, blk: &mut ContactBlock, p: &BatchSolveParams) 
         let imp = normal.scale(applied);
         ba.apply(imp, ra, has);
         bb.apply(neg(imp), rb, has);
+        // 팔 `3` — **apply 한 쌍의 비용**을 잰다. 임펄스가 0이라 물리는 그대로다
+        // (`lin + 0*inv_m = lin`, `ang + inv_i·(r×0) = ang`). `black_box`로 0을 불투명하게
+        // 만들어야 옵티마이저가 통째로 지우지 않는다.
+        //
+        // 왜 이걸 재나: 접점마다 apply가 **4쌍** 돈다 — 법선 1 · 마찰 2축 각 1 · Coulomb 보정 1.
+        // 마찰 두 축을 2x2 블록으로 동시에 풀고 Coulomb 클램프를 같은 apply에 접으면 2쌍이
+        // 사라진다. 그 구조 변경의 상한이 `2 × (팔3 − 팔0)`이다 — 짓기 전에 재려고 둔다.
+        #[cfg(feature = "solve-probe")]
+        if solve_probe_mode() == 3 {
+            let z = core::hint::black_box(Vec3x4::from_array([maru_math::Vec3::ZERO; 4]));
+            ba.apply(z, ra, has);
+            bb.apply(neg(z), rb, has);
+        }
         // --- 마찰: 축별 순차 GS 후 Coulomb 원판 ---
         let max_f = friction * pt.normal_impulse;
         for axis in 0..2 {
