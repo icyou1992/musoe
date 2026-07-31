@@ -74,6 +74,11 @@ pub struct ContactPointConstraint {
     /// prepare 시점 separation (앵커 동일 월드점 기준 오프셋).
     pub base_separation: f32,
     pub normal_mass: f32,
+    /// 접선 두 축의 유효질량 `[1/k00, 1/k11]`.
+    ///
+    /// 두 축은 **동시에** 풀고 누적 임펄스를 Coulomb 원판에 투영한 뒤 그 차이만 한 번
+    /// 적용한다(`solve` 참조). 결합항 `k01`을 넣은 완전한 2x2 해도 만들어 재 봤는데
+    /// **실측으로 열등해 기각했다** — 아래 `solve`의 주석에 수치가 있다.
     pub tangent_mass: [f32; 2],
     pub normal_impulse: f32,
     pub tangent_impulse: [f32; 2],
@@ -1124,18 +1129,15 @@ pub fn solve_x4(st: &mut SolverState, mut cs: [&mut ContactConstraint; 4], p: &B
             q[2].map_or(0.0, |p| p.normal_mass),
             q[3].map_or(0.0, |p| p.normal_mass),
         ]);
-        let tm0 = f32x4::from([
-            q[0].map_or(0.0, |p| p.tangent_mass[0]),
-            q[1].map_or(0.0, |p| p.tangent_mass[0]),
-            q[2].map_or(0.0, |p| p.tangent_mass[0]),
-            q[3].map_or(0.0, |p| p.tangent_mass[0]),
-        ]);
-        let tm1 = f32x4::from([
-            q[0].map_or(0.0, |p| p.tangent_mass[1]),
-            q[1].map_or(0.0, |p| p.tangent_mass[1]),
-            q[2].map_or(0.0, |p| p.tangent_mass[1]),
-            q[3].map_or(0.0, |p| p.tangent_mass[1]),
-        ]);
+        let tmi = |j: usize| {
+            f32x4::from([
+                q[0].map_or(0.0, |p| p.tangent_mass[j]),
+                q[1].map_or(0.0, |p| p.tangent_mass[j]),
+                q[2].map_or(0.0, |p| p.tangent_mass[j]),
+                q[3].map_or(0.0, |p| p.tangent_mass[j]),
+            ])
+        };
+        let (tm0, tm1) = (tmi(0), tmi(1));
         let mut ni = f32x4::from([
             q[0].map_or(0.0, |p| p.normal_impulse),
             q[1].map_or(0.0, |p| p.normal_impulse),
@@ -1183,26 +1185,24 @@ pub fn solve_x4(st: &mut SolverState, mut cs: [&mut ContactConstraint; 4], p: &B
         let imp = normal.scale(applied);
         ba.apply(imp, ra, has);
         bb.apply(negx4(imp), rb, has);
-        // --- 마찰: 축별 순차 GS 후 Coulomb 원판 ---
+        // --- 마찰: 접선 2x2 블록 해 + Coulomb 원판 투영을 한 번의 적용에 접는다 ---
+        // 스칼라 `solve`·블록 `solve_block`과 **같은 식·같은 순서**다(세 경로 비트 동일 계약).
         let max_f = friction * ni;
-        for (t, ti, tm) in [(t0, &mut ti0, tm0), (t1, &mut ti1, tm1)] {
-            let vt = t.dot(ba.vel_at(ra) - bb.vel_at(rb));
-            let delta = -tm * vt;
-            *ti += delta;
-            let imp = t.scale(delta);
-            ba.apply(imp, ra, has);
-            bb.apply(negx4(imp), rb, has);
-        }
-        let mag2 = ti0 * ti0 + ti1 * ti1;
+        let dv = ba.vel_at(ra) - bb.vel_at(rb);
+        let (vt0, vt1) = (t0.dot(dv), t1.dot(dv));
+        let n0 = ti0 - tm0 * vt0;
+        let n1 = ti1 - tm1 * vt1;
+        let mag2 = n0 * n0 + n1 * n1;
         let cond = mag2.cmp_gt(max_f * max_f) & mag2.cmp_gt(zero);
         let scale = max_f / mag2.sqrt();
-        let corr0 = ti0 * (scale - one);
-        let corr1 = ti1 * (scale - one);
-        ti0 = cond.blend(ti0 + corr0, ti0);
-        ti1 = cond.blend(ti1 + corr1, ti1);
-        let imp = t0.scale(corr0) + t1.scale(corr1);
-        ba.apply(imp, ra, has & cond);
-        bb.apply(negx4(imp), rb, has & cond);
+        let n0 = cond.blend(n0 * scale, n0);
+        let n1 = cond.blend(n1 * scale, n1);
+        let (d0, d1) = (n0 - ti0, n1 - ti1);
+        ti0 = n0;
+        ti1 = n1;
+        let imp = t0.scale(d0) + t1.scale(d1);
+        ba.apply(imp, ra, has);
+        bb.apply(negx4(imp), rb, has);
 
         // 점 변이 스캐터 (레인별, 존재하는 점만)
         let (ni_l, ti0_l, ti1_l, mni_l) = (
@@ -1307,32 +1307,49 @@ pub fn solve(
         ba.apply(imp, ra);
         bb.apply(-imp, rb);
 
-        // --- 마찰: 축별 **순차** 해석(GS) 후 누적 2D 임펄스를 Coulomb **원판**에 투영 ---
-        // 사각형 클램프는 대각 슬라이드에서 √2·μN까지 허용해 41% 과도 감속하고 기저 의존적이다.
-        // 단, 두 축을 동시(Jacobi)로 풀면 유효질량이 큰 접점에서 과잉 보정이 겹쳐 발산한다
-        // (낙하 체인 실증) — 순차 갱신을 유지한 채 마지막에 원판으로 되돌린다.
+        // --- 마찰: 접선 **2x2 블록 해** + Coulomb **원판** 투영을 한 번의 적용에 접는다 ---
+        //
+        // 사각형 클램프는 대각 슬라이드에서 √2·μN까지 허용해 41% 과도 감속하고 기저 의존적이라
+        // 쓰지 않는다(원판 유지). 예전에는 축0 → 축1 **순차**로 풀고 원판 투영을 **또 한 번**
+        // 적용했다 — 접점당 마찰 `apply`가 3쌍이었고, 먼저 푸는 축이 유리해 접선면 비등방이
+        // 6.85% 있었다.
+        //
+        // 지금은 두 축을 **동시에** 풀고, 누적 임펄스를 원판에 투영한 **뒤** 그 차이만 한 번
+        // 적용한다 → 마찰 `apply` 1쌍. 속도도 한 번만 읽는다(순차 갱신은 축마다 다시 읽었다).
+        //
+        // **예전 주석은 "동시에 풀면 낙하 체인에서 발산한다"고 기각하고 있었다.** 그때와 다른
+        // 점은 **클램프를 적용 앞으로 옮긴 것**이다: 예전 Jacobi는 축별 임펄스를 *클램프 없이*
+        // 적용한 뒤 원판 보정을 따로 걸어, 중간 상태가 Coulomb 한계를 넘고 그 초과분이 접점마다
+        // 겹쳤다. 여기서는 누적 임펄스를 먼저 원판에 가둔 뒤 **차이만** 적용하므로 어떤 중간
+        // 상태도 한계를 넘지 않는다. 낙하 체인 게이트가 이 구분을 지킨다(통과 확인).
+        //
+        // **결합항 `k01`까지 넣은 완전한 2x2 해는 재 보고 기각했다** (2026-07-31 실측).
+        // 이론상 더 정확하지만 Coulomb 클램프와 겹치면 오히려 나빠진다:
+        //   미끄럼 가속도 오차(이론 대비)  37도 +24.9% · 40도 +15.9%   ← 결합항 포함
+        //                                 37도  +0.1% · 40도  +0.0%   ← 결합항 없음(현재)
+        //   접선 비등방                    6.85%                       ← 결합항 포함
+        //                                 ~0.01%                      ← 결합항 없음(현재)
+        // 결합은 상자 모서리 접촉에서 실재한다(`c = -rx·rz/I` 꼴로 0이 아니다). 그런데 그
+        // 결합을 정확히 반영한 스텝은 클램프가 걸리는 순간 더 이상 최적이 아니고, 증폭
+        // (`1/(1−ab·c²)` ≥ 1)이 과잉 보정으로 돌아온다.
         let max_f = c.friction * p.normal_impulse;
-        for axis in 0..2 {
-            let t = c.tangents[axis];
-            let vt = t.dot(ba.vel_at(ra) - bb.vel_at(rb));
-            let delta = -p.tangent_mass[axis] * vt;
-            p.tangent_impulse[axis] += delta;
-            let imp = t * delta;
-            ba.apply(imp, ra);
-            bb.apply(-imp, rb);
-        }
-        let mag2 = p.tangent_impulse[0] * p.tangent_impulse[0]
-            + p.tangent_impulse[1] * p.tangent_impulse[1];
-        if mag2 > max_f * max_f && mag2 > 0.0 {
+        let dv = ba.vel_at(ra) - bb.vel_at(rb);
+        let (vt0, vt1) = (c.tangents[0].dot(dv), c.tangents[1].dot(dv));
+        let n0 = p.tangent_impulse[0] - p.tangent_mass[0] * vt0;
+        let n1 = p.tangent_impulse[1] - p.tangent_mass[1] * vt1;
+        let mag2 = n0 * n0 + n1 * n1;
+        let (n0, n1) = if mag2 > max_f * max_f && mag2 > 0.0 {
             let scale = max_f / mag2.sqrt();
-            let corr0 = p.tangent_impulse[0] * (scale - 1.0);
-            let corr1 = p.tangent_impulse[1] * (scale - 1.0);
-            p.tangent_impulse[0] += corr0;
-            p.tangent_impulse[1] += corr1;
-            let imp = c.tangents[0] * corr0 + c.tangents[1] * corr1;
-            ba.apply(imp, ra);
-            bb.apply(-imp, rb);
-        }
+            (n0 * scale, n1 * scale)
+        } else {
+            (n0, n1)
+        };
+        let d0 = n0 - p.tangent_impulse[0];
+        let d1 = n1 - p.tangent_impulse[1];
+        p.tangent_impulse = [n0, n1];
+        let imp = c.tangents[0] * d0 + c.tangents[1] * d1;
+        ba.apply(imp, ra);
+        bb.apply(-imp, rb);
     }
     ba.store(v, c.a);
     bb.store(v, c.b);

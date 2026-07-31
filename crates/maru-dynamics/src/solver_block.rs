@@ -515,28 +515,26 @@ pub fn solve_block(v: &SolveView, blk: &mut ContactBlock, p: &BatchSolveParams) 
             }
             core::hint::black_box((pa, pb));
         }
-        // --- 마찰: 축별 순차 GS 후 Coulomb 원판 ---
+        // --- 마찰: 접선 2x2 블록 해 + Coulomb 원판 투영을 **한 번의 적용**에 접는다 ---
+        // 스칼라 `solver::solve`와 **연산 순서까지 같은 식**이다(비트 동일 계약).
+        // 클램프는 분기가 아니라 blend다 — 레인마다 조건이 다르다.
         let max_f = friction * pt.normal_impulse;
-        for axis in 0..2 {
-            let t = if axis == 0 { t0 } else { t1 };
-            let vt = t.dot(ba.vel_at(ra) - bb.vel_at(rb));
-            let delta = -pt.tangent_mass[axis] * vt;
-            pt.tangent_impulse[axis] += delta;
-            let imp = t.scale(delta);
-            ba.apply(imp, ra, has);
-            bb.apply(neg(imp), rb, has);
-        }
-        let mag2 = pt.tangent_impulse[0] * pt.tangent_impulse[0]
-            + pt.tangent_impulse[1] * pt.tangent_impulse[1];
+        let dv = ba.vel_at(ra) - bb.vel_at(rb);
+        let (vt0, vt1) = (t0.dot(dv), t1.dot(dv));
+        let n0 = pt.tangent_impulse[0] - pt.tangent_mass[0] * vt0;
+        let n1 = pt.tangent_impulse[1] - pt.tangent_mass[1] * vt1;
+        let mag2 = n0 * n0 + n1 * n1;
         let cond = mag2.cmp_gt(max_f * max_f) & mag2.cmp_gt(zero);
         let scale = max_f / mag2.sqrt();
-        let corr0 = pt.tangent_impulse[0] * (scale - one);
-        let corr1 = pt.tangent_impulse[1] * (scale - one);
-        pt.tangent_impulse[0] = cond.blend(pt.tangent_impulse[0] + corr0, pt.tangent_impulse[0]);
-        pt.tangent_impulse[1] = cond.blend(pt.tangent_impulse[1] + corr1, pt.tangent_impulse[1]);
-        let imp = t0.scale(corr0) + t1.scale(corr1);
-        ba.apply(imp, ra, has & cond);
-        bb.apply(neg(imp), rb, has & cond);
+        let n0 = cond.blend(n0 * scale, n0);
+        let n1 = cond.blend(n1 * scale, n1);
+        let d0 = n0 - pt.tangent_impulse[0];
+        let d1 = n1 - pt.tangent_impulse[1];
+        pt.tangent_impulse[0] = n0;
+        pt.tangent_impulse[1] = n1;
+        let imp = t0.scale(d0) + t1.scale(d1);
+        ba.apply(imp, ra, has);
+        bb.apply(neg(imp), rb, has);
     }
     ba.store(v, blk.a);
     bb.store(v, blk.b);
