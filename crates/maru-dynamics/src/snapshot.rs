@@ -51,7 +51,7 @@ const MAGIC: u32 = 0x4d41_5255; // "MARU"
 /// 캐노니컬 상태이고, 옛 버전을 "적당히" 읽으면 빠진 필드가 기본값으로 채워져 **같은
 /// 바이트가 다른 미래**를 만든다(그 사고를 이미 v13→v14에서 겪었다). 버전이 다르면
 /// `BadVersion(found)`으로 거부하고, 호스트가 마이그레이션 여부를 스스로 정한다.
-pub const VERSION: u32 = 15;
+pub const VERSION: u32 = 16;
 
 /// 크레이트 밖으로 나가는 이름(재수출).
 pub use self::VERSION as SNAPSHOT_VERSION;
@@ -88,6 +88,10 @@ mod min_bytes {
     pub const HULL_POINT: usize = 12;
     /// 하이트필드 샘플: f32 하나.
     pub const HEIGHT: usize = 4;
+    /// 메시 정점: Vec3 12바이트.
+    pub const MESH_VERT: usize = 12;
+    /// 메시 삼각형: u32 인덱스 3개.
+    pub const MESH_TRI: usize = 12;
 }
 
 /// 디코딩 후 원소가 힙에서 차지하는 크기 — count 과금용.
@@ -113,6 +117,13 @@ mod decoded_size {
     /// 디코딩된 높이 한 칸(f32).
     pub fn height() -> usize {
         core::mem::size_of::<f32>()
+    }
+    /// 디코딩된 메시 정점/삼각형.
+    pub fn mesh_vert() -> usize {
+        core::mem::size_of::<maru_math::Vec3>()
+    }
+    pub fn mesh_tri() -> usize {
+        core::mem::size_of::<[u32; 3]>()
     }
 
     pub fn hull_point() -> usize {
@@ -322,6 +333,23 @@ fn write_shape(w: &mut Writer, s: &Shape) {
                 w.f32(*h);
             }
         }
+        // BVH·용접 마스크는 정점·인덱스의 **파생물이라 직렬화하지 않는다** — 복원에서
+        // 생성자가 다시 만든다(하이트필드 타일과 같은 정책). 파생을 저장하면 "바이트는 같은데
+        // 파생이 다른" 상태가 생기고, 그걸 막으려면 복원에서 비트 검증을 해야 한다.
+        Shape::TriMesh(m) => {
+            w.u8(6);
+            // 개수는 **명시로 쓴다** — 리더가 남은 바이트로 예산을 걸 수 있어야 한다.
+            w.u32(m.verts().len() as u32);
+            for v in m.verts() {
+                w.vec3(*v);
+            }
+            w.u32(m.tris().len() as u32);
+            for t in m.tris() {
+                w.u32(t[0]);
+                w.u32(t[1]);
+                w.u32(t[2]);
+            }
+        }
         Shape::Triangle { .. } => {
             // 내부 전용 셰이프는 바디가 될 수 없다(validate가 거부) — 여기 오면 계약 위반.
             unreachable!("triangle is an internal shape and is never serialized")
@@ -386,6 +414,23 @@ fn read_shape(r: &mut Reader, allow_compound: bool) -> Result<Shape, SnapshotErr
             // 생성자가 `None`을 내고, 그건 손상된 스냅샷이므로 형식 오류로 올린다.
             maru_collide::Shape::heightfield(heights, nx, nz, cell)
                 .ok_or(SnapshotError::BadShape)?
+        }
+        6 => {
+            // 정점 → 삼각형 순. 두 개수 모두 **입력 길이에서 유도된 예산**으로 묶는다
+            // (nv를 믿고 곱하면 작은 파일이 거대한 할당을 주장할 수 있다 — 스냅샷 상시 규칙).
+            let nv = r.count(min_bytes::MESH_VERT, decoded_size::mesh_vert())?;
+            let mut verts = try_vec(nv)?;
+            for _ in 0..nv {
+                verts.push(r.vec3()?);
+            }
+            let nt = r.count(min_bytes::MESH_TRI, decoded_size::mesh_tri())?;
+            let mut tris: Vec<[u32; 3]> = try_vec(nt)?;
+            for _ in 0..nt {
+                tris.push([r.u32()?, r.u32()?, r.u32()?]);
+            }
+            // **인덱스 범위·퇴화·크기 정책은 생성자가 본다.** 손상된 스냅샷이 만들어 낸
+            // 범위 밖 인덱스는 여기서 형식 오류가 되지, 나중에 인덱싱 패닉이 되지 않는다.
+            maru_collide::Shape::trimesh(verts, tris).ok_or(SnapshotError::BadShape)?
         }
         4 => {
             // **재귀 전에 깊이를 자른다**(교차검수 rev_e4075e85 BLOCKER): 자식을 읽고 나서
@@ -762,6 +807,8 @@ fn shape_size(s: &Shape) -> usize {
         Shape::Hull { points, .. } => 4 + points.len() * 12 + 4,
         // nx4 + nz4 + cell4 + count4 + 높이 4바이트씩
         Shape::Heightfield(g) => 4 + 4 + 4 + 4 + g.heights().len() * 4,
+        // count4 + 정점 12씩 + count4 + 삼각형 12씩
+        Shape::TriMesh(m) => 4 + m.verts().len() * 12 + 4 + m.tris().len() * 12,
         Shape::Triangle { .. } => unreachable!("triangle is never serialized"),
         Shape::Compound { children } => {
             1 + children

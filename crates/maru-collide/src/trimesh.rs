@@ -39,12 +39,6 @@ pub const MAX_TRIMESH_VERTS: usize = 1 << 20;
 ///
 /// 파생물(BVH·마스크·AABB)은 **캐노니컬 상태가 아니다**: 스냅샷에는 정점·인덱스만 넣고
 /// 복원에서 다시 만든다(하이트필드 `tiles`와 같은 정책).
-// **다음 슬라이스가 지울 표식이다.** `tree`·`weld`와 그 접근자는 접촉·레이·캐스트 디스패치가
-// 쓸 것인데, 그 디스패치는 아직 없다. 지금 `-D warnings`를 통과시키려고 접근자를 공개 API로
-// 올리면 "공개 표면은 셰이프 무관 디스패처만"이라는 계약이 깨지므로(README), 대신 **이 표식을
-// 남긴다** — 조용한 강등이 아니라 눈에 띄는 미완 표시다. 디스패치가 들어오면 이 줄은 사라지고,
-// 사라지지 않으면 그 자체가 "아직 안 붙였다"는 신호다.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct TriMeshData {
     verts: Vec<Vec3>,
@@ -64,7 +58,6 @@ impl PartialEq for TriMeshData {
     }
 }
 
-#[allow(dead_code)]
 impl TriMeshData {
     /// 메시를 만든다 — 구조 불변식을 검사하고 BVH·용접 마스크를 계산한다. 어기면 `None`.
     ///
@@ -183,9 +176,14 @@ impl TriMeshData {
         self.weld[i as usize]
     }
 
-    /// 로컬 AABB와 겹치는 삼각형 후보를 모은다 (BVH 순회, 상위집합).
-    pub(crate) fn query_in(&self, local: Aabb, out: &mut Vec<u32>, stack: &mut Vec<u32>) {
-        self.tree.query_candidates_in(local, out, stack);
+    /// 로컬 AABB와 겹치는 삼각형 후보를 **콜백으로** 흘린다 (BVH 순회, 상위집합).
+    ///
+    /// 후보를 모으지 않는 이유: 이 경로는 스텝 안에서 돌고 "스텝 중 힙 할당 0" 계약 아래 있다.
+    /// 반환 `false` = BVH 순회 스택 포화 — 호출자는 **조용히 넘기지 말고** 자원 오류로
+    /// 처리해야 한다(후보를 빠뜨리면 물체가 메시를 통과한다).
+    /// 콜백이 `false`를 돌려주면 순회를 멈춘다(예산 소진).
+    pub(crate) fn for_each_candidate(&self, local: Aabb, f: impl FnMut(u32) -> bool) -> bool {
+        self.tree.for_each_candidate(local, f)
     }
 }
 
@@ -366,21 +364,26 @@ mod tests {
     fn bvh_query_returns_a_superset_of_overlapping_triangles() {
         let (v, t) = quad();
         let m = TriMeshData::new(v, t).expect("정상 메시");
-        let (mut out, mut stack) = (Vec::new(), Vec::new());
+        let mut out: Vec<u32> = Vec::new();
         // 사각형 전체를 덮는 질의 — 둘 다 후보다.
-        m.query_in(
+        let ok = m.for_each_candidate(
             Aabb::new(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(2.0, 1.0, 2.0)),
-            &mut out,
-            &mut stack,
+            |i| {
+                out.push(i);
+                true
+            },
         );
+        assert!(ok, "순회가 포화됐다");
         out.sort_unstable();
         assert_eq!(out, vec![0, 1]);
         // 완전히 벗어난 질의 — 후보 없음(가지치기가 실제로 자른다는 증거).
         out.clear();
-        m.query_in(
+        m.for_each_candidate(
             Aabb::new(Vec3::new(10.0, 10.0, 10.0), Vec3::new(11.0, 11.0, 11.0)),
-            &mut out,
-            &mut stack,
+            |i| {
+                out.push(i);
+                true
+            },
         );
         assert!(out.is_empty(), "떨어진 질의가 후보를 냈다: {out:?}");
     }
@@ -403,6 +406,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 큰 메시도 BVH 순회가 **완주**한다 — 고정 스택(64)의 깊이 상한이 실제로 충분한가.
+    ///
+    /// `for_each_candidate`는 스택이 넘치면 `false`를 돌려주고 호출자가 자원 오류로 올린다.
+    /// 그 포화는 "일어나면 안 되는" 방어인데, **정말 안 일어나는지는 재봐야 안다**
+    /// (깊이 상한 3·log4(n)+1은 균형 트리 가정이고, 빌더가 치우치면 깨질 수 있다).
+    #[test]
+    fn large_mesh_traverses_without_stack_saturation() {
+        let n = 120usize; // 119×119×2 = 28,322 삼각형
+        let (mut verts, mut tris) = (Vec::new(), Vec::new());
+        for iz in 0..n {
+            for ix in 0..n {
+                verts.push(Vec3::new(ix as f32, 0.0, iz as f32));
+            }
+        }
+        for iz in 0..n - 1 {
+            for ix in 0..n - 1 {
+                let i = (iz * n + ix) as u32;
+                let (r, d) = (i + 1, i + n as u32);
+                tris.push([i, r, d]);
+                tris.push([r, d + 1, d]);
+            }
+        }
+        let count = tris.len();
+        let m = TriMeshData::new(verts, tris).expect("정상 메시");
+        let mut seen = 0usize;
+        let ok = m.for_each_candidate(
+            Aabb::new(
+                Vec3::new(-1.0, -1.0, -1.0),
+                Vec3::new(n as f32, 1.0, n as f32),
+            ),
+            |_| {
+                seen += 1;
+                true
+            },
+        );
+        assert!(ok, "스택이 포화됐다 — 고정 깊이 상한이 부족하다");
+        assert_eq!(seen, count, "전체를 덮는 질의가 삼각형을 빠뜨렸다");
     }
 
     #[test]

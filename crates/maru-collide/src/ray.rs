@@ -116,6 +116,35 @@ pub(crate) fn cast_ray(
                 normal: n,
                 started_inside: false,
             }),
+        // 메시: BVH로 **선분 AABB**와 겹치는 삼각형만 시험한다.
+        //
+        // 레이 전용 BVH 하강(슬래브 순서 순회)이 아니라 선분 AABB 질의를 쓴다 — 후보가
+        // 상위집합이라 정확성은 같고, 트리 API를 하나로 유지한다. 긴 레이는 후보가 늘지만
+        // 지형 레이는 대개 짧다(길어지면 그때 하강을 넣는다 — 지금 넣으면 근거 없는 복잡도다).
+        //
+        // **순회가 포화되면 `None`이 아니라 "안 맞음"으로 뭉개지 않는다**: 조용히 후보를
+        // 빠뜨리면 레이가 지형을 통과한 것처럼 보인다. 포화는 상한을 넘긴 메시에서만 나고,
+        // 그 경우 히트 없음 대신 **그때까지 찾은 최근접**을 돌려준다(보수적).
+        Shape::TriMesh(ref mesh) => {
+            let end = o + d * max_toi;
+            let lo = Vec3::new(o.x.min(end.x), o.y.min(end.y), o.z.min(end.z));
+            let hi = Vec3::new(o.x.max(end.x), o.y.max(end.y), o.z.max(end.z));
+            let mut best: Option<Local> = None;
+            mesh.for_each_candidate(crate::Aabb::new(lo, hi), |i| {
+                let tri = mesh.triangle(i);
+                if let Some((toi, n)) = crate::heightfield::ray_triangle(o, d, tri, max_toi) {
+                    if best.as_ref().is_none_or(|b| toi < b.toi) {
+                        best = Some(Local {
+                            toi,
+                            normal: n,
+                            started_inside: false,
+                        });
+                    }
+                }
+                true
+            });
+            best
+        }
         // 하이트필드: 격자 DDA — 지나는 셀만 삼각형으로 시험한다.
         Shape::Heightfield { .. } => {
             let hf = shape.heightfield_ref().expect("Heightfield 변종");
@@ -193,6 +222,16 @@ pub(crate) fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
         }
         // 삼각형은 부피가 없다 — radius가 있을 때만 코어까지 거리로 판정(hull과 같은 경로).
         Shape::Triangle { .. } => r > 0.0 && closest_core_dist(shape, local).0 <= r,
+        // **메시는 표면이지 부피가 아니다 — 포함은 항상 거짓이다.**
+        //
+        // 하이트필드는 "높이 아래 = 속이 참"으로 정의할 수 있다. 격자가 **높이 함수**라
+        // 위/아래가 전역적으로 정해지기 때문이다. 일반 메시에는 그런 것이 없다: 열린
+        // 지형 패치일 수도, 닫힌 방일 수도 있고, 안팎 판정은 레이 패리티 계산이 필요한데
+        // 그건 열린 메시에서 답이 아예 정의되지 않는다.
+        //
+        // 그래서 **정의되지 않은 것을 추측하지 않는다**. rapier의 TriMesh도 기본이 표면이다.
+        // 부피 질의가 필요하면 닫힌 볼록 셰이프나 복합으로 표현하는 것이 옳다.
+        Shape::TriMesh(_) => false,
         // 하이트필드는 **표면 아래를 속이 찬 것으로** 본다(Jolt 동형): 격자 범위 안이고
         // 보간 높이 아래면 포함이다. 그래야 `query_point`가 지형에 묻힌 물체를 찾는다.
         Shape::Heightfield { .. } => {

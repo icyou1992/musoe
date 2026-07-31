@@ -95,6 +95,29 @@ fn main() {
     wb.add_body(Body::new_static(hf, pose(0.0, 0.0, 0.0)));
     let hb = add_dynamics(&mut wb, ndyn);
 
+    // (c) TriMesh 하나 — 같은 삼각형 수, 같은 평면. **구현이 실제로 값을 냈는지** 확인하는 팔.
+    let mut wc = World::new(params());
+    {
+        let (mut verts, mut tris) = (Vec::new(), Vec::new());
+        let n = side + 1;
+        for iz in 0..n {
+            for ix in 0..n {
+                verts.push(Vec3::new(ix as f32 * cell, 0.0, iz as f32 * cell));
+            }
+        }
+        for iz in 0..side {
+            for ix in 0..side {
+                let i = (iz * n + ix) as u32;
+                let (r, d) = (i + 1, i + n as u32);
+                tris.push([i, r, d]);
+                tris.push([r, d + 1, d]);
+            }
+        }
+        let mesh = Shape::trimesh(verts, tris).expect("메시 생성");
+        wc.add_body(Body::new_static(mesh, pose(0.0, 0.0, 0.0)));
+    }
+    let hc = add_dynamics(&mut wc, ndyn);
+
     let run = |w: &mut World, label: &str, hs: &[BodyHandle]| {
         for _ in 0..40 {
             w.step(1.0 / 60.0);
@@ -134,15 +157,19 @@ fn main() {
 
     println!("지형 삼각형 {tris}개 ({side}×{side} 격자), 동적 구 {ndyn}개, 수면 OFF, {steps}스텝");
     // 교차 실행 — 순차로 한 번씩만 재면 기계 드리프트를 차이로 읽는다.
-    let (mut a_best, mut b_best) = (f64::MAX, f64::MAX);
+    let (mut a_best, mut b_best, mut c_best) = (f64::MAX, f64::MAX, f64::MAX);
     for _ in 0..3 {
         a_best = a_best.min(run(&mut wa, "삼각형 바디 N개", &ha));
         b_best = b_best.min(run(&mut wb, "하이트필드 1개", &hb));
+        c_best = c_best.min(run(&mut wc, "TriMesh 1개", &hc));
+        c_best = c_best.min(run(&mut wc, "TriMesh 1개", &hc));
         b_best = b_best.min(run(&mut wb, "하이트필드 1개", &hb));
         a_best = a_best.min(run(&mut wa, "삼각형 바디 N개", &ha));
     }
     println!(
-        "\nmin-of-6: 바디 {a_best:.3} ms vs 내부구조 {b_best:.3} ms → 내부 구조가 {:.2}배 빠름",
-        a_best / b_best
+        "\nmin-of-6: 바디 {a_best:.3} · 하이트필드 {b_best:.3} · TriMesh {c_best:.3} ms\n\
+         → 바디 대비 TriMesh {:.2}배 빠름 · 하이트필드 대비 TriMesh {:.2}배",
+        a_best / c_best,
+        b_best / c_best
     );
 }

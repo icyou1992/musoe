@@ -155,6 +155,60 @@ impl Tree {
         self.query_above_in(q, None, out, stack)
     }
 
+    /// **힙 없이** 도는 순회 — 후보를 모으지 않고 콜백으로 흘린다.
+    ///
+    /// 스텝 안에서 도는 경로(메시 접촉·CCD 캐스트)는 "스텝 중 힙 할당 0" 계약 아래 있어서
+    /// `Vec` 스택도 후보 벡터도 쓸 수 없다. 스택은 **고정 배열**이고, 넘치면 `false`를
+    /// 돌려준다 — 조용히 후보를 빠뜨리는 대신 호출자가 포화로 처리하게 한다
+    /// (조용한 누락은 물체가 지형을 통과하는 결함이 된다).
+    ///
+    /// 깊이 상한: 4-ary 트리라 리프 n개면 깊이 ≈ log4(n)이고, DFS 스택에는 형제 노드가
+    /// 최대 3개씩 쌓이므로 3·log4(n) + 1이 상한이다. n = 2^20이면 31이라 64면 충분하다.
+    /// 콜백이 `false`를 돌려주면 순회를 즉시 멈춘다(예산 소진).
+    pub(crate) fn for_each_candidate(&self, q: Aabb, mut f: impl FnMut(u32) -> bool) -> bool {
+        const STACK_CAP: usize = 64;
+        let root = self.root;
+        if root == EMPTY {
+            return true;
+        }
+        if let Child::Leaf(id) = decode(root) {
+            f(id);
+            return true;
+        }
+        let qmin = Vec3x4::splat(q.min);
+        let qmax = Vec3x4::splat(q.max);
+        let mut stack = [0u32; STACK_CAP];
+        let mut top = 0usize;
+        stack[top] = root;
+        top += 1;
+        while top > 0 {
+            top -= 1;
+            let n = stack[top] as usize;
+            let mask = self.bounds[n].overlaps_mask(qmin, qmax).to_array();
+            for (hit, &child) in mask.iter().zip(&self.children[n]) {
+                if *hit == 0.0 {
+                    continue;
+                }
+                match decode(child) {
+                    Child::Node(c) => {
+                        if top == STACK_CAP {
+                            return false; // 포화 — 호출자가 오류로 처리한다
+                        }
+                        stack[top] = c;
+                        top += 1;
+                    }
+                    Child::Leaf(id) => {
+                        if !f(id) {
+                            return true; // 호출자가 멈추라고 했다(예산)
+                        }
+                    }
+                    Child::None => {}
+                }
+            }
+        }
+        true
+    }
+
     /// `above`가 있으면 **id가 그 값 이하인 후보는 만들지 않는다**.
     ///
     /// 동적-동적 페어는 `(i, j)`를 i의 질의와 j의 질의에서 두 번 만나 절반을 버린다.

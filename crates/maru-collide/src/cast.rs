@@ -22,7 +22,10 @@ pub struct ShapeCastHit {
 /// 볼록 전용 경로 판정 (`manifold`의 것과 같은 규칙).
 #[inline]
 fn is_non_convex(s: &Shape) -> bool {
-    matches!(s, Shape::Compound { .. } | Shape::Heightfield { .. })
+    matches!(
+        s,
+        Shape::Compound { .. } | Shape::Heightfield { .. } | Shape::TriMesh { .. }
+    )
 }
 
 /// 선형 셰이프 캐스트. `skin` = 이 거리 안이면 "닿았다"로 판정하는 피부 두께 —
@@ -347,6 +350,47 @@ pub fn try_shape_cast_dispatch_rotational(
                 // `unreachable!`에 닿아 trap이 된다(검수 rev_1e81559e BLOCKER: 회전 CCD를 켠
                 // 블레이드를 지형 옆에 두면 선속도 0에서도 즉시 재현). 선형 경로와 같은 규칙으로
                 // 스윕 봉투가 덮는 셀만 삼각형으로 펼친다. 회전 봉투는 외접 반지름으로 넓힌다.
+                // 메시도 볼록이 아니다 — 같은 규칙으로 스윕 봉투가 덮는 삼각형만 펼친다.
+                // 예산 초과는 **자르지 않고 오류로 올린다**(자르면 관통, 가짜 히트면 영구 동결 —
+                // 근거는 아래 하이트필드 분기의 같은 자리 주석).
+                Shape::TriMesh { .. } => {
+                    let mesh = sb.trimesh_ref().expect("TriMesh 변종");
+                    // 자식은 부모 피벗 주위를 돈다 — 궤도 반경으로 봉투를 잡는다(하이트필드와 동일).
+                    let orbit_r = (cpa.pos - pa.pos).length() + csa.bounding_radius();
+                    let e = Vec3::new(orbit_r, orbit_r, orbit_r);
+                    let a0 = crate::Aabb::new(pa.pos - e, pa.pos + e);
+                    let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
+                    let expanded = crate::Aabb::new(
+                        sweep.min - Vec3::new(skin, skin, skin),
+                        sweep.max + Vec3::new(skin, skin, skin),
+                    );
+                    let local = crate::heightfield::world_aabb_to_local(expanded, pb);
+                    let mut best: Option<ShapeCastHit> = None;
+                    let mut out_of_budget = false;
+                    let complete = mesh.for_each_candidate(local, |ti| {
+                        if *budget == 0 {
+                            out_of_budget = true;
+                            return false;
+                        }
+                        *budget -= 1;
+                        let tri = Shape::Triangle {
+                            points: mesh.triangle(ti),
+                            radius: 0.0,
+                        };
+                        if let Some(h) = shape_cast_rotational(
+                            csa, cpa, motion, axis, angle, pa.pos, &tri, pb, skin,
+                        ) {
+                            if best.as_ref().is_none_or(|b| h.toi < b.toi) {
+                                best = Some(h);
+                            }
+                        }
+                        true
+                    });
+                    if !complete || out_of_budget {
+                        return Err(CastReject::BudgetExceeded);
+                    }
+                    best
+                }
                 Shape::Heightfield { .. } => {
                     let hf = sb.heightfield_ref().expect("Heightfield 변종");
                     // **자식은 자기 원점이 아니라 부모 피벗 주위를 돈다.** 자식 반경만 넓히면
@@ -496,6 +540,36 @@ pub fn try_shape_cast_dispatch(
             }
             // 하이트필드가 대상이면 스윕 봉투가 덮는 셀만 삼각형으로 펼친다.
             // CCD의 유일한 대상이 static이므로(설계 §4 linear cast) 이 경로가 지형 관통을 막는다.
+            // 메시가 대상이면 스윕 봉투가 덮는 삼각형만 펼친다(하이트필드와 같은 계약).
+            Shape::TriMesh { .. } => {
+                let mesh = sb.trimesh_ref().expect("TriMesh 변종");
+                let a0 = crate::transformed_aabb(csa.local_aabb(), cpa);
+                let sweep = a0.merge(crate::Aabb::new(a0.min + motion, a0.max + motion));
+                let expanded = crate::Aabb::new(
+                    sweep.min - Vec3::new(skin, skin, skin),
+                    sweep.max + Vec3::new(skin, skin, skin),
+                );
+                let local = crate::heightfield::world_aabb_to_local(expanded, pb);
+                let mut out_of_budget = false;
+                let complete = mesh.for_each_candidate(local, |ti| {
+                    if *budget == 0 {
+                        out_of_budget = true;
+                        return false;
+                    }
+                    *budget -= 1;
+                    let tri = Shape::Triangle {
+                        points: mesh.triangle(ti),
+                        radius: 0.0,
+                    };
+                    if let Some(h) = shape_cast(csa, cpa, motion, &tri, pb, skin) {
+                        consider(h);
+                    }
+                    true
+                });
+                if !complete || out_of_budget {
+                    return Err(CastReject::BudgetExceeded);
+                }
+            }
             Shape::Heightfield { .. } => {
                 let hf = sb.heightfield_ref().expect("Heightfield 변종");
                 let a0 = crate::transformed_aabb(csa.local_aabb(), cpa);

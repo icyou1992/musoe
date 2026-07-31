@@ -36,6 +36,12 @@ pub enum Shape {
     /// 호스트가 위조하면 가지치기가 진짜 접촉을 조용히 건너뛴다(그 타입 문서 참조).
     /// 만들려면 `Shape::heightfield(heights, nx, nz, cell)`.
     Heightfield(crate::heightfield::HeightfieldGrid),
+    /// **삼각형 메시** — 하이트필드와 같은 "비볼록 컨테이너" 계약이다(모든 진입점이
+    /// `Shape::Triangle`로 디스패치, `support_core`는 unreachable, static 전용).
+    /// 다른 점은 가지치기 구조뿐이다: 격자 대신 **내부 BVH**(`TriMeshData`).
+    /// 데이터·파생물은 `TriMeshData`가 소유하고 필드는 비공개다 — 만들려면
+    /// `Shape::trimesh(verts, tris)`.
+    TriMesh(crate::trimesh::TriMeshData),
     /// **내부 전용 삼각형** — 하이트필드/메시가 접촉 순간에 펼치는 임시 셰이프다.
     ///
     /// 호스트가 만들 수 없다(`validate`가 거부하고 스냅샷도 쓰지 않는다): 스텝마다
@@ -166,6 +172,12 @@ impl Shape {
         crate::heightfield::HeightfieldGrid::new(heights, nx, nz, cell).map(Shape::Heightfield)
     }
 
+    /// 삼각형 메시를 만든다 — 구조 불변식·크기 정책을 `TriMeshData::new`가 세운다.
+    /// 어기면 `None`.
+    pub fn trimesh(verts: Vec<Vec3>, tris: Vec<[u32; 3]>) -> Option<Self> {
+        crate::trimesh::TriMeshData::new(verts, tris).map(Shape::TriMesh)
+    }
+
     /// **패닉 없이 캐스트·접촉에 넣을 수 있는 형상인가** — O(1)(복합은 자식 수) 구조 검사.
     ///
     /// `Shape`의 필드가 공개이므로 호스트는 `Hull { points: vec![] }`처럼 불변식을 깬 값을
@@ -244,6 +256,7 @@ impl Shape {
                                 child,
                                 Shape::Compound { .. }
                                     | Shape::Heightfield { .. }
+                                    | Shape::TriMesh { .. }
                                     | Shape::Triangle { .. }
                             )
                             && child.is_castable()
@@ -252,7 +265,9 @@ impl Shape {
             // 셀 인덱싱·나눗셈의 전제와 타일 무결성은 **생성자가 세운다**(`HeightfieldGrid`).
             // 위조된 타일이 타입 수준에서 불가능하므로 여기서 다시 볼 것이 없다 —
             // 예전에는 O(1) 검사로 그걸 잡을 방법이 없어 구멍이었다(rev_97887d75 BLOCKER).
-            Shape::Heightfield(_) => true,
+            // 메시도 같다 — 인덱스 범위·퇴화·크기 정책을 `TriMeshData::new`가 세웠고
+            // 필드가 비공개라 위조가 타입 수준에서 불가능하다.
+            Shape::Heightfield(_) | Shape::TriMesh(_) => true,
         }
     }
 
@@ -303,7 +318,10 @@ impl Shape {
                     // 상한을 못 센다(검수 rev_1e81559e BLOCKER).
                     if matches!(
                         child,
-                        Shape::Compound { .. } | Shape::Heightfield { .. } | Shape::Triangle { .. }
+                        Shape::Compound { .. }
+                            | Shape::Heightfield { .. }
+                            | Shape::TriMesh { .. }
+                            | Shape::Triangle { .. }
                     ) {
                         return Err("compound children must be convex primitives");
                     }
@@ -324,7 +342,7 @@ impl Shape {
             // 구조 불변식과 **크기 정책 모두** `HeightfieldGrid::new`가 세웠다(필드 비공개).
             // 그래서 여기도, O(1)인 `is_castable`도 다시 볼 것이 없다 — 두 경계가 같은 기준을
             // 쓰는 방법이 "양쪽에서 같은 검사를 반복"이 아니라 "생성자만이 만들 수 있게"다.
-            Shape::Heightfield(_) => {}
+            Shape::Heightfield(_) | Shape::TriMesh(_) => {}
             Shape::Triangle { .. } => {
                 // 내부 전용 — 호스트 입력 경계에서는 언제나 거부한다.
                 return Err("triangle is an internal shape and cannot be added to a world");
@@ -366,7 +384,7 @@ impl Shape {
             // 복합·하이트필드는 볼록 질의 대상이 아니다 — radius는 convex 경로 전용 개념.
             // 하이트필드 삼각형은 두께 0으로 펼친다(Jolt 동형): 둥근 삼각형은 레이·캐스트
             // 해가 근사가 되는데, 지형에서 그 근사를 감수할 이유가 없다.
-            Shape::Compound { .. } | Shape::Heightfield { .. } => 0.0,
+            Shape::Compound { .. } | Shape::Heightfield { .. } | Shape::TriMesh { .. } => 0.0,
         }
     }
 
@@ -389,8 +407,8 @@ impl Shape {
             Shape::Triangle { points, radius } => {
                 points.iter().fold(0.0f32, |m, p| m.max(p.length())) + radius
             }
-            Shape::Heightfield { .. } => {
-                // 원점(격자 모서리)에서 가장 먼 표면점 — 로컬 AABB 코너로 상한을 잡는다.
+            Shape::Heightfield { .. } | Shape::TriMesh { .. } => {
+                // 원점에서 가장 먼 표면점 — 로컬 AABB 코너로 상한을 잡는다.
                 let a = self.local_aabb();
                 a.min.length().max(a.max.length())
             }
@@ -408,7 +426,7 @@ impl Shape {
         match self {
             // 하이트필드는 캐스트의 **대상**이지 주체가 아니다(static 전용) — 그래도
             // 계약을 만족시키려 외접 반지름으로 상한을 준다(보수적).
-            Shape::Heightfield { .. } => self.bounding_radius(),
+            Shape::Heightfield { .. } | Shape::TriMesh { .. } => self.bounding_radius(),
             Shape::Triangle { points, radius } => {
                 points.iter().fold(0.0f32, |m, p| m.max(perp(*p))) + radius
             }
@@ -469,7 +487,7 @@ impl Shape {
                     if d.z >= 0.0 { c.z } else { -c.z },
                 )
             }
-            Shape::Compound { .. } | Shape::Heightfield { .. } => {
+            Shape::Compound { .. } | Shape::Heightfield { .. } | Shape::TriMesh { .. } => {
                 unreachable!("non-convex shape — dispatch to children/triangles before GJK/support")
             }
             Shape::Triangle { points, radius } => {
@@ -517,6 +535,14 @@ impl Shape {
         }
     }
 
+    /// 메시 뷰 — 다른 변종이면 `None`. 삼각형 펼침의 단일 진입점이다.
+    pub(crate) fn trimesh_ref(&self) -> Option<&crate::trimesh::TriMeshData> {
+        match self {
+            Shape::TriMesh(m) => Some(m),
+            _ => None,
+        }
+    }
+
     /// **공개 로컬 AABB 질의** — 불변식이 깨진 형상은 패닉 대신 오류다.
     ///
     /// 빈 hull은 `points[0]`에서, 빈 복합은 누적값 `expect`에서 프로세스를 죽였다. 레이·점
@@ -543,6 +569,8 @@ impl Shape {
                 .heightfield_ref()
                 .expect("Heightfield 변종")
                 .local_aabb(),
+            // 메시의 AABB는 생성자가 정점에서 한 번 구해 들고 있다(파생물).
+            Shape::TriMesh(m) => m.local_aabb(),
             Shape::Triangle { points, .. } => {
                 let e = Vec3::new(r, r, r);
                 let mut lo = points[0];

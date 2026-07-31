@@ -776,7 +776,9 @@ fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
     match *shape {
         // 하이트필드·삼각형은 **static 전용**이라 질량이 없다(월드가 강제). 0을 돌려
         // 두면 dynamic으로 만들려는 시도가 상위 검증에서 걸린다 — 패닉이 아니라 거부다.
-        Shape::Heightfield { .. } | Shape::Triangle { .. } => (0.0, Vec3::ZERO),
+        Shape::Heightfield { .. } | Shape::TriMesh { .. } | Shape::Triangle { .. } => {
+            (0.0, Vec3::ZERO)
+        }
         Shape::Sphere { radius } => {
             let m = density * 4.0 / 3.0 * core::f32::consts::PI * radius.powi(3);
             let i = 0.4 * m * radius * radius;

@@ -159,6 +159,128 @@ pub fn any_contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) ->
     }
 }
 
+/// 메시 접촉 — BVH로 겹치는 삼각형만 펼친다 (`heightfield_contacts`의 동형).
+///
+/// 격자와 다른 점은 후보를 얻는 방법뿐이다: 셀 범위 순회 대신 **내부 BVH 질의**.
+/// 나머지 계약은 그대로다 —
+/// - `flip`이면 A/B 역할이 반대라 매니폴드를 되돌린다.
+/// - 예산은 **호출자 소유**다(질의 단위). 페어마다 새로 주면 여러 바디를 도는 질의의
+///   총 작업량이 유계가 아니다.
+/// - 상한(`MAX_HEIGHTFIELD_MANIFOLDS`)에서 끊고 그 사실을 반환값으로 낸다(조용한 누락 금지).
+/// - **feature ID는 전부 generic으로 덮는다.** 클리핑이 삼각형마다 주는 ID는 삼각형이 다르면
+///   같은 값이 나올 수 있어(같은 페어 안에서 충돌) warm start가 남의 임펄스를 물려받는다.
+///   generic은 위치 근접으로 매칭되므로 삼각형이 달라도 옳게 갈린다.
+///
+/// **BVH 순회가 포화되면 예산 초과로 올린다.** 후보를 조용히 빠뜨리면 물체가 메시를
+/// 통과하는데, 그건 "접촉 없음"과 구분되지 않아 디버깅이 불가능해진다.
+#[allow(clippy::too_many_arguments)]
+fn trimesh_contacts(
+    sa: &Shape,
+    pa: &Pose,
+    mesh_shape: &Shape,
+    mesh_pose: &Pose,
+    margin: f32,
+    flip: bool,
+    budget: &mut usize,
+    f: &mut dyn FnMut(u8, u8, Manifold),
+) -> ContactWalk {
+    let mesh = mesh_shape.trimesh_ref().expect("TriMesh 변종");
+    // 볼록 쪽 월드 AABB를 메시 로컬로 옮긴다(margin만큼 넓힌다).
+    let mut world = crate::transformed_aabb(sa.local_aabb(), pa);
+    let pad = Vec3::new(margin, margin, margin);
+    world = crate::Aabb::new(world.min - pad, world.max + pad);
+    let local = crate::heightfield::world_aabb_to_local(world, mesh_pose);
+    let mut emitted = 0usize;
+    let mut saturated = false;
+    let mut over_budget = false;
+    // 복합 자식도 함께 펼친다 — 자식 키는 그대로 콜백에 넘겨 네임스페이싱을 유지한다.
+    let children: &[(Pose, Shape)] = match sa {
+        Shape::Compound { children } => children,
+        _ => &[],
+    };
+    let complete = mesh.for_each_candidate(local, |ti| {
+        if *budget == 0 {
+            over_budget = true;
+            return false;
+        }
+        *budget -= 1;
+        let tri_local = mesh.triangle(ti);
+        let tri_shape = Shape::Triangle {
+            points: tri_local,
+            radius: 0.0,
+        };
+        let mask = mesh.weld_mask(ti);
+        let mut emit = |ci: u8, cs: &Shape, cp: &Pose| -> bool {
+            let Some(mut m) = contact(cs, cp, &tri_shape, mesh_pose, margin) else {
+                return false;
+            };
+            if m.is_empty() {
+                return false;
+            }
+            // 내부 에지 억제 — 월드 좌표 삼각형이 필요하다. 밴드 폭 = 허용오차 + 침투 깊이
+            // (근거는 하이트필드 쪽 같은 자리 주석: 깊이 파고들수록 최근접점이 에지에서 멀어진다).
+            if mask != 0 {
+                let tw = [
+                    mesh_pose.pos + mesh_pose.rot.rotate(tri_local[0]),
+                    mesh_pose.pos + mesh_pose.rot.rotate(tri_local[1]),
+                    mesh_pose.pos + mesh_pose.rot.rotate(tri_local[2]),
+                ];
+                let pen = m.points().iter().fold(0.0f32, |a, p| a.max(-p.separation));
+                crate::weld_internal_edges(&mut m, tw, margin + pen.max(0.0), mask);
+            }
+            for i in 0..m.count as usize {
+                m.points[i].feature = FeatureId(FEATURE_GENERIC);
+            }
+            if flip {
+                m.flip();
+                f(0, ci, m);
+            } else {
+                f(ci, 0, m);
+            }
+            true
+        };
+        let hit = if children.is_empty() {
+            emit(0, sa, pa)
+        } else {
+            let mut any = false;
+            for (i, (cp, cs)) in children.iter().enumerate() {
+                let wp = Pose {
+                    pos: pa.pos + pa.rot.rotate(cp.pos),
+                    rot: pa.rot * cp.rot.normalize(),
+                };
+                if emit(i as u8, cs, &wp) {
+                    any = true;
+                    emitted += 1;
+                    if emitted >= crate::MAX_HEIGHTFIELD_MANIFOLDS {
+                        saturated = true;
+                        return false;
+                    }
+                }
+            }
+            any
+        };
+        if children.is_empty() && hit {
+            emitted += 1;
+            if emitted >= crate::MAX_HEIGHTFIELD_MANIFOLDS {
+                saturated = true;
+                return false;
+            }
+        }
+        true
+    });
+    if !complete {
+        // BVH 순회 스택 포화 — 후보를 다 못 봤다. 예산 초과와 같은 계열로 올린다.
+        return ContactWalk::BudgetExceeded;
+    }
+    if over_budget {
+        return ContactWalk::BudgetExceeded;
+    }
+    if saturated {
+        return ContactWalk::Saturated;
+    }
+    ContactWalk::Complete
+}
+
 /// 하이트필드 접촉 — 겹치는 셀만 삼각형으로 펼친다.
 ///
 /// `flip`이면 A/B 역할이 원래와 반대라 매니폴드 법선·접점 소유를 되돌린다.
@@ -398,6 +520,13 @@ pub fn for_each_contact_with_budget(
     if matches!(sa, Shape::Heightfield { .. }) {
         // 하이트필드가 A쪽인 경우(질의 경로) — 역할을 바꿔 풀고 매니폴드를 뒤집는다.
         return heightfield_contacts(sb, pb, sa, pa, margin, true, budget, f);
+    }
+    // 메시도 같다 — 가지치기 구조만 격자에서 BVH로 바뀐다.
+    if matches!(sb, Shape::TriMesh { .. }) {
+        return trimesh_contacts(sa, pa, sb, pb, margin, false, budget, f);
+    }
+    if matches!(sa, Shape::TriMesh { .. }) {
+        return trimesh_contacts(sb, pb, sa, pa, margin, true, budget, f);
     }
     match (sa, sb) {
         (Shape::Compound { children: ca }, Shape::Compound { children: cb }) => {
@@ -1331,6 +1460,135 @@ fn dist_point_segment(p: Vec3, a: Vec3, b: Vec3) -> f32 {
     }
     let t = ((p - a).dot(ab) / denom).clamp(0.0, 1.0);
     (p - (a + ab * t)).length()
+}
+
+#[cfg(test)]
+mod trimesh_dispatch_tests {
+    use super::*;
+    use crate::{FEATURE_GENERIC, MAX_INPUT};
+    use maru_math::Quat;
+
+    fn pose(x: f32, y: f32, z: f32) -> Pose {
+        Pose {
+            pos: Vec3::new(x, y, z),
+            rot: Quat::IDENTITY,
+        }
+    }
+
+    /// 평평한 2×2 사각형 메시 (대각을 공유하는 삼각형 2개), y=0.
+    fn quad_mesh() -> Shape {
+        Shape::trimesh(
+            vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 2.0),
+                Vec3::new(2.0, 0.0, 2.0),
+            ],
+            vec![[0, 1, 2], [1, 3, 2]],
+        )
+        .expect("정상 메시")
+    }
+
+    fn manifolds(sa: &Shape, pa: &Pose, mesh: &Shape, pm: &Pose) -> Vec<Manifold> {
+        let mut out = Vec::new();
+        for_each_contact(sa, pa, mesh, pm, 0.02, &mut |_, _, m| out.push(m));
+        out
+    }
+
+    /// 평평한 메시 위의 접촉은 **면 법선**을 낸다(기울지 않는다).
+    ///
+    /// **정직한 한계**: 이 테스트는 용접(`mask != 0` 분기)을 덮지 못한다. 뮤테이션으로
+    /// 확인했다 — 용접을 통째로 지워도 통과한다. 평평하고 동일 평면인 메시에서는 두 삼각형
+    /// 모두 이미 면 법선을 내므로 용접이 바꿀 것이 없기 때문이다. 용접이 실제로 값을 하는
+    /// 기하(에지를 옆에서 때리는 배치)는 여기서 만들지 못했다. 용접 **로직 자체**는
+    /// `weld_tests`가 덮고 있고, 덮이지 않은 것은 이 경로의 **배선**이다.
+    #[test]
+    fn flat_mesh_contacts_use_the_face_normal() {
+        let mesh = quad_mesh();
+        let ball = Shape::Sphere { radius: 0.5 };
+        // 대각선 (2,0,0)–(0,0,2) 위의 점 (1,·,1)에 중심을 두고 살짝 띄운다.
+        let ms = manifolds(&ball, &pose(1.0, 0.48, 1.0), &mesh, &pose(0.0, 0.0, 0.0));
+        assert!(!ms.is_empty(), "접촉이 아예 없다 — 씬이 틀렸다");
+        for (i, m) in ms.iter().enumerate() {
+            let ny = m.normal.y.abs();
+            assert!(
+                ny > 0.99,
+                "매니폴드 {i}의 법선이 면에서 기울었다: {:?} (|ny|={ny}) — 유령 에지",
+                m.normal
+            );
+        }
+    }
+
+    /// **접점 feature는 전부 generic이다** — warm start가 삼각형을 건너 섞이지 않는 근거.
+    ///
+    /// **정직한 한계**: 이 불변식은 참이지만, 지금 경로에서는 `feature = FEATURE_GENERIC`
+    /// 덮어쓰기를 지워도 유지된다(뮤테이션 확인). 삼각형 접촉이 클리핑이 아니라 witness
+    /// 경로를 타서 **이미** generic으로 나오기 때문이다. 덮어쓰기는 하이트필드와 같은
+    /// 방어선이고(그쪽도 같은 줄이 있다), 나중에 삼각형 전용 해석 경로가 생기면 그때 값을 한다.
+    /// 이 테스트가 잠그는 것은 **불변식**이지 그 줄이 아니다.
+    #[test]
+    fn mesh_contacts_are_tagged_generic() {
+        let mesh = quad_mesh();
+        let box_shape = Shape::Box {
+            half: Vec3::new(0.6, 0.3, 0.6),
+            radius: 0.0,
+        };
+        // 대각을 걸치도록 놓아 삼각형 둘 다에서 매니폴드가 나오게 한다.
+        let ms = manifolds(
+            &box_shape,
+            &pose(1.0, 0.28, 1.0),
+            &mesh,
+            &pose(0.0, 0.0, 0.0),
+        );
+        assert!(!ms.is_empty(), "접촉이 아예 없다 — 씬이 틀렸다");
+        let mut points = 0usize;
+        for m in &ms {
+            for p in m.points() {
+                assert_eq!(
+                    p.feature.0, FEATURE_GENERIC,
+                    "메시 접점이 generic이 아니다: {:#x}",
+                    p.feature.0
+                );
+                points += 1;
+            }
+        }
+        assert!(points > 0, "접점이 하나도 없다 — 단언이 아무것도 안 봤다");
+    }
+
+    /// 메시가 A쪽이어도(질의 경로) 같은 답이 나오고 법선이 뒤집힌다.
+    #[test]
+    fn mesh_on_either_side_agrees() {
+        let mesh = quad_mesh();
+        let ball = Shape::Sphere { radius: 0.5 };
+        let (pb, pm) = (pose(1.0, 0.45, 1.0), pose(0.0, 0.0, 0.0));
+        let ab = manifolds(&ball, &pb, &mesh, &pm);
+        let mut ba = Vec::new();
+        for_each_contact(&mesh, &pm, &ball, &pb, 0.02, &mut |_, _, m| ba.push(m));
+        assert_eq!(ab.len(), ba.len(), "역할을 바꾸니 매니폴드 수가 달라졌다");
+        for (x, y) in ab.iter().zip(&ba) {
+            let d = (x.normal + y.normal).length();
+            assert!(
+                d < 1.0e-3,
+                "법선이 반대가 아니다: {:?} vs {:?}",
+                x.normal,
+                y.normal
+            );
+        }
+    }
+
+    /// 크기 정책 밖 메시는 만들어지지 않는다(생성자 경계) — 질의 경로가 볼 일이 없다.
+    #[test]
+    fn oversized_mesh_is_rejected_at_construction() {
+        assert!(Shape::trimesh(
+            vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(MAX_INPUT * 4.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ],
+            vec![[0, 1, 2]],
+        )
+        .is_none());
+    }
 }
 
 #[cfg(test)]

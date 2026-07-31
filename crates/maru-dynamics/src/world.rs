@@ -1371,7 +1371,9 @@ impl World {
         // 복합을 스윕하고 싶으면 자식별로 호출하는 것이 호출자의 몫이다.
         if matches!(
             shape,
-            maru_collide::Shape::Heightfield { .. } | maru_collide::Shape::Compound { .. }
+            maru_collide::Shape::Heightfield { .. }
+                | maru_collide::Shape::TriMesh { .. }
+                | maru_collide::Shape::Compound { .. }
         ) {
             return Err(ApiError::InvalidValue);
         }
@@ -3065,7 +3067,12 @@ impl World {
                 maru_collide::Shape::Compound { children } => children.len(),
                 // 하이트필드는 겹치는 셀마다 매니폴드를 낸다 — 상한이 곧 페어당 제약 상한이다
                 // (그 상한을 내로우페이즈가 실제로 강제하고 포화를 진단으로 보고한다).
-                maru_collide::Shape::Heightfield { .. } => maru_collide::MAX_HEIGHTFIELD_MANIFOLDS,
+                // 메시도 겹치는 삼각형마다 매니폴드를 내고 **같은 상한**에서 끊는다
+                // (`trimesh_contacts`가 `MAX_HEIGHTFIELD_MANIFOLDS`를 그대로 쓴다).
+                // 이 회계를 빠뜨리면 제약 버퍼가 모자라 스텝이 자원 오류로 떨어진다.
+                maru_collide::Shape::Heightfield { .. } | maru_collide::Shape::TriMesh { .. } => {
+                    maru_collide::MAX_HEIGHTFIELD_MANIFOLDS
+                }
                 _ => 1,
             }
         };
