@@ -8,6 +8,7 @@ description = "Maru bench harness (M0: SIMD math microbenches, native + wasm)"
 [features]
 # maru-dynamics의 PCM 상한 계측 팔을 여는 통로 (기본 off).
 pcm-probe = ["maru-dynamics/pcm-probe"]
+solve-probe = ["maru-dynamics/solve-probe"]
 
 [dependencies]
 maru-math = { path = "../maru-math" }

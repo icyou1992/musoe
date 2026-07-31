@@ -15,8 +15,8 @@ cargo test --target wasm32-wasip1
 
 # 계측 팔은 기본 빌드에서 빠져 있으므로(피처 off) 위 clippy가 **그 코드를 보지 않는다** —
 # 따로 켜서 훑지 않으면 조용히 썩는다.
-echo "== clippy (pcm-probe 피처 — 계측 팔이 썩지 않게) =="
-cargo clippy --target wasm32-wasip1 -p maru-bench --features pcm-probe -- -D warnings
+echo "== clippy (계측 피처 — 팔이 썩지 않게) =="
+cargo clippy --target wasm32-wasip1 -p maru-bench --features pcm-probe,solve-probe -- -D warnings
 
 echo "== 브라우저 wasm 빌드 (wasm32-unknown-unknown) =="
 # 바인딩은 **브라우저 타깃으로도 빌드돼야** 한다 — wasip1만 통과하면

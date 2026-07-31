@@ -331,9 +331,80 @@ pub fn warm_start_block(v: &SolveView, blk: &ContactBlock) {
 }
 
 /// solve — 블록판. `solver::solve_x4`와 **같은 산술·같은 순서**이고 게더만 없다.
+/// **게더 미스 비용 계측 노브** (`MARU_SOLVE_PROBE`, `solve-probe` 피처 뒤 — 기본 off).
+///
+/// 재려는 것: `bias`/`relax` 루프가 (a) 흩어진 바디 레지스터 게더의 **캐시 미스** 지배인지
+/// (b) 산술 지배인지. 답에 따라 유효한 수단이 갈린다 — 미스 지배면 제약별 바디 인덱스
+/// 재정렬(지역성), 산술 지배면 반복 횟수·수렴 쪽이다.
+///
+/// 설계: 진짜 게더를 **한 번 더** 하되 결과를 버린다. 두 팔의 차이는 그 추가 게더가
+/// 어디를 읽느냐뿐이다.
+/// - `1`: **같은 인덱스**(방금 읽어 L1에 있다) → 추가 비용 ≈ 순수 명령어 비용
+/// - `2`: **어긋난 인덱스**(다른 캐시 라인) → 추가 비용 ≈ 명령어 + 미스
+///
+/// `2 − 1`이 곧 **흩어진 바디 게더 1회의 미스 비용**이다. 결과를 버리므로 **물리는 세 팔
+/// 모두 진짜 그대로**다(PCM 프로브와 달리 궤적을 망가뜨리지 않는다) — 그래서 대조군 걱정 없이
+/// 실제 장면에서 잰다. 실제 `solve_block`은 게더를 2회(a·b) 하므로 상한은 `2 × (2−1)`이다.
+///
+/// **실측 결론 (2026-07-31, 피라미드 40단·수면 OFF·1스레드, 각 팔 12회 교차실행,
+/// 대조군 = `warm+intv`(이 팔이 안 건드리는 solve 하위 단계)):**
+/// - `2 − 1` = `bias+relax`의 **1.50%**, 쌍대 우세 139/144
+/// - 게더는 블록당 2회 → 게더 미스 총계 ≈ **3%** of `bias+relax`
+///
+/// `bias+relax`는 solve의 75%, solve는 스텝의 45% → 게더 미스는 **스텝의 ~1%**다.
+/// 필요한 감축은 38~56%(rapier 대비 1.6~2.3배)이므로 **제약별 바디 인덱스 재정렬
+/// (색 내 지역성)은 기각**한다 — 짓기 전에 재서 걸렀다.
+///
+/// 뒷받침: 규모 스윕에서 제약당 bias 비용이 8단→40단(작업량 23배)에 걸쳐
+/// 1.77 → 1.89 us로 거의 평평했다. 절벽이 없는 이유는 이 규모의 작업집합이
+/// L2 안에 들어가기 때문이다(820바디 × ~93B ≈ 76 KB, L2 1 MiB). 그리고 솔버는
+/// 이미 뚱뚱한 `Body`가 아니라 `SolverState`의 **바디별 SoA 배열**을 읽는다.
+/// 즉 `bias`/`relax`는 게더가 아니라 **산술·의존 사슬** 지배다 — 다음 레버는
+/// 반복 횟수·수렴 쪽이지 배치 쪽이 아니다.
+#[cfg(feature = "solve-probe")]
+fn solve_probe_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(u8::MAX);
+    let c = CACHED.load(Ordering::Relaxed);
+    if c != u8::MAX {
+        return c;
+    }
+    let raw = std::env::var("MARU_SOLVE_PROBE").unwrap_or_else(|_| "0".into());
+    let m = match raw.trim().parse::<u8>() {
+        Ok(m @ 0..=2) => m,
+        _ => panic!("MARU_SOLVE_PROBE={raw:?} — 지원하는 값은 0·1·2뿐이다"),
+    };
+    if m != 0 {
+        eprintln!("!! MARU_SOLVE_PROBE={m} — 계측 전용 팔이다(추가 게더 1회, 결과는 버린다).");
+    }
+    CACHED.store(m, Ordering::Relaxed);
+    m
+}
+
 pub fn solve_block(v: &SolveView, blk: &mut ContactBlock, p: &BatchSolveParams) {
     let mut ba = BodyRegs::load(v, blk.a);
     let mut bb = BodyRegs::load(v, blk.b);
+    #[cfg(feature = "solve-probe")]
+    {
+        // 팔 1·2는 **결과를 버린다** — 물리는 손대지 않는다.
+        let m = solve_probe_mode();
+        if m != 0 {
+            let n = v.len();
+            // 어긋난 인덱스는 **같은 배열 안**에 있어야 한다(다른 배열을 읽으면 무엇을
+            // 재는지 흐려진다). n/2 만큼 밀어 다른 캐시 라인으로 보낸다.
+            let idx = if m == 1 {
+                blk.a
+            } else {
+                [
+                    (blk.a[0] + n / 2) % n,
+                    (blk.a[1] + n / 2) % n,
+                    (blk.a[2] + n / 2) % n,
+                    (blk.a[3] + n / 2) % n,
+                ]
+            };
+            core::hint::black_box(BodyRegs::load(v, idx));
+        }
+    }
     let pos_a = Vec3x4::from_array([
         v.pos(blk.a[0]),
         v.pos(blk.a[1]),
