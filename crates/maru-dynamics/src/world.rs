@@ -4931,6 +4931,65 @@ fn reserve_narrow_bufs(
 /// 페어 하나의 처리가 순수하다는 사실(읽기는 이 구조체, 쓰기는 자기 `NarrowOut`)이
 /// 병렬화의 근거이자 결정론의 근거다. 새 필드를 추가할 때 **가변 상태를 끼워 넣으면
 /// 그 근거가 무너진다** — 누적이 필요하면 `NarrowOut`으로 간다.
+/// **PCM 캐시 조회의 메모리 비용 상한 계측 노브** (`MARU_PCM_PROBE`) — 기본 0(정상).
+///
+/// 재려는 것은 "해시맵 조회가 narrow의 얼마인가"이고, 그 답이 해시맵→정렬배열 순차 병합
+/// 구조 변경의 **상한**이다. 그런데 조회를 그냥 없애면 warm start가 꺼져 궤적이 갈라지고,
+/// 궤적이 갈라지면 페어 수·접촉 수가 달라져 대조가 성립하지 않는다
+/// ([[feedback_control_group_needs_fixed_workload]]와 같은 함정).
+///
+/// 그래서 **warm start를 끈 팔 둘**을 만든다:
+/// - `1`: 진짜 캐시(페어 수천 개, 무작위 접근)를 조회하고 결과를 버린다.
+/// - `2`: **빈 맵**을 조회하고 결과를 버린다 — 조회 횟수·키 계산은 같고 만지는 메모리만 다르다.
+///
+/// 두 팔은 `prepare_into`에 똑같이 `&empty`를 주므로 **물리가 동일**하다 — 같은 궤적,
+/// 같은 페어 수. 따라서 `1 − 2`가 곧 캐시 조회가 만지는 **메모리 비용**이고 다른 차이는 없다.
+/// 한계비용으로 재면 안 되는 이유가 여기 있다: 같은 조회를 두 번 하면 두 번째는 이미
+/// 데워져 있어 과소평가된다([[feedback_microbench_undermeasures_in_situ_cost.md]]).
+///
+/// 읽기는 페어당 원자 로드 1회이고 파싱은 프로세스당 1회다(`MARU_SCALAR_EFFMASS`와 같은 꼴).
+/// 기본 경로(0)에 대한 비용은 두 바이너리 교차실행으로 확인했다: **+0.11%, 쌍대 52%** —
+/// 잡음과 구분되지 않는다.
+///
+/// **실측 결론 (2026-07-31, 피라미드 40단·수면 OFF·1스레드, 각 팔 12회 교차실행):**
+/// - `1 − 2`(해시맵 프로브만) = narrow의 **1.51%**, 쌍대 우세 77%
+/// - `3 − 2`(프로브 + 찾은 Vec 역참조) = narrow의 **2.17%**, 쌍대 우세 89%
+///
+/// narrow는 이 장면에서 스텝의 ~42%이므로, PCM 캐시 접근을 **완전히 공짜로 만들어도**
+/// 스텝은 1% 남짓 줄어든다. 큰 피라미드의 열세는 rapier 대비 1.6~2.3배(38~56% 감축 필요)라
+/// **해시맵→정렬배열 순차 병합 구조 변경으로는 닿지 않는다** — 짓기 전에 재서 기각했다.
+/// 잡음이 커서(sd ~0.02) 크기보다 부호를 먼저 봤고, 대조군은 solve(이 팔들이 안 건드리는
+/// 단계)로 두어 머신 드리프트를 나눴다.
+fn pcm_probe_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(u8::MAX);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != u8::MAX {
+        return v;
+    }
+    let m = std::env::var("MARU_PCM_PROBE")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(0)
+        .min(3);
+    // **켜져 있으면 조용히 지나가지 않는다.** 팔 1~3은 warm start를 꺼서 물리를 바꾼다 —
+    // 환경변수가 남아 있는 채로 돌면 "솔버가 갑자기 나빠졌다"로 나타난다. 프로세스당 1회.
+    if m != 0 {
+        eprintln!("!! MARU_PCM_PROBE={m} — 계측 전용 팔이다. warm start가 꺼져 물리가 달라진다.");
+    }
+    CACHED.store(m, Ordering::Relaxed);
+    m
+}
+
+/// PCM warm-start 캐시의 타입 — 페어 키 → 그 페어의 (특징 ID, 누적 임펄스) 목록.
+type PcmCache = IntMap<(u32, u32), Vec<(FeatureId, CachedImpulse)>>;
+
+/// 계측 팔 `2`가 조회할 빈 캐시. 프로세스당 하나, 절대 채우지 않는다.
+fn pcm_probe_empty_cache() -> &'static PcmCache {
+    static EMPTY: std::sync::OnceLock<PcmCache> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(PcmCache::default)
+}
+
 struct NarrowCtx<'a> {
     bodies: &'a [Body],
     asleep: &'a [bool],
@@ -5192,7 +5251,29 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
                 if is_compound {
                     m.namespace_features(ca as u32 * 8 + cb as u32 + 1);
                 }
-                let cached = cx.cache.get(&key).unwrap_or(&empty);
+                let cached = match pcm_probe_mode() {
+                    // 0 = 정상. 아래 1·2는 **상한 계측 전용 팔**이다(기본 경로 아님).
+                    0 => cx.cache.get(&key).unwrap_or(&empty),
+                    // 1 = 실제 캐시를 조회하되 **결과를 버리고** warm start를 끈다.
+                    1 => {
+                        core::hint::black_box(cx.cache.get(&key));
+                        &empty
+                    }
+                    // 2 = 같은 키로 **빈 맵**을 조회하고 결과를 버린다. warm start는 1과 같이 꺼진다.
+                    2 => {
+                        core::hint::black_box(pcm_probe_empty_cache().get(&key));
+                        &empty
+                    }
+                    // 3 = 1에 더해 **찾은 Vec의 내용까지 만진다**(힙 간접참조 비용 포함).
+                    _ => {
+                        if let Some(v) = cx.cache.get(&key) {
+                            for e in v.iter() {
+                                core::hint::black_box(e);
+                            }
+                        }
+                        &empty
+                    }
+                };
                 for p in m.points() {
                     out.max_penetration = out.max_penetration.max(-p.separation);
                 }
