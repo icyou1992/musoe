@@ -387,8 +387,8 @@ fn solve_probe_mode() -> u8 {
     }
     let raw = std::env::var("MARU_SOLVE_PROBE").unwrap_or_else(|_| "0".into());
     let m = match raw.trim().parse::<u8>() {
-        Ok(m @ 0..=3) => m,
-        _ => panic!("MARU_SOLVE_PROBE={raw:?} — 지원하는 값은 0·1·2·3뿐이다"),
+        Ok(m @ 0..=4) => m,
+        _ => panic!("MARU_SOLVE_PROBE={raw:?} — 지원하는 값은 0·1·2·3·4뿐이다"),
     };
     if m != 0 {
         eprintln!("!! MARU_SOLVE_PROBE={m} — 계측 전용 팔이다(추가 게더 1회, 결과는 버린다).");
@@ -481,12 +481,39 @@ pub fn solve_block(v: &SolveView, blk: &mut ContactBlock, p: &BatchSolveParams) 
         //
         // 왜 이걸 재나: 접점마다 apply가 **4쌍** 돈다 — 법선 1 · 마찰 2축 각 1 · Coulomb 보정 1.
         // 마찰 두 축을 2x2 블록으로 동시에 풀고 Coulomb 클램프를 같은 apply에 접으면 2쌍이
-        // 사라진다. 그 구조 변경의 상한이 `2 × (팔3 − 팔0)`이다 — 짓기 전에 재려고 둔다.
+        // 사라진다. 그 구조 변경의 상한이 `2 × (팔4 − 팔3)`이다 — 짓기 전에 재려고 둔다.
+        //
+        // **실측 (2026-07-31, 피라미드 40단·수면 OFF·1스레드, 각 팔 12회 교차실행,
+        //   대조군 = narrow):** apply 1쌍의 한계비용 = `bias+relax`의 **8.04%**,
+        //   쌍대 144/144(완전 분리). → 2쌍 제거의 상한 ≈ 16% of bias+relax ≈ **스텝의 5.2%**.
+        //
+        // 다른 두 수치를 상한/하한으로 함께 남긴다(어느 쪽도 순수하지 않다):
+        // - 진짜 `ba`/`bb`에 제자리로 걸었을 때 6.04% — **과소**. 옵티마이저가 일부를 접을 수
+        //   있고, 무엇보다 `-0.0 + 0.0 = +0.0`이라 비트 항등이 아니었다(검수 rev_fa8f70b2).
+        // - 복사본을 만들어 한 쌍만 걸었을 때 18.32% — **과대**. 복사본을 살려 두는 레지스터
+        //   압박이 일회성으로 섞인다. 한계비용은 그 일회성을 양쪽에서 상쇄한다.
         #[cfg(feature = "solve-probe")]
-        if solve_probe_mode() == 3 {
+        if solve_probe_mode() >= 3 {
+            // **진짜 `ba`/`bb`가 아니라 복사본에 건다**(교차검수 rev_fa8f70b2 MAJOR).
+            // 0 임펄스는 수학적으로 항등이지만 **비트 항등이 아니다**: `apply`는
+            // `lin + imp*inv_m`을 계산해 store하므로 `-0.0` 성분이 `+0.0`이 된다.
+            // 그러면 vmax·top_y는 같아도 상태 해시가 달라져 "물리 불변" 전제가 깨진다.
+            // `BodyRegs`는 `Copy`라 복사는 레지스터 안에서 끝나고, 복사본을 통째로
+            // `black_box`로 소비해 계산이 지워지지 않게 한다.
             let z = core::hint::black_box(Vec3x4::from_array([maru_math::Vec3::ZERO; 4]));
-            ba.apply(z, ra, has);
-            bb.apply(neg(z), rb, has);
+            //
+            // 팔 `4`는 **같은 복사본에 한 쌍을 더** 건다. `4 − 3`이 복사·스필 같은 일회성
+            // 비용을 뺀 **apply 한 쌍의 한계비용**이다 — `3 − 0`은 복사본을 살려 두는
+            // 레지스터 압박까지 물어 과대평가한다(6.04% → 18.32%로 뛴 것이 그 증거다).
+            // 이 작업은 ALU·레지스터라 캐시 지배가 아니므로 한계비용이 옳은 추정자다.
+            let (mut pa, mut pb) = (ba, bb);
+            pa.apply(z, ra, has);
+            pb.apply(neg(z), rb, has);
+            if solve_probe_mode() == 4 {
+                pa.apply(z, ra, has);
+                pb.apply(neg(z), rb, has);
+            }
+            core::hint::black_box((pa, pb));
         }
         // --- 마찰: 축별 순차 GS 후 Coulomb 원판 ---
         let max_f = friction * pt.normal_impulse;

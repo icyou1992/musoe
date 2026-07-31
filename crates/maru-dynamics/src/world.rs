@@ -4034,6 +4034,9 @@ impl World {
             ccd_plane_count = vec![0u8; ccd_list.len()];
             ccd_frozen = vec![false; ccd_list.len()];
         }
+        // 서브스텝 말 갱신 시점의 자세 — 다음 서브스텝 시작에서 "안 바뀌었다"를 확인한다.
+        #[cfg(debug_assertions)]
+        let mut rot_at_prev_refresh: Vec<maru_math::Quat> = Vec::new();
         for sub_i in 0..n_sub {
             // 역관성 갱신을 **외력보다 먼저** — 토크는 현재 자세의 월드 역관성을 쓴다
             // (뒤에 두면 첫 서브스텝에서 `inv_i`가 아직 0이라 토크가 통째로 사라진다).
@@ -4050,19 +4053,26 @@ impl World {
             } else {
                 // 위 논증을 **검사로 바꿔 둔다** — 자세를 바꾸는 경로가 새로 생기면
                 // (예: 서브스텝 사이 자세 보정) 여기서 즉시 터진다. 릴리스에는 컴파일되지 않는다.
+                //
+                // 보는 것은 **자세 그 자체**다. 처음엔 `inv_i` 재계산 결과를 비교했는데
+                // 그건 (B) 앵커 건너뛰기를 못 지킨다(교차검수 rev_fa8f70b2 MAJOR):
+                // `refresh_inv_i_active`는 **dynamic만** 갱신하고(`solver.rs:377`),
+                // 등방 관성(구)은 회전해도 월드 역관성이 **불변**이다. 그래서 kinematic이나
+                // 구의 자세가 바뀌면 단언은 통과하는데 `ra`/`rb`는 옛 자세에 남는다.
+                // 자세를 비트로 비교하면 두 건너뛰기를 한 번에 지킨다(부호 있는 0까지).
                 #[cfg(debug_assertions)]
                 {
-                    let before: Vec<[f32; 9]> = active
-                        .iter()
-                        .map(|&i| flatten_mat3(st.inv_i[i as usize]))
-                        .collect();
-                    st.refresh_inv_i_active(inv_i_local, &active);
-                    for (k, &i) in active.iter().enumerate() {
+                    debug_assert_eq!(
+                        rot_at_prev_refresh.len(),
+                        st.rot.len(),
+                        "자세 스냅샷 길이가 바디 수와 다르다 — 서브스텝 안에서 슬롯이 바뀌었다"
+                    );
+                    for (i, (now, then)) in st.rot.iter().zip(&rot_at_prev_refresh).enumerate() {
                         debug_assert_eq!(
-                            before[k],
-                            flatten_mat3(st.inv_i[i as usize]),
-                            "서브스텝 {sub_i} 시작의 inv_i가 직전 서브스텝 말과 다르다 — \
-                         서브스텝 사이에 자세를 바꾸는 경로가 생겼다(건너뛰기 전제 붕괴)"
+                            quat_bits(*now),
+                            quat_bits(*then),
+                            "바디 {i}의 자세가 서브스텝 {sub_i} 시작까지 사이에 바뀌었다 — \
+                             inv_i·앵커 건너뛰기의 전제가 깨졌다"
                         );
                     }
                 }
@@ -4466,6 +4476,12 @@ impl World {
                 &color_work,
             );
             self.diag.solve_ns[1] += _t_ra2.ns();
+            // 이 시점의 자세가 다음 서브스텝 시작까지 불변이어야 한다(건너뛰기의 전제).
+            #[cfg(debug_assertions)]
+            {
+                rot_at_prev_refresh.clear();
+                rot_at_prev_refresh.extend_from_slice(&st.rot);
+            }
             let _t_js2 = Stopwatch::start();
             for &ji in &active_joints {
                 joint::solve(&mut st, &mut joints[ji], h, None);
@@ -5026,13 +5042,11 @@ fn pcm_probe_mode() -> u8 {
     m
 }
 
-/// `Mat3`에 `PartialEq`가 없어 디버그 단언용으로 성분을 편다(디버그 빌드에서만 쓰인다).
+/// 자세를 **비트로** 비교하기 위한 디버그 헬퍼. `==`가 아니라 비트를 보는 이유는
+/// `-0.0 == 0.0`이 참이라 부호 있는 0의 변화를 놓치기 때문이다(디버그 빌드 전용).
 #[cfg(debug_assertions)]
-fn flatten_mat3(m: maru_math::Mat3) -> [f32; 9] {
-    let c = m.c;
-    [
-        c[0].x, c[0].y, c[0].z, c[1].x, c[1].y, c[1].z, c[2].x, c[2].y, c[2].z,
-    ]
+fn quat_bits(q: maru_math::Quat) -> [u32; 4] {
+    [q.x.to_bits(), q.y.to_bits(), q.z.to_bits(), q.w.to_bits()]
 }
 
 /// PCM warm-start 캐시의 타입 — 페어 키 → 그 페어의 (특징 ID, 누적 임펄스) 목록.
