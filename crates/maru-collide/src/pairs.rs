@@ -33,6 +33,15 @@ pub const STATIC_BIT: u32 = 1 << 31;
 /// 증분 병합 성공 시 반환 — fresh(R 접촉 페어)만. 병합 전체는 호출자의 `out` 버퍼에 채운다.
 pub type IncrementalPairs = Vec<(u32, u32)>;
 
+/// `incremental_pairs_bounded`의 결과.
+pub struct IncrementalOut {
+    /// R이 만든 새 페어 (활성 끝점을 가질 수 있는 페어의 정확한 상집합).
+    pub fresh: IncrementalPairs,
+    /// **페어 목록이 직전과 완전히 같다** — 병합을 아예 돌리지 않았고 `out`은 비어 있다.
+    /// 호출자는 `prev`를 그대로 이번 스텝의 목록으로 써야 한다.
+    pub unchanged: bool,
+}
+
 impl Broadphase {
     pub fn build(dynamic_items: Vec<(u32, Aabb)>, static_items: Vec<(u32, Aabb)>) -> Self {
         assert!(
@@ -253,9 +262,12 @@ impl Broadphase {
         moved: &[u32],
         moved_mask: &[bool],
         prev: &[(u32, u32)],
+        // `prev_pair_count`: 슬롯별 "직전 목록에서 그 바디가 낀 페어 수"(길이 부족은 0으로).
+        // R 전체에서 0이고 `fresh`도 비면 목록이 직전과 완전히 같다 — 아래 fast path.
+        prev_pair_count: &[u32],
         budget: usize,
         out: &mut Vec<(u32, u32)>,
-    ) -> Option<IncrementalPairs> {
+    ) -> Option<IncrementalOut> {
         let budget = budget.min(MAX_PAIRS);
         let in_r = |id: u32| moved_mask.get(id as usize).copied().unwrap_or(false);
 
@@ -332,6 +344,29 @@ impl Broadphase {
         fresh.sort_unstable();
         fresh.dedup();
 
+        // **목록이 그대로면 병합을 돌리지 않는다.**
+        //
+        // 병합 루프는 `prev` 전체를 훑는다 — 정착한 더미 위로 소수가 떨어지는 장면에서는
+        // R이 5개인데 prev가 24,810개라 스텝의 58%가 여기서 나갔다(2026-07-31 실측:
+        // 낙하체가 5개든 100개든 broad가 같고 페어 수에만 비례했다).
+        //
+        // 그런데 R이 직전 목록의 어떤 페어에도 끼지 않았고(=제거할 게 없다) `fresh`도 비면
+        // (=추가할 게 없다) 결과는 `prev`와 **같은 집합·같은 순서**다. 그 판정을 O(|R|)로
+        // 하려고 슬롯별 페어 수를 받는다. 공중에 떠 있는 낙하체가 정확히 이 경우다.
+        //
+        // 등가 논증: 병합은 `prev`에서 R을 건드리는 항만 빼고 `fresh`를 정렬 병합한다.
+        // 뺄 항이 없고 넣을 항도 없으면 항등 사상이다.
+        if fresh.is_empty()
+            && moved
+                .iter()
+                .all(|&r| prev_pair_count.get(r as usize).copied().unwrap_or(0) == 0)
+        {
+            return Some(IncrementalOut {
+                fresh,
+                unchanged: true,
+            });
+        }
+
         // prev에서 R 접촉 페어 제거 (정렬 보존) + fresh와 병합. `out`은 호출자의 영속
         // 스크래치다 — 직전 스텝의 prev 버퍼와 핑퐁하면 워밍업 후 재할당이 없다
         // (예전에는 매 스텝 ~200KB를 새로 할당·해제했다).
@@ -367,13 +402,34 @@ impl Broadphase {
             out.windows(2).all(|w| w[0] < w[1]),
             "증분 병합 결과는 중복 없는 전순서여야 한다"
         );
-        Some(fresh)
+        Some(IncrementalOut {
+            fresh,
+            unchanged: false,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 슬롯별 페어 수 — 운영 경로(`world.rs`)와 같은 규약으로 만든다.
+    /// 이걸 안 주고 빈 슬라이스를 넘기면 "전부 0"으로 읽혀 fast path가 거짓 양성이 된다.
+    fn pair_counts(pairs: &[(u32, u32)]) -> Vec<u32> {
+        let n = pairs
+            .iter()
+            .flat_map(|&(a, b)| [a, b & !STATIC_BIT])
+            .max()
+            .map_or(0, |m| m as usize + 1);
+        let mut c = vec![0u32; n];
+        for &(a, b_raw) in pairs {
+            c[a as usize] += 1;
+            if b_raw & STATIC_BIT == 0 {
+                c[b_raw as usize] += 1;
+            }
+        }
+        c
+    }
 
     /// 고정 시드 xorshift — 재현 가능한 무작위 박스.
     struct Rng(u64);
@@ -487,9 +543,11 @@ mod tests {
                 .collect();
             assert!(bp.refresh_dynamic(&updates));
             let mut merged = Vec::new();
+            let counts = pair_counts(&pairs);
             let fresh = bp
-                .incremental_pairs_bounded(&moved, &mask, &pairs, usize::MAX, &mut merged)
-                .expect("budget unbounded");
+                .incremental_pairs_bounded(&moved, &mask, &pairs, &counts, usize::MAX, &mut merged)
+                .expect("budget unbounded")
+                .fresh;
             // fresh 계약: 병합 결과 중 R 접촉 페어와 정확히 일치해야 한다
             let want_fresh: Vec<(u32, u32)> = merged
                 .iter()
@@ -542,7 +600,8 @@ mod tests {
         let mask = vec![true; 10];
         // 예산 = 정확히 canonical 페어 수. 중복을 세면 90에 닿아 실패한다.
         let mut merged = Vec::new();
-        let got = bp.incremental_pairs_bounded(&moved, &mask, &prev, 45, &mut merged);
+        let counts = pair_counts(&prev);
+        let got = bp.incremental_pairs_bounded(&moved, &mask, &prev, &counts, 45, &mut merged);
         assert!(
             got.is_some(),
             "canonical 45페어 == 예산 45인데 증분이 ResourceLimit — raw 중복이 과금됐다"
@@ -569,7 +628,7 @@ mod tests {
         let moved: Vec<u32> = (0..100).collect();
         let mask = vec![true; 100];
         let mut got = Vec::new();
-        bp.incremental_pairs_bounded(&moved, &mask, &[], usize::MAX, &mut got)
+        bp.incremental_pairs_bounded(&moved, &mask, &[], &[], usize::MAX, &mut got)
             .unwrap();
         let want = brute_force(&items, &[]);
         assert_eq!(got, want, "전량 이동 후 증분 페어가 브루트포스와 불일치");

@@ -307,6 +307,10 @@ pub struct World {
     bp_pairs: Vec<(u32, u32)>,
     /// 증분 병합의 출력 버퍼 — `bp_pairs`와 핑퐁하며 재사용한다(캐노니컬 아님).
     bp_pairs_scratch: Vec<(u32, u32)>,
+    /// 슬롯별 "`bp_pairs`에서 그 바디가 낀 페어 수" — 증분 경로의 O(|R|) 판정용.
+    /// 이 값이 R 전체에서 0이고 새 페어도 없으면 목록이 직전과 같아 **병합을 건너뛴다**.
+    /// 목록을 다시 만드는 모든 자리에서 같이 갱신한다(안 하면 fast path가 거짓 양성이 된다).
+    bp_pair_count: Vec<u32>,
     /// 캐시가 유효한가. 구조 변경·변이·적분이 있으면 무효화된다.
     bp_valid: bool,
     /// 캐시를 만들 때의 dt (sweep AABB가 dt에 비례하므로 바뀌면 무효).
@@ -622,6 +626,7 @@ impl World {
             resource_limit: false,
             bp_pairs: Vec::new(),
             bp_pairs_scratch: Vec::new(),
+            bp_pair_count: Vec::new(),
             contact_blocks: Vec::new(),
             bp_valid: false,
             bp_dt: 0.0,
@@ -2284,6 +2289,7 @@ impl World {
         // 페어 핑퐁 두 벌 — 살아있는 목록은 지역 `pairs`가 들고 있다.
         self.bp_pairs = Vec::new();
         self.bp_pairs_scratch = Vec::new();
+        self.bp_pair_count = Vec::new();
         self.gravity_gate = Vec::new();
         self.sleep_bak = Vec::new();
         self.sleep_timer_bak = Vec::new();
@@ -3065,8 +3071,21 @@ impl World {
         // 증분 스텝의 R 접촉 페어(fresh) — 아래 wake/narrow 순회 제한의 근거로 살려 둔다.
         let mut fresh_pairs: Option<Vec<(u32, u32)>> = None;
         let mut moved_mask: Vec<bool> = Vec::new();
+        // 슬롯별 페어 수를 이번 스텝 말에 어떻게 할 것인가.
+        //
+        // 이 값은 **증분 경로의 fast path에서만** 쓰인다. 그래서 전체 재빌드 스텝에서는
+        // 만들지 않고 **버린다** — 만들면 O(페어) 패스가 통째로 낭비다(전부 깨어 있는
+        // 처리량 장면이 정확히 그 경우고, 무조건 만들었더니 +2~4% 회귀가 났다).
+        // 버린 다음 스텝의 증분은 fast path를 못 타지만, 그 스텝의 느린 병합에서 다시 만든다.
+        enum CountAction {
+            Keep,
+            Rebuild,
+            Drop,
+        }
+        let mut count_action = CountAction::Rebuild;
         let pairs = if bp_cache_hit {
             self.diag.bp_reused = true;
+            count_action = CountAction::Keep;
             std::mem::take(&mut self.bp_pairs)
         } else if incremental {
             // 증분: R의 AABB만 교체 + 트리 리핏(위상 유지) + 페어 델타 병합.
@@ -3086,9 +3105,24 @@ impl World {
             let prev = std::mem::take(&mut self.bp_pairs);
             // 병합 출력은 영속 스크래치 — 직전 prev 버퍼와 핑퐁해 워밍업 후 재할당이 없다.
             let mut out = std::mem::take(&mut self.bp_pairs_scratch);
-            match bp.incremental_pairs_bounded(&moved_ids, &moved_mask, &prev, budget, &mut out) {
-                Some(fresh) => {
-                    fresh_pairs = Some(fresh);
+            match bp.incremental_pairs_bounded(
+                &moved_ids,
+                &moved_mask,
+                &prev,
+                &self.bp_pair_count,
+                budget,
+                &mut out,
+            ) {
+                Some(r) if r.unchanged => {
+                    // 목록이 직전과 같다 — 병합을 안 돌렸으므로 `prev`를 그대로 쓴다.
+                    // 페어 수도 그대로라 `bp_pair_count`는 손대지 않는다.
+                    count_action = CountAction::Keep;
+                    fresh_pairs = Some(r.fresh);
+                    self.bp_pairs_scratch = out;
+                    prev
+                }
+                Some(r) => {
+                    fresh_pairs = Some(r.fresh);
                     self.bp_pairs_scratch = prev;
                     out
                 }
@@ -3103,6 +3137,8 @@ impl World {
                 }
             }
         } else {
+            // 전체 재빌드 — 페어 수는 만들지 않는다(위 CountAction 주석 참조).
+            count_action = CountAction::Drop;
             let bp = Broadphase::build(dyn_items, static_items);
             let Some(p) = bp.canonical_pairs_bounded(budget) else {
                 self.invalidate_bp();
@@ -4536,6 +4572,25 @@ impl World {
         // 이번 스텝에 **적분된 바디가 하나도 없으면** 자세가 그대로이므로 페어 집합도 그대로다.
         // (kinematic도 적분 대상이라 구동 중이면 자연히 무효화된다.)
         let moved = self.integrate_gate.iter().any(|x| *x);
+        // 슬롯별 페어 수 — 다음 스텝 증분 경로의 O(|R|) 판정 근거다.
+        match count_action {
+            CountAction::Keep => {} // 목록이 그대로면 값도 그대로다
+            CountAction::Drop => self.bp_pair_count.clear(), // 전체 재빌드 — 만들지 않는다
+            CountAction::Rebuild => {
+                self.bp_pair_count.clear();
+                self.bp_pair_count.resize(self.bodies.len(), 0);
+                for &(a, b_raw) in &pairs {
+                    if let Some(c) = self.bp_pair_count.get_mut(a as usize) {
+                        *c += 1;
+                    }
+                    if b_raw & maru_collide::STATIC_BIT == 0 {
+                        if let Some(c) = self.bp_pair_count.get_mut(b_raw as usize) {
+                            *c += 1;
+                        }
+                    }
+                }
+            }
+        }
         self.bp_pairs = pairs;
         self.bp_valid = !moved;
         self.bp_dt = dt;
