@@ -1064,7 +1064,11 @@ fn clip_box_box(
             reference_mask: 0,
         };
     }
+    // **측면마다 배열을 통째로 복사하지 않는다.** 예전에는 `poly = buf`로 8원소(=128B)를
+    // 매 측면 복사했다(페어당 4회). 두 버퍼를 두고 **역할만 바꾸면** 복사가 사라진다.
+    // 값·순서는 그대로다(같은 원소를 같은 순서로 읽고 쓴다).
     let mut buf = poly;
+    let mut flip = false;
     // reference 면의 중심은 **측면 4개에 대해 같은 값**이다 — 루프 안에 두면 페어마다
     // 4번 다시 만든다(값은 같으므로 밖으로 빼도 비트 동일).
     let center = (rverts[0] + rverts[1] + rverts[2] + rverts[3]) * 0.25;
@@ -1076,6 +1080,12 @@ fn clip_box_box(
         if pn.dot(center - e0) < 0.0 {
             pn = -pn;
         }
+        // src = 이번 측면의 입력 폴리곤, dst = 출력. 다음 측면에서 역할이 뒤바뀐다.
+        let (src, dst) = if flip {
+            (&buf, &mut poly)
+        } else {
+            (&poly, &mut buf)
+        };
         let mut out_len = 0usize;
         // 볼록 입력에서 상한 초과는 수학적으로 불가 — 부동소수 퇴화 방어로만 잘라낸다
         // (wasm에서 인덱스 패닉 = trap이라, 불가능 케이스도 조용히 버리는 쪽이 계약이다).
@@ -1088,12 +1098,12 @@ fn clip_box_box(
             }
         };
         for i in 0..poly_len {
-            let v0 = poly[i];
-            let v1 = poly[(i + 1) % poly_len];
+            let v0 = src[i];
+            let v1 = src[(i + 1) % poly_len];
             let d0 = pn.dot(v0.position - e0);
             let d1 = pn.dot(v1.position - e0);
             if d0 >= 0.0 {
-                push(&mut buf, &mut out_len, v0);
+                push(dst, &mut out_len, v0);
             }
             // 교점은 **엄격한 부호 반대**일 때만 생성 (확인 라운드 MAJOR 반영 — d0==0인 경계
             // 정점은 위에서 이미 보존되므로 t=0 교점까지 만들면 같은 위치가 서로 다른 계보
@@ -1106,7 +1116,7 @@ fn clip_box_box(
                 let t = d0 / (d0 - d1);
                 let x = v0.position + (v1.position - v0.position) * t;
                 push(
-                    &mut buf,
+                    dst,
                     &mut out_len,
                     ClipVertex {
                         position: x,
@@ -1116,7 +1126,7 @@ fn clip_box_box(
                 );
             }
         }
-        poly = buf;
+        flip = !flip;
         poly_len = out_len;
         if poly_len == 0 {
             return None;
@@ -1124,6 +1134,8 @@ fn clip_box_box(
     }
 
     // reference 평면 아래(margin 이내)만 채택, separation = 평면까지 부호 거리
+    // 마지막으로 **쓴** 버퍼가 결과다(교체 후이므로 `flip`이 가리키는 쪽).
+    let poly = if flip { &buf } else { &poly };
     let mut pts = [ContactPoint::default(); CLIP_CAP];
     let mut pts_len = 0usize;
     // **같은 자리에 접점이 둘 들어가면 솔버가 그 지점에 제약을 두 번 건다.** 위 부호 규칙은
