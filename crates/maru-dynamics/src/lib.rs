@@ -1796,6 +1796,75 @@ mod tests {
         let _ = &mut w;
     }
 
+    /// PCM 캐시 엔트리가 **내용에 비해 과대한 용량을 쥐고 있지 않다**.
+    ///
+    /// 배경(교차검수 rev_8f75295a MAJOR): 캐시를 자리에서 채우면 `Vec` 용량이 스텝 간
+    /// 살아남는다 — 그게 할당을 없앤 이유지만, 상한이 없으면 한 번 크게 자란 키가 과거
+    /// 최대치를 영구 잔류시킨다(128 MiB 스텝 회계 **밖**에서). 그래서 채운 뒤
+    /// `capacity > max(len,4)·4`면 되돌린다.
+    ///
+    /// **정직한 한계**: 이 테스트는 그 상한 가드를 **격리하지 못한다**. 뮤테이션으로
+    /// 확인했다 — 가드를 지워도 통과한다. 시도한 모든 씬(복합 바디를 기울여 접점을 줄이는
+    /// 경로, 한 번에/점진적으로 둘 다)에서 전이 도중 접촉이 끊겨 **캐시 키가 `retain`에
+    /// 먼저 지워지고**, 그러면 `Vec`이 통째로 해제돼 용량이 어차피 돌아온다.
+    /// 그 사실은 누수 경로가 좁다는 뜻이기도 하다(같은 키가 접촉을 **한 번도 놓지 않으면서**
+    /// 접점 수만 줄어야 한다). 가드는 싸고 불변식은 옳으므로 남기되, 여기서 잠그는 것은
+    /// **불변식**이지 그 줄이 아니다.
+    /// wasm 레그에서는 건너뛴다 — 복합 8자식 × 150스텝이 단일 wasm 인스턴스에서 순차로 도는
+    /// 전체 스위트의 메모리 예산을 넘긴다(격리 실행은 통과). 이 불변식은 타깃 무관이다.
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", ignore)]
+    fn pcm_cache_entries_do_not_hoard_capacity() {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(30.0, 1.0, 30.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        ));
+        let children: Vec<(maru_collide::Pose, Shape)> = (0..8)
+            .map(|i| {
+                (
+                    pose(i as f32 * 1.2 - 4.2, 0.0, 0.0),
+                    Shape::Box {
+                        half: Vec3::new(0.5, 0.25, 0.5),
+                        radius: 0.0,
+                    },
+                )
+            })
+            .collect();
+        let comp = w
+            .try_add_body(
+                Body::try_new_kinematic(Shape::Compound { children }, pose(0.0, 0.25, 0.0))
+                    .expect("kinematic 복합"),
+            )
+            .expect("삽입");
+        for _ in 0..90 {
+            w.step(1.0 / 60.0);
+        }
+        assert!(
+            w.pcm_cache_capacity_bytes() > 0,
+            "캐시가 비었다 — 씬이 접촉을 안 만들었다(단언이 아무것도 안 본다)"
+        );
+        // 접점 수를 줄여 가며 불변식을 계속 확인한다.
+        for k in 1..=60 {
+            let a = 0.45 * k as f32 / 60.0;
+            let p = maru_collide::Pose {
+                pos: Vec3::new(0.0, 0.25 + 4.7 * a.sin(), 0.0),
+                rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), a),
+            };
+            w.set_pose(comp, p).expect("자세 설정");
+            w.step(1.0 / 60.0);
+            if let Some((len, cap)) = w.pcm_cache_worst_capacity_ratio() {
+                assert!(
+                    cap <= len.max(4) * 4,
+                    "step {k}: 캐시 엔트리가 과대 용량을 쥐고 있다 (len={len}, cap={cap})"
+                );
+            }
+        }
+    }
+
     /// 메시 스냅샷 왕복 — 파생물(BVH·용접 마스크)은 저장하지 않고 복원에서 다시 만든다.
     #[test]
     fn trimesh_survives_snapshot_roundtrip() {

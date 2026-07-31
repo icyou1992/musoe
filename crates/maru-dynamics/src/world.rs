@@ -1771,6 +1771,25 @@ impl World {
     }
 
     /// 살아있는 바디 수 (제거된 슬롯 제외).
+    /// PCM 캐시가 쥐고 있는 총 용량(바이트) — 자리 채우기가 용량을 무한정 쥐지 않는지
+    /// 관측하는 창이다(테스트 전용).
+    #[cfg(test)]
+    pub fn pcm_cache_capacity_bytes(&self) -> usize {
+        self.contact_cache
+            .values()
+            .map(|v| v.capacity() * core::mem::size_of::<(FeatureId, CachedImpulse)>())
+            .sum()
+    }
+
+    /// 캐시 엔트리 중 **용량/길이 비가 가장 나쁜** 것의 `(len, capacity)` (테스트 전용).
+    #[cfg(test)]
+    pub fn pcm_cache_worst_capacity_ratio(&self) -> Option<(usize, usize)> {
+        self.contact_cache
+            .values()
+            .map(|v| (v.len(), v.capacity()))
+            .max_by_key(|(l, c)| c.saturating_sub(*l))
+    }
+
     /// 접촉 이벤트 출력 버퍼의 현재 보유 용량.
     #[cfg(test)]
     pub fn contact_events_capacity(&self) -> usize {
@@ -4572,6 +4591,17 @@ impl World {
                         existing.clear();
                     }
                     existing.extend(c.points.iter().map(&mut make));
+                    // **재사용 용량에 상한을 둔다** (교차검수 rev_8f75295a MAJOR).
+                    // 자리에서 채우면 `Vec` 용량이 스텝 간 살아남는데, 예전에는 매 스텝
+                    // 교체로 해제됐다. 복합 페어가 한 프레임에 자식 접점을 잔뜩 만들어
+                    // 크게 자란 뒤 접점 하나만 계속 유지되면, 논리 길이는 작아져도
+                    // **과거 최대치가 영구 잔류**한다 — 그것도 128 MiB 회계 밖에서.
+                    // 여유 4배(+바닥 4)를 넘으면 되돌린다: 정상 상태에서는 절대 발화하지
+                    // 않고(할당 0 유지), 한 번 부푼 키만 제자리로 돌아온다.
+                    let cap_limit = existing.len().max(4).saturating_mul(4);
+                    if existing.capacity() > cap_limit {
+                        existing.shrink_to_fit();
+                    }
                 }
                 // 새 키에서만 할당한다(이번 스텝에 새로 생긴 접촉).
                 None => {
