@@ -1608,13 +1608,19 @@ mod tests {
                 max_events = max_events.max(n);
             }
             let now = w.contact_events_capacity();
+            // **방출 진입 시점의 용량과 스텝 종료 시점의 용량이 같아야 한다.**
+            // 다르면 방출 중에 자란 것이다 = 재할당 = 계약 위반. 스텝 시작의 선점 블록에서
+            // 자라는 것은 정상이므로 이 비교여야만 둘이 구분된다.
+            // (스텝 후 용량만 보거나 `len <= capacity`를 보는 검사는 어떤 Vec에서도 참이라
+            //  아무것도 잠그지 못한다 — 첫 판이 그랬고 교차검수가 MAJOR로 잡았다.)
+            assert_eq!(
+                now,
+                w.contact_events_capacity_at_emit(),
+                "step {step}: 이벤트 방출 중에 버퍼가 자랐다 (재할당 = 스텝 중 할당 0 위반)"
+            );
             assert!(
                 now >= cap,
                 "step {step}: 이벤트 버퍼 용량이 줄었다 ({cap} → {now})"
-            );
-            assert!(
-                n <= now,
-                "step {step}: 이벤트 수 {n}가 용량 {now}를 넘었다 — 재할당이 있었다"
             );
             cap = now;
         }

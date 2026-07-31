@@ -329,6 +329,9 @@ pub struct World {
     damping: Vec<(f32, f32)>,
     /// 이번 스텝의 접촉 이벤트. 스텝 시작에 비우고 스텝 안에서 채운다.
     contact_events: Vec<ContactEvent>,
+    /// 이벤트 방출 진입 시점의 `contact_events` 용량 (테스트 관측용).
+    #[cfg(test)]
+    ev_cap_at_emit: usize,
     /// 이번 스텝의 CCD 절단 히트 (비캐노니컬 — 스냅샷 밖, 스텝 시작에 비운다).
     /// 상한 `MAX_CCD_HITS`, 버퍼는 영속이라 스텝 중 할당이 없다.
     ccd_hits: Vec<CcdHit>,
@@ -629,6 +632,8 @@ impl World {
             ext_force: Vec::new(),
             damping: Vec::new(),
             contact_events: Vec::new(),
+            #[cfg(test)]
+            ev_cap_at_emit: 0,
             ccd_hits: Vec::new(),
             touching: IntSet::default(),
             integrate_gate: Vec::new(),
@@ -1764,11 +1769,22 @@ impl World {
     }
 
     /// 살아있는 바디 수 (제거된 슬롯 제외).
-    /// 접촉 이벤트 출력 버퍼의 보유 용량 — **스텝 중 재할당이 없었는지** 관측하는 창이다.
-    /// (테스트 전용. 용량이 스텝 사이에 늘지 않으면 이벤트 구간에서 할당이 없었다는 뜻이다.)
+    /// 접촉 이벤트 출력 버퍼의 현재 보유 용량.
     #[cfg(test)]
     pub fn contact_events_capacity(&self) -> usize {
         self.contact_events.capacity()
+    }
+
+    /// **이벤트 방출 구간에 진입한 순간**의 용량 (테스트 전용).
+    ///
+    /// 이것이 있어야 "이벤트 구간에서 재할당이 없었다"를 관측할 수 있다. 스텝이 끝난 뒤의
+    /// 용량과 이 값을 비교하면 된다 — 스텝 시작의 선점 블록에서 자라는 것(정상)과
+    /// 방출 중에 자라는 것(계약 위반)이 그제서야 구분된다.
+    /// 스텝 후 용량만 보는 검사는 **어떤 Vec에서도 참**이라 아무것도 잠그지 못한다
+    /// (교차검수 rev_18633fde MAJOR — 첫 판 테스트가 정확히 그랬다).
+    #[cfg(test)]
+    pub fn contact_events_capacity_at_emit(&self) -> usize {
+        self.ev_cap_at_emit
     }
 
     /// 바디가 속한 아일랜드 id (`u32::MAX` = 아일랜드 밖 = static·무접촉·수면).
@@ -2124,7 +2140,16 @@ impl World {
     /// 월드를 한 번 돌린 뒤 작은 월드로 복원하면 그 차이가 회계 밖에 남고, 128 MiB
     /// 총상한 주장이 거짓이 된다(확인검수 rev_21c1a97f MAJOR — 참여자 버퍼만 정확히
     /// 세고 나머지를 빠뜨렸다).
-    fn persistent_excess_bytes(&self, nbody: usize, constraint_cap: usize) -> usize {
+    /// `contact_event_target` = 이번 스텝의 이벤트 출력 상한(`ncap + touching.len()`).
+    /// 이벤트 버퍼는 **영속**이라 큰 장면을 한 번 돌면 용량이 남는데, 그 초과분을 세지 않으면
+    /// 작은 장면으로 돌아온 뒤에도 과거 버퍼가 총상한 밖에 영구 잔류한다
+    /// (교차검수 rev_18633fde MAJOR).
+    fn persistent_excess_bytes(
+        &self,
+        nbody: usize,
+        constraint_cap: usize,
+        contact_event_target: usize,
+    ) -> usize {
         let ex = |cap: usize, target: usize, elem: usize| cap.saturating_sub(target) * elem;
         self.solver_state
             .excess_capacity_bytes(nbody)
@@ -2149,6 +2174,11 @@ impl World {
                 self.island_parent.capacity(),
                 nbody,
                 core::mem::size_of::<usize>(),
+            ))
+            .saturating_add(ex(
+                self.contact_events.capacity(),
+                contact_event_target,
+                core::mem::size_of::<ContactEvent>(),
             ))
             .saturating_add(ex(self.sleep_bak.capacity(), nbody, 1))
             .saturating_add(ex(
@@ -2226,6 +2256,10 @@ impl World {
         self.damping = Vec::new();
         self.island_parent = Vec::new();
         self.contact_blocks = Vec::new();
+        // 이벤트 출력도 영속이라 반납 대상이다 — 반납하지 않으면 위 초과 회계가 잡은 바이트를
+        // 되돌릴 방법이 없어 "반납 후 재측정" 회복 경로가 작동하지 않는다.
+        // 이 시점은 스텝 시작(이미 `clear`됨)이라 버릴 내용이 없다.
+        self.contact_events = Vec::new();
         // 페어 핑퐁 두 벌 — 살아있는 목록은 지역 `pairs`가 들고 있다.
         self.bp_pairs = Vec::new();
         self.bp_pairs_scratch = Vec::new();
@@ -2858,9 +2892,8 @@ impl World {
         // 64배 틀린다). 아래에서 실제 페어 목록으로 **정확한** 제약 상한을 구해 다시 잰다.
         let per_pair_bytes = core::mem::size_of::<(u32, u32)>()          // pairs
             + core::mem::size_of::<(u32, u32)>()                         // NarrowOut.live
-            + core::mem::size_of::<(u32, u32)>()                         // started (≤ 페어 수)
-            + core::mem::size_of::<(u32, u32)>()                         // stopped (≤ 직전 기준선 ≤ 페어 수)
-            + 2 * core::mem::size_of::<ContactEvent>()                   // contact_events (두 델타의 합)
+            + core::mem::size_of::<(u32, u32)>()                         // started (≤ 이번 스텝 페어 수)
+            + core::mem::size_of::<ContactEvent>()                       // started 쪽 출력
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
         let per_constraint_bytes = core::mem::size_of::<ContactConstraint>() // constraints
             + maru_collide::MAX_MANIFOLD_POINTS
@@ -2931,9 +2964,22 @@ impl World {
         } else {
             0
         };
+        // **직전 기준선 비례 스크래치는 페어 비례가 아니다** (교차검수 rev_18633fde BLOCKER).
+        // `touch_sorted`·`stopped`·stopped 쪽 출력의 상한은 **직전 스텝**의 `touching` 크기이고,
+        // 그것은 이번 스텝의 페어 수와 무관하다. 실제로 어긋난다: 직전 스텝에 N개가 닿은 뒤
+        // 전부 멀리 텔레포트하면 `pairs.len() == 0`인데 `touching.len() == N`이라,
+        // 페어 비례로만 세면 회계가 0바이트를 보고하면서 N개를 선점한다 — 128 MiB 계약이 깨진다.
+        // 그래서 고정 항으로 뺀다(`touch_sorted`는 이 변경 **이전부터** 같은 구멍이었고,
+        // 이벤트 버퍼 둘을 같은 상한으로 추가하면서 폭이 넓어졌다).
+        let baseline_event_bytes = self.touching.len().saturating_mul(
+            2usize
+                .saturating_mul(core::mem::size_of::<(u32, u32)>()) // touch_sorted + stopped
+                .saturating_add(core::mem::size_of::<ContactEvent>()), // stopped 쪽 출력
+        );
         let fixed_bytes = fixed_body_bytes
             .saturating_add(fixed_joint_bytes)
-            .saturating_add(fixed_ccd_bytes);
+            .saturating_add(fixed_ccd_bytes)
+            .saturating_add(baseline_event_bytes);
         if fixed_bytes >= MAX_STEP_SCRATCH_BYTES {
             self.resource_limit = true;
             return;
@@ -3087,6 +3133,7 @@ impl World {
             .saturating_mul(pair_bytes)
             .saturating_add(self.bp_pairs.capacity().saturating_mul(pair_bytes))
             .saturating_add(self.bp_pairs_scratch.capacity().saturating_mul(pair_bytes));
+        let contact_event_target = ncap.saturating_add(self.touching.len());
         let step_bytes = |this: &Self, narrow_held: usize| {
             fixed_bytes
                 .saturating_add(ncap.saturating_mul(per_pair_bytes))
@@ -3094,7 +3141,11 @@ impl World {
                 .saturating_add(narrow_held)
                 .saturating_add(narrow_new)
                 .saturating_add(pair_held_extra)
-                .saturating_add(this.persistent_excess_bytes(nbody, constraint_cap))
+                .saturating_add(this.persistent_excess_bytes(
+                    nbody,
+                    constraint_cap,
+                    contact_event_target,
+                ))
         };
         if step_bytes(self, narrow_held) > MAX_STEP_SCRATCH_BYTES {
             // 먼저 **반납**하고 다시 잰다(위 `release_oversized_scratch` 주석 — 거절만 하면
@@ -3119,7 +3170,11 @@ impl World {
                 .saturating_add(narrow_held)
                 .saturating_add(narrow_new)
                 .saturating_add(pair_held_extra)
-                .saturating_add(self.persistent_excess_bytes(nbody, constraint_cap));
+                .saturating_add(self.persistent_excess_bytes(
+                    nbody,
+                    constraint_cap,
+                    contact_event_target,
+                ));
             if after > MAX_STEP_SCRATCH_BYTES {
                 // 참여자 버퍼는 아직 self가 들고 있다(아래에서 take한다) — 되돌릴 것이 없다.
                 self.bp_pairs = pairs;
@@ -4398,6 +4453,10 @@ impl World {
             // (같은 키가 started와 stopped에 동시에 들어가지 않는다: 하나는 live∖touching,
             // 다른 하나는 touching∖live다). 이 단언이 그 논증을 검사로 바꾼다 —
             // 넘으면 이벤트 구간에서 할당이 나고, 그건 wake 뒤라 되돌릴 수 없다.
+            #[cfg(test)]
+            {
+                self.ev_cap_at_emit = self.contact_events.capacity();
+            }
             debug_assert!(
                 started.len() + stopped.len() <= self.contact_events.capacity(),
                 "이벤트 출력 용량 부족: started {} + stopped {} > cap {}",

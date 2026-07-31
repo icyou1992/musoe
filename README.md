@@ -967,6 +967,15 @@ MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyra
 이벤트 구간은 `clear` + `extend` + `drain`으로 돌아 **재할당하지 않는다**. 바이트 회계
 (`per_pair_bytes`)에도 세 버퍼를 편입했다 — 예산은 조이는 쪽으로만 움직인다.
 
+바이트 회계는 **기준선 비례분을 고정 항으로 분리**했다: `touch_sorted`·`stopped`·stopped 쪽
+출력의 상한은 이번 스텝 페어 수가 아니라 **직전 스텝** `touching` 크기다. 둘은 어긋난다 —
+직전에 N개가 닿은 뒤 전부 멀리 텔레포트하면 `pairs.len() == 0`인데 `touching.len() == N`이라,
+페어 비례로만 세면 회계가 0바이트를 보고하면서 N개를 선점한다(교차검수 rev_18633fde BLOCKER).
+`touch_sorted`는 이 수리 **이전부터** 같은 구멍이었다. 그리고 영속 버퍼인 `contact_events`의
+초과 용량을 `persistent_excess_bytes`에 넣고 `release_oversized_scratch`가 반납하게 했다 —
+안 그러면 큰 장면을 한 번 돈 뒤 작은 장면으로 돌아와도 과거 버퍼가 총상한 밖에 영구 잔류하고,
+"반납 후 재측정" 회복 경로가 작동하지 않는다.
+
 논증을 검사로 바꿔 두었다: 이벤트 방출 직전 `debug_assert!(started + stopped <= capacity)`.
 같은 키가 두 델타에 동시에 들지 않으므로(하나는 live∖touching, 다른 하나는 touching∖live)
 합이 상한을 넘을 수 없다는 논증이 근거인데, **그 단언이 수리 첫 판의 버그를 즉시 잡았다**:
@@ -974,6 +983,11 @@ MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyra
 넘기는 바람에 용량이 목표에 못 미쳤다(첫 스텝에만 우연히 맞는다). 회귀는
 `contact_event_buffers_do_not_grow_during_a_step`가 반발 계수를 준 공 12개로 이벤트를
 계속 내며 잠근다(이벤트가 안 나면 단언이 아무것도 검증하지 않으므로 커버리지도 함께 요구한다).
+**그 테스트의 첫 판은 무력했다** — `len <= capacity`와 "스텝 후 용량이 안 줄었다"는 어떤
+`Vec`에서도 참이라 회귀를 넣어도 통과한다(교차검수 rev_18633fde MAJOR). 지금은 **방출 진입
+시점의 용량**을 따로 관측해 스텝 종료 시점과 비교한다 — 그래야 선점 블록에서 자라는 것(정상)과
+방출 중에 자라는 것(위반)이 구분된다. 방출 직전에 `shrink_to_fit`으로 용량을 빼앗는 뮤테이션에서
+실제로 실패하는 것을 확인했다.
 
 남은 것: `started`/`stopped`는 여전히 **지역 버퍼**라 스텝당 각 1회 할당한다(계측기로 +2회 확인).
 이 저장소의 다른 스텝 스크래치(`touch_sorted`·`order`·`conflict` …)와 같은 형태이고, 계약이
