@@ -1193,8 +1193,14 @@ pub fn solve_x4(st: &mut SolverState, mut cs: [&mut ContactConstraint; 4], p: &B
         let n0 = ti0 - tm0 * vt0;
         let n1 = ti1 - tm1 * vt1;
         let mag2 = n0 * n0 + n1 * n1;
+        // **0/0을 실행하지 않는다** (교차검수 rev_87748fe6 MAJOR). 정지 접촉(누적 임펄스 0,
+        // 접선 속도 0)이나 블록의 빈 레인은 `max_f = 0`·`mag2 = 0`이 흔한데, `scale`을 조건과
+        // 무관하게 먼저 계산하면 매 반복 `0/0` invalid 연산이 난다. `blend`는 값의 NaN만 가리고
+        // **FP 예외 플래그는 이미 오른다** — 이 저장소의 `fp_verify()`는 FTZ/DAZ와 반올림만
+        // 보므로 예외를 언마스크한 호스트에서는 트랩하고, 기본 환경에서도 sticky 플래그가 오염된다.
+        // 클램프가 필요 없는 레인은 분모를 1로 갈아 끼운다(그 레인의 `scale`은 어차피 버려진다).
         let cond = mag2.cmp_gt(max_f * max_f) & mag2.cmp_gt(zero);
-        let scale = max_f / mag2.sqrt();
+        let scale = max_f / cond.blend(mag2, one).sqrt();
         let n0 = cond.blend(n0 * scale, n0);
         let n1 = cond.blend(n1 * scale, n1);
         let (d0, d1) = (n0 - ti0, n1 - ti1);

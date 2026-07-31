@@ -194,6 +194,7 @@ fn main() {
         println!("  {i:>3}스텝 후 angvel.y = {wy:.4} rad/s");
     }
     probe_extra();
+    probe_energy();
 }
 
 // ── 검수 rev_ac00206f 보강분 계측 ───────────────────────────────────────────────
@@ -328,4 +329,72 @@ fn probe_extra() {
         com.z - com0.z,
         com.y - com0.y
     );
+}
+
+// ── 검수 rev_87748fe6: 마찰이 에너지를 주입하는가 ────────────────────────────────
+// 반례(수학적으로 확인): 대각 질량 스텝 후 유클리드 원판 투영은 K가 등방일 때만 제약 해와
+// 같다. 비등방 접촉에서는 원판 안의 이전 임펄스에서 **에너지를 늘리는** 갱신이 가능하다.
+// 여기서는 그게 실제 장면에서 나는지, 그리고 **순차 GS 시절보다 나빠졌는지**를 잰다.
+// 역학적 에너지 = 운동 + 위치. 중력은 보존력이라 둘의 합은 마찰·접촉이 없으면 보존된다.
+fn probe_energy() {
+    println!("\n[8] 마찰 에너지 주입 — 비등방 막대, 스텝당 역학적 에너지 증가분");
+    let g = 9.81f32;
+    for (label, half, spin) in [
+        ("등방 정육면체", Vec3::new(0.5, 0.5, 0.5), 0.0f32),
+        ("비등방 막대", Vec3::new(0.1, 0.1, 2.0), 0.0),
+        ("비등방 막대+스핀", Vec3::new(0.1, 0.1, 2.0), 6.0),
+    ] {
+        let mut w = World::new(params());
+        ground_flat(&mut w);
+        let rot = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 12f32.to_radians());
+        let h = w.add_body(Body::new_dynamic(
+            Shape::Box { half, radius: 0.0 },
+            Pose {
+                pos: Vec3::new(0.0, 1.1, 0.0),
+                rot,
+            },
+            1.0,
+        ));
+        w.set_linear_velocity(h, Vec3::new(2.0, 0.0, 1.3)).unwrap();
+        if spin != 0.0 {
+            w.set_angular_velocity(h, Vec3::new(0.3, spin, 0.2))
+                .unwrap();
+        }
+        // 관성 텐서를 모르므로 회전 에너지는 |w|^2 대용이 아니라 실제 관성으로 재야 정확하다.
+        // 여기서는 **상대 비교**가 목적이라 균질 직육면체 관성으로 직접 계산한다.
+        let (hx, hy, hz) = (half.x, half.y, half.z);
+        let m = 1.0f32;
+        let i = Vec3::new(
+            m / 3.0 * (hy * hy + hz * hz),
+            m / 3.0 * (hx * hx + hz * hz),
+            m / 3.0 * (hx * hx + hy * hy),
+        );
+        let energy = |w: &World| {
+            let b = w.body(h);
+            let v = b.linvel();
+            let om = b.angvel(); // 월드 각속도 — 근사(주축 정렬 가정)라 절대값이 아닌 추세를 본다
+            0.5 * m * v.dot(v)
+                + 0.5 * (i.x * om.x * om.x + i.y * om.y * om.y + i.z * om.z * om.z)
+                + m * g * b.pose().pos.y
+        };
+        let mut prev = energy(&w);
+        let (mut max_gain, mut at) = (0.0f32, 0usize);
+        let mut total_gain = 0.0f32;
+        for s in 0..400 {
+            w.step(DT);
+            let e = energy(&w);
+            let d = e - prev;
+            if d > max_gain {
+                max_gain = d;
+                at = s + 1;
+            }
+            if d > 0.0 {
+                total_gain += d;
+            }
+            prev = e;
+        }
+        println!(
+            "  {label:<16} 최대 스텝 증가 {max_gain:>9.5} J (step {at:>3}) · 양의 증가 합 {total_gain:>9.5} J"
+        );
+    }
 }
