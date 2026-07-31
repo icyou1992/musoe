@@ -9029,6 +9029,68 @@ mod tests {
         );
     }
 
+    /// **전체 재빌드 직후의 증분 스텝**이 fast path를 거짓 양성으로 타지 않는가
+    /// (교차검수 rev_3de4e59a BLOCKER를 그대로 옮긴 시나리오).
+    ///
+    /// 전체 재빌드는 슬롯별 페어 수를 만들지 않는다(만들어도 안 쓰므로 순손해다). 그때
+    /// 빈 벡터를 다음 스텝이 "전부 0"으로 읽으면, 페어를 가진 바디가 상대에게서 멀어져
+    /// **없어져야 할 페어**가 그대로 보존된다. 바디 상태는 안 바뀌므로 스냅샷 대조로는
+    /// 안 잡히고(위 락스텝 테스트가 그 이유로 못 잡았다), 목록만 조용히 부푼다.
+    ///
+    /// 구성: 정적 다수 + 동적 하나. `moved_ids`는 동적 하나뿐이라 bp가 생긴 **다음 스텝부터
+    /// 곧바로 증분**이다. 동적 바디를 정적과 겹쳐 두고 위로 쏘아 페어를 잃게 만든다.
+    /// 전체 재빌드 월드와 매 스텝 페어 수를 대조한다.
+    #[test]
+    fn incremental_after_full_rebuild_does_not_keep_stale_pairs() {
+        let build = |force_full: bool| {
+            let mut w = World::new(no_sleep_params());
+            w.set_force_full_broadphase(force_full);
+            // 정적 다수 — moved_ids가 바디 수의 절반 아래가 되게 한다(증분 조건).
+            for i in 0..20 {
+                w.add_body(Body::new_static(
+                    Shape::Box {
+                        half: Vec3::new(0.5, 0.5, 0.5),
+                        radius: 0.0,
+                    },
+                    pose(i as f32 * 4.0, 0.0, 0.0),
+                ));
+            }
+            // 첫 정적과 **겹쳐** 시작 → 첫 스텝에 페어가 생긴다.
+            let h = w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.5, 0.5),
+                    radius: 0.0,
+                },
+                pose(0.0, 0.6, 0.0),
+                1.0,
+            ));
+            // 위로 **아주 빠르게** 쏘아 보낸다 — 취약 창은 "전체 재빌드 바로 다음 스텝"뿐이라,
+            // 그 한 스텝 만에 페어를 잃어야 재현된다(천천히 벗어나면 그 사이 느린 병합이
+            // 카운트를 만들어 창이 닫힌다).
+            w.set_linear_velocity(h, Vec3::new(0.0, 200.0, 0.0))
+                .unwrap();
+            w
+        };
+        let (mut a, mut b) = (build(false), build(true));
+        let mut saw_incremental = false;
+        for step in 0..40 {
+            a.step(DT);
+            b.step(DT);
+            saw_incremental |= a.diagnostics().bp_incremental;
+            assert_eq!(
+                a.diagnostics().pairs,
+                b.diagnostics().pairs,
+                "step {step}: 전체 재빌드 직후 증분이 옛 페어를 보존했다 — \
+                 카운트 '모름'을 '0'으로 읽은 것이다"
+            );
+        }
+        // 이 테스트가 증분 경로를 **실제로** 지났는지 — 안 지났으면 아무것도 잠그지 않는다.
+        assert!(
+            saw_incremental,
+            "증분 경로를 한 번도 타지 않았다 — 시나리오가 무의미하다"
+        );
+    }
+
     /// 증분 브로드페이즈 등가성 — **궤적 전체**로 잠근다: 증분 월드와 전체-재빌드 월드를
     /// 같은 입력으로 락스텝 진행하며 매 스텝 스냅샷 바이트가 같아야 한다. 페어 집합이
     /// 한 스텝이라도 갈리면 제약·이벤트·wake가 갈려 스냅샷이 갈린다.

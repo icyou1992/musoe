@@ -307,6 +307,10 @@ pub struct World {
     bp_pairs: Vec<(u32, u32)>,
     /// 증분 병합의 출력 버퍼 — `bp_pairs`와 핑퐁하며 재사용한다(캐노니컬 아님).
     bp_pairs_scratch: Vec<(u32, u32)>,
+    /// `bp_pair_count`가 **현재 `bp_pairs`와 맞는가**. 전체 재빌드는 카운트를 만들지 않고
+    /// 스크래치 반납은 버퍼를 비우므로, 그 뒤에는 "모름"이다 — 빈 Vec을 "전부 0"으로 읽으면
+    /// fast path가 거짓 양성이 되어 페어를 잃는다(교차검수 rev_3de4e59a BLOCKER).
+    bp_pair_count_valid: bool,
     /// 슬롯별 "`bp_pairs`에서 그 바디가 낀 페어 수" — 증분 경로의 O(|R|) 판정용.
     /// 이 값이 R 전체에서 0이고 새 페어도 없으면 목록이 직전과 같아 **병합을 건너뛴다**.
     /// 목록을 다시 만드는 모든 자리에서 같이 갱신한다(안 하면 fast path가 거짓 양성이 된다).
@@ -627,6 +631,7 @@ impl World {
             bp_pairs: Vec::new(),
             bp_pairs_scratch: Vec::new(),
             bp_pair_count: Vec::new(),
+            bp_pair_count_valid: false,
             contact_blocks: Vec::new(),
             bp_valid: false,
             bp_dt: 0.0,
@@ -2213,6 +2218,11 @@ impl World {
                 core::mem::size_of::<f32>(),
             ))
             .saturating_add(ex(
+                self.bp_pair_count.capacity(),
+                nbody,
+                core::mem::size_of::<u32>(),
+            ))
+            .saturating_add(ex(
                 self.contact_blocks.capacity(),
                 constraint_cap / 4,
                 core::mem::size_of::<solver_block::ContactBlock>(),
@@ -2290,6 +2300,7 @@ impl World {
         self.bp_pairs = Vec::new();
         self.bp_pairs_scratch = Vec::new();
         self.bp_pair_count = Vec::new();
+        self.bp_pair_count_valid = false;
         self.gravity_gate = Vec::new();
         self.sleep_bak = Vec::new();
         self.sleep_timer_bak = Vec::new();
@@ -3008,7 +3019,8 @@ impl World {
             + 2 * core::mem::size_of::<(u32, Aabb)>()                    // dyn/static 목록(분할) + bp_updates
             + core::mem::size_of::<usize>()                              // island_min 키
             + 2 * core::mem::size_of::<f32>()                            // island_min 값 + 해시 여유
-            + core::mem::size_of::<f32>(); // sleep_timer_bak
+            + core::mem::size_of::<f32>()                                // sleep_timer_bak
+            + core::mem::size_of::<u32>(); // bp_pair_count(슬롯당 페어 수)
         let fixed_body_bytes = self.bodies.len().saturating_mul(per_body_bytes);
         // 조인트 비례 스크래치: joint_pairs·active_joints·excluded. **조인트 수는 pairs·bodies의
         // 상한이 아니므로** 별도로 차감해야 총상한이 성립한다 (교차검수 rev_ba3ca887 MAJOR).
@@ -3109,7 +3121,11 @@ impl World {
                 &moved_ids,
                 &moved_mask,
                 &prev,
-                &self.bp_pair_count,
+                if self.bp_pair_count_valid {
+                    Some(&self.bp_pair_count[..])
+                } else {
+                    None
+                },
                 budget,
                 &mut out,
             ) {
@@ -3432,6 +3448,12 @@ impl World {
                 .is_err()
             || self.sleep_timer_bak
                 .try_reserve(nbody.saturating_sub(self.sleep_timer_bak.len()))
+                .is_err()
+            // **스텝 말에 `resize`로 자라던 것을 여기로 올렸다** (교차검수 rev_3de4e59a MAJOR).
+            // 거기서는 이미 write_back까지 끝난 뒤라 실패를 `ResourceLimit`으로 돌려줄 수 없어
+            // 전역 할당자 실패가 곧 abort였고, 128 MiB 총상한 회계에도 빠져 있었다.
+            || self.bp_pair_count
+                .try_reserve(nbody.saturating_sub(self.bp_pair_count.len()))
                 .is_err()
             || reserve_narrow_bufs(&mut narrow_bufs, n_par, &chunk_caps).is_err()
         {
@@ -4574,8 +4596,13 @@ impl World {
         let moved = self.integrate_gate.iter().any(|x| *x);
         // 슬롯별 페어 수 — 다음 스텝 증분 경로의 O(|R|) 판정 근거다.
         match count_action {
-            CountAction::Keep => {} // 목록이 그대로면 값도 그대로다
-            CountAction::Drop => self.bp_pair_count.clear(), // 전체 재빌드 — 만들지 않는다
+            CountAction::Keep => {} // 목록이 그대로면 값도 그대로다(유효성도 그대로)
+            CountAction::Drop => {
+                // 전체 재빌드 — 만들지 않는다. **유효 플래그를 반드시 내린다**:
+                // 비운 벡터를 다음 스텝이 "전부 0"으로 읽으면 페어를 잃는다.
+                self.bp_pair_count.clear();
+                self.bp_pair_count_valid = false;
+            }
             CountAction::Rebuild => {
                 self.bp_pair_count.clear();
                 self.bp_pair_count.resize(self.bodies.len(), 0);
@@ -4589,6 +4616,7 @@ impl World {
                         }
                     }
                 }
+                self.bp_pair_count_valid = true;
             }
         }
         self.bp_pairs = pairs;
