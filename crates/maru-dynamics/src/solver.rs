@@ -546,6 +546,61 @@ pub struct CachedImpulse {
 /// **반환형을 키우지 않는다** — `[ContactPointConstraint; 4]` 인라인은 2026-07-26에
 /// narrow +40%로 이미 기각됐다(`prepare`가 큰 구조체를 값으로 돌려주고 push가 복사한다).
 /// 버퍼를 받아 채워 돌려주면 그 문제 없이 할당만 없앤다.
+/// 캐시 소비 표시 비트셋 폭. 매니폴드당 접점 4개 × 페어당 매니폴드 상한 64 = 256.
+pub const CACHE_USED_WORDS: usize = 4;
+
+#[inline]
+fn cache_used_get(w: &[u64; CACHE_USED_WORDS], i: usize) -> bool {
+    let (word, bit) = (i / 64, i % 64);
+    word < CACHE_USED_WORDS && w[word] & (1u64 << bit) != 0
+}
+
+#[inline]
+fn cache_used_set(w: &mut [u64; CACHE_USED_WORDS], i: usize) {
+    let (word, bit) = (i / 64, i % 64);
+    if word < CACHE_USED_WORDS {
+        w[word] |= 1u64 << bit;
+    }
+}
+
+/// warm start 캐시에서 이 접점이 물려받을 항목을 하나 고른다 — **쓰지 않은 것 중 가장
+/// 가까운 것**. 고른 항목은 소비 표시를 남긴다.
+///
+/// 순수 함수로 떼어 둔 이유는 **시험 가능성**이다(검수 rev_141caff1 제안). 예전에는
+/// 접점마다 `cache.iter().find(...)`를 처음부터 다시 돌려 같은 ID의 접점 여럿이 한 항목을
+/// 동시에 계승했는데, 그 계약을 씬으로 재려니 진단(`warm_hits`)이 전 페어 합계라
+/// 페어별 불변식을 세울 수 없었다. 함수 층에서는 바로 잰다.
+///
+/// 정확 ID 경로는 매니폴드 안에서 ID가 유일하므로 후보가 하나뿐이라 동작이 그대로다
+/// (cliff 불변). 동률은 캐시 인덱스가 작은 쪽 — 결정적이어야 한다.
+pub(crate) fn match_cache_entry(
+    cache: &[(maru_collide::FeatureId, CachedImpulse)],
+    used: &mut [u64; CACHE_USED_WORDS],
+    feature: maru_collide::FeatureId,
+    position: Vec3,
+    normal: Vec3,
+    generic: bool,
+    match_tol2: f32,
+) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, (f, c)) in cache.iter().enumerate() {
+        if cache_used_get(used, i) || *f != feature {
+            continue;
+        }
+        let d2 = (c.position - position).length_sq();
+        if generic && (d2 > match_tol2 || c.contact_normal.dot(normal) < WARM_MATCH_COS) {
+            // 면이 바뀌었으면 다른 접촉 (곡면 feature 점프 차단)
+            continue;
+        }
+        if best.is_none_or(|(_, bd)| d2 < bd) {
+            best = Some((i, d2));
+        }
+    }
+    let (i, _) = best?;
+    cache_used_set(used, i);
+    Some(i)
+}
+
 /// 풀 없이 부르는 편의판 — **테스트·단발 호출 전용**이다. 스텝 핫패스는 `prepare_into`로
 /// 버퍼를 재사용해야 한다(그게 이 분리의 이유다).
 #[cfg(test)]
@@ -557,7 +612,16 @@ pub fn prepare(
     cache: &[(maru_collide::FeatureId, CachedImpulse)],
     dt: f32,
 ) -> Result<ContactConstraint, crate::world::ApiError> {
-    prepare_into(bodies, a, b, m, cache, dt, Vec::new())
+    prepare_into(
+        bodies,
+        a,
+        b,
+        m,
+        cache,
+        dt,
+        Vec::new(),
+        &mut [0u64; CACHE_USED_WORDS],
+    )
 }
 
 /// 유효질량 경로 A/B 노브 (**측정 전용**, 기본 = SIMD).
@@ -592,6 +656,7 @@ pub fn prepare_into(
     cache: &[(maru_collide::FeatureId, CachedImpulse)],
     dt: f32,
     mut points: Vec<ContactPointConstraint>,
+    cache_used: &mut [u64; CACHE_USED_WORDS],
 ) -> Result<ContactConstraint, crate::world::ApiError> {
     // 기하 바닥은 형상 크기에 비례해야 한다(절대 상수 금지 — 톨러런스 정책과 동일 원칙).
     let geo_tol =
@@ -602,8 +667,6 @@ pub fn prepare_into(
     // **실제로 warm load된 접점 수**. 진단이 feature ID 일치만 세면 generic 접점의 위치·법선
     // 게이트가 얼마나 자주 매칭을 끊는지 보이지 않는다 — 지표가 거짓이면 회귀 테스트도 거짓이다.
     let mut warm_matched = 0u32;
-    // 이미 계승된 캐시 항목 표시 — 같은 ID의 접점 여럿이 한 항목을 나눠 갖지 않게 한다.
-    let mut used = 0u64;
     let (ia, ib) = (ba.inv_inertia_world(), bb.inv_inertia_world());
     let scalar_mass = scalar_effective_mass_path();
     points.clear();
@@ -661,37 +724,21 @@ pub fn prepare_into(
         // 매니폴드 안에서 ID가 유일하므로 후보가 하나뿐이라 동작이 그대로다(cliff 불변).
         // 동률은 캐시 인덱스가 작은 쪽 — 결정적이어야 한다.
         //
+        // 소비 표시는 **바디 페어의 contact walk 전체**에서 공유한다 — 메시·하이트필드·
+        // 복합은 한 페어에서 매니폴드를 여럿 방출하고 **같은 pair cache**를 매번 넘기므로,
+        // 호출마다 표시를 리셋하면 첫 삼각형이 쓴 항목을 다음 삼각형이 또 쓴다
+        // (검수 rev_141caff1 BLOCKER). 폭도 캐시 전체를 덮어야 한다: 매니폴드당 4점 ×
+        // 최대 64매니폴드 = 256항목까지 가능해 u64 하나로는 뒤쪽이 표시되지 않는다.
+        //
         // **이 소비 표시는 뮤테이션으로 관측되지 않는다**(지워도 전 시험 통과). 관측하려면
         // "한 페어의 캐시 항목 하나가 두 접점에 물려갔다"를 봐야 하는데, 진단(`warm_hits`·
         // `warm_total`)이 **전 페어 합계**라 페어별 불변식을 만들 수 없다. 합계로 세우면
         // 박스가 삼각형 두 개에 걸칠 때 정상 동작도 위반으로 잡힌다(실측: 직전 합계 4에
         // 이번 6 — 페어 둘의 캐시가 각각 살아 있는 정상 상황이었다). 그 시험은 지웠다.
-        let mut best: Option<(usize, f32)> = None;
-        for (i, (f, c)) in cache.iter().enumerate() {
-            // 소비 표시는 64칸까지만 든다. 그보다 긴 캐시는 예전처럼 중복될 수 있지만,
-            // 페어당 접점 상한이 4라 실제로 도달하지 않는다(도달하면 진단이 아니라 계약
-            // 위반이다 — debug_assert가 잡는다).
-            if i < 64 && used & (1u64 << i) != 0 {
-                continue;
-            }
-            if *f != p.feature {
-                continue;
-            }
-            let d2 = (c.position - p.position).length_sq();
-            if generic && (d2 > match_tol2 || c.contact_normal.dot(n) < WARM_MATCH_COS) {
-                // 면이 바뀌었으면 다른 접촉 (곡면 feature 점프 차단)
-                continue;
-            }
-            if best.is_none_or(|(_, bd)| d2 < bd) {
-                best = Some((i, d2));
-            }
-        }
-        let hit = best.map(|(i, _)| {
-            if i < 64 {
-                used |= 1u64 << i;
-            }
-            cache[i].1
-        });
+        let hit = match_cache_entry(
+            cache, cache_used, p.feature, p.position, n, generic, match_tol2,
+        )
+        .map(|i| cache[i].1);
         if hit.is_some() {
             warm_matched += 1;
         }

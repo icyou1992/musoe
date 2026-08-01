@@ -282,3 +282,72 @@ fn per_substep_gate_cannot_hide_a_full_step_rotation() {
         );
     }
 }
+
+/// **BLOCKER (검수 rev_141caff1·rev_0b791000)**: 캐시 항목은 접점 하나에만 물려줘야 한다.
+///
+/// 예전에는 접점마다 `cache.iter().find(...)`를 처음부터 다시 돌려서, 같은 ID를 단 접점
+/// 여럿(generic 다접점 — 메시·복합 폴백과 원기둥 뚜껑 apex가 만든다)이 **같은 이전 접점
+/// 하나를 동시에 계승**했다. 그러면 그 임펄스가 접점 수만큼 중복 적용돼 총 법선 임펄스와
+/// 토크가 부풀고, 반대로 첫 항목이 무하중점이면 전부 cold-start가 된다.
+///
+/// 씬으로는 못 잰다 — 진단(`warm_hits`·`warm_total`)이 **전 페어 합계**라 페어별
+/// 불변식을 세울 수 없다(합계로 세우면 박스가 삼각형 둘에 걸치는 정상 동작을 위반으로
+/// 잡는다). 그래서 매칭을 순수 함수로 떼어 함수 층에서 잰다.
+#[test]
+fn a_cache_entry_is_inherited_by_exactly_one_contact_point() {
+    use crate::solver::{match_cache_entry, CACHE_USED_WORDS};
+    let generic = maru_collide::FeatureId(maru_collide::FEATURE_GENERIC);
+    let entry = crate::solver::CachedImpulse {
+        position: Vec3::new(0.0, 0.0, 0.0),
+        contact_normal: Vec3::new(0.0, 1.0, 0.0),
+        ..Default::default()
+    };
+    let cache = [(generic, entry)];
+    let n = Vec3::new(0.0, 1.0, 0.0);
+    let tol2 = 1.0f32; // 두 접점 모두 게이트를 통과할 만큼 넉넉하게
+
+    // ① 같은 generic ID의 접점 둘 — 첫째만 물려받는다.
+    let mut used = [0u64; CACHE_USED_WORDS];
+    let a = match_cache_entry(&cache, &mut used, generic, Vec3::ZERO, n, true, tol2);
+    let b = match_cache_entry(
+        &cache,
+        &mut used,
+        generic,
+        Vec3::new(0.1, 0.0, 0.0),
+        n,
+        true,
+        tol2,
+    );
+    assert_eq!((a, b), (Some(0), None), "한 항목이 두 접점에 물려갔다");
+
+    // ② **소비 상태는 매니폴드 경계를 넘어 이어진다** — 메시는 한 페어에서 매니폴드를
+    //    여럿 내고 같은 캐시를 매번 넘긴다. 같은 `used`로 다시 부르면 못 받아야 한다.
+    let c = match_cache_entry(&cache, &mut used, generic, Vec3::ZERO, n, true, tol2);
+    assert_eq!(c, None, "다음 매니폴드가 이미 쓴 항목을 또 가져갔다");
+
+    // ③ 음성 대조: 새 상태에서는 다시 받는다(무조건 거절이 아니다).
+    let mut fresh = [0u64; CACHE_USED_WORDS];
+    assert_eq!(
+        match_cache_entry(&cache, &mut fresh, generic, Vec3::ZERO, n, true, tol2),
+        Some(0)
+    );
+
+    // ④ **가장 가까운 것**을 고른다 — 선착순이 아니다.
+    let far = crate::solver::CachedImpulse {
+        position: Vec3::new(0.5, 0.0, 0.0),
+        contact_normal: n,
+        ..Default::default()
+    };
+    let near = crate::solver::CachedImpulse {
+        position: Vec3::new(0.01, 0.0, 0.0),
+        contact_normal: n,
+        ..Default::default()
+    };
+    let two = [(generic, far), (generic, near)];
+    let mut u2 = [0u64; CACHE_USED_WORDS];
+    assert_eq!(
+        match_cache_entry(&two, &mut u2, generic, Vec3::ZERO, n, true, tol2),
+        Some(1),
+        "더 가까운 항목(1번)을 두고 선착순으로 0번을 골랐다"
+    );
+}

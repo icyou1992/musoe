@@ -5866,6 +5866,10 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
             }
             _ => None,
         };
+        // **캐시 소비 표시는 페어의 contact walk 전체에서 공유한다** — 메시·복합은 한
+        // 페어에서 매니폴드를 여럿 내고 같은 pair cache를 매번 넘기므로, 매니폴드마다
+        // 리셋하면 같은 이전 접점을 여러 현재 접점이 나눠 갖는다(검수 rev_141caff1).
+        let mut cache_used = [0u64; solver::CACHE_USED_WORDS];
         let saturated = for_each_contact(
             &cx.bodies[a_id].shape,
             &cx.bodies[a_id].pose,
@@ -5934,8 +5938,16 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
                 // 올바른 방법은 **한계비용**이다: 같은 호출을 한 번 더 돌리고 결과를 버린 뒤
                 // `narrow` 증가분을 읽는다(대조군 solve가 ±1% 안일 때만 유효).
                 let buf = out.point_pool.pop().unwrap_or_default();
-                let Ok(c) = solver::prepare_into(cx.bodies, a_id, b_id, &m, cached, cx.dt, buf)
-                else {
+                let Ok(c) = solver::prepare_into(
+                    cx.bodies,
+                    a_id,
+                    b_id,
+                    &m,
+                    cached,
+                    cx.dt,
+                    buf,
+                    &mut cache_used,
+                ) else {
                     out.bail = true;
                     return;
                 };
