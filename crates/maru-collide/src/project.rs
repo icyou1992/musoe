@@ -21,6 +21,13 @@ use maru_math::{Quat, Vec3};
 const TIE_X: Vec3 = Vec3::new(1.0, 0.0, 0.0);
 const TIE_Y: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 
+/// 한 번의 투영 질의(월드 질의는 물체 전체)가 들여다볼 수 있는 **후보 수** 상한.
+///
+/// 단위는 "후보 하나를 들여다본 횟수"다 — 메시 삼각형 하나, hull 지지 내적 하나가 각 1이다.
+/// 32점 hull 코어 **안쪽** 질의 하나가 최악 약 16만이므로, 한 물체는 넉넉히 통과하고
+/// 그런 물체가 여럿 겹친 질의는 막힌다(검수 rev_c30d32fd MAJOR).
+pub const MAX_PROJECT_WORK: usize = 1 << 18;
+
 #[inline]
 fn splat(v: f32) -> Vec3 {
     Vec3::new(v, v, v)
@@ -44,6 +51,23 @@ pub fn try_project_point(
     pose: &Pose,
     p: Vec3,
 ) -> Result<PointProjection, QueryReject> {
+    let mut work = MAX_PROJECT_WORK;
+    try_project_point_with_budget(shape, pose, p, &mut work)
+}
+
+/// **작업 예산을 공유하는** 투영 — 여러 물체를 훑는 호출자용.
+///
+/// `budget`은 "후보 하나를 들여다본 횟수"의 잔량이고 호출 사이에 **누적**된다. 소진되면
+/// 답을 지어내지 않고 `ResourceLimit`이다. 한 물체가 아무리 비싸도 상한이 있지만, 진짜
+/// 위험은 **여러 물체가 겹친 한 번의 질의**다: hull 코어 안쪽 질의는 물체마다 지지 함수를
+/// 전수로 돌리므로 겹친 hull 수만큼 곱해진다(검수 rev_c30d32fd MAJOR). 예산을 호출자가
+/// 들고 다니면 그 곱셈이 한 프레임을 삼키지 못한다.
+pub fn try_project_point_with_budget(
+    shape: &Shape,
+    pose: &Pose,
+    p: Vec3,
+    budget: &mut usize,
+) -> Result<PointProjection, QueryReject> {
     if !shape.is_castable() || !crate::vec_in_range(p) || !crate::vec_in_range(pose.pos) {
         return Err(QueryReject::InvalidInput);
     }
@@ -52,7 +76,7 @@ pub fn try_project_point(
         rot: pose.rot.try_normalize().ok_or(QueryReject::InvalidInput)?,
     };
     let local = pose.rot.conjugate().rotate(p - pose.pos);
-    let proj = project_local(shape, local)?;
+    let proj = project_local(shape, local, budget)?;
     Ok(PointProjection {
         point: pose.pos + pose.rot.rotate(proj.point),
         inside: proj.inside,
@@ -60,7 +84,11 @@ pub fn try_project_point(
 }
 
 /// 로컬 좌표 투영 — **검증된 입력 전용**(크레이트 내부·월드 경계 통과분).
-pub(crate) fn project_local(shape: &Shape, p: Vec3) -> Result<PointProjection, QueryReject> {
+pub(crate) fn project_local(
+    shape: &Shape,
+    p: Vec3,
+    budget: &mut usize,
+) -> Result<PointProjection, QueryReject> {
     let r = shape.radius();
     match *shape {
         Shape::Sphere { radius } => Ok(inflate(Vec3::ZERO, p, radius, TIE_X)),
@@ -74,23 +102,27 @@ pub(crate) fn project_local(shape: &Shape, p: Vec3) -> Result<PointProjection, Q
         Shape::Box { half, radius } => Ok(project_box(half, radius, p)),
         Shape::Triangle { points, radius } => {
             let q = closest_on_triangle(p, points);
-            // fallback은 **아핀 여공간**이다 — 면적이 0이면 삼각형 법선이 0이라 고정축으로
-            // 마감되는데, 그 축이 퇴화한 선분과 나란할 수 있다(검수 rev_ef5d1868 MAJOR:
-            // (-1,0,0)·(1,0,0)·(0,0,0)에 radius 0.1, 원점 질의가 (0.1,0,0)을 냈다 —
-            // 여전히 코어 선분 안이다). 세 점의 아핀 랭크는 2 이하라 항상 여공간이 있다.
-            let fallback = affine_complement_dir(&points).unwrap_or(TIE_X);
+            // fallback은 삼각형 **평면의 법선**이다. 외적이 정확히 0(세 점이 한 직선)일
+            // 때만 그 직선에 수직인 방향으로 간다 — 고정축으로 마감하면 퇴화한 선분과
+            // 나란할 수 있다(검수 rev_ef5d1868 MAJOR: (-1,0,0)·(1,0,0)·(0,0,0)에
+            // radius 0.1, 원점 질의가 (0.1,0,0)을 냈다 — 여전히 코어 선분 안이다).
+            // **임계로 랭크를 판정하지 않는다** — 얇은 삼각형도 평면은 잘 정의된다.
+            let fallback = (points[1] - points[0])
+                .cross(points[2] - points[0])
+                .try_normalize()
+                .unwrap_or_else(|| collinear_exit_dir(&points));
             let mut proj = inflate(q, p, radius, fallback);
             // 삼각형은 **부피가 없다** — radius가 0이면 어떤 점도 안이 아니다
             // (`contains_point`의 삼각형 분기와 같은 계약).
             proj.inside &= radius > 0.0;
             Ok(proj)
         }
-        Shape::Hull { .. } => Ok(project_convex_core(shape, p, r)),
-        Shape::Compound { ref children } => project_compound(children, p),
-        Shape::TriMesh(ref mesh) => project_trimesh(mesh, p, r),
+        Shape::Hull { .. } => project_convex_core(shape, p, r, budget),
+        Shape::Compound { ref children } => project_compound(children, p, budget),
+        Shape::TriMesh(ref mesh) => project_trimesh(mesh, p, r, budget),
         Shape::Heightfield { .. } => {
             let hf = shape.heightfield_ref().expect("Heightfield 변종");
-            project_heightfield(&hf, p, r)
+            project_heightfield(&hf, p, r, budget)
         }
     }
 }
@@ -161,7 +193,12 @@ fn project_box(half: Vec3, radius: f32, p: Vec3) -> PointProjection {
 /// (`ray::closest_core_dist`와 같은 기법 — 여기서는 witness 점까지 받는다).
 /// 코어 **안쪽** 점은 GJK가 교차를 주므로 EPA로 최소 이탈 방향을 구한다: 최소 관통
 /// 깊이의 반대 방향이 곧 최근접 겉면 방향이다.
-fn project_convex_core(shape: &Shape, p: Vec3, radius: f32) -> PointProjection {
+fn project_convex_core(
+    shape: &Shape,
+    p: Vec3,
+    radius: f32,
+    budget: &mut usize,
+) -> Result<PointProjection, QueryReject> {
     let point = Shape::Sphere { radius: 0.0 };
     let at = Pose {
         pos: p,
@@ -176,10 +213,10 @@ fn project_convex_core(shape: &Shape, p: Vec3, radius: f32) -> PointProjection {
             let inside = distance <= radius;
             if radius <= 0.0 {
                 // 두께가 없으면 코어가 곧 겉면이다 — 방향이 필요 없다.
-                return PointProjection {
+                return Ok(PointProjection {
                     point: on_b,
                     inside,
-                };
+                });
             }
             // **방향은 GJK 법선이 아니라 위치 차이로 만든다.**
             //
@@ -196,28 +233,28 @@ fn project_convex_core(shape: &Shape, p: Vec3, radius: f32) -> PointProjection {
             let l = v.length();
             let eps = crate::length_eps(crate::characteristic_length(shape, shape));
             if l > eps {
-                return PointProjection {
+                return Ok(PointProjection {
                     point: on_b + v * (radius / l),
                     inside,
-                };
+                });
             }
             // 코어 **위/안**이라 방향이 없다 — 지지 함수로 이탈 방향과 여유를 구한다.
-            let (n, gap) = core_exit(shape, p);
-            PointProjection {
+            let (n, gap) = core_exit(shape, p, budget)?;
+            Ok(PointProjection {
                 point: p + n * (gap + radius),
                 inside,
-            }
+            })
         }
         GjkResult::Intersecting(_) => {
             // 코어 안이다. **EPA를 쓰지 않는다** — EPA는 GJK가 부피 있는 사면체 시드를
             // 만들 수 있을 때만 돌고, 그 판정은 최대 에지 길이에 **상대적**이라 얇고 긴
             // 코어(예: 반크기 (1000, 0.002, 0.002))에서는 전체 차원인데도 시드를 못 만든다.
             // 지지 함수 경로는 그 문턱이 없다.
-            let (n, gap) = core_exit(shape, p);
-            PointProjection {
+            let (n, gap) = core_exit(shape, p, budget)?;
+            Ok(PointProjection {
                 point: p + n * (gap + radius),
                 inside: true,
-            }
+            })
         }
     }
 }
@@ -239,18 +276,22 @@ fn project_convex_core(shape: &Shape, p: Vec3, radius: f32) -> PointProjection {
 ///
 /// 비용은 점 수의 4제곱(`C(m,3)·m`)이지만 상한이 32개로 잠겨 있고, 이 경로는 질의점이
 /// 코어 **안**일 때만 돈다(밖이면 위치 차이가 방향을 준다).
-fn core_exit(shape: &Shape, q: Vec3) -> (Vec3, f32) {
+fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32), QueryReject> {
     let Shape::Hull { ref points, .. } = *shape else {
         // 다른 셰이프는 해석 경로가 따로 있어 여기 오지 않는다.
-        return (TIE_X, 0.0);
+        return Ok((TIE_X, 0.0));
     };
-    // 코어가 저차원이면 표면까지 여유가 0이고, 방향은 아핀 껍질의 직교 여공간이다
-    // (그쪽으로는 지지 평면이 무한히 많아 위 최소화가 방향을 못 고른다).
-    if let Some(d) = affine_complement_dir(points) {
-        return (d, 0.0);
-    }
+    // **지지 최소화를 먼저 돌린다.** 예전에는 아핀 랭크를 먼저 재서 "저차원이면 여유 0"으로
+    // 갈랐는데, 그 판정이 상대 임계라 **얇지만 3차원인** 코어를 평면으로 오판했다. 그러면
+    // 그 방향의 진짜 여유(반두께)를 0으로 버려 반환점이 코어 안에 남는다
+    // (검수 rev_c30d32fd BLOCKER: 반크기 (1000, 7.5e-4, 7.5e-4) + radius 1e-6).
+    //
+    // 순서를 뒤집으면 임계가 아예 없어진다: 평면 코어는 후보 법선이 그 평면의 법선뿐이고
+    // 모든 점이 평면 위라 여유가 **자연히 0**으로 나오며, 얇은 3차원 코어는 반두께가
+    // 그대로 나온다. 같은 식이 두 경우를 다 맞힌다.
     let mut best: Option<(f32, Vec3)> = None;
-    for i in 0..points.len() {
+    let mut exhausted = false;
+    'outer: for i in 0..points.len() {
         for j in (i + 1)..points.len() {
             for k in (j + 1)..points.len() {
                 let Some(n) = (points[j] - points[i])
@@ -259,13 +300,28 @@ fn core_exit(shape: &Shape, q: Vec3) -> (Vec3, f32) {
                 else {
                     continue; // 세 점이 한 직선 위 — 면을 이루지 못한다
                 };
-                for cand in [n, n * -1.0] {
-                    // `p − q`를 먼저 빼서 지지 거리를 한 번의 반올림으로 만든다.
-                    let mut h = f32::NEG_INFINITY;
-                    for pt in points {
-                        h = h.max(cand.dot(*pt - q));
+                // **한 번의 순회로 두 방향을 다 본다**: +n의 지지 거리는 max, −n의 지지
+                // 거리는 −min이다. 그리고 둘 다 현재 최선을 넘긴 순간 이 법선은 답이 될 수
+                // 없으므로 끊는다(정확성 불변 — 최소를 찾는 중이다).
+                let bound = best.map_or(f32::INFINITY, |(h, _)| h);
+                let (mut hi, mut lo) = (f32::NEG_INFINITY, f32::INFINITY);
+                for pt in points {
+                    if *budget == 0 {
+                        // **중간에 끊긴 최소값은 답이 아니다.** 아직 못 본 면이 더 가까울 수
+                        // 있고, 그러면 반환점이 코어 안에 남는다 — 조용한 오답이다.
+                        exhausted = true;
+                        break 'outer;
                     }
-                    // 동률은 먼저 본 후보가 이긴다 — 순회가 결정적이므로 답도 결정적이다.
+                    *budget -= 1;
+                    let d = n.dot(*pt - q);
+                    hi = hi.max(d);
+                    lo = lo.min(d);
+                    if hi >= bound && -lo >= bound {
+                        break;
+                    }
+                }
+                // 동률은 먼저 본 후보가 이긴다 — 순회가 결정적이므로 답도 결정적이다.
+                for (h, cand) in [(hi, n), (-lo, n * -1.0)] {
                     if h.is_finite() && best.is_none_or(|(bh, _)| h < bh) {
                         best = Some((h, cand));
                     }
@@ -273,55 +329,32 @@ fn core_exit(shape: &Shape, q: Vec3) -> (Vec3, f32) {
             }
         }
     }
-    match best {
+    if exhausted {
+        return Err(QueryReject::ResourceLimit);
+    }
+    Ok(match best {
         // 여유는 음수가 될 수 없다(볼록체 안의 점) — 반올림이 만든 음수는 0으로 본다.
         Some((h, n)) => (n, h.max(0.0)),
-        // 도달 불가(전체 차원인데 면이 하나도 안 나올 수 없다) — 계약을 지켜 결정적 축.
-        None => (TIE_X, 0.0),
-    }
+        // 면 후보가 하나도 없다 = 모든 점이 한 직선 위(또는 3점 미만). 그 직선에는 지지
+        // 평면이 무한히 많아 위 최소화가 방향을 못 고르므로 수직 방향을 준다.
+        None => (collinear_exit_dir(points), 0.0),
+    })
 }
 
-/// 코어 **위**에 있는 점에서 겉면으로 나가는 결정적 방향.
+/// 모든 점이 **한 직선**(또는 한 자리)에 있을 때의 이탈 방향 — 그 직선에 수직인 벡터.
 ///
-/// 코어의 아핀 껍질이 3차원보다 낮으면(평면·선·점) 여공간이 있고, 그 방향이 답이다.
-/// 3차원이면 여공간이 없다 — 그건 점이 코어 **경계 위**에 정확히 놓인 경우이므로
-/// (안쪽이었다면 GJK가 교차를 줬다) 중심 쪽으로 아주 조금 당겨 교차 상태를 만들고
-/// EPA에 최소 이탈 방향을 묻는다.
-/// 점 집합의 아핀 껍질이 3차원보다 낮으면 그 **직교 여공간**의 단위 벡터, 아니면 `None`.
-///
-/// 임계는 점 집합의 지름에 상대적이다 — 절대 상수는 장면 스케일에서 깨진다(설계 §8).
-fn affine_complement_dir(points: &[Vec3]) -> Option<Vec3> {
-    let &p0 = points.first()?;
-    let mut span = 0.0f32;
+/// 임계로 랭크를 재지 않는다. 호출자는 "면 후보가 하나도 없었다"는 사실로 이미 공선을
+/// 알고 있고, 여기서 임계를 또 쓰면 얇은 형상을 오판하는 자리가 다시 생긴다.
+fn collinear_exit_dir(points: &[Vec3]) -> Vec3 {
+    let Some(&p0) = points.first() else {
+        return TIE_X;
+    };
     for q in points {
-        span = span.max((*q - p0).length());
-    }
-    if span <= 0.0 || span.is_nan() {
-        return Some(TIE_X); // 모든 점이 한 자리(또는 비유한) — 코어는 점으로 본다
-    }
-    let eps = crate::length_eps(span);
-    let mut basis = [Vec3::ZERO; 2];
-    let mut rank = 0usize;
-    for q in points {
-        let mut v = *q - p0;
-        for e in basis.iter().take(rank) {
-            v = v - *e * e.dot(v);
+        if let Some(d) = (*q - p0).try_normalize() {
+            return perpendicular_to(d);
         }
-        let Some(u) = v.try_normalize() else { continue };
-        if v.length() <= eps {
-            continue;
-        }
-        if rank == 2 {
-            return None; // 세 번째 독립 방향 — 전체 차원이다
-        }
-        basis[rank] = u;
-        rank += 1;
     }
-    Some(match rank {
-        0 => TIE_X,
-        1 => perpendicular_to(basis[0]),
-        _ => basis[0].cross(basis[1]).try_normalize().unwrap_or(TIE_X),
-    })
+    TIE_X // 모든 점이 한 자리 — 코어는 점이라 어느 방향이든 겉면에 닿는다
 }
 
 /// `d`에 수직인 결정적 단위 벡터 — 가장 덜 정렬된 축과 외적한다(퇴화 없음).
@@ -342,7 +375,11 @@ fn perpendicular_to(d: Vec3) -> Vec3 {
 /// 겹치는 자식을 준 경우 반환점이 다른 자식 안쪽일 수 있다 — 그건 "합집합의 경계"가
 /// 아니라 "경계들의 합집합"이며, rapier도 같은 정의다. 계약으로 명시하고 숨기지 않는다.
 /// (진짜 합집합 경계는 자식 쌍마다 곡면 교선을 풀어야 한다.)
-fn project_compound(children: &[(Pose, Shape)], p: Vec3) -> Result<PointProjection, QueryReject> {
+fn project_compound(
+    children: &[(Pose, Shape)],
+    p: Vec3,
+    budget: &mut usize,
+) -> Result<PointProjection, QueryReject> {
     // 빈 복합은 답이 없다 — "무한히 먼 점"으로 위장하면 호스트가 NaN을 먹는다.
     // (`validate`가 1..=8을 강제하지만 이 함수는 그걸 가정하지 않는다.)
     let mut best: Option<(f32, Vec3)> = None;
@@ -354,7 +391,7 @@ fn project_compound(children: &[(Pose, Shape)], p: Vec3) -> Result<PointProjecti
         // (검수 rev_6429a223 MAJOR).
         let rot = cp.rot.try_normalize().ok_or(QueryReject::InvalidInput)?;
         let local = rot.conjugate().rotate(p - cp.pos);
-        let sub = project_local(cs, local)?;
+        let sub = project_local(cs, local, budget)?;
         let world = cp.pos + rot.rotate(sub.point);
         inside |= sub.inside;
         let d2 = (world - p).length_sq();
@@ -426,11 +463,12 @@ fn project_trimesh(
     mesh: &crate::trimesh::TriMeshData,
     p: Vec3,
     radius: f32,
+    budget: &mut usize,
 ) -> Result<PointProjection, QueryReject> {
     let bounds = mesh.local_aabb();
     let (mut r, full) = search_radii(p, bounds);
     let mut acc;
-    let mut budget = PROJECT_TRI_BUDGET;
+    let mut tri_budget = PROJECT_TRI_BUDGET;
     loop {
         acc = NearestTri::new();
         let q = Aabb::new(p - splat(r), p + splat(r));
@@ -438,11 +476,12 @@ fn project_trimesh(
         // 순회 스택 포화도 예산 소진도 **후보 누락**이다 — 그대로 답을 내면 "더 먼 겉면"을
         // 최근접이라 우기게 된다. 오답 대신 자원 오류로 드러낸다.
         let complete = mesh.for_each_candidate(q, |i| {
-            if budget == 0 {
+            if tri_budget == 0 || *budget == 0 {
                 over = true;
                 return false;
             }
-            budget -= 1;
+            tri_budget -= 1;
+            *budget -= 1;
             acc.feed(p, mesh.triangle(i));
             true
         });
@@ -468,22 +507,24 @@ fn project_heightfield(
     hf: &crate::heightfield::HeightfieldRef<'_>,
     p: Vec3,
     radius: f32,
+    budget: &mut usize,
 ) -> Result<PointProjection, QueryReject> {
     let bounds = hf.local_aabb();
     let (mut r, full) = search_radii(p, bounds);
     let mut acc;
-    let mut budget = PROJECT_TRI_BUDGET;
+    let mut cell_budget = PROJECT_TRI_BUDGET;
     loop {
         acc = NearestTri::new();
         let q = Aabb::new(p - splat(r), p + splat(r));
         let mut over = false;
         if let Some(range) = hf.cell_range(q) {
             crate::heightfield::for_each_overlapping_cell(hf, range, p.y - r, p.y + r, |cx, cz| {
-                if budget == 0 {
+                if cell_budget == 0 || *budget < 2 {
                     over = true;
                     return false;
                 }
-                budget -= 1;
+                cell_budget -= 1;
+                *budget -= 2;
                 acc.feed(p, hf.triangle(cx, cz, 0));
                 acc.feed(p, hf.triangle(cx, cz, 1));
                 true
@@ -1116,6 +1157,90 @@ mod tests {
         assert!(
             (d - 0.102).abs() < 1.0e-4,
             "겉면까지 거리가 반두께+radius가 아니다: {d}"
+        );
+    }
+
+    /// **얇지만 3차원인 코어**: 아핀 랭크를 임계로 먼저 재면 이걸 평면으로 오판하고
+    /// 그 방향의 진짜 여유(반두께)를 0으로 버린다(검수 rev_c30d32fd BLOCKER).
+    /// 지지 최소화를 먼저 돌리면 같은 식이 평면 코어와 얇은 3차원 코어를 다 맞힌다.
+    #[test]
+    fn thin_but_three_dimensional_core_keeps_its_half_thickness() {
+        let h = v(1000.0, 7.5e-4, 7.5e-4);
+        let mut pts = Vec::new();
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    pts.push(v(h.x * sx, h.y * sy, h.z * sz));
+                }
+            }
+        }
+        let radius = 1.0e-6;
+        let s = Shape::Hull {
+            points: pts,
+            radius,
+        };
+        assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
+        let pr = try_project_point(&s, &ident(), Vec3::ZERO).unwrap();
+        assert!(pr.inside);
+        // 겉면까지 거리 = 반두께 + radius. 여유를 버리면 radius(1e-6)만 움직인다.
+        let d = pr.point.length();
+        assert!(
+            (d - (7.5e-4 + radius)).abs() < 1.0e-6,
+            "반두께를 버렸다(코어 안에 남는다): 거리 {d}, 점 {:?}",
+            pr.point
+        );
+        assert!(
+            pr.point.x.abs() < 1.0e-6,
+            "긴 축으로 나갔다: {:?}",
+            pr.point
+        );
+    }
+
+    /// 예산은 **호출 사이에 누적**된다 — 겹친 hull이 많은 한 번의 질의가 프레임을 삼키지
+    /// 못하게 하는 것이 목적이다(검수 rev_c30d32fd MAJOR).
+    #[test]
+    fn shared_budget_stops_repeated_interior_hull_queries() {
+        // 32점 hull(구 표면 샘플) — 코어 안쪽 질의가 지지 함수를 전수로 돈다.
+        let mut pts = Vec::new();
+        let mut rng = Lcg(4321);
+        while pts.len() < 32 {
+            let d = rng.point(2.0);
+            if let Some(u) = d.try_normalize() {
+                pts.push(u);
+            }
+        }
+        let s = Shape::Hull {
+            points: pts,
+            radius: 0.05,
+        };
+        // 예산 없이 한 번은 통과한다.
+        assert!(try_project_point(&s, &ident(), Vec3::ZERO).is_ok());
+        // 공유 예산으로 반복하면 언젠가 막힌다 — 그리고 "먼 점"이 아니라 오류다.
+        // 소모량을 재서 예산 상한이 "한 물체는 통과, 여럿 겹치면 차단"인지 확인한다.
+        let mut probe = usize::MAX;
+        try_project_point_with_budget(&s, &ident(), Vec3::ZERO, &mut probe).unwrap();
+        let per_query = usize::MAX - probe;
+        assert!(
+            per_query < super::MAX_PROJECT_WORK,
+            "한 물체가 예산을 다 먹는다: {per_query}"
+        );
+        let mut budget = super::MAX_PROJECT_WORK;
+        let mut ok = 0usize;
+        let mut limited = false;
+        for _ in 0..4096 {
+            match try_project_point_with_budget(&s, &ident(), Vec3::ZERO, &mut budget) {
+                Ok(_) => ok += 1,
+                Err(QueryReject::ResourceLimit) => {
+                    limited = true;
+                    break;
+                }
+                Err(e) => panic!("예상 밖 오류 {e:?}"),
+            }
+        }
+        assert!(ok > 0, "첫 질의부터 막히면 예산이 너무 빡빡하다");
+        assert!(
+            limited,
+            "예산이 누적되지 않아 무한히 통과했다 (통과 {ok}회)"
         );
     }
 

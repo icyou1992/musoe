@@ -1587,6 +1587,9 @@ impl World {
             return Err(ApiError::InvalidValue);
         }
         let mut best: Option<(f32, PointHit)> = None;
+        // 작업 예산은 **질의 하나 전체**가 공유한다. 물체마다 상한을 두면 겹친 hull이
+        // 많은 질의가 그 상한을 물체 수만큼 곱해 한 프레임을 삼킨다(검수 rev_c30d32fd).
+        let mut budget = maru_collide::MAX_PROJECT_WORK;
         for i in 0..self.bodies.len() {
             if !self.passes(i, filter) {
                 continue;
@@ -1611,10 +1614,11 @@ impl World {
             }
             // 순회 포화는 "먼 점"으로 위장하지 않는다 — 못 본 후보가 더 가까울 수 있다.
             let proj =
-                maru_collide::try_project_point(&b.shape, &b.pose, p).map_err(|e| match e {
-                    maru_collide::QueryReject::ResourceLimit => ApiError::ResourceLimit,
-                    maru_collide::QueryReject::InvalidInput => ApiError::InvalidValue,
-                })?;
+                maru_collide::try_project_point_with_budget(&b.shape, &b.pose, p, &mut budget)
+                    .map_err(|e| match e {
+                        maru_collide::QueryReject::ResourceLimit => ApiError::ResourceLimit,
+                        maru_collide::QueryReject::InvalidInput => ApiError::InvalidValue,
+                    })?;
             let d2 = (proj.point - p).length_sq();
             if best.is_none_or(|(bd2, _)| d2 < bd2) {
                 best = Some((
