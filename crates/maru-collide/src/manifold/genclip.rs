@@ -628,6 +628,24 @@ pub(super) fn convex_face_manifold(
         let (n, f, _) = support_face(sa, pa, &ma, neg_rn, &mut va, &mut ia)?;
         (n, f)
     };
+    // **apex가 낀 면 쌍은 정확 ID 계약이 성립하지 않는다** (검수 rev_cd288093 BLOCKER).
+    // apex는 물체에 붙은 계보가 아니라 접촉 방향에 따라 원 둘레를 미끄러지는 합성점이다.
+    // 뚜껑이 평면과 거의 나란하면 입력 법선이 조금만 흔들려도 접선 방위가 크게 돌아,
+    // 같은 ID를 단 점이 멀리 이동한다 — 실측: 입력 법선 변화 7.8e-7 rad에 반지름 10 m
+    // apex가 **3.90 m** 움직였다. 솔버는 non-generic ID를 위치 게이트 없이 매칭하므로
+    // 이전 임펄스를 3.9 m 떨어진 레버암에 그대로 얹는다.
+    //
+    // 참조면 쪽은 더 직접적이다: 클리퍼는 참조 정점·측면을 **배열 순번**으로 부르므로
+    // (id 배열은 입사면에만 넘긴다), apex 삽입 슬롯이 1→2로 바뀌면 같은
+    // `ReferenceVertex(a=2)`가 다른 점을 가리키고 `EdgeCross.b`도 인접 변으로 재매핑된다.
+    //
+    // 그래서 apex가 활성인 면 쌍의 접점은 전부 **generic**으로 내려 위치 근접 매칭에 맡긴다.
+    // 곡면·witness 접점이 이미 쓰는 계약이라 새로운 종류의 저하가 아니다.
+    let dynamic_cap_lineage = if ref_is_a {
+        ia[..na].contains(&CAP_APEX_ID) || ib[..inc_n].contains(&CAP_APEX_ID)
+    } else {
+        ib[..nb].contains(&CAP_APEX_ID) || ia[..inc_n].contains(&CAP_APEX_ID)
+    };
     let (rverts, iverts, iids) = if ref_is_a {
         (&va[..na], &vb[..inc_n], &ib[..inc_n])
     } else {
@@ -673,15 +691,19 @@ pub(super) fn convex_face_manifold(
         }
         // 계보를 특정 못 했으면(퇴화) 지어내지 않고 generic으로 떨어뜨린다 —
         // 솔버가 ID 대신 위치 근접으로 warm start를 매칭한다.
-        let feature = super::feature::pack(super::feature::FaceFeature {
-            ref_is_a,
-            ref_face,
-            inc_face,
-            kind: v.kind,
-            a: v.a as u32,
-            b: v.b as u32,
-        })
-        .unwrap_or(super::FeatureId(super::FEATURE_GENERIC));
+        let feature = if dynamic_cap_lineage {
+            super::FeatureId(super::FEATURE_GENERIC)
+        } else {
+            super::feature::pack(super::feature::FaceFeature {
+                ref_is_a,
+                ref_face,
+                inc_face,
+                kind: v.kind,
+                a: v.a as u32,
+                b: v.b as u32,
+            })
+            .unwrap_or(super::FeatureId(super::FEATURE_GENERIC))
+        };
         pts[pts_len] = super::ContactPoint {
             position,
             separation: sep,
@@ -725,11 +747,23 @@ pub(super) fn convex_face_manifold(
 /// 최종 4점 선택은 여전히 전수 면적 최대다 — 탐욕은 면적 최대를 보장하지 못해 박스 경로에서
 /// 이미 한 번 리뷰로 기각된 규칙이다.
 /// 접평면 넓이 ×2 — 축약 결과를 비교하는 자(회전 저항의 대리 지표).
+///
+/// **순환 순서를 가정하면 안 된다** (검수 rev_cd288093 MAJOR): `reduce_to_4`는 반환 직전에
+/// `sort_by_key(feature)`로 재정렬하고, 일반 클립 feature는 종류(정점/교점/참조정점)와
+/// 양쪽 인덱스가 섞여 기하 순환 순서와 무관하다. 부채꼴 합으로 재면 자기교차 사각형이
+/// 되어 면적이 상쇄된다 — 실측: 넓이 8인 정사각형을 feature 순 `[0,2,1,3]`으로 주면
+/// **0.000**이 나왔다. 그러면 실제로 더 넓은 후보가 0으로 보여 채택이 뒤집힌다.
+///
+/// 볼록한 네 점의 넓이 ×2는 **대각선 두 개의 외적** 크기다. 어느 쌍이 대각선인지 모르므로
+/// 세 가지 짝짓기를 다 재서 최대를 쓴다 — 순서에 독립이다.
 fn twice_area(q: &[super::ContactPoint; 4], n: Vec3) -> f32 {
-    let o = q[0].position;
-    ((q[1].position - o).cross(q[2].position - o).dot(n)
-        + (q[2].position - o).cross(q[3].position - o).dot(n))
-    .abs()
+    let pair = |a: usize, b: usize, c: usize, d: usize| {
+        (q[b].position - q[a].position)
+            .cross(q[d].position - q[c].position)
+            .dot(n)
+            .abs()
+    };
+    pair(0, 1, 2, 3).max(pair(0, 2, 1, 3)).max(pair(0, 3, 1, 2))
 }
 
 /// 최원점 표본으로 후보 8개를 고른 뒤 전수 면적 최대 4점을 낸다.
@@ -2003,9 +2037,15 @@ mod tests {
             };
             let m = crate::manifold::dispatch::contact(&cyl, &pa, &floor, &pf, 0.05)
                 .unwrap_or_else(|| panic!("spin={spin}에서 접촉이 있어야 한다"));
-            let f = unpack(m.points()[0].feature)
-                .unwrap_or_else(|| panic!("spin={spin}에서 뚜껑 다접점을 잃고 witness로 떨어졌다"));
-            assert_eq!(f.inc_face, 1, "−Y 뚜껑이어야 한다: {f:?}");
+            // apex가 활성이면 계보는 **generic**이다(방향 의존 합성점이라 정확 ID 계약이
+            // 성립하지 않는다 — 검수 rev_cd288093). 여기서 잠그는 것은 계보가 아니라
+            // **최심 접점이 실제 침투를 보고하는가**다.
+            assert_eq!(
+                unpack(m.points()[0].feature),
+                None,
+                "apex가 낀 접점에 정확 계보가 붙었다: {:?}",
+                m.points()[0].feature
+            );
             let deepest = m
                 .points()
                 .iter()
@@ -2275,6 +2315,167 @@ mod tests {
             got >= a3.max(at) - 1e-9,
             "채택한 쪽이 두 척도 중 나쁜 쪽이다: 채택={got:.5} 3D={a3:.5} 접평면={at:.5}"
         );
+    }
+
+    /// **BLOCKER (검수 rev_cd288093)**: apex는 물체에 붙은 계보가 아니라 접촉 방향에 따라
+    /// 원 둘레를 미끄러지는 합성점이다. 뚜껑이 평면과 거의 나란하면 입력 법선이 조금만
+    /// 흔들려도 접선 방위가 크게 돌아, **같은 ID를 단 점이 멀리 이동**한다.
+    /// 실측: 입력 법선 변화 7.80e-7 rad에 반지름 10 m apex가 **3.90 m** 움직였다.
+    /// 그래서 apex가 활성인 면 쌍의 접점은 전부 generic으로 내려 위치 근접 매칭에 맡긴다.
+    #[test]
+    fn an_apex_bearing_manifold_falls_back_to_position_matching() {
+        use crate::manifold::feature::unpack;
+        use crate::{Pose, Shape};
+        use maru_math::{Mat3, Quat};
+        let cyl = Shape::Cylinder {
+            half_height: 0.6,
+            radius: 10.0,
+        };
+        let pose = Pose {
+            pos: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+        };
+        let m = Mat3::from_quat(Quat::IDENTITY);
+        // 방위 11.25° / 33.75° — 접평면 성분은 그대로 2e-6이고 방위만 돈다.
+        let dirs = [
+            (0.980_785_3f32, 0.195_090_32f32),
+            (0.831_469_6, 0.555_570_2),
+        ];
+        let mut prev: Option<(Vec3, Vec3)> = None;
+        for (c, sn) in dirs {
+            let dir = Vec3::new(2e-6 * c, -1.0, 2e-6 * sn)
+                .try_normalize()
+                .unwrap();
+            let mut out = [Vec3::ZERO; MAX_FACE_VERTS];
+            let mut ids = [0u8; MAX_FACE_VERTS];
+            let (n, _, _) =
+                super::support_face(&cyl, &pose, &m, dir, &mut out, &mut ids).expect("뚜껑 지지면");
+            let apex = out[..n]
+                .iter()
+                .zip(&ids[..n])
+                .find(|(_, i)| **i == CAP_APEX_ID)
+                .map(|(p, _)| *p)
+                .expect("apex가 있어야 한다");
+            if let Some((pa, pd)) = prev {
+                // 전제 확인: 입력은 거의 안 변했는데 apex는 멀리 움직인다.
+                assert!(
+                    (dir - pd).length() < 1e-5,
+                    "픽스처 전제: 입력 법선이 거의 같아야 한다"
+                );
+                assert!(
+                    (apex - pa).length() > 1.0,
+                    "픽스처 전제: apex가 크게 움직여야 한다: {}",
+                    (apex - pa).length()
+                );
+            }
+            prev = Some((apex, dir));
+        }
+
+        // 그래서 apex가 낀 매니폴드는 정확 계보를 달지 않는다.
+        let floor = Shape::Box {
+            half: Vec3::new(50.0, 0.5, 50.0),
+            radius: 0.0,
+        };
+        let pf = Pose {
+            pos: Vec3::new(0.0, -0.5, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        // 0.28 rad 기울이면 최저 테두리점이 중심에서 hh·cos + r·sin = 3.3408 아래다.
+        // |축·법선| = cos(0.28) = 0.961 ≥ 0.95라 뚜껑 경로를 탄다.
+        let tilted = Pose {
+            pos: Vec3::new(0.0, 3.3398, 0.0),
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.28),
+        };
+        let man = crate::manifold::dispatch::contact(&cyl, &tilted, &floor, &pf, 0.05)
+            .expect("닿아야 한다");
+        for p in man.points() {
+            assert_eq!(
+                unpack(p.feature),
+                None,
+                "apex가 낀 접점에 정확 계보가 붙었다: {:#010x}",
+                p.feature.0
+            );
+        }
+        // **뚜껑이 참조면일 때도 막아야 한다.** 클리퍼는 참조 정점·측면을 배열 순번으로
+        // 부르므로(계보 배열은 입사면에만 넘긴다), apex 삽입 슬롯이 바뀌면 같은
+        // `ReferenceVertex(a=k)`가 다른 점을 가리킨다. 뚜껑이 더 정렬되도록 상대 면을
+        // 기울여 두고, 법선을 직접 줘서 그 배치를 만든다.
+        let slab: Vec<Vec3> = (0..8)
+            .map(|i| {
+                Vec3::new(
+                    if i & 1 == 0 { -5.0 } else { 5.0 },
+                    if i & 2 == 0 { -0.5 } else { 0.5 },
+                    if i & 4 == 0 { -5.0 } else { 5.0 },
+                )
+            })
+            .collect();
+        let hull = Shape::Hull {
+            data: crate::HullData::new(slab),
+            radius: 0.0,
+        };
+        let ph = Pose {
+            pos: Vec3::new(0.0, -0.5, 0.0),
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.28),
+        };
+        let pc = Pose {
+            pos: Vec3::new(0.0, 0.55, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        // 뚜껑 dot = 0.99 (기울인 법선), hull 면 dot = cos(0.28) = 0.961 → 뚜껑이 참조면.
+        let nrm = Vec3::new(-0.14, 1.0, 0.0).try_normalize().unwrap();
+        let man = super::convex_face_manifold(&cyl, &pc, &hull, &ph, nrm, 0.2)
+            .expect("이 배치는 면 매니폴드를 낸다");
+        let f0 = unpack(man.points()[0].feature);
+        assert!(
+            man.points().iter().all(|p| unpack(p.feature).is_none()),
+            "뚜껑이 참조면인데 apex 강등이 안 걸렸다: {f0:?}"
+        );
+
+        // 음성 대조: 정확히 세우면 apex가 없고 계보가 붙는다.
+        let upright = Pose {
+            pos: Vec3::new(0.0, 0.599, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        let man = crate::manifold::dispatch::contact(&cyl, &upright, &floor, &pf, 0.05)
+            .expect("닿아야 한다");
+        assert!(
+            man.points().iter().all(|p| unpack(p.feature).is_some()),
+            "apex가 없는데 계보를 잃었다: {:?}",
+            man.points()
+        );
+    }
+
+    /// **MAJOR (검수 rev_cd288093)**: 축약 결과를 비교하는 면적은 **순서에 독립**이어야
+    /// 한다. `reduce_to_4`가 반환 직전에 feature 순으로 재정렬하므로 부채꼴 합으로 재면
+    /// 자기교차 사각형이 되어 상쇄된다. 실측: 넓이 8인 정사각형을 feature 순 `[0,2,1,3]`로
+    /// 주면 **0.000**이 나왔다.
+    #[test]
+    fn area_measure_is_independent_of_point_order() {
+        use super::super::{ContactPoint, FeatureId};
+        let n = Vec3::new(0.0, 0.0, 1.0);
+        let sq = [
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ];
+        let mk = |order: [usize; 4]| -> [ContactPoint; 4] {
+            core::array::from_fn(|i| ContactPoint {
+                position: sq[order[i]],
+                separation: -0.01,
+                feature: FeatureId(order[i] as u32),
+            })
+        };
+        let cyclic = super::twice_area(&mk([0, 1, 2, 3]), n);
+        assert!((cyclic - 8.0).abs() < 1e-4, "정사각형 넓이×2 = 8: {cyclic}");
+        // 순환 순서가 아닌 어떤 배열로 줘도 같은 값이어야 한다.
+        for order in [[0, 2, 1, 3], [3, 1, 0, 2], [1, 3, 2, 0], [2, 0, 3, 1]] {
+            let got = super::twice_area(&mk(order), n);
+            assert!(
+                (got - 8.0).abs() < 1e-4,
+                "순서 {order:?}에서 면적이 달라졌다: {got}"
+            );
+        }
     }
 
     /// 분리된 면끼리는 폴리곤이 비고 `false` — 호출자가 witness로 폴백한다.
