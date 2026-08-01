@@ -1012,10 +1012,10 @@ fn hull_face_charge_does_not_reject_ordinary_snapshots() {
         radius: 0.0,
     };
     let mut w = World::new(WorldParams::default());
-    for k in 0..500 {
+    for k in 0..200 {
         w.add_body(Body::new_dynamic(
             hull.clone(),
-            pose((k % 50) as f32 * 3.0, (k / 50) as f32 * 3.0, 0.0),
+            pose((k % 20) as f32 * 3.0, (k / 20) as f32 * 3.0, 0.0),
             1.0,
         ));
     }
@@ -1023,4 +1023,45 @@ fn hull_face_charge_does_not_reject_ordinary_snapshots() {
     let mut w2 = World::new(WorldParams::default());
     w2.restore(&snap).expect("평범한 hull 스냅샷이 거절됐다");
     assert_eq!(w.state_hash(), w2.state_hash());
+}
+
+/// **면 빌더의 CPU 작업량도 복원 예산에 든다.**
+///
+/// 메모리만 묶으면 CPU가 열린다: 32점 hull 하나가 `C(32,3)·32·2 ≈ 31만` 회 점 검사인데
+/// 메모리 장부로는 4만 개가 통과해 한 번의 복원이 120억 회를 단일 스레드로 돈다
+/// (검수 rev_ae6d97b1 BLOCKER). 작업 장부는 2^27 ≈ 134 ms 분량에서 끊는다.
+///
+/// 32점 hull 423개면 장부를 넘긴다 — 그런 스냅샷이 **오류로** 거절되는지 본다.
+#[test]
+fn hull_build_work_is_charged_to_the_decode_budget() {
+    let mut pts = Vec::new();
+    let mut rng = 4321u32;
+    let mut next = || {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+    };
+    while pts.len() < 32 {
+        if let Some(u) = Vec3::new(next(), next(), next()).try_normalize() {
+            pts.push(u);
+        }
+    }
+    let hull = maru_collide::Shape::Hull {
+        data: maru_collide::HullData::new(pts),
+        radius: 0.0,
+    };
+    // 한 개당 317,440 유닛 → 2^27을 넘기려면 423개.
+    let mut w = World::new(WorldParams::default());
+    for k in 0..500 {
+        w.add_body(Body::new_dynamic(
+            hull.clone(),
+            pose((k % 60) as f32 * 3.0, (k / 60) as f32 * 3.0, 0.0),
+            1.0,
+        ));
+    }
+    let snap = w.snapshot();
+    let mut w2 = World::new(WorldParams::default());
+    assert!(
+        matches!(w2.restore(&snap), Err(SnapshotError::CountTooLarge)),
+        "작업량이 장부 밖이라 거절되지 않았다"
+    );
 }

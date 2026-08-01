@@ -124,13 +124,24 @@ pub(crate) fn read_shape(r: &mut Reader, allow_compound: bool) -> Result<Shape, 
             for _ in 0..n {
                 points.push(r.vec3()?);
             }
-            // **면 구조의 힙을 만들기 전에 과금한다.** `HullData::new`가 최대 `2n−4`개
-            // 면을 infallible하게 잡는데, 그 힙이 장부 밖이면 장부상 한도 안인 스냅샷이
-            // 실제로는 allocator abort로 끝난다(검수 rev_8eacf4a5 BLOCKER).
-            // 면 하나 = 법선12 + 오프셋4 + Vec 헤더24 + 정점 최대 n바이트.
+            // **면 구조를 만들기 전에 힙과 작업량을 둘 다 과금한다.**
+            //
+            // 힙: `HullData::new`가 최대 `2n−4`개 면을 infallible하게 잡는데, 그게 장부 밖이면
+            // 장부상 한도 안인 스냅샷이 실제로는 allocator abort로 끝난다
+            // (검수 rev_8eacf4a5 BLOCKER). 면 하나 = `HullFace` + 정점 최대 n바이트.
+            // **크기를 손으로 적지 않는다** — `Vec` 헤더는 wasm32에서 절반이라 상수가 갈린다.
+            //
+            // 작업량: 빌더가 `C(n,3)·n·2`라 32점 hull 하나가 약 31만 회 점 검사다. 메모리만
+            // 묶으면 4만 개가 통과해 한 번의 복원이 120억 회를 돈다(검수 rev_ae6d97b1 BLOCKER).
             let radius = r.f32()?;
             let faces = (2 * n).saturating_sub(4);
-            r.charge_decoded(faces.saturating_mul(40 + n))?;
+            let face_bytes = core::mem::size_of::<maru_collide::HullFace>() + n;
+            r.charge_decoded(faces.saturating_mul(face_bytes))?;
+            let triples = n
+                .saturating_mul(n.saturating_sub(1))
+                .saturating_mul(n.saturating_sub(2))
+                / 6;
+            r.charge_work(triples.saturating_mul(n).saturating_mul(2))?;
             Shape::Hull {
                 // 면 구조를 여기서 다시 만든다 — 빌더가 결정적이라 같은 점이면 같은 면이다.
                 data: maru_collide::HullData::new(points),

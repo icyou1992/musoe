@@ -39,6 +39,25 @@ pub(crate) const MAX_SNAPSHOT_BYTES: usize = 64 << 20;
 /// **디코딩 후** 힙 예산. count × 원소 크기를 누적 과금한다.
 pub(crate) const MAX_DECODED_BYTES: usize = 192 << 20;
 
+/// 복원이 **파생물을 만드는 데 쓸 수 있는 작업량** 상한 (단위: 점 검사 1회).
+///
+/// 메모리만 묶으면 CPU가 열린다: hull 면 빌더는 `C(n,3)·n·2`라 32점 hull 하나가 약 31만 회
+/// 점 검사다. 메모리 장부(hull당 4.7 KiB)로는 4만 개가 통과하는데, 그러면 한 번의 복원이
+/// 120억 회를 단일 스레드로 돌아 브라우저·서버가 장시간 멈춘다(검수 rev_ae6d97b1 BLOCKER).
+///
+/// 값은 **시간으로** 잡았다: 점 검사 하나가 대략 1 ns이므로 2^27 ≈ 1.34억 회 ≈ **134 ms**가
+/// 최악이다. 1초까지 허용하면(2^30) 복원 한 번이 프레임을 통째로 삼킨다 — 브라우저에서
+/// 50 ms 넘는 정지는 이미 체감되는 끊김이라, 한 번의 사용자 동작에 100 ms대가 상한이다.
+///
+/// 이 상한이 실제로 무엇을 막고 무엇을 통과시키는가(점 검사 = `C(n,3)·n·2`):
+/// - 32점 hull: 317,440회 → **423개**까지
+/// - 12점 hull: 3,168회 → 42,000개까지
+/// - 박스형 8점 hull: 896회 → 149,000개까지
+///
+/// 즉 상한에 걸리는 것은 "복잡한 볼록 조각 수백 개"뿐이고, 일반적인 레벨 지오메트리는
+/// 여유롭게 통과한다.
+pub(crate) const MAX_DECODE_WORK: usize = 1 << 27;
+
 // 크기 상한은 `maru_collide::limits`가 정본이다. `f32::MAX`처럼 **유한하지만 거대한** 값은
 // 유한성 검사를 통과한 뒤 첫 곱에서 Inf가 되므로 `is_finite()`만으로는 방어가 되지 않는다.
 
@@ -182,6 +201,8 @@ pub struct Reader<'a> {
     at: usize,
     /// 지금까지 과금된 디코딩 후 힙 바이트.
     decoded: usize,
+    /// 지금까지 과금된 **파생물 생성 작업량**(점 검사 1회 단위) — 메모리와 별개 장부다.
+    work: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -199,6 +220,7 @@ impl<'a> Reader<'a> {
             b: bytes,
             at: 0,
             decoded: 0,
+            work: 0,
         }
     }
 }
@@ -310,6 +332,20 @@ impl Reader<'_> {
             .checked_add(bytes)
             .ok_or(SnapshotError::CountTooLarge)?;
         if self.decoded > MAX_DECODED_BYTES {
+            return Err(SnapshotError::CountTooLarge);
+        }
+        Ok(())
+    }
+
+    /// 복원이 파생물을 만드는 **작업량**을 과금한다(단위: 점 검사 1회).
+    ///
+    /// 메모리 장부와 별개다 — 같은 바이트로도 CPU는 몇 자릿수 차이가 난다.
+    pub(crate) fn charge_work(&mut self, units: usize) -> Result<(), SnapshotError> {
+        self.work = self
+            .work
+            .checked_add(units)
+            .ok_or(SnapshotError::CountTooLarge)?;
+        if self.work > MAX_DECODE_WORK {
             return Err(SnapshotError::CountTooLarge);
         }
         Ok(())
