@@ -464,21 +464,25 @@ impl Shape {
             // 하이트필드는 캐스트의 **대상**이지 주체가 아니다(static 전용) — 그래도
             // 계약을 만족시키려 외접 반지름으로 상한을 준다(보수적).
             Shape::Heightfield { .. } | Shape::TriMesh { .. } => self.bounding_radius(),
-            // 코어 점 중 축에서 가장 먼 것 = 밑면 테두리(축이 Y면 radius, 축이 XZ면 대각).
+            // **원기둥은 자기 축(Y) 회전에 대해 점유 집합이 불변이다** — 그 성분은 점유를
+            // 바꾸지 않는다. 캡슐과 같은 논증이고 식도 같은 꼴이다:
+            //
+            //   스윕 반지름 = |축의 XZ 성분| × (축 수직 방향에 대한 코어 최대 거리)
+            //
+            // 뒤 항은 u ⊥ Y인 어떤 u에 대해서도 `sqrt(r² + hh²)`다(테두리 점 중 `p·u = 0`인
+            // 것이 최대이고, 모든 테두리 점의 |p|가 같기 때문). 캡슐이 `hh × |축 XZ 성분|`인
+            // 것과 정확히 같은 구조다(캡슐 코어는 선분이라 뒤 항이 hh).
+            //
+            // 네 테두리 점만 표본화하면 **과소평가한다** — 예: hh=0.01, r=1, 축 (1,0,1)/√2에서
+            // 표본값 0.7072 vs 실제 1.00005(29% 낮다). 그러면 회전 CCD가 접촉 구간을 건너뛴다
+            // (검수 rev_0e075168 BLOCKER). 반대로 Y축 회전에 radius를 돌려주면 있지도 않은
+            // 충돌로 바디를 얼린다(같은 검수 MAJOR).
             Shape::Cylinder {
                 half_height,
                 radius,
             } => {
-                let rim = |sy: f32, sx: f32| perp(Vec3::new(radius * sx, half_height * sy, 0.0));
-                let rim_z = |sy: f32, sz: f32| perp(Vec3::new(0.0, half_height * sy, radius * sz));
-                rim(1.0, 1.0)
-                    .max(rim(1.0, -1.0))
-                    .max(rim(-1.0, 1.0))
-                    .max(rim(-1.0, -1.0))
-                    .max(rim_z(1.0, 1.0))
-                    .max(rim_z(1.0, -1.0))
-                    .max(rim_z(-1.0, 1.0))
-                    .max(rim_z(-1.0, -1.0))
+                let axial = (axis.x * axis.x + axis.z * axis.z).sqrt();
+                axial * (radius * radius + half_height * half_height).sqrt()
             }
             Shape::Triangle { points, radius } => {
                 points.iter().fold(0.0f32, |m, p| m.max(perp(*p))) + radius

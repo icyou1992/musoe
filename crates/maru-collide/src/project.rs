@@ -1460,6 +1460,69 @@ mod tests {
         assert!(!try_contains_point(&s, &ident(), v(0.51, 0.99, 0.0)).unwrap());
     }
 
+    /// **각 스윕 반지름은 연속 테두리의 최대값이어야 한다** — 네 점만 표본화하면
+    /// 대각 축에서 과소평가해 회전 CCD가 접촉 구간을 건너뛴다(검수 rev_0e075168 BLOCKER).
+    /// 그리고 **자기 축(Y) 회전에는 0**이어야 한다 — 점유 집합이 불변이므로(같은 검수 MAJOR).
+    #[test]
+    fn cylinder_angular_sweep_radius_is_exact_and_symmetric() {
+        let (hh, r) = (0.01f32, 1.0f32);
+        let s = Shape::Cylinder {
+            half_height: hh,
+            radius: r,
+        };
+        let bound = (r * r + hh * hh).sqrt();
+        // 대각 축: XZ 성분이 1이므로 전체 상한이 나와야 한다.
+        let diag = v(1.0, 0.0, 1.0).try_normalize().unwrap();
+        let got = s.angular_sweep_radius(diag);
+        assert!(
+            (got - bound).abs() < 1e-5,
+            "대각 축에서 과소평가: {got} (기대 {bound})"
+        );
+        // 자기 축: 회전 불변이라 0.
+        assert_eq!(s.angular_sweep_radius(v(0.0, 1.0, 0.0)), 0.0);
+        assert_eq!(s.angular_sweep_radius(v(0.0, -1.0, 0.0)), 0.0);
+        // 중간 축: XZ 성분에 비례해 연속적으로 줄어든다(불연속이면 근처 축에서 튄다).
+        let mid = v(0.6, 0.8, 0.0).try_normalize().unwrap();
+        let got = s.angular_sweep_radius(mid);
+        assert!(
+            (got - 0.6 * bound).abs() < 1e-5,
+            "중간 축이 XZ 성분에 비례하지 않는다: {got}"
+        );
+        // 어떤 축에서도 외접 반지름을 넘지 않는다(상한 계약).
+        let mut rng = Lcg(4242);
+        for _ in 0..200 {
+            if let Some(a) = rng.point(2.0).try_normalize() {
+                assert!(
+                    s.angular_sweep_radius(a) <= s.bounding_radius() + 1e-5,
+                    "외접 반지름을 넘었다"
+                );
+            }
+        }
+    }
+
+    /// 안에서 시작한 광선의 법선은 **단위 벡터**여야 한다 — 0을 주면 호스트 계산이 NaN이 된다.
+    #[test]
+    fn cylinder_ray_from_inside_returns_unit_normal() {
+        let s = Shape::Cylinder {
+            half_height: 1.0,
+            radius: 0.5,
+        };
+        for dir in [v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(0.3, -0.7, 0.2)] {
+            let h = crate::try_cast_ray(&s, &ident(), Vec3::ZERO, dir, 10.0)
+                .unwrap()
+                .expect("안에서 시작");
+            assert_eq!(h.toi, 0.0);
+            assert!(h.started_inside);
+            assert!(
+                (h.normal.length() - 1.0).abs() < 1e-5,
+                "법선이 단위가 아니다: {:?}",
+                h.normal
+            );
+            // 광선 반대 방향이어야 한다(캡슐·구와 같은 규약).
+            assert!(h.normal.dot(dir) < 0.0, "법선이 광선 쪽을 본다");
+        }
+    }
+
     // ---------- 검수 rev_6429a223 회귀 ----------
 
     /// **저차원 코어 + 두께**: z=0 평면 hull에 convex radius를 주면 겉면은 z=±r인데,

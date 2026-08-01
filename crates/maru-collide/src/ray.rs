@@ -422,7 +422,12 @@ fn ray_cylinder(o: Vec3, d: Vec3, half_height: f32, radius: f32, max_toi: f32) -
     if o.y.abs() <= half_height && o.x * o.x + o.z * o.z <= radius * radius {
         return Some(Local {
             toi: 0.0,
-            normal: Vec3::ZERO,
+            // **0 벡터를 내보내지 않는다.** 공개 계약은 "법선은 단위 벡터"이고, 0을 주면
+            // 호스트의 반사·슬라이딩이 NaN이 되거나 충돌을 무시한다(검수 rev_0e075168 MAJOR).
+            // 안에서 시작하면 캡슐·구와 같이 **광선 반대 방향**을 준다.
+            normal: d
+                .try_normalize()
+                .map_or(Vec3::new(0.0, 1.0, 0.0), |u| u * -1.0),
             started_inside: true,
         });
     }
