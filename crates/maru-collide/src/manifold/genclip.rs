@@ -262,9 +262,59 @@ fn support_face(
             }
             Some((ring.len(), f as u32, m.mul_vec(face.normal)))
         }
+        crate::Shape::Cylinder {
+            half_height,
+            radius,
+        } => {
+            // 축은 로컬 Y다(`support_core`와 같은 규약). 뚜껑이 지지 특징이 아니면
+            // 여기서 거절한다 — 옆면 접촉인데 뚜껑을 입사면으로 넘기면 모서리로 선
+            // 다각형이 참조면에 눕는 꼴이 된다. 임계는 바깥 면 지배 판정과 같은 값을
+            // 써서 문턱이 한 군데만 있게 한다.
+            let axis = m.c[1];
+            let d = axis.dot(dir);
+            if d.abs() < super::FACE_DOT_MIN {
+                return None; // 옆면 지배 — 아직 witness 단일점 경로다(README 한계)
+            }
+            let s = if d >= 0.0 { 1.0 } else { -1.0 };
+            for (i, (cx, cz)) in CAP_RING.iter().enumerate() {
+                out[i] = pose.pos + m.mul_vec(Vec3::new(radius * cx, s * half_height, radius * cz));
+            }
+            // 면 코드: +Y 뚜껑 0, −Y 뚜껑 1. (옆면은 뒤에 2..를 쓴다)
+            let code = if s > 0.0 { 0 } else { 1 };
+            Some((
+                CAP_RING.len(),
+                code,
+                Vec3::new(axis.x * s, axis.y * s, axis.z * s),
+            ))
+        }
         _ => None,
     }
 }
+
+/// 원기둥 뚜껑의 **내접 정팔각형** 단위 좌표(로컬 XZ). 삼각함수를 부르지 않는다
+/// (결정론 정책 L1: 상태에 닿는 경로에서 libm 금지 — native와 wasm의 마지막 ulp가 다르다).
+///
+/// **왜 내접 다각형이어도 되나**: 뚜껑이 평면에 닿을 때 다각형은 원과 **같은 평면**에
+/// 있으므로 높이 오차가 0이다. 근사는 옆으로 뻗는 정도에만 남고, 그 최대 오차는
+/// 현-호 거리 `r·(1 − cos(π/8)) = 0.076·r`다(에지 중점에서). 접점은 전부 반지름 `r`
+/// 위에 있으므로 회전 저항의 팔 길이는 정확하다.
+///
+/// **왜 8각형인가**: 접점 상한이 4라 축약이 어차피 4개를 고른다 — 정점을 더 늘려도
+/// 서 있는 자세의 안정성은 안 변하고, 뚜껑이 참조면 모서리에 걸쳤을 때의 클리핑
+/// 정확도만 오른다. 8이면 그 오차가 반지름의 7.6%이고 클리핑 비용은 측면 8회다.
+const CAP_RING: [(f32, f32); 8] = {
+    const C: f32 = core::f32::consts::FRAC_1_SQRT_2;
+    [
+        (1.0, 0.0),
+        (C, C),
+        (0.0, 1.0),
+        (-C, C),
+        (-1.0, 0.0),
+        (-C, -C),
+        (0.0, -1.0),
+        (C, -C),
+    ]
+};
 
 /// 일반 볼록 면 접촉 매니폴드. 실패하면 `None`(호출자가 witness 단일점으로 폴백).
 ///
@@ -702,6 +752,113 @@ mod tests {
             ids.len(),
             "계보가 충돌했다: {:?}",
             out.as_slice()
+        );
+    }
+
+    /// 세워 둔 원기둥은 뚜껑이 지지 특징이라 **다접점**이 나오고, 옆으로 누우면
+    /// 뚜껑이 지지 특징이 아니라 기존 witness **단일점**으로 떨어져야 한다.
+    ///
+    /// 지지 판정을 빼면 모서리로 선 뚜껑 다각형이 참조면에 눕는 꼴이 되어 접점이 엉뚱한
+    /// 곳에 생긴다. 300스텝 동역학으로는 두 경우가 y=0.2844 대 0.2706으로만 갈려
+    /// 판정이 아슬아슬하다 — 접점 개수와 계보로 직접 겨눈다.
+    ///
+    /// **옆면 접촉 자체는 아직 결함이다**(단일점이라 안 가라앉게 못 막는다).
+    /// 그건 이 시험의 대상이 아니라 다음 단계(옆면 선분 매니폴드)의 대상이다.
+    #[test]
+    fn cylinder_uses_the_cap_face_only_when_the_cap_is_the_support_feature() {
+        use crate::{Pose, Shape};
+        use maru_math::Quat;
+        let floor = Shape::Box {
+            half: Vec3::new(5.0, 0.5, 5.0),
+            radius: 0.0,
+        };
+        let pf = Pose {
+            pos: Vec3::new(0.0, -0.5, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        let cyl = Shape::Cylinder {
+            half_height: 0.6,
+            radius: 0.3,
+        };
+        let upright = Pose {
+            pos: Vec3::new(0.0, 0.599, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        let m = crate::manifold::dispatch::contact(&cyl, &upright, &floor, &pf, 0.02)
+            .expect("세운 원기둥이 바닥에 닿아야 한다");
+        assert!(
+            m.points().len() >= 3,
+            "세운 원기둥이 다접점을 못 냈다: {}개",
+            m.points().len()
+        );
+        for p in m.points() {
+            assert_ne!(
+                p.feature.0,
+                crate::FEATURE_GENERIC,
+                "뚜껑 접점에 계보가 없다"
+            );
+        }
+
+        // 축(로컬 Y)을 Z축 둘레로 90° 돌려 눕힌다 — 뚜껑은 모서리로 선다.
+        let lying = Pose {
+            pos: Vec3::new(0.0, 0.299, 0.0),
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), core::f32::consts::FRAC_PI_2),
+        };
+        let m = crate::manifold::dispatch::contact(&cyl, &lying, &floor, &pf, 0.02)
+            .expect("누운 원기둥이 바닥에 닿아야 한다");
+        assert_eq!(
+            m.points().len(),
+            1,
+            "누운 원기둥이 뚜껑 면을 썼다: {:?}",
+            m.points()
+        );
+        assert_eq!(
+            m.points()[0].feature.0,
+            crate::FEATURE_GENERIC,
+            "누운 원기둥 접점이 witness가 아니다"
+        );
+    }
+
+    /// 두 뚜껑은 **서로 다른 면 코드**를 받아야 한다. 같은 코드를 주면 원기둥이 뒤집혀
+    /// 반대쪽 뚜껑이 닿을 때 서로 다른 물리 특징이 같은 ID를 받아, 솔버가 직전 임펄스를
+    /// 엉뚱한 접점에 잇는다(뮤테이션 실측: 코드를 0으로 고정해도 다른 시험은 전부 통과).
+    #[test]
+    fn the_two_caps_get_different_face_codes() {
+        use crate::{Pose, Shape};
+        use maru_math::Quat;
+        let floor = Shape::Box {
+            half: Vec3::new(5.0, 0.5, 5.0),
+            radius: 0.0,
+        };
+        let pf = Pose {
+            pos: Vec3::new(0.0, -0.5, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        let cyl = Shape::Cylinder {
+            half_height: 0.6,
+            radius: 0.3,
+        };
+        let ids = |rot: Quat| -> Vec<u32> {
+            let p = Pose {
+                pos: Vec3::new(0.0, 0.599, 0.0),
+                rot,
+            };
+            let m = crate::manifold::dispatch::contact(&cyl, &p, &floor, &pf, 0.02)
+                .expect("원기둥이 바닥에 닿아야 한다");
+            let mut v: Vec<u32> = m.points().iter().map(|p| p.feature.0).collect();
+            v.sort_unstable();
+            v
+        };
+        // 똑바로 서면 로컬 −Y 뚜껑이, X축 둘레 180°로 뒤집으면 로컬 +Y 뚜껑이 바닥에 닿는다.
+        let upright = ids(Quat::IDENTITY);
+        let flipped = ids(Quat::from_axis_angle(
+            Vec3::new(1.0, 0.0, 0.0),
+            core::f32::consts::PI,
+        ));
+        assert_eq!(upright.len(), flipped.len());
+        assert!(
+            upright.iter().all(|a| !flipped.contains(a)),
+            "서로 다른 뚜껑이 같은 feature ID를 받았다: {upright:?} vs {flipped:?}"
         );
     }
 

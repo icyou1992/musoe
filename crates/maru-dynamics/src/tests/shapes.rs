@@ -1409,3 +1409,45 @@ fn box_shaped_hull_rests_at_the_same_height_as_a_box() {
         "hull이 정지하지 않았다: vel {hull_v:?}"
     );
 }
+
+/// **원기둥 뚜껑 매니폴드의 완료 판정**: 세워 둔 원기둥이 기울지 않고 정지한다.
+///
+/// 이 시험 전에는 원기둥이 GJK/EPA witness **단일점**으로 떨어져 회전을 못 막았다
+/// (실측 2026-08-01: 300스텝 뒤 4.6° 기울고 vel.x=0.37로 흔들렸다).
+#[test]
+fn upright_cylinder_stays_upright_on_a_flat_floor() {
+    let mut w = World::new(WorldParams::default());
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(5.0, 0.5, 5.0),
+            radius: 0.0,
+        },
+        pose(0.0, -0.5, 0.0),
+    ));
+    let h = w.add_body(Body::new_dynamic(
+        Shape::Cylinder {
+            half_height: 0.6,
+            radius: 0.3,
+        },
+        pose(0.0, 0.65, 0.0),
+        1.0,
+    ));
+    for _ in 0..300 {
+        w.step(1.0 / 60.0);
+    }
+    let b = w.body(h);
+    // 축(로컬 Y)이 얼마나 기울었나 — 내적으로 재고 삼각함수를 쓰지 않는다.
+    let axis = b.pose().rot.rotate(Vec3::new(0.0, 1.0, 0.0));
+    let cos_tilt = axis.dot(Vec3::new(0.0, 1.0, 0.0));
+    // 0.5° 기울기 = cos 0.9999619
+    assert!(
+        cos_tilt > 0.999_961_9,
+        "원기둥이 기울었다: cos={cos_tilt} (0.5° 한계 0.9999619), pos={:?}",
+        b.pose().pos
+    );
+    assert!(
+        b.linvel().length() < 0.02,
+        "원기둥이 정지하지 않았다: vel {:?}",
+        b.linvel()
+    );
+}
