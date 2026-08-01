@@ -1303,3 +1303,102 @@ fn project_point_saturation_is_not_slot_order_dependent() {
     let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
     assert!((a.point - p).length() < 1e-5 && (b.point - p).length() < 1e-5);
 }
+
+/// 포화해도 **하한으로 정답이 증명되면** 성공해야 한다.
+///
+/// 멀리 있는 비싼 hull이 예산을 다 먹어도, 그것들의 AABB 하한(0.346)이 최종 최선(0.1)보다
+/// 멀면 그중 누구도 더 가까울 수 없다. 거리 0만 예외로 인정하면 이 경우가 슬롯 순서에
+/// 따라 오류가 된다(검수 rev_2da962df MAJOR).
+#[test]
+fn project_point_saturation_still_succeeds_when_bounds_prove_the_answer() {
+    // 32점 hull(구 표면 샘플) — 코어 안쪽 질의가 아니어도 GJK 선청구로 예산을 먹는다.
+    let mut pts = Vec::new();
+    let mut rng = 31337u32;
+    let mut next = || {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) as f32 / (1u32 << 24) as f32
+    };
+    while pts.len() < 32 {
+        let d = Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5);
+        if let Some(u) = d.try_normalize() {
+            // 반지름 5짜리 구 표면 → AABB가 [0.2, 10.2]^3 안에 들어오게 중심을 옮긴다.
+            pts.push(u * 5.0);
+        }
+    }
+    let far_hull = maru_collide::Shape::Hull {
+        points: pts,
+        radius: 0.0,
+    };
+    // 중심 (5.2,5.2,5.2), 반지름 5 → AABB 최소 모서리가 (0.2,0.2,0.2)라 원점까지 하한 0.346.
+    let hull_pose = maru_collide::Pose {
+        pos: Vec3::new(5.2, 5.2, 5.2),
+        rot: maru_math::Quat::IDENTITY,
+    };
+    // 표면이 원점에서 0.1 떨어진 구.
+    let near_sphere = maru_collide::Shape::Sphere { radius: 1.0 };
+    let sphere_pose = maru_collide::Pose {
+        pos: Vec3::new(1.1, 0.0, 0.0),
+        rot: maru_math::Quat::IDENTITY,
+    };
+
+    let build = |sphere_first: bool| {
+        let mut w = World::new(WorldParams::default());
+        if sphere_first {
+            w.add_body(Body::new_dynamic(near_sphere.clone(), sphere_pose, 1.0));
+        }
+        for _ in 0..300 {
+            w.add_body(Body::new_dynamic(far_hull.clone(), hull_pose, 1.0));
+        }
+        if !sphere_first {
+            w.add_body(Body::new_dynamic(near_sphere.clone(), sphere_pose, 1.0));
+        }
+        w
+    };
+    for sphere_first in [true, false] {
+        let w = build(sphere_first);
+        let hit = w
+            .project_point(Vec3::ZERO)
+            .unwrap_or_else(|e| panic!("구 먼저={sphere_first}: {e:?}"))
+            .expect("후보가 없다");
+        let d = (hit.point - Vec3::ZERO).length();
+        assert!(
+            (d - 0.1).abs() < 1e-3,
+            "구 먼저={sphere_first}: 최근접이 구가 아니다 (거리 {d})"
+        );
+    }
+}
+
+/// **증명이 안 되면 오류를 내야 한다.** 포화한 후보가 질의점을 감싸고 있으면(하한 0) 그중
+/// 하나가 더 가까울 수 있으므로, 찾아 둔 "최선"을 답으로 내밀면 조용한 오답이다.
+#[test]
+fn project_point_saturation_without_proof_is_an_error() {
+    let mut pts = Vec::new();
+    let mut rng = 555u32;
+    let mut next = || {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) as f32 / (1u32 << 24) as f32
+    };
+    while pts.len() < 32 {
+        let d = Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5);
+        if let Some(u) = d.try_normalize() {
+            pts.push(u);
+        }
+    }
+    // 원점을 **품는** hull 여러 개 — AABB 하한이 0이라 가지치기도 안 되고 증명도 안 된다.
+    let hull = maru_collide::Shape::Hull {
+        points: pts,
+        radius: 0.05,
+    };
+    let at_origin = maru_collide::Pose {
+        pos: Vec3::ZERO,
+        rot: maru_math::Quat::IDENTITY,
+    };
+    let mut w = World::new(WorldParams::default());
+    for _ in 0..64 {
+        w.add_body(Body::new_dynamic(hull.clone(), at_origin, 1.0));
+    }
+    assert!(
+        matches!(w.project_point(Vec3::ZERO), Err(ApiError::ResourceLimit)),
+        "증명 없이 답을 냈다"
+    );
+}

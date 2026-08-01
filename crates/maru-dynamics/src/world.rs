@@ -1675,34 +1675,39 @@ impl World {
         // 작업 예산은 **질의 하나 전체**가 공유한다. 물체마다 상한을 두면 겹친 hull이
         // 많은 질의가 그 상한을 물체 수만큼 곱해 한 프레임을 삼킨다(검수 rev_c30d32fd).
         let mut budget = maru_collide::MAX_PROJECT_WORK;
-        let mut saturated = false;
+        // 예산이 모자라 **못 본** 후보들의 AABB 하한 중 최솟값(제곱). 최종 최선이 이 값
+        // 이하면 못 본 후보가 더 가까울 수 없으므로 답이 확정된다.
+        let mut unseen_lb2 = f32::INFINITY;
         for i in 0..self.bodies.len() {
             if !self.passes(i, filter) {
                 continue;
             }
             let b = &self.bodies[i];
+            // 하한은 **항상** 계산한다 — 가지치기에도 쓰고, 포화한 후보의 하한을 기억하는
+            // 데에도 쓴다(뒤에서 정답을 증명하는 근거가 된다).
+            let local = b
+                .shape
+                .try_local_aabb()
+                .map_err(|_| ApiError::InvalidValue)?;
+            let bb = maru_collide::transformed_aabb(local, &b.pose);
+            let c = Vec3::new(
+                p.x.clamp(bb.min.x, bb.max.x),
+                p.y.clamp(bb.min.y, bb.max.y),
+                p.z.clamp(bb.min.z, bb.max.z),
+            );
+            let lb2 = (c - p).length_sq();
             if let Some((bd2, _)) = best {
-                let local = b
-                    .shape
-                    .try_local_aabb()
-                    .map_err(|_| ApiError::InvalidValue)?;
-                let bb = maru_collide::transformed_aabb(local, &b.pose);
-                let c = Vec3::new(
-                    p.x.clamp(bb.min.x, bb.max.x),
-                    p.y.clamp(bb.min.y, bb.max.y),
-                    p.z.clamp(bb.min.z, bb.max.z),
-                );
                 // 동률에서 건너뛰는 것이 옳다 — 아래 승자 판정도 엄격 부등호라
                 // 어차피 **낮은 슬롯**이 이긴다. 두 규칙이 같아야 결정론이 성립한다.
-                if (c - p).length_sq() >= bd2 {
+                if lb2 >= bd2 {
                     continue;
                 }
             }
             // 순회 포화는 "먼 점"으로 위장하지 않는다 — 못 본 후보가 더 가까울 수 있다.
-            // 다만 **여기서 바로 반환하지는 않는다**: 예산을 안 쓰는 값싼 셰이프(구·박스·
-            // 캡슐)가 뒤에 있으면 그중 하나가 거리 0을 줄 수 있고, 그건 전역 최소가 확정된
-            // 것이라 답을 낼 수 있다. 즉시 반환하면 같은 기하가 **슬롯 순서만으로** 성공과
-            // 오류로 갈린다(검수 rev_8a258ed3 MAJOR).
+            // 다만 **여기서 바로 반환하지는 않는다**: 뒤에 값싼 후보(구·박스·캡슐은 예산을
+            // 안 쓴다)가 더 가까운 답을 줄 수 있고, 그 답이 **못 본 후보들의 하한보다 가까우면
+            // 전역 최소가 증명된다**. 즉시 반환하면 같은 기하가 슬롯 순서만으로 성공과
+            // 오류로 갈린다(검수 rev_8a258ed3·rev_2da962df MAJOR).
             let proj = match maru_collide::try_project_point_with_budget(
                 &b.shape,
                 &b.pose,
@@ -1711,7 +1716,7 @@ impl World {
             ) {
                 Ok(proj) => proj,
                 Err(maru_collide::QueryReject::ResourceLimit) => {
-                    saturated = true;
+                    unseen_lb2 = unseen_lb2.min(lb2);
                     continue;
                 }
                 Err(maru_collide::QueryReject::InvalidInput) => return Err(ApiError::InvalidValue),
@@ -1728,11 +1733,12 @@ impl World {
                 ));
             }
         }
-        // 포화가 있었으면 "최선"이 진짜 최소라는 증명이 없다 — 거리 0일 때만 예외다
-        // (더 가까울 수 없으므로 못 본 후보와 무관하게 확정이다).
+        // 포화가 있었으면 "최선"이 진짜 최소라는 **증명**이 필요하다: 못 본 후보들의 AABB
+        // 하한보다 가까우면 그들 중 누구도 더 가까울 수 없으므로 확정이다. 증명이 안 되면
+        // 그럴듯한 답 대신 자원 오류를 낸다.
         match best {
-            Some((d2, h)) if !saturated || d2 <= 0.0 => Ok(Some(h)),
-            _ if saturated => Err(ApiError::ResourceLimit),
+            Some((d2, h)) if d2 <= unseen_lb2 => Ok(Some(h)),
+            _ if unseen_lb2.is_finite() => Err(ApiError::ResourceLimit),
             other => Ok(other.map(|(_, h)| h)),
         }
     }

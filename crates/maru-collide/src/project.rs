@@ -235,27 +235,32 @@ fn project_convex_core(
                     inside,
                 });
             }
-            // **방향은 GJK 법선이 아니라 위치 차이로 만든다.**
+            // **코어 밖이냐 안이냐를 GJK의 `distance`로 가른다 — 임계가 없다.**
             //
-            // 코어가 평면·선처럼 낮은 차원일 수 있다(그래도 convex radius가 두께를 주므로
-            // 합법 셰이프다). 그런 코어 **안**의 점에 대해 GJK는 거리를 거의 0으로 주는데,
-            // 그때 법선은 반올림이 만든 **코어 평면 안** 방향일 수 있다. 그 방향으로 radius
-            // 만큼 밀면 여전히 물체 안이라 "겉면 위 점" 계약이 깨진다
-            // (검수 rev_6429a223 BLOCKER: z=0 사각형 hull + radius 0.1의 중심 투영이
-            //  (-0.07, 0.07, 0)으로 나왔다 — 겉면은 z=±0.1이다).
+            // 밖이면 답은 "코어 최근접점에서 질의점 방향으로 radius"다. 안이면 그 방향이
+            // 없으니 지지 함수로 이탈 방향과 여유를 구한다.
             //
-            // 위치 차이는 그런 착시가 없다: 코어 밖이면 진짜 바깥 방향이고, 코어 안이면
-            // 길이가 0에 붙어 **여기서 걸러진다**. 그때만 이탈 방향을 따로 구한다.
-            let v = p - on_b;
-            let l = v.length();
-            let eps = crate::length_eps(crate::characteristic_length(shape, shape));
-            if l > eps {
-                return Ok(PointProjection {
-                    point: on_b + v * (radius / l),
-                    inside,
-                });
+            // 예전에는 `|p − on_b|`를 스케일 상대 임계와 비교해 갈랐는데, 그러면
+            // **모서리·꼭짓점 바로 바깥** 점이 안쪽 경로로 들어간다. 그 경로의 후보는 면
+            // 법선뿐이라 모서리 방향이 없고, 답이 겉면을 벗어난다(검수 rev_2da962df BLOCKER:
+            // 반크기 (1000,1,1) hull·radius 0.001에 p=(1000.0019, 1.0006, 0)).
+            //
+            // `distance`는 코어 안·표면에서 **정확히 0**이다(실측: 평면 코어 내부 0.0,
+            // 긴 상자 내부 0.0, 모서리 밖 1.985e-3). 심플렉스 축약이 최근접 벡터를 0으로
+            // 만들기 때문이라 반올림 여유를 둘 필요가 없다. witness 위치(`on_b`)에는
+            // 반올림이 남지만(내부에서 4e-8) 그건 이 판정에 쓰지 않는다.
+            if distance > 0.0 {
+                let v = p - on_b;
+                let l = v.length();
+                if l > 0.0 {
+                    return Ok(PointProjection {
+                        point: on_b + v * (radius / l),
+                        inside,
+                    });
+                }
             }
-            // 코어 **위/안**이라 방향이 없다 — 지지 함수로 이탈 방향과 여유를 구한다.
+            // 코어 위/안이라 방향이 없다 — 지지 함수로 이탈 방향과 여유를 구한다.
+            // (여기서만 부른다: 전수 열거라 비싸고, 밖에서는 필요 없다.)
             let (n, gap) = core_exit(shape, p, budget)?;
             Ok(PointProjection {
                 point: p + n * (gap + radius),
@@ -1252,6 +1257,56 @@ mod tests {
         assert!(
             limited,
             "코어 밖 질의가 예산을 전혀 쓰지 않았다 (통과 {ok}회)"
+        );
+    }
+
+    /// **모서리 바로 바깥** 점은 면 법선 후보로 풀 수 없다 — 실제 최근접 방향이 모서리에서
+    /// 질의점으로 가는 방향이라 어떤 면 법선도 아니다(검수 rev_2da962df BLOCKER).
+    /// 코어 밖이면 거리가 아무리 작아도 GJK witness 방향을 써야 한다.
+    #[test]
+    fn point_just_outside_an_edge_uses_the_witness_direction() {
+        let h = v(1000.0, 1.0, 1.0);
+        let mut pts = Vec::new();
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    pts.push(v(h.x * sx, h.y * sy, h.z * sz));
+                }
+            }
+        }
+        let radius = 0.001;
+        let s = Shape::Hull {
+            points: pts,
+            radius,
+        };
+        assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
+        // 코어 모서리 (1000, 1, 0)에서 대각으로 살짝 벗어난 점.
+        let p = v(1000.0019, 1.0006, 0.0);
+        let edge = v(1000.0, 1.0, 0.0);
+        let d = (p - edge).length();
+        assert!(
+            d < 0.002 && d > radius,
+            "전제: 모서리에서 아주 가깝지만 radius보다는 멀다 (d={d})"
+        );
+        let pr = try_project_point(&s, &ident(), p).unwrap();
+        assert!(!pr.inside, "밖인데 안이라고 했다");
+        // 겉면 위 점은 코어(모서리)에서 정확히 radius만큼 떨어져 있어야 한다.
+        let from_edge = (pr.point - edge).length();
+        // 허용치는 **GJK witness 정밀도**다. 좌표 크기가 1000이면 f32 간격이 6e-5라
+        // witness가 그 정도 흔들린다(실측 2.2e-5). 면 법선 후보로 푸는 옛 경로는 오차가
+        // 1.7e-4라 이 허용치로도 갈린다 — 뮤테이션으로 확인했다.
+        const TOL: f32 = 6.0e-5;
+        assert!(
+            (from_edge - radius).abs() < TOL,
+            "겉면이 아니다: 모서리에서 {from_edge} (기대 {radius}), 점 {:?}",
+            pr.point
+        );
+        // 그리고 질의점과 모서리를 잇는 선 위에 있어야 한다.
+        let want = edge + (p - edge) * (radius / d);
+        assert!(
+            (pr.point - want).length() < TOL,
+            "{:?} vs {want:?}",
+            pr.point
         );
     }
 
