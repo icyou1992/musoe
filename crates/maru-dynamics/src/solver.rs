@@ -602,6 +602,8 @@ pub fn prepare_into(
     // **실제로 warm load된 접점 수**. 진단이 feature ID 일치만 세면 generic 접점의 위치·법선
     // 게이트가 얼마나 자주 매칭을 끊는지 보이지 않는다 — 지표가 거짓이면 회귀 테스트도 거짓이다.
     let mut warm_matched = 0u32;
+    // 이미 계승된 캐시 항목 표시 — 같은 ID의 접점 여럿이 한 항목을 나눠 갖지 않게 한다.
+    let mut used = 0u64;
     let (ia, ib) = (ba.inv_inertia_world(), bb.inv_inertia_world());
     let scalar_mass = scalar_effective_mass_path();
     points.clear();
@@ -647,16 +649,49 @@ pub fn prepare_into(
             + bb.angvel.length() * rb.length();
         let match_tol = geo_tol + WARM_MATCH_MOTION * drift * dt;
         let match_tol2 = match_tol * match_tol;
-        let hit = cache
-            .iter()
-            .find(|(f, c)| {
-                *f == p.feature
-                    && (!generic
-                        || ((c.position - p.position).length_sq() <= match_tol2
-                                // 면이 바뀌었으면 다른 접촉 (곡면 feature 점프 차단)
-                                && c.contact_normal.dot(n) >= WARM_MATCH_COS))
-            })
-            .map(|(_, c)| *c);
+        // **캐시 항목은 한 번만 소비한다** (교차검수 rev_0b791000 BLOCKER).
+        // 예전에는 접점마다 `find`를 처음부터 다시 돌려, 같은 ID를 단 접점 여럿(generic
+        // 다접점 매니폴드 — 원기둥 뚜껑의 apex 강등·복합 폴백이 만든다)이 **같은 이전
+        // 접점 하나를 동시에 계승**했다. 그러면 그 임펄스가 접점 수만큼 중복 적용돼
+        // 총 법선 임펄스와 토크가 부풀고, 반대로 첫 항목이 무하중점이면 전부 cold-start가
+        // 된다. 실측 시나리오: 반지름 1 mm 원기둥이 60 Hz로 1 m/s 미끄러지면 매칭 허용치가
+        // 약 16.9 mm라 지름 2 mm 안의 네 접점이 전부 첫 항목의 게이트를 통과한다.
+        //
+        // 그래서 **쓰지 않은 항목 중 가장 가까운 것**을 하나씩 짝지어 준다. 정확 ID 경로는
+        // 매니폴드 안에서 ID가 유일하므로 후보가 하나뿐이라 동작이 그대로다(cliff 불변).
+        // 동률은 캐시 인덱스가 작은 쪽 — 결정적이어야 한다.
+        //
+        // **이 소비 표시는 뮤테이션으로 관측되지 않는다**(지워도 전 시험 통과). 관측하려면
+        // "한 페어의 캐시 항목 하나가 두 접점에 물려갔다"를 봐야 하는데, 진단(`warm_hits`·
+        // `warm_total`)이 **전 페어 합계**라 페어별 불변식을 만들 수 없다. 합계로 세우면
+        // 박스가 삼각형 두 개에 걸칠 때 정상 동작도 위반으로 잡힌다(실측: 직전 합계 4에
+        // 이번 6 — 페어 둘의 캐시가 각각 살아 있는 정상 상황이었다). 그 시험은 지웠다.
+        let mut best: Option<(usize, f32)> = None;
+        for (i, (f, c)) in cache.iter().enumerate() {
+            // 소비 표시는 64칸까지만 든다. 그보다 긴 캐시는 예전처럼 중복될 수 있지만,
+            // 페어당 접점 상한이 4라 실제로 도달하지 않는다(도달하면 진단이 아니라 계약
+            // 위반이다 — debug_assert가 잡는다).
+            if i < 64 && used & (1u64 << i) != 0 {
+                continue;
+            }
+            if *f != p.feature {
+                continue;
+            }
+            let d2 = (c.position - p.position).length_sq();
+            if generic && (d2 > match_tol2 || c.contact_normal.dot(n) < WARM_MATCH_COS) {
+                // 면이 바뀌었으면 다른 접촉 (곡면 feature 점프 차단)
+                continue;
+            }
+            if best.is_none_or(|(_, bd)| d2 < bd) {
+                best = Some((i, d2));
+            }
+        }
+        let hit = best.map(|(i, _)| {
+            if i < 64 {
+                used |= 1u64 << i;
+            }
+            cache[i].1
+        });
         if hit.is_some() {
             warm_matched += 1;
         }

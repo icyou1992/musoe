@@ -111,6 +111,7 @@ fn shared_ref_vertex(t: usize, s: usize, k: usize) -> Option<usize> {
 pub(super) fn clip_convex_face(
     rverts: &[Vec3],
     rn: Vec3,
+    rids: &[u8],
     iverts: &[Vec3],
     iids: &[u8],
     out: &mut GenClip,
@@ -194,10 +195,12 @@ pub(super) fn clip_convex_face(
                 let t = d0 / (d0 - d1);
                 let x = v0.position + (v1.position - v0.position) * t;
                 // 계보는 **잘린 에지**(v0에서 출발하는 에지)의 출처가 결정한다.
+                // **참조면 번호도 `rids`가 준다** — 원기둥 뚜껑은 apex를 순환 순서 중간에
+                // 끼우므로 배열 순번을 쓰면 그 뒤 참조 정점·측면 번호가 통째로 밀린다.
                 let (kind, a, b) = match v0.edge {
-                    EdgeSrc::Incident(j) => (ClipKind::EdgeCross, j, side as u8),
+                    EdgeSrc::Incident(j) => (ClipKind::EdgeCross, j, rids[side]),
                     EdgeSrc::RefSide(t_side) => match shared_ref_vertex(t_side as usize, side, k) {
-                        Some(v) => (ClipKind::ReferenceVertex, v as u8, 0),
+                        Some(v) => (ClipKind::ReferenceVertex, rids[v], 0),
                         // 비인접 측면끼리 만났다 = 볼록 가정이 부동소수로 깨졌다.
                         // 지어내지 않고 모른다고 표시한다.
                         None => (ClipKind::ReferenceVertex, UNKNOWN_INDEX, 0),
@@ -244,6 +247,7 @@ pub(super) fn clip_convex_face(
 fn clip_segment(
     rverts: &[Vec3],
     rn: Vec3,
+    rids: &[u8],
     p0: Vec3,
     p1: Vec3,
     iids: &[u8],
@@ -332,8 +336,8 @@ fn clip_segment(
                     inplane.length() <= corner_eps
                 });
                 match corner {
-                    Some(c) => (ClipKind::ReferenceVertex, c as u8, 0),
-                    None => (ClipKind::EdgeCross, 0, s), // 선분은 에지가 하나다
+                    Some(c) => (ClipKind::ReferenceVertex, rids[c], 0),
+                    None => (ClipKind::EdgeCross, iids[0], rids[si]), // 선분은 에지가 하나다
                 }
             }
             None => (ClipKind::IncidentVertex, iids[end as usize], 0),
@@ -641,15 +645,21 @@ pub(super) fn convex_face_manifold(
     //
     // 그래서 apex가 활성인 면 쌍의 접점은 전부 **generic**으로 내려 위치 근접 매칭에 맡긴다.
     // 곡면·witness 접점이 이미 쓰는 계약이라 새로운 종류의 저하가 아니다.
-    let dynamic_cap_lineage = if ref_is_a {
-        ia[..na].contains(&CAP_APEX_ID) || ib[..inc_n].contains(&CAP_APEX_ID)
+    let (ref_has_apex, inc_has_apex) = if ref_is_a {
+        (
+            ia[..na].contains(&CAP_APEX_ID),
+            ib[..inc_n].contains(&CAP_APEX_ID),
+        )
     } else {
-        ib[..nb].contains(&CAP_APEX_ID) || ia[..inc_n].contains(&CAP_APEX_ID)
+        (
+            ib[..nb].contains(&CAP_APEX_ID),
+            ia[..inc_n].contains(&CAP_APEX_ID),
+        )
     };
-    let (rverts, iverts, iids) = if ref_is_a {
-        (&va[..na], &vb[..inc_n], &ib[..inc_n])
+    let (rverts, rids, iverts, iids) = if ref_is_a {
+        (&va[..na], &ia[..na], &vb[..inc_n], &ib[..inc_n])
     } else {
-        (&vb[..nb], &va[..inc_n], &ia[..inc_n])
+        (&vb[..nb], &ib[..nb], &va[..inc_n], &ia[..inc_n])
     };
 
     // **퇴화 패치는 클리핑할 수 없다** (검수 rev_68687b10 BLOCKER). rounded box의 코어가
@@ -664,10 +674,10 @@ pub(super) fn convex_face_manifold(
 
     let mut clipped = GenClip::new();
     if iverts.len() == 2 {
-        let seg = clip_segment(rverts, rn, iverts[0], iverts[1], iids)?;
+        let seg = clip_segment(rverts, rn, rids, iverts[0], iverts[1], iids)?;
         clipped.verts[..2].copy_from_slice(&seg);
         clipped.len = 2;
-    } else if !clip_convex_face(rverts, rn, iverts, iids, &mut clipped) {
+    } else if !clip_convex_face(rverts, rn, rids, iverts, iids, &mut clipped) {
         return None;
     }
 
@@ -683,15 +693,23 @@ pub(super) fn convex_face_manifold(
         }
         let proj = v.position - rn * sep;
         let position = (v.position + proj) * 0.5;
-        if pts[..pts_len]
-            .iter()
-            .any(|q| (q.position - position).length_sq() <= dup_eps_sq)
-        {
-            continue;
-        }
         // 계보를 특정 못 했으면(퇴화) 지어내지 않고 generic으로 떨어뜨린다 —
         // 솔버가 ID 대신 위치 근접으로 warm start를 매칭한다.
-        let feature = if dynamic_cap_lineage {
+        //
+        // **강등은 apex에서 파생된 접점에만 건다** (검수 rev_0b791000 MAJOR).
+        // 면 쌍 전체를 내리면, apex 임계를 잡음으로 넘나들 때마다 위치가 거의 그대로인
+        // 물체 고정 링 접점의 feature까지 exact ↔ generic을 왕복해 warm start를 통째로
+        // 버린다(거의 세워 둔 원기둥 스택의 잔진동·수면 실패).
+        // `CAP_APEX_ID`는 다른 셰이프에서 정상 정점 번호일 수 있으므로 **그 면에 apex가
+        // 있을 때만** 본다.
+        let touches_apex = match v.kind {
+            ClipKind::IncidentVertex => inc_has_apex && v.a == CAP_APEX_ID,
+            ClipKind::EdgeCross => {
+                (inc_has_apex && v.a == CAP_APEX_ID) || (ref_has_apex && v.b == CAP_APEX_ID)
+            }
+            ClipKind::ReferenceVertex => ref_has_apex && v.a == CAP_APEX_ID,
+        };
+        let feature = if touches_apex {
             super::FeatureId(super::FEATURE_GENERIC)
         } else {
             super::feature::pack(super::feature::FaceFeature {
@@ -704,6 +722,19 @@ pub(super) fn convex_face_manifold(
             })
             .unwrap_or(super::FeatureId(super::FEATURE_GENERIC))
         };
+        // 같은 자리 중복은 **먼저 온 쪽**을 남긴다. apex가 링 정점과 겹칠 때(뚜껑을 축
+        // 둘레로 돌리다 보면 반드시 지난다) 안정 ID(링)가 남아야 계보가 exact ↔ generic을
+        // 왕복하지 않는데, **삽입 규칙이 그것을 이미 보장한다**: 섹터 판정이
+        // `cross(ring_j, apex) >= 0 && cross(apex, ring_{j+1}) > 0`이라, apex가 ring_j와
+        // 정확히 겹치면 두 번째 조건이 살아 slot = j+1 — 즉 **겹치는 정점 바로 뒤**에
+        // 들어간다. 그래서 선착순이 곧 "링 우선"이다(우선순위 코드를 따로 두면
+        // 뮤테이션으로 관측되지 않는 잉여가 된다 — 실측으로 확인했다).
+        if pts[..pts_len]
+            .iter()
+            .any(|q| (q.position - position).length_sq() <= dup_eps_sq)
+        {
+            continue;
+        }
         pts[pts_len] = super::ContactPoint {
             position,
             separation: sep,
@@ -953,6 +984,7 @@ mod tests {
         assert!(clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -977,6 +1009,7 @@ mod tests {
         assert!(clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -1019,6 +1052,7 @@ mod tests {
         assert!(clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -1050,6 +1084,7 @@ mod tests {
             assert!(clip_convex_face(
                 &r,
                 Vec3::new(0.0, 0.0, 1.0),
+                &IDS,
                 &i,
                 &IDS,
                 &mut out
@@ -1084,6 +1119,7 @@ mod tests {
         assert!(clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -1125,6 +1161,7 @@ mod tests {
         assert!(clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -1173,6 +1210,7 @@ mod tests {
         assert!(clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -1206,6 +1244,7 @@ mod tests {
         assert!(clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -1318,6 +1357,7 @@ mod tests {
         let seg = clip_segment(
             &r,
             n,
+            &IDS,
             Vec3::new(-0.5, 0.0, 0.1),
             Vec3::new(0.5, 0.0, 0.1),
             &IDS,
@@ -1332,6 +1372,7 @@ mod tests {
         let seg = clip_segment(
             &r,
             n,
+            &IDS,
             Vec3::new(-3.0, 0.25, 0.1),
             Vec3::new(3.0, 0.25, 0.1),
             &IDS,
@@ -1355,6 +1396,7 @@ mod tests {
             clip_segment(
                 &r,
                 n,
+                &IDS,
                 Vec3::new(2.5, 0.0, 0.1),
                 Vec3::new(0.0, 2.5, 0.1),
                 &IDS
@@ -1367,6 +1409,7 @@ mod tests {
             clip_segment(
                 &r,
                 n,
+                &IDS,
                 Vec3::new(1.5, 0.0, 0.1),
                 Vec3::new(0.0, 1.5, 0.1),
                 &IDS
@@ -1379,6 +1422,7 @@ mod tests {
             clip_segment(
                 &r,
                 n,
+                &IDS,
                 Vec3::new(-5.0, 1.5, 0.1),
                 Vec3::new(5.0, 1.5, 0.1),
                 &IDS
@@ -1391,6 +1435,7 @@ mod tests {
         assert!(clip_segment(
             &two,
             n,
+            &IDS,
             Vec3::new(0.0, 0.0, 0.1),
             Vec3::new(1.0, 0.0, 0.1),
             &IDS
@@ -1734,6 +1779,7 @@ mod tests {
         assert!(clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -1859,6 +1905,7 @@ mod tests {
         let seg = clip_segment(
             &r,
             n,
+            &IDS,
             Vec3::new(-3.0, -3.0, 0.1),
             Vec3::new(3.0, 3.0, 0.1),
             &IDS,
@@ -1876,6 +1923,7 @@ mod tests {
         let off = clip_segment(
             &r,
             n,
+            &IDS,
             Vec3::new(-3.0, -2.6, 0.1),
             Vec3::new(3.0, 3.4, 0.1),
             &IDS,
@@ -1942,7 +1990,7 @@ mod tests {
         ];
         let p0 = Vec3::new(-2.903_672_7, 1.612_034, 0.1);
         let p1 = Vec3::new(-3.437_234_9, -4.372_513_3, 0.1);
-        let seg = clip_segment(&r, Vec3::new(0.0, 0.0, 1.0), p0, p1, &IDS)
+        let seg = clip_segment(&r, Vec3::new(0.0, 0.0, 1.0), &IDS, p0, p1, &IDS)
             .expect("선분이 참조면을 가로지른다");
         let corner = seg
             .iter()
@@ -2037,24 +2085,35 @@ mod tests {
             };
             let m = crate::manifold::dispatch::contact(&cyl, &pa, &floor, &pf, 0.05)
                 .unwrap_or_else(|| panic!("spin={spin}에서 접촉이 있어야 한다"));
-            // apex가 활성이면 계보는 **generic**이다(방향 의존 합성점이라 정확 ID 계약이
-            // 성립하지 않는다 — 검수 rev_cd288093). 여기서 잠그는 것은 계보가 아니라
-            // **최심 접점이 실제 침투를 보고하는가**다.
-            assert_eq!(
-                unpack(m.points()[0].feature),
-                None,
-                "apex가 낀 접점에 정확 계보가 붙었다: {:?}",
-                m.points()[0].feature
-            );
+            // 최심 접점은 apex이고, apex에서 **파생된 접점만** generic이다(방향 의존
+            // 합성점이라 정확 ID 계약이 성립하지 않는다 — 검수 rev_cd288093).
+            // 여기서 잠그는 것은 그 접점이 실제 침투를 보고하는가다.
             let deepest = m
                 .points()
                 .iter()
-                .map(|p| p.separation)
-                .fold(f32::INFINITY, f32::min);
+                .min_by(|x, y| x.separation.total_cmp(&y.separation))
+                .expect("접점이 있어야 한다");
             assert!(
-                (deepest + 0.001).abs() < 1e-4,
-                "spin={spin}에서 최심 접점이 실제 1 mm 침투와 다르다: {deepest}"
+                (deepest.separation + 0.001).abs() < 1e-4,
+                "spin={spin}에서 최심 접점이 실제 1 mm 침투와 다르다: {}",
+                deepest.separation
             );
+            // 계보는 **apex가 링 정점과 겹치는지**에 달렸다: spin=0이면 최급강하 방향이
+            // 링 정점과 같아 apex가 중복 제거되고 안정 ID(링)가 남는다. 겹치지 않는
+            // spin=11.25°에서만 apex가 따로 서고 generic으로 내려간다.
+            if spin > 0.0 {
+                assert_eq!(
+                    unpack(deepest.feature),
+                    None,
+                    "apex 접점에 정확 계보가 붙었다: {:#010x}",
+                    deepest.feature.0
+                );
+            } else {
+                assert!(
+                    unpack(deepest.feature).is_some(),
+                    "apex가 링 정점과 겹치는데 안정 ID를 잃었다"
+                );
+            }
         }
     }
 
@@ -2132,6 +2191,7 @@ mod tests {
         let seg = clip_segment(
             &r,
             n,
+            &IDS,
             Vec3::new(0.0, cut_y, 0.1),
             Vec3::new(1000.0, cut_y, 0.1),
             &IDS,
@@ -2151,6 +2211,7 @@ mod tests {
         let corner = clip_segment(
             &r,
             n,
+            &IDS,
             Vec3::new(0.0, -0.0005, 0.1),
             Vec3::new(1000.0, -0.0005, 0.1),
             &IDS,
@@ -2247,7 +2308,7 @@ mod tests {
             ];
             let p0 = Vec3::new(-2.903_672_7, 1.612_034, 0.1) + t;
             let p1 = Vec3::new(-3.437_234_9, -4.372_513_3, 0.1) + t;
-            let seg = clip_segment(&r, Vec3::new(0.0, 0.0, 1.0), p0, p1, &IDS)
+            let seg = clip_segment(&r, Vec3::new(0.0, 0.0, 1.0), &IDS, p0, p1, &IDS)
                 .expect("선분이 참조면을 가로지른다");
             // **양 끝을 다 본다.** 한쪽만 보면 ULP 바닥이 관측되지 않는다 — 실측으로
             // off=9000에서 한 끝은 `EdgeCross`, 다른 끝은 `ReferenceVertex`가 됐고,
@@ -2382,9 +2443,12 @@ mod tests {
         };
         // 0.28 rad 기울이면 최저 테두리점이 중심에서 hh·cos + r·sin = 3.3408 아래다.
         // |축·법선| = cos(0.28) = 0.961 ≥ 0.95라 뚜껑 경로를 탄다.
+        // 축 둘레로 11.25°(링 정점 사이 한가운데) 돌려 apex가 링 정점과 안 겹치게 한다 —
+        // 겹치면 중복 제거에서 안정 ID(링)가 이겨 generic 접점이 안 생긴다.
         let tilted = Pose {
             pos: Vec3::new(0.0, 3.3398, 0.0),
-            rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.28),
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.28)
+                * Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::PI / 16.0),
         };
         let man = crate::manifold::dispatch::contact(&cyl, &tilted, &floor, &pf, 0.05)
             .expect("닿아야 한다");
@@ -2417,18 +2481,23 @@ mod tests {
             pos: Vec3::new(0.0, -0.5, 0.0),
             rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), 0.28),
         };
+        // 반지름 1짜리 원기둥이라야 10×10 슬랩 위에 얹힌다(반지름 10은 밖으로 넘친다).
+        let cyl2 = Shape::Cylinder {
+            half_height: 0.6,
+            radius: 1.0,
+        };
         let pc = Pose {
-            pos: Vec3::new(0.0, 0.55, 0.0),
-            rot: Quat::IDENTITY,
+            pos: Vec3::new(0.0, 0.615, 0.0),
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::PI / 16.0),
         };
         // 뚜껑 dot = 0.99 (기울인 법선), hull 면 dot = cos(0.28) = 0.961 → 뚜껑이 참조면.
         let nrm = Vec3::new(-0.14, 1.0, 0.0).try_normalize().unwrap();
-        let man = super::convex_face_manifold(&cyl, &pc, &hull, &ph, nrm, 0.2)
+        let man = super::convex_face_manifold(&cyl2, &pc, &hull, &ph, nrm, 0.2)
             .expect("이 배치는 면 매니폴드를 낸다");
-        let f0 = unpack(man.points()[0].feature);
         assert!(
-            man.points().iter().all(|p| unpack(p.feature).is_none()),
-            "뚜껑이 참조면인데 apex 강등이 안 걸렸다: {f0:?}"
+            man.points().iter().any(|p| unpack(p.feature).is_none()),
+            "뚜껑이 참조면인데 apex 강등이 안 걸렸다: {:?}",
+            man.points()
         );
 
         // 음성 대조: 정확히 세우면 apex가 없고 계보가 붙는다.
@@ -2487,6 +2556,7 @@ mod tests {
         assert!(!clip_convex_face(
             &r,
             Vec3::new(0.0, 0.0, 1.0),
+            &IDS,
             &i,
             &IDS,
             &mut out
@@ -2501,21 +2571,21 @@ mod tests {
         let n = Vec3::new(0.0, 0.0, 1.0);
         let two = vec![Vec3::ZERO, Vec3::new(1.0, 0.0, 0.1)];
         assert!(
-            !clip_convex_face(&r, n, &two, &IDS, &mut out),
+            !clip_convex_face(&r, n, &IDS, &two, &IDS, &mut out),
             "정점 2개가 통과했다"
         );
         assert!(
-            !clip_convex_face(&two, n, &r, &IDS, &mut out),
+            !clip_convex_face(&two, n, &IDS, &r, &IDS, &mut out),
             "참조면 2개가 통과했다"
         );
         let over = convex_lens(MAX_FACE_VERTS + 2, 1.0, 0.1);
         assert!(
-            !clip_convex_face(&r, n, &over, &IDS, &mut out),
+            !clip_convex_face(&r, n, &IDS, &over, &IDS, &mut out),
             "상한 초과가 통과했다"
         );
         let at_cap = convex_lens(MAX_FACE_VERTS, 0.5, 0.1);
         assert!(
-            clip_convex_face(&r, n, &at_cap, &IDS, &mut out),
+            clip_convex_face(&r, n, &IDS, &at_cap, &IDS, &mut out),
             "경계값(상한 정확히)이 거절됐다"
         );
     }
@@ -2527,11 +2597,11 @@ mod tests {
         let i = square(0.6, 0.6, 1.0, 0.1);
         let mut ccw = GenClip::new();
         let r = square(0.0, 0.0, 1.0, 0.0);
-        assert!(clip_convex_face(&r, n, &i, &IDS, &mut ccw));
+        assert!(clip_convex_face(&r, n, &IDS, &i, &IDS, &mut ccw));
         let mut cw = GenClip::new();
         let mut rr = r.clone();
         rr.reverse();
-        assert!(clip_convex_face(&rr, n, &i, &IDS, &mut cw));
+        assert!(clip_convex_face(&rr, n, &IDS, &i, &IDS, &mut cw));
         assert_eq!(ccw.as_slice().len(), cw.as_slice().len());
         for v in cw.as_slice() {
             assert!(
