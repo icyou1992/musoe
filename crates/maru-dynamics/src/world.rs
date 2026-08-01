@@ -153,6 +153,16 @@ pub struct CcdHit {
 /// `Diagnostics::ccd_hits_dropped`로 보고한다 — 조용히 사라지지 않는다.
 pub const MAX_CCD_HITS: usize = 1024;
 
+/// 최근접점 투영 결과 — 어느 물체의 겉면 위 어디인가.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointHit {
+    pub body: BodyHandle,
+    /// 그 물체의 **겉면** 위 최근접점 (월드 좌표).
+    pub point: Vec3,
+    /// 질의점이 그 물체 안에 있었는가 (`query_point`와 같은 판정).
+    pub inside: bool,
+}
+
 /// 광선 질의 히트.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RayHit {
@@ -1550,6 +1560,74 @@ impl World {
         } else {
             Ok(false)
         }
+    }
+
+    /// 점에서 **가장 가까운 물체 겉면** 위의 점. 물체가 하나도 없으면 `None`.
+    ///
+    /// `query_point`가 "이 점을 누가 품고 있나"라면 이건 "가장 가까운 겉면이 어디냐"다 —
+    /// 스냅·집기·자석 배치·최단거리 판정에 쓴다.
+    ///
+    /// **주의**: `p`가 A 안에 있어도 옆 물체 B의 겉면이 더 가까우면 B가 나온다. 겉면까지의
+    /// 거리로 고르기 때문이다(rapier도 같다). "누가 품고 있나"는 `query_point`가 답한다.
+    pub fn project_point(&self, p: Vec3) -> Result<Option<PointHit>, ApiError> {
+        self.project_point_filtered(p, QueryFilter::ALL)
+    }
+
+    /// 필터를 받는 최근접점 투영.
+    ///
+    /// 후보를 **AABB 하한으로 가지친다**: 점에서 물체 AABB까지의 거리는 겉면까지의 거리보다
+    /// 크지 않으므로, 그 하한이 이미 현재 최선보다 멀면 투영을 풀 필요가 없다. 가지치기가
+    /// 답을 바꾸지 않는다는 것은 무가지치기 전수 대조 테스트가 잠근다.
+    pub fn project_point_filtered(
+        &self,
+        p: Vec3,
+        filter: QueryFilter,
+    ) -> Result<Option<PointHit>, ApiError> {
+        if !maru_collide::vec_in_range(p) {
+            return Err(ApiError::InvalidValue);
+        }
+        let mut best: Option<(f32, PointHit)> = None;
+        for i in 0..self.bodies.len() {
+            if !self.passes(i, filter) {
+                continue;
+            }
+            let b = &self.bodies[i];
+            if let Some((bd2, _)) = best {
+                let local = b
+                    .shape
+                    .try_local_aabb()
+                    .map_err(|_| ApiError::InvalidValue)?;
+                let bb = maru_collide::transformed_aabb(local, &b.pose);
+                let c = Vec3::new(
+                    p.x.clamp(bb.min.x, bb.max.x),
+                    p.y.clamp(bb.min.y, bb.max.y),
+                    p.z.clamp(bb.min.z, bb.max.z),
+                );
+                // 동률에서 건너뛰는 것이 옳다 — 아래 승자 판정도 엄격 부등호라
+                // 어차피 **낮은 슬롯**이 이긴다. 두 규칙이 같아야 결정론이 성립한다.
+                if (c - p).length_sq() >= bd2 {
+                    continue;
+                }
+            }
+            // 순회 포화는 "먼 점"으로 위장하지 않는다 — 못 본 후보가 더 가까울 수 있다.
+            let proj =
+                maru_collide::try_project_point(&b.shape, &b.pose, p).map_err(|e| match e {
+                    maru_collide::QueryReject::ResourceLimit => ApiError::ResourceLimit,
+                    maru_collide::QueryReject::InvalidInput => ApiError::InvalidValue,
+                })?;
+            let d2 = (proj.point - p).length_sq();
+            if best.is_none_or(|(bd2, _)| d2 < bd2) {
+                best = Some((
+                    d2,
+                    PointHit {
+                        body: self.handle_of(i),
+                        point: proj.point,
+                        inside: proj.inside,
+                    },
+                ));
+            }
+        }
+        Ok(best.map(|(_, h)| h))
     }
 
     /// 점을 품은 물체들 (슬롯 오름차순). 겉면 기준 — convex radius를 포함한다.

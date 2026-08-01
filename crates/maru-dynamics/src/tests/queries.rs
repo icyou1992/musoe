@@ -1087,3 +1087,162 @@ fn spinning_blade_does_not_sweep_through_wall() {
     }
     assert!(w1.diagnostics().ccd_clamps > 0 || tip_x(&w1, h1) < 1.0);
 }
+
+// ---------- 최근접점 투영 ----------
+
+#[test]
+fn project_point_picks_nearest_surface() {
+    let (w, hs) = query_world();
+    // x=-3 → 첫 구(중심 0, 반지름 1)의 겉면 (-1, 0, 0)
+    let hit = w.project_point(Vec3::new(-3.0, 0.0, 0.0)).unwrap().unwrap();
+    assert_eq!(hit.body, hs[0]);
+    assert!(!hit.inside);
+    assert!((hit.point - Vec3::new(-1.0, 0.0, 0.0)).length() < 1e-5);
+    // x=12 → 셋째 구(중심 10)의 겉면 (11, 0, 0)
+    let hit = w.project_point(Vec3::new(12.0, 0.0, 0.0)).unwrap().unwrap();
+    assert_eq!(hit.body, hs[2]);
+    assert!((hit.point - Vec3::new(11.0, 0.0, 0.0)).length() < 1e-5);
+    // 구 안 → inside, 그래도 겉면 위 점
+    let hit = w.project_point(Vec3::new(5.2, 0.0, 0.0)).unwrap().unwrap();
+    assert_eq!(hit.body, hs[1]);
+    assert!(hit.inside);
+    assert!(((hit.point - Vec3::new(5.0, 0.0, 0.0)).length() - 1.0).abs() < 1e-5);
+}
+
+#[test]
+fn project_point_on_empty_world_is_none() {
+    let w = World::new(WorldParams::default());
+    assert!(w.project_point(Vec3::ZERO).unwrap().is_none());
+    // 비유한 입력은 "먼 점"이 아니라 오류다.
+    let (w, _) = query_world();
+    assert!(matches!(
+        w.project_point(Vec3::new(f32::NAN, 0.0, 0.0)),
+        Err(ApiError::InvalidValue)
+    ));
+}
+
+/// **AABB 하한 가지치기가 답을 바꾸지 않는다** — 가지치기 없이 전수로 푼 답과 같아야 한다.
+/// (하한이 틀리면 진짜 최근접이 조용히 잘려나가고, 결과는 "그럴듯한 다른 물체"가 된다.)
+#[test]
+fn project_point_pruning_matches_brute_force() {
+    let mut w = World::new(WorldParams::default());
+    let mut rng = 12345u32;
+    let mut next = || {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let mut handles = Vec::new();
+    for k in 0..24 {
+        let pos = Vec3::new(
+            (next() - 0.5) * 20.0,
+            (next() - 0.5) * 20.0,
+            (next() - 0.5) * 20.0,
+        );
+        let shape = match k % 3 {
+            0 => maru_collide::Shape::Sphere {
+                radius: 0.3 + next(),
+            },
+            1 => maru_collide::Shape::Box {
+                half: Vec3::new(0.4 + next(), 0.4 + next(), 0.4 + next()),
+                radius: 0.0,
+            },
+            _ => maru_collide::Shape::Capsule {
+                half_height: 0.3 + next(),
+                radius: 0.2 + next() * 0.5,
+            },
+        };
+        handles.push(w.add_body(Body::new_dynamic(
+            shape,
+            maru_collide::Pose {
+                pos,
+                rot: maru_math::Quat::from_axis_angle(
+                    Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5),
+                    next() * 6.0,
+                ),
+            },
+            1.0,
+        )));
+    }
+    for _ in 0..200 {
+        let p = Vec3::new(
+            (next() - 0.5) * 26.0,
+            (next() - 0.5) * 26.0,
+            (next() - 0.5) * 26.0,
+        );
+        let got = w.project_point(p).unwrap().unwrap();
+        // 전수: 물체마다 직접 투영해 최소를 고른다(같은 동률 규칙 — 낮은 슬롯 우선).
+        let mut want: Option<(f32, BodyHandle, Vec3)> = None;
+        for h in &handles {
+            let b = w.body(*h);
+            let pr = maru_collide::try_project_point(&b.shape, &b.pose, p).unwrap();
+            let d2 = (pr.point - p).length_sq();
+            if want.is_none_or(|(bd, _, _)| d2 < bd) {
+                want = Some((d2, *h, pr.point));
+            }
+        }
+        let (_, wh, wp) = want.unwrap();
+        assert_eq!(got.body, wh, "가지치기가 다른 물체를 골랐다 p={p:?}");
+        assert!((got.point - wp).length() < 1e-6);
+    }
+}
+
+/// 필터가 걸린 물체는 후보에서 빠진다 — 광선 질의와 같은 규칙.
+#[test]
+fn project_point_respects_filter() {
+    let (w, hs) = query_world();
+    // 첫 구를 빼면 그다음으로 가까운 구가 나온다.
+    let p = Vec3::new(-3.0, 0.0, 0.0);
+    assert_eq!(w.project_point(p).unwrap().unwrap().body, hs[0]);
+    let hit = w
+        .project_point_filtered(p, QueryFilter::ALL.exclude(hs[0]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit.body, hs[1]);
+    // 아무 그룹과도 안 맞으면 후보가 없다.
+    assert!(w
+        .project_point_filtered(p, QueryFilter::ALL.groups(0))
+        .unwrap()
+        .is_none());
+}
+
+/// **동률은 낮은 슬롯이 이긴다** — 결과가 순회 순서에 의존하지 않게 하는 규칙이다.
+///
+/// 질의점을 두 구의 **수직 이등분면 위**(축에서 벗어난 자리)에 둔다: 겉면까지의 거리는
+/// 대칭이라 비트까지 같지만, 각 구의 AABB 하한은 그보다 작아 가지치기가 발동하지 않는다.
+/// 축 위에 두면 가지치기가 먼저 동률을 잘라내 승자 판정 자체가 안 돈다.
+#[test]
+fn project_point_tie_goes_to_lower_slot() {
+    let mut w = World::new(WorldParams::default());
+    let mut hs = Vec::new();
+    for x in [-2.0f32, 2.0] {
+        hs.push(w.add_body(Body::new_dynamic(
+            maru_collide::Shape::Sphere { radius: 1.0 },
+            maru_collide::Pose {
+                pos: Vec3::new(x, 0.0, 0.0),
+                rot: maru_math::Quat::IDENTITY,
+            },
+            1.0,
+        )));
+    }
+    let p = Vec3::new(0.0, 0.5, 0.0);
+    // 전제: 두 거리가 정말 같고, AABB 하한은 그보다 작다(= 가지치기가 안 잡는다).
+    let d: Vec<f32> = hs
+        .iter()
+        .map(|h| {
+            let b = w.body(*h);
+            (maru_collide::try_project_point(&b.shape, &b.pose, p)
+                .unwrap()
+                .point
+                - p)
+                .length_sq()
+        })
+        .collect();
+    assert_eq!(d[0], d[1], "동률 전제가 깨졌다: {d:?}");
+    let lower_bound = (Vec3::new(-1.0, 0.5, 0.0) - p).length_sq();
+    assert!(
+        lower_bound < d[0],
+        "AABB 하한이 이미 동률이라 승자 판정이 안 돈다"
+    );
+
+    assert_eq!(w.project_point(p).unwrap().unwrap().body, hs[0]);
+}
