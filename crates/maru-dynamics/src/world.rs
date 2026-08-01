@@ -174,6 +174,67 @@ pub struct ContactForceEvent {
     pub max_force_magnitude: f32,
 }
 
+/// 한 페어(또는 그 안의 한 제약)가 이번 스텝에 실은 접촉력 누적값.
+///
+/// 튜플을 이름 있는 구조체로 둔 이유는 자리를 헷갈리지 않기 위해서다 — 벡터 합과 크기 합은
+/// 의미가 다른데(마주 보는 접점에서 상쇄 여부가 갈린다) 둘 다 같은 자리에 놓이면 섞인다.
+#[derive(Clone, Copy, Default)]
+struct ForceAcc {
+    /// 임펄스 **벡터** 합 (A가 받는 방향).
+    total: Vec3,
+    /// 접점별 임펄스 **크기**의 합 — 상쇄되지 않는다.
+    mag_sum: f32,
+    /// 가장 큰 접점 임펄스와 그 크기².
+    max_imp: Vec3,
+    max_m2: f32,
+}
+
+/// 블록(SoA)의 누적 임펄스를 스칼라 제약으로 되쓴다.
+///
+/// **풀은 직전 스텝의 길이를 남길 수 있다** — 이번 스텝의 블록 수만 훑는다.
+fn scatter_block_impulses(
+    blocks: &[solver_block::ContactBlock],
+    block_starts: &[usize],
+    constraints: &mut [ContactConstraint],
+) {
+    for (bi, blk) in blocks.iter().enumerate().take(block_starts.len()) {
+        let s = block_starts[bi];
+        let (l, r) = constraints.split_at_mut(s + 1);
+        let (c1, c2) = r.split_at_mut(1);
+        let (c3, c4) = c2.split_at_mut(1);
+        blk.scatter_impulses([&mut l[s], &mut c1[0], &mut c3[0], &mut c4[0]]);
+    }
+}
+
+/// 이번 **서브스텝**이 각 제약에 실은 임펄스를 누적기에 더한다.
+///
+/// 왜 서브스텝마다인가: 접점의 `normal_impulse`는 그 서브스텝에 실제로 실린 임펄스다
+/// (다음 서브스텝의 warm start가 그 값을 다시 적용하고 solve가 새 값으로 고친다).
+/// 스텝이 끝난 뒤 한 번만 읽으면 **마지막 서브스텝 값**만 보게 되는데, 충돌처럼 첫
+/// 서브스텝에 큰 임펄스가 실리고 이후 분리되는 경우 그 값이 0에 가까워 **충격 자체를
+/// 놓친다**(검수 rev_26dffa4b BLOCKER). 스텝 총 임펄스는 서브스텝 값의 **합**이다.
+fn accumulate_contact_forces(constraints: &[ContactConstraint], acc: &mut [ForceAcc]) {
+    for (ci, c) in constraints.iter().enumerate() {
+        let a = &mut acc[ci];
+        for p in &c.points {
+            // 접점 임펄스 = 법선 성분 + 접선 두 성분(월드 기저).
+            let imp = c.normal * p.normal_impulse
+                + c.tangents[0] * p.tangent_impulse[0]
+                + c.tangents[1] * p.tangent_impulse[1];
+            a.total += imp;
+            let m2 = imp.length_sq();
+            // **크기의 합**을 따로 센다. 벡터 합만 보면 서로 마주 보는 두 접점이 상쇄돼
+            // "100 N으로 짓눌리는데 총 힘 0"이 된다(검수 rev_26dffa4b MAJOR).
+            // rapier의 `total_force_magnitude`도 크기의 합이다.
+            a.mag_sum += m2.sqrt();
+            if m2 > a.max_m2 {
+                a.max_m2 = m2;
+                a.max_imp = imp;
+            }
+        }
+    }
+}
+
 /// 최근접점 투영 결과 — 어느 물체의 겉면 위 어디인가.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointHit {
@@ -2307,6 +2368,9 @@ impl World {
         nbody: usize,
         constraint_cap: usize,
         contact_event_target: usize,
+        // `force_event_target` = 접촉력 출력 상한 = 이번 스텝의 페어 수(`ncap`).
+        // 접촉 이벤트 목표와 **다르다** — 그쪽은 stopped까지 담아 `+ touching.len()`이다.
+        force_event_target: usize,
     ) -> usize {
         let ex = |cap: usize, target: usize, elem: usize| cap.saturating_sub(target) * elem;
         self.solver_state
@@ -2339,11 +2403,16 @@ impl World {
                 core::mem::size_of::<ContactEvent>(),
             ))
             // 접촉력 출력도 영속 버퍼다 — 회계에서 빠지면 128 MiB 상한이 실제 선점보다
-            // 낮게 계산돼, 거절해야 할 입력이 allocator 실패로 끝난다(이 세션에만 세 번
-            // 빠뜨렸던 자리다). 상한은 **키**당 하나이므로 페어 수 상한과 같다.
+            // 낮게 계산돼, 거절해야 할 입력이 allocator 실패로 끝난다.
+            //
+            // **목표는 접촉 이벤트와 다르다.** 접촉 이벤트는 stopped까지 담아 상한이
+            // `ncap + touching.len()`이지만, 접촉력은 **이번 스텝에 살아있는 페어**만
+            // 담으므로 `ncap`이다. 큰 접촉 장면 다음 스텝에 전부 분리되면 `ncap = 0`인데
+            // `touching.len()`은 여전히 커서, 같은 목표를 쓰면 과거에 부푼 접촉력 버퍼를
+            // "필요한 용량"으로 오인해 초과분을 0으로 센다(검수 rev_26dffa4b MAJOR).
             .saturating_add(ex(
                 self.contact_force_events.capacity(),
-                contact_event_target,
+                force_event_target,
                 core::mem::size_of::<ContactForceEvent>(),
             ))
             .saturating_add(ex(self.sleep_bak.capacity(), nbody, 1))
@@ -3124,7 +3193,8 @@ impl World {
             + maru_collide::MAX_MANIFOLD_POINTS
                 * core::mem::size_of::<solver::ContactPointConstraint>() // 접점 힙 원소
             + core::mem::size_of::<(u32, u32)>()                         // constraint_keys
-            + core::mem::size_of::<((u32, u32), Vec3, Vec3, f32)>()      // force_rows
+            + core::mem::size_of::<((u32, u32), ForceAcc)>()             // force_rows
+            + core::mem::size_of::<ForceAcc>()                           // force_acc
             + core::mem::size_of::<u32>()                                // 컬러 order
             + core::mem::size_of::<(u32, u32)>()                         // 컬러 endpoints
             + core::mem::size_of::<u32>()                                // color_of
@@ -3416,6 +3486,7 @@ impl World {
                     nbody,
                     constraint_cap,
                     contact_event_target,
+                    ncap,
                 ))
         };
         if step_bytes(self, narrow_held) > MAX_STEP_SCRATCH_BYTES {
@@ -3445,6 +3516,7 @@ impl World {
                     nbody,
                     constraint_cap,
                     contact_event_target,
+                    ncap,
                 ));
             if after > MAX_STEP_SCRATCH_BYTES {
                 // 참여자 버퍼는 아직 self가 들고 있다(아래에서 take한다) — 되돌릴 것이 없다.
@@ -3456,11 +3528,14 @@ impl World {
         let njoint = self.joints.len();
         let mut constraints: Vec<ContactConstraint> = Vec::new();
         let mut constraint_keys: Vec<(u32, u32)> = Vec::new();
-        // 접촉력 합산 스크래치 — 제약마다 한 줄(키, 총 임펄스, 최대 접점 임펄스, 그 크기²).
-        // **맵을 쓰지 않는다**: 스텝 중 할당 0 계약 아래라 해시 맵을 새로 만들 수 없다.
-        // 제약 순서로 밀어 넣고 나중에 키로 정렬해 병합하면, 같은 키의 제약이 흩어져 있어도
-        // 정확하고 출력 순서까지 **키 오름차순으로 결정**된다(접촉 이벤트와 같은 규약).
-        let mut force_rows: Vec<((u32, u32), Vec3, Vec3, f32)> = Vec::new();
+        // 접촉력 누적기 — 제약 인덱스별 (총 임펄스, 크기의 합, 최대 접점 임펄스, 그 크기²).
+        // **서브스텝마다** 더한다(아래 `accumulate_contact_forces` 주석 참조).
+        let mut force_acc: Vec<ForceAcc> = Vec::new();
+        // 방출 직전 스크래치 — 제약마다 한 줄(키 + 누적값). **맵을 쓰지 않는다**:
+        // 스텝 중 할당 0 계약 아래라 해시 맵을 새로 만들 수 없다. 제약 순서로 밀어 넣고
+        // 키로 정렬해 병합하면 같은 키의 제약이 흩어져 있어도 정확하고, 출력 순서까지
+        // **키 오름차순으로 결정**된다(접촉 이벤트와 같은 규약).
+        let mut force_rows: Vec<((u32, u32), ForceAcc)> = Vec::new();
         let mut live_keys: IntSet<(u32, u32)> = IntSet::default();
         let mut joint_pairs: Vec<(usize, usize)> = Vec::new();
         let mut active_joints: Vec<usize> = Vec::new();
@@ -3566,6 +3641,7 @@ impl World {
             || started.try_reserve(ncap).is_err()
             // 접촉력: 행은 제약당 하나, 출력은 **키**당 하나(페어 수 상한 = ncap).
             || force_rows.try_reserve(constraint_cap).is_err()
+            || force_acc.try_reserve(constraint_cap).is_err()
             || self
                 .contact_force_events
                 .try_reserve(ncap.saturating_sub(self.contact_force_events.len()))
@@ -4255,6 +4331,21 @@ impl World {
         // 서브스텝 말 갱신 시점의 자세 — 다음 서브스텝 시작에서 "안 바뀌었다"를 확인한다.
         #[cfg(debug_assertions)]
         let mut rot_at_prev_refresh: Vec<maru_math::Quat> = Vec::new();
+        // 접촉력 이벤트가 **켜져 있는가** — 임계가 유한한 물체가 하나라도 있으면 켜진 것이다.
+        // 꺼져 있으면 서브스텝 누적이 통째로 빠져 안 쓰는 호스트의 비용이 0이다.
+        let force_events_on = self
+            .bodies
+            .iter()
+            .any(|b| b.contact_force_threshold.is_finite());
+        if force_events_on {
+            // 용량은 스텝 시작에 `constraint_cap`으로 선점됐다 — 재할당하지 않는다.
+            debug_assert!(
+                constraints.len() <= force_acc.capacity(),
+                "접촉력 누적기 선점 부족"
+            );
+            force_acc.clear();
+            force_acc.resize(constraints.len(), ForceAcc::default());
+        }
         for sub_i in 0..n_sub {
             // 역관성 갱신을 **외력보다 먼저** — 토크는 현재 자세의 월드 역관성을 쓴다
             // (뒤에 두면 첫 서브스텝에서 `inv_i`가 아직 0이라 토크가 통째로 사라진다).
@@ -4718,24 +4809,29 @@ impl World {
                 &relax_params,
             );
             self.diag.solve_ns[4] += _t_rs.ns();
+
+            // 접촉력 이벤트를 켠 물체가 있을 때만 서브스텝 임펄스를 모은다.
+            // **마지막 서브스텝은 여기서 세지 않는다** — restitution이 그 값에 반발
+            // 임펄스를 더하므로, 아래 스캐터·restitution 뒤에 한 번 더 세면 그것까지 들어간다.
+            if force_events_on && sub_i + 1 < n_sub {
+                scatter_block_impulses(&blocks, &block_starts, &mut constraints);
+                accumulate_contact_forces(&constraints, &mut force_acc);
+            }
         }
 
         // 블록의 누적 임펄스를 스칼라 제약으로 되쓴다 — restitution 패스와 PCM 갱신이
-        // 스칼라 제약을 읽는다. 스텝당 1회면 충분하다(서브스텝 안에서는 블록이 정본).
-        // **풀은 직전 스텝의 길이를 남길 수 있다** — 이번 스텝의 블록 수만 훑는다.
-        for (bi, blk) in blocks.iter().enumerate().take(block_starts.len()) {
-            let s = block_starts[bi];
-            let (l, r) = constraints.split_at_mut(s + 1);
-            let (c1, c2) = r.split_at_mut(1);
-            let (c3, c4) = c2.split_at_mut(1);
-            blk.scatter_impulses([&mut l[s], &mut c1[0], &mut c3[0], &mut c4[0]]);
-        }
+        // 스칼라 제약을 읽는다(서브스텝 안에서는 블록이 정본).
+        scatter_block_impulses(&blocks, &block_starts, &mut constraints);
 
         self.contact_blocks = blocks;
 
         // 4) restitution 패스 (임팩트 게이트)
         for c in constraints.iter_mut() {
             solver::apply_restitution(&mut st, c, self.params.solver.restitution_threshold);
+        }
+        // 마지막 서브스텝 분 + 반발 임펄스를 여기서 센다(위 루프가 마지막을 건너뛴 이유).
+        if force_events_on {
+            accumulate_contact_forces(&constraints, &mut force_acc);
         }
 
         self.diag.phase_ns[3] = _t_sv.ns();
@@ -4905,17 +5001,8 @@ impl World {
         //
         // 임계를 켠 물체가 하나도 없으면 아래 `pair_threshold`가 항상 무한이라 합산이 통째로
         // 빠진다 — 안 쓰는 호스트의 비용은 0이다.
-        // **서브스텝 길이로 나눈다.** 접점의 누적 임펄스는 스텝 전체가 아니라 **한 서브스텝**
-        // 분이다(다음 서브스텝이 다시 warm start부터 쌓는다). 스텝 dt로 나누면 서브스텝 수
-        // 배만큼 작게 나온다 — 4서브스텝 기본값에서 무게 10 N짜리 박스가 2.5 N으로 보고됐다.
-        // 정상 상태에서는 서브스텝마다 같은 임펄스가 쌓이므로, 서브스텝 평균 힘이 곧 스텝
-        // 평균 힘이다.
-        let inv_h = if dt > 0.0 {
-            self.params.substeps as f32 / dt
-        } else {
-            0.0
-        };
-        for (c, key) in constraints.iter().zip(&constraint_keys) {
+        let inv_dt = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+        for (ci, (c, key)) in constraints.iter().zip(&constraint_keys).enumerate() {
             let first = cache_written.insert(*key);
             // 접점 → 캐시 엔트리 변환. **자리에서 채우기 위해** 클로저로 뽑아 뒀다:
             // 예전에는 `collect()`로 새 `Vec`을 만들어 `insert`했는데, 그러면 직전 스텝의
@@ -4957,40 +5044,27 @@ impl World {
                     },
                 )
             };
-            // 접촉력: 이 제약이 페어에 더한 임펄스를 한 줄로 남긴다. 복합 페어는 같은 키에
+            // 접촉력: **서브스텝 내내 누적한** 값을 한 줄로 남긴다. 복합 페어는 같은 키에
             // 제약이 여럿인데, 여기서 합치지 않고 **나중에 키로 정렬해 병합**한다 —
             // 같은 키의 제약이 배열에서 붙어 있다는 보장이 없기 때문이다.
-            let (ai, bi) = (key.0 as usize, (key.1 & !STATIC_BIT) as usize);
-            let pair_threshold = if ai < self.bodies.len() && bi < self.bodies.len() {
-                self.bodies[ai]
-                    .contact_force_threshold
-                    .min(self.bodies[bi].contact_force_threshold)
-            } else {
-                f32::INFINITY
-            };
-            if pair_threshold.is_finite() {
-                let mut total = Vec3::ZERO;
-                let mut max_p = Vec3::ZERO;
-                let mut max_m2 = 0.0f32;
-                for p in &c.points {
-                    // 접점 임펄스 = 법선 성분 + 월드 마찰 벡터. 마찰은 이미 월드 벡터라
-                    // 접선 기저를 다시 곱하지 않는다(기저는 법선에서 유도돼 회전한다).
-                    let imp = c.normal * p.normal_impulse
-                        + c.tangents[0] * p.tangent_impulse[0]
-                        + c.tangents[1] * p.tangent_impulse[1];
-                    total += imp;
-                    let m2 = imp.length_sq();
-                    if m2 > max_m2 {
-                        max_m2 = m2;
-                        max_p = imp;
-                    }
+            if force_events_on {
+                let (ai, bi) = (key.0 as usize, (key.1 & !STATIC_BIT) as usize);
+                let pair_threshold = if ai < self.bodies.len() && bi < self.bodies.len() {
+                    self.bodies[ai]
+                        .contact_force_threshold
+                        .min(self.bodies[bi].contact_force_threshold)
+                } else {
+                    f32::INFINITY
+                };
+                if pair_threshold.is_finite() {
+                    let a = force_acc[ci];
+                    // 용량은 스텝 시작에 `constraint_cap`으로 선점됐다 — 재할당하지 않는다.
+                    debug_assert!(
+                        force_rows.len() < force_rows.capacity(),
+                        "접촉력 행 선점 부족"
+                    );
+                    force_rows.push((*key, a));
                 }
-                // 용량은 스텝 시작에 `constraint_cap`으로 선점됐다 — 재할당하지 않는다.
-                debug_assert!(
-                    force_rows.len() < force_rows.capacity(),
-                    "접촉력 행 선점 부족"
-                );
-                force_rows.push((*key, total, max_p, max_m2));
             }
             match self.contact_cache.get_mut(key) {
                 // 살아남은 키 — 용량을 그대로 재사용한다. 같은 키의 첫 제약만 비우고,
@@ -5040,14 +5114,16 @@ impl World {
             while i < force_rows.len() {
                 let key = force_rows[i].0;
                 let mut total = Vec3::ZERO;
+                let mut mag_sum = 0.0f32;
                 let mut max_p = Vec3::ZERO;
                 let mut max_m2 = 0.0f32;
                 while i < force_rows.len() && force_rows[i].0 == key {
-                    let (_, t, mp, m2) = force_rows[i];
-                    total += t;
-                    if m2 > max_m2 {
-                        max_m2 = m2;
-                        max_p = mp;
+                    let a = force_rows[i].1;
+                    total += a.total;
+                    mag_sum += a.mag_sum;
+                    if a.max_m2 > max_m2 {
+                        max_m2 = a.max_m2;
+                        max_p = a.max_imp;
                     }
                     i += 1;
                 }
@@ -5062,13 +5138,17 @@ impl World {
                 let threshold = self.bodies[ai]
                     .contact_force_threshold
                     .min(self.bodies[bi].contact_force_threshold);
-                let force = total * inv_h;
-                let mag = force.length();
+                // **스텝 dt로 나눈다.** 위에서 서브스텝 값을 전부 더했으므로 `total`이
+                // 이미 스텝 총 임펄스다(서브스텝 길이로 나누면 서브스텝 수만큼 커진다).
+                let force = total * inv_dt;
+                // 임계와 보고 크기는 **크기의 합**이다 — 벡터 합은 마주 보는 접점에서
+                // 상쇄돼 "짓눌리는데 총 힘 0"이 된다(rapier의 동명 필드와 같은 의미).
+                let mag = mag_sum * inv_dt;
                 // NaN은 여기 못 온다(`validate`가 임계에서 막고, 힘은 상태 위생을 거친다).
                 if mag <= threshold {
                     continue;
                 }
-                let max_force = max_p * inv_h;
+                let max_force = max_p * inv_dt;
                 let max_mag = max_force.length();
                 debug_assert!(
                     self.contact_force_events.len() < self.contact_force_events.capacity(),

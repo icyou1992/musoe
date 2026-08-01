@@ -370,8 +370,14 @@ fn contact_force_reports_weight_at_rest() {
             assert!((l - 1.0).abs() < 1e-3, "최대 힘 방향이 단위가 아니다: {l}");
             assert!(e.max_force_magnitude <= e.total_force_magnitude + 1e-3);
             assert!(e.a == b || e.b == b, "이벤트 대상이 다르다");
-            // 총 힘 벡터의 크기가 보고된 크기와 일치해야 한다.
-            assert!((e.total_force.length() - e.total_force_magnitude).abs() < 1e-3);
+            // `total_force_magnitude`는 **크기의 합**이라 벡터 합의 크기 이상이다
+            // (삼각부등식). 접점이 서로 다른 방향을 보면 엄격히 크다.
+            assert!(
+                e.total_force_magnitude >= e.total_force.length() - 1e-3,
+                "크기의 합이 벡터 합보다 작다: {} < {}",
+                e.total_force_magnitude,
+                e.total_force.length()
+            );
         }
     }
     let f = seen.expect("정착한 박스의 접촉력 이벤트가 없다");
@@ -541,5 +547,109 @@ fn contact_force_includes_the_friction_component() {
     assert!(
         sliding.x.abs() > 1.0,
         "미끄러지는데 접선 힘이 안 잡혔다: {sliding:?}"
+    );
+}
+
+/// **충격 순간이 보고돼야 한다.** 접점 임펄스는 서브스텝마다 다시 계산되므로, 스텝이
+/// 끝난 뒤 한 번만 읽으면 마지막 서브스텝 값만 보게 된다 — 첫 서브스텝에 큰 임펄스가
+/// 실리고 이후 분리되는 충돌에서는 그 값이 작아 **충격 자체를 놓친다**
+/// (검수 rev_26dffa4b BLOCKER). 스텝 총 임펄스는 서브스텝 값의 합이다.
+///
+/// 판정 기준: 빠르게 떨어뜨린 물체의 착지 스텝 힘이 **정착 후 무게보다 훨씬 커야** 한다.
+/// 운동량 정리로 대략 `m·Δv/dt` — 20 m/s로 부딪히면 무게(10 N)의 수십 배다.
+#[test]
+fn contact_force_captures_the_impact_peak() {
+    let params = WorldParams {
+        gravity: Vec3::new(0.0, -10.0, 0.0),
+        ..no_sleep_params()
+    };
+    let mut w = World::new(params);
+    w.add_body(
+        Body::new_static(
+            Shape::Box {
+                half: Vec3::new(50.0, 1.0, 50.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        )
+        .with_contact_force_threshold(0.1),
+    );
+    let b = w.add_body(Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(0.5, 0.5, 0.5),
+            radius: 0.0,
+        },
+        pose(0.0, 1.2, 0.0),
+        1.0,
+    ));
+    w.set_linear_velocity(b, Vec3::new(0.0, -20.0, 0.0))
+        .unwrap();
+    let mut peak = 0.0f32;
+    for _ in 0..60 {
+        w.step(DT);
+        for e in w.contact_force_events() {
+            peak = peak.max(e.total_force_magnitude);
+        }
+    }
+    // 정착 무게는 10 N. 20 m/s를 한 스텝(1/60초)에 멈추면 대략 1 kg·20/(1/60) = 1200 N.
+    // 서브스텝에 나뉘어 완만해지므로 넉넉히 5배(50 N)만 요구한다 — 마지막 서브스텝만
+    // 보는 구현은 무게 수준(≈10 N)에 머문다.
+    assert!(
+        peak > 50.0,
+        "충격 피크가 안 잡혔다: {peak} N (정착 무게는 10 N)"
+    );
+}
+
+/// **마주 보는 접점이 상쇄되면 안 된다.** 복합 셰이프의 두 자식이 양쪽에서 누르면 벡터
+/// 합은 0에 가깝지만 실제 접촉 하중은 크다 — 파괴·데미지 판정에 필요한 값은 후자다
+/// (검수 rev_26dffa4b MAJOR, rapier의 `total_force_magnitude`도 크기의 합이다).
+#[test]
+fn squeeze_is_reported_even_though_the_vector_sum_cancels() {
+    let params = WorldParams {
+        gravity: Vec3::ZERO, // 중력을 빼서 압착만 남긴다
+        ..no_sleep_params()
+    };
+    let mut w = World::new(params);
+    // 양쪽 벽을 **한 복합 셰이프**로 만든다 — 그래야 같은 페어 키 아래 두 접촉이 생긴다.
+    let wall = |x: f32| {
+        (
+            pose(x, 0.0, 0.0),
+            Shape::Box {
+                half: Vec3::new(0.5, 2.0, 2.0),
+                radius: 0.0,
+            },
+        )
+    };
+    w.add_body(
+        Body::new_static(
+            Shape::Compound {
+                children: vec![wall(-1.0), wall(1.0)],
+            },
+            pose(0.0, 0.0, 0.0),
+        )
+        .with_contact_force_threshold(0.1),
+    );
+    // 안쪽 면은 x=±0.5. 반크기 0.55면 양쪽으로 0.05씩 파고들어 눌린다.
+    w.add_body(Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(0.55, 0.5, 0.5),
+            radius: 0.0,
+        },
+        pose(0.0, 0.0, 0.0),
+        1.0,
+    ));
+    let mut best: Option<(f32, f32)> = None;
+    for _ in 0..90 {
+        w.step(DT);
+        if let Some(e) = w.contact_force_events().first() {
+            best = Some((e.total_force_magnitude, e.total_force.length()));
+        }
+    }
+    let (mag, vec_len) = best.expect("압착 접촉력 이벤트가 없다");
+    assert!(mag > 1.0, "압착 하중이 안 잡혔다: {mag}");
+    assert!(
+        vec_len < mag * 0.5,
+        "벡터 합이 상쇄되지 않았다 — 이 장면이 두 의미를 구분하지 못한다 \
+         (크기합 {mag}, 벡터합 {vec_len})"
     );
 }
