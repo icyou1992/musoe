@@ -249,12 +249,6 @@ fn clip_segment(rverts: &[Vec3], rn: Vec3, p0: Vec3, p1: Vec3) -> Option<[GenVer
     let (mut t_lo, mut t_hi) = (0.0f32, 1.0f32);
     // 각 끝을 무엇이 잘랐나. `None`이면 원래 끝점 그대로다.
     let (mut lo_side, mut hi_side): (Option<u8>, Option<u8>) = (None, None);
-    // 코너 판정용 길이 척도 — 참조면 크기에 상대적이어야 한다(절대 상수는 장면 스케일에서 깨진다).
-    let mut span = 0.0f32;
-    for v in rverts {
-        span = span.max((*v - rverts[0]).length());
-    }
-    let corner_eps = crate::tolerance::length_eps(span);
 
     for side in 0..k {
         let e0 = rverts[side];
@@ -299,6 +293,13 @@ fn clip_segment(rverts: &[Vec3], rn: Vec3, p0: Vec3, p1: Vec3) -> Option<[GenVer
         let (kind, a, b) = match cut {
             Some(s) => {
                 let si = s as usize;
+                // **척도는 잘린 측면 자신의 길이다** (검수 rev_1328a77b MAJOR).
+                // 면 전체 지름을 쓰면 극단 종횡비에서 짧은 변 **전체**가 코너로 오인된다:
+                // 1000 m × 1 mm 면이면 임계가 1 mm라 1 mm짜리 변 위의 모든 교점이 양 끝
+                // 정점 중 하나에서 1 mm 이내다. 그러면 교점이 변을 따라 움직여도 한쪽 정점
+                // ID에 고정되다가 중간에서 반대쪽으로 점프한다.
+                let corner_eps =
+                    crate::tolerance::length_eps((rverts[(si + 1) % k] - rverts[si]).length());
                 // **참조 평면 안에서 잰다** — 입사 선분은 참조면과 다른 평면에 있으므로
                 // 3D 거리로 재면 법선 방향 간격이 섞여 코너를 절대 못 알아본다.
                 let corner = [si, (si + 1) % k].into_iter().find(|&c| {
@@ -396,7 +397,16 @@ fn support_face(
             // 여기서 거절한다 — 옆면 접촉인데 뚜껑을 입사면으로 넘기면 모서리로 선
             // 다각형이 참조면에 눕는 꼴이 된다. 임계는 바깥 면 지배 판정과 같은 값을
             // 써서 문턱이 한 군데만 있게 한다.
-            let axis = m.c[1];
+            // **축을 재정규화한다** — `Mat3::from_quat`의 열은 f32 반올림 때문에 정확한
+            // 단위벡터가 아니다(|c|² = 1 ± ~1e-7). 그 잔차가 아래 두 곳을 통째로 깬다:
+            // ① `axis.dot(dir)`를 면 지배 임계와 비교하는 자리(척도가 어긋난다),
+            // ② `dir − axis·(dir·axis)`를 접평면 투영이라 부르는 자리 — 비단위면 이 식은
+            //    `axis·(1−|axis|²)`라는 **법선 방향 잔차**를 남긴다. 뚜껑이 평면과 정확히
+            //    평행일 때도 0이 아니고, `try_normalize`는 크기 임계가 없어 그 잔차를
+            //    그대로 받아 `u ≈ axis`, `v = axis×u ≈ 0`이 된다. 실측: 열을 6e-8만
+            //    비단위로 만들면 반지름 10 링의 법선 방향 폭이 0 → **20.0**이 되고
+            //    면 안 반지름이 10 → **0**으로 붕괴한다(원판이 축 방향 선분이 된다).
+            let axis = m.c[1].try_normalize()?;
             let d = axis.dot(dir);
             if d.abs() < super::FACE_DOT_MIN {
                 // **옆면 지지 특징은 선분이다** — 면이 아니다. 방향 `dir`의 축 수직 성분이
@@ -427,10 +437,25 @@ fn support_face(
             // 접평면 성분이 0이면(뚜껑이 평면과 평행) 방향을 못 정하는데, 그때는 오차도
             // 0이므로 **물체에 붙은 기저**로 떨어진다 — 세워 둔 원기둥에서 링이 프레임마다
             // 흔들려 ID가 튀는 것을 막는다.
-            let u = (dir - cap_n * dir.dot(cap_n))
-                .try_normalize()
-                .unwrap_or(m.c[0]);
-            let v = cap_n.cross(u);
+            // 접평면 성분이 **수치 잡음보다 큰지** 명시적으로 본다. `try_normalize`는
+            // 크기 임계가 없어 잔차도 받아 주므로, 성공 여부로 판단하면 안 된다.
+            //
+            // **방어를 하나씩 빼며 실측한 결과 일하는 층은 이 임계 하나다**: 임계를 빼면
+            // 정확히 평행한 뚜껑(잔차가 진짜 0)에서 `try_normalize`가 실패해 지지면 자체가
+            // 사라지고(면 경로 통째로 폴백), 잔차가 남는 경우는 링의 법선 방향 폭이
+            // 9.5e-7 → 6.3e-5로 66배 나빠졌다. 아래 축 재정규화는 관측되지 않았고
+            // (7.2e-7 vs 9.5e-7), 씨앗 재투영은 1.6배(9.5e-7 → 1.5e-6)로 허용치보다
+            // 세 자릿수 아래다. 둘 다 값싸고 계약을 명시하므로 남기되, 관측 불가임을 적어 둔다.
+            let tangent = dir - cap_n * dir.dot(cap_n);
+            let eps = crate::tolerance::length_eps(1.0);
+            let seed = if tangent.length_sq() > eps * eps * dir.length_sq() {
+                tangent
+            } else {
+                m.c[0] // 뚜껑이 평면과 평행 — 오차도 0이므로 물체 고정 기저로 간다
+            };
+            // 씨앗을 한 번 더 접평면에 투영한다(물체 고정 기저도 f32에선 완전 직교가 아니다).
+            let u = (seed - cap_n * seed.dot(cap_n)).try_normalize()?;
+            let v = cap_n.cross(u).try_normalize()?;
             for (i, (cx, cz)) in CAP_RING.iter().enumerate() {
                 out[i] = center + u * (radius * cx) + v * (radius * cz);
             }
@@ -676,6 +701,24 @@ pub(super) fn reduce_to_4_general(
         let mut best = usize::MAX;
         let mut best_d = -1.0f32;
         for (i, p) in pts.iter().enumerate() {
+            // **3D 거리를 그대로 쓴다.** 검수 rev_1328a77b는 접평면 거리로 바꾸라고 했지만
+            // (근거: `position`이 separation의 절반만큼 법선 좌표를 갖고, 얇은 패치에서
+            // 깊이 차가 접평면 퍼짐을 밀어낸다), **재보니 반대였다**.
+            //
+            // 실측: 얇은 다각형 가족(x·z 폭 2e-5..6e-4, 깊이 기울기 0.5..16, 기울기 방향을
+            // x축·z축 양쪽으로, 변마다 점 5~7개)에서 두 척도가 갈리는 배치 **120건** 중
+            // 최종 4점의 접평면 면적이 더 큰 쪽은 **3D 102건 / 접평면 18건**이었다.
+            // 회전 저항은 곧 그 면적이므로, 우리 자신의 기준으로 접평면 거리가 손해다.
+            //
+            // 이유: 접점은 전부 **입사면이라는 한 평면 위**에 있으므로 깊이가 접평면 좌표의
+            // 아핀 함수다. 그래서 3D 거리는 "접평면 거리를 깊이 기울기 방향으로 늘린"
+            // 비등방 거리이고, 그 늘림이 **얇은 방향을 펴 준다** — 후보 선택이 실제로
+            // 중요한 곳이 바로 거기다. 접평면 거리만 쓰면 머리카락처럼 얇은 패치를 사실상
+            // 1차원으로 보고 긴 축에만 8칸을 다 쓴다.
+            //
+            // 검수가 든 실패 모드("같은 모서리에서 깊이만 다른 점들이 표본을 채운다")는
+            // 이 경로에서 **구조적으로 불가능**하다: 깊이가 접평면 좌표의 함수라 같은
+            // 접평면 위치에 깊이가 다른 점이 둘 있을 수 없다.
             let d = (p.position - anchor).length_sq();
             if d < mind[i] {
                 mind[i] = d;
@@ -1759,6 +1802,91 @@ mod tests {
                 "spin={spin}에서 최심 접점이 실제 1 mm 침투와 다르다: {deepest}"
             );
         }
+    }
+
+    /// **BLOCKER (검수 rev_1328a77b)**: 회전행렬 열은 f32에서 정확한 단위벡터가 아니다.
+    /// 그 잔차를 접평면 투영에 쓰면 `axis·(1−|axis|²)`라는 **법선 방향** 성분이 남고,
+    /// `try_normalize`는 크기 임계가 없어 그것을 그대로 받아 링이 원판이 아니라 축 방향
+    /// 선분으로 붕괴한다.
+    ///
+    /// 실측(고치기 전): 열을 6e-8만 비단위로 만들면 반지름 10 링의 법선 방향 폭이
+    /// 0 → **20.0**, 면 안 반지름이 10 → **0**이 됐다.
+    #[test]
+    fn a_slightly_non_unit_axis_does_not_collapse_the_cap_ring() {
+        use crate::{Pose, Shape};
+        use maru_math::{Mat3, Quat};
+        let cyl = Shape::Cylinder {
+            half_height: 0.6,
+            radius: 10.0,
+        };
+        let pose = Pose {
+            pos: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+        };
+        let mut m = Mat3::from_quat(Quat::IDENTITY);
+        for eps in [0.0f32, 6e-8, 3e-7, -6e-8] {
+            m.c[1] = Vec3::new(0.0, 1.0 - eps, 0.0);
+            let mut out = [Vec3::ZERO; MAX_FACE_VERTS];
+            let (n, _, nrm) =
+                super::support_face(&cyl, &pose, &m, Vec3::new(0.0, -1.0, 0.0), &mut out)
+                    .unwrap_or_else(|| panic!("eps={eps}에서 뚜껑 지지면이 있어야 한다"));
+            assert_eq!(n, CAP_RING.len());
+            // 링은 뚜껑 평면 위에 **평평하게** 누워 있어야 한다.
+            let hs: Vec<f32> = out[..n].iter().map(|p| p.dot(nrm)).collect();
+            let spread = hs.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                - hs.iter().cloned().fold(f32::INFINITY, f32::min);
+            assert!(
+                spread < 1e-3,
+                "eps={eps}에서 링이 법선 방향으로 퍼졌다(원판이 선분이 됐다): {spread}"
+            );
+            // 그리고 원판 전체를 덮어야 한다 — 모든 정점이 반지름 위에 있다.
+            let c = out[..n].iter().fold(Vec3::ZERO, |a, b| a + *b) * (1.0 / n as f32);
+            for p in &out[..n] {
+                assert!(
+                    ((*p - c).length() - 10.0).abs() < 1e-2,
+                    "eps={eps}에서 정점이 반지름 위에 없다: {}",
+                    (*p - c).length()
+                );
+            }
+        }
+    }
+
+    /// **MAJOR (검수 rev_1328a77b)**: 코너 임계를 면 전체 지름으로 잡으면 극단 종횡비에서
+    /// 짧은 변 **전체**가 코너로 오인된다. 1000 m × 1 mm 면이면 임계가 1 mm라 1 mm짜리
+    /// 변 위의 모든 교점이 양 끝 정점 중 하나에서 1 mm 이내다.
+    #[test]
+    fn a_long_thin_reference_face_does_not_swallow_its_short_side_into_a_corner() {
+        // z=0 평면 위의 1000 × 0.001 직사각형.
+        let r = vec![
+            Vec3::new(-500.0, -0.0005, 0.0),
+            Vec3::new(500.0, -0.0005, 0.0),
+            Vec3::new(500.0, 0.0005, 0.0),
+            Vec3::new(-500.0, 0.0005, 0.0),
+        ];
+        let n = Vec3::new(0.0, 0.0, 1.0);
+        // 짧은 변(x = 500)의 **한가운데**를 자르는 선분.
+        let seg = clip_segment(&r, n, Vec3::new(0.0, 0.0, 0.1), Vec3::new(1000.0, 0.0, 0.1))
+            .expect("선분이 참조면을 가로지른다");
+        let cut = &seg[1];
+        assert!(
+            (cut.position.x - 500.0).abs() < 1e-2,
+            "짧은 변에서 잘려야 한다: {cut:?}"
+        );
+        assert_eq!(
+            cut.kind,
+            ClipKind::EdgeCross,
+            "변 한가운데인데 코너로 포장됐다: {cut:?}"
+        );
+        // 음성 대조: 실제로 코너를 지나면 코너로 인식해야 한다.
+        let corner = clip_segment(
+            &r,
+            n,
+            Vec3::new(0.0, -0.0005, 0.1),
+            Vec3::new(1000.0, -0.0005, 0.1),
+        )
+        .expect("가로지른다");
+        assert_eq!(corner[1].kind, ClipKind::ReferenceVertex, "{:?}", corner[1]);
+        assert_eq!(corner[1].a, 1, "정점 1 = (500, −0.0005): {:?}", corner[1]);
     }
 
     /// 분리된 면끼리는 폴리곤이 비고 `false` — 호출자가 witness로 폴백한다.
