@@ -1590,6 +1590,7 @@ impl World {
         // 작업 예산은 **질의 하나 전체**가 공유한다. 물체마다 상한을 두면 겹친 hull이
         // 많은 질의가 그 상한을 물체 수만큼 곱해 한 프레임을 삼킨다(검수 rev_c30d32fd).
         let mut budget = maru_collide::MAX_PROJECT_WORK;
+        let mut saturated = false;
         for i in 0..self.bodies.len() {
             if !self.passes(i, filter) {
                 continue;
@@ -1613,12 +1614,23 @@ impl World {
                 }
             }
             // 순회 포화는 "먼 점"으로 위장하지 않는다 — 못 본 후보가 더 가까울 수 있다.
-            let proj =
-                maru_collide::try_project_point_with_budget(&b.shape, &b.pose, p, &mut budget)
-                    .map_err(|e| match e {
-                        maru_collide::QueryReject::ResourceLimit => ApiError::ResourceLimit,
-                        maru_collide::QueryReject::InvalidInput => ApiError::InvalidValue,
-                    })?;
+            // 다만 **여기서 바로 반환하지는 않는다**: 예산을 안 쓰는 값싼 셰이프(구·박스·
+            // 캡슐)가 뒤에 있으면 그중 하나가 거리 0을 줄 수 있고, 그건 전역 최소가 확정된
+            // 것이라 답을 낼 수 있다. 즉시 반환하면 같은 기하가 **슬롯 순서만으로** 성공과
+            // 오류로 갈린다(검수 rev_8a258ed3 MAJOR).
+            let proj = match maru_collide::try_project_point_with_budget(
+                &b.shape,
+                &b.pose,
+                p,
+                &mut budget,
+            ) {
+                Ok(proj) => proj,
+                Err(maru_collide::QueryReject::ResourceLimit) => {
+                    saturated = true;
+                    continue;
+                }
+                Err(maru_collide::QueryReject::InvalidInput) => return Err(ApiError::InvalidValue),
+            };
             let d2 = (proj.point - p).length_sq();
             if best.is_none_or(|(bd2, _)| d2 < bd2) {
                 best = Some((
@@ -1631,7 +1643,13 @@ impl World {
                 ));
             }
         }
-        Ok(best.map(|(_, h)| h))
+        // 포화가 있었으면 "최선"이 진짜 최소라는 증명이 없다 — 거리 0일 때만 예외다
+        // (더 가까울 수 없으므로 못 본 후보와 무관하게 확정이다).
+        match best {
+            Some((d2, h)) if !saturated || d2 <= 0.0 => Ok(Some(h)),
+            _ if saturated => Err(ApiError::ResourceLimit),
+            other => Ok(other.map(|(_, h)| h)),
+        }
     }
 
     /// 점을 품은 물체들 (슬롯 오름차순). 겉면 기준 — convex radius를 포함한다.

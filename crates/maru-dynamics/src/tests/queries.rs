@@ -1246,3 +1246,60 @@ fn project_point_tie_goes_to_lower_slot() {
 
     assert_eq!(w.project_point(p).unwrap().unwrap().body, hs[0]);
 }
+
+/// 예산 포화가 **슬롯 순서로 성공/오류를 가르면 안 된다**.
+///
+/// 비싼 물체(hull) 여럿과 값싼 물체(질의점이 겉면 위인 구)를 같은 월드에 두고, 삽입
+/// 순서만 바꿔 두 번 만든다. 구가 거리 0을 주므로 어느 순서든 답은 그 구여야 한다
+/// (거리 0은 못 본 후보와 무관하게 전역 최소다).
+#[test]
+fn project_point_saturation_is_not_slot_order_dependent() {
+    // 32점 hull — 코어 안쪽 질의가 예산을 크게 먹는다.
+    let mut pts = Vec::new();
+    let mut rng = 777u32;
+    let mut next = || {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) as f32 / (1u32 << 24) as f32
+    };
+    while pts.len() < 32 {
+        let d = Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5);
+        if let Some(u) = d.try_normalize() {
+            pts.push(u);
+        }
+    }
+    let hull = maru_collide::Shape::Hull {
+        points: pts,
+        radius: 0.05,
+    };
+    // 질의점이 겉면 위인 구 — 거리 0.
+    let sphere = maru_collide::Shape::Sphere { radius: 1.0 };
+    let at = |x: f32| maru_collide::Pose {
+        pos: Vec3::new(x, 0.0, 0.0),
+        rot: maru_math::Quat::IDENTITY,
+    };
+    let p = Vec3::ZERO;
+
+    let build = |sphere_first: bool| {
+        let mut w = World::new(WorldParams::default());
+        if sphere_first {
+            w.add_body(Body::new_dynamic(sphere.clone(), at(1.0), 1.0));
+        }
+        for _ in 0..64 {
+            w.add_body(Body::new_dynamic(hull.clone(), at(0.0), 1.0));
+        }
+        if !sphere_first {
+            w.add_body(Body::new_dynamic(sphere.clone(), at(1.0), 1.0));
+        }
+        w
+    };
+
+    let a = build(true).project_point(p);
+    let b = build(false).project_point(p);
+    assert!(a.is_ok(), "구가 먼저면 성공해야 한다: {a:?}");
+    assert!(
+        b.is_ok(),
+        "구가 나중이면 오류가 났다 — 슬롯 순서가 결과를 갈랐다: {b:?}"
+    );
+    let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+    assert!((a.point - p).length() < 1e-5 && (b.point - p).length() < 1e-5);
+}

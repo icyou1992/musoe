@@ -28,6 +28,12 @@ const TIE_Y: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 /// 그런 물체가 여럿 겹친 질의는 막힌다(검수 rev_c30d32fd MAJOR).
 pub const MAX_PROJECT_WORK: usize = 1 << 18;
 
+/// GJK 한 번이 부를 수 있는 support 횟수 상한 (`gjk::MAX_ITER`와 같은 값).
+///
+/// 예산 선청구용 보수 상수다. 실제보다 크게 물지만, 예산의 목적은 정산이 아니라
+/// **한 질의가 프레임을 삼키지 못하게 하는 것**이다.
+const GJK_MAX_SUPPORTS: usize = 64;
+
 #[inline]
 fn splat(v: f32) -> Vec3 {
     Vec3::new(v, v, v)
@@ -208,6 +214,17 @@ fn project_convex_core(
         pos: Vec3::ZERO,
         rot: Quat::IDENTITY,
     };
+    // **GJK 비용을 먼저 청구한다.** GJK도 support마다 hull 점을 전수 내적하고 반복 상한이
+    // 있으므로, 이걸 안 세면 "코어 밖 hull이 수천 개"인 질의가 예산을 한 톨도 안 쓰고
+    // 수백만 내적을 돈다(검수 rev_8a258ed3 MAJOR). 보수적으로 상한(점수 × 반복상한)을
+    // 선청구한다 — 실제보다 크게 물지만, 예산은 "못 넘게 하는 것"이지 정산이 아니다.
+    if let Shape::Hull { ref points, .. } = *shape {
+        let cost = points.len().saturating_mul(GJK_MAX_SUPPORTS);
+        if *budget < cost {
+            return Err(QueryReject::ResourceLimit);
+        }
+        *budget -= cost;
+    }
     match gjk(&point, &at, shape, &ident) {
         GjkResult::Separated { distance, on_b, .. } => {
             let inside = distance <= radius;
@@ -333,8 +350,12 @@ fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32), 
         return Err(QueryReject::ResourceLimit);
     }
     Ok(match best {
-        // 여유는 음수가 될 수 없다(볼록체 안의 점) — 반올림이 만든 음수는 0으로 본다.
-        Some((h, n)) => (n, h.max(0.0)),
+        // **부호를 살린다.** 이 함수는 "코어에 아주 가까운 점"까지 받는데, 그 점이 코어
+        // 바깥이면 지지 여유가 음수다. 0으로 자르면 그만큼 겉면을 지나친다
+        // (검수 rev_8a258ed3 BLOCKER: 반크기 (1000,1,1) hull·radius 0.1에 p=(1000.001,0,0)
+        //  → 겉면 x=1000.1인데 x=1000.101이 나왔다). 부호를 살리면 같은 식
+        //  `p + n·(gap + radius)`가 안팎 모두에서 정확한 표면을 준다.
+        Some((h, n)) => (n, h),
         // 면 후보가 하나도 없다 = 모든 점이 한 직선 위(또는 3점 미만). 그 직선에는 지지
         // 평면이 무한히 많아 위 최소화가 방향을 못 고르므로 수직 방향을 준다.
         None => (collinear_exit_dir(points), 0.0),
@@ -1193,6 +1214,87 @@ mod tests {
             pr.point.x.abs() < 1.0e-6,
             "긴 축으로 나갔다: {:?}",
             pr.point
+        );
+    }
+
+    /// 코어 **바깥** 질의도 예산을 먹어야 한다 — GJK도 support마다 점을 전수 내적한다.
+    /// 안 세면 "밖에 있는 hull이 수천 개"인 질의가 예산을 한 톨도 안 쓰고 돈다
+    /// (검수 rev_8a258ed3 MAJOR).
+    #[test]
+    fn budget_counts_gjk_for_points_outside_the_core() {
+        // 원점을 품지 않는 tetra: 모든 꼭짓점이 x+y+z >= 1 위에 있다.
+        let s = Shape::Hull {
+            points: vec![
+                v(1.0, 1.0, 1.0),
+                v(-1.0, 1.0, 1.0),
+                v(1.0, -1.0, 1.0),
+                v(1.0, 1.0, -1.0),
+            ],
+            radius: 0.05,
+        };
+        // 전제: 질의점이 코어 **밖**이라 지지 함수 경로(비싼 쪽)를 안 탄다.
+        let pr = try_project_point(&s, &ident(), Vec3::ZERO).unwrap();
+        assert!(!pr.inside, "밖이라는 전제가 깨졌다");
+        let mut budget = super::MAX_PROJECT_WORK;
+        let mut ok = 0usize;
+        let mut limited = false;
+        for _ in 0..8192 {
+            match try_project_point_with_budget(&s, &ident(), Vec3::ZERO, &mut budget) {
+                Ok(_) => ok += 1,
+                Err(QueryReject::ResourceLimit) => {
+                    limited = true;
+                    break;
+                }
+                Err(e) => panic!("예상 밖 오류 {e:?}"),
+            }
+        }
+        assert!(ok > 0, "첫 질의부터 막히면 선청구가 너무 크다");
+        assert!(
+            limited,
+            "코어 밖 질의가 예산을 전혀 쓰지 않았다 (통과 {ok}회)"
+        );
+    }
+
+    /// 코어 **바로 바깥**(반올림 임계 안쪽) 점도 지지 함수 경로로 가는데, 그때 여유는
+    /// 음수다. 0으로 자르면 그만큼 겉면을 지나친다(검수 rev_8a258ed3 BLOCKER).
+    #[test]
+    fn point_just_outside_a_long_core_lands_exactly_on_the_surface() {
+        let h = v(1000.0, 1.0, 1.0);
+        let mut pts = Vec::new();
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    pts.push(v(h.x * sx, h.y * sy, h.z * sz));
+                }
+            }
+        }
+        let s = Shape::Hull {
+            points: pts,
+            radius: 0.1,
+        };
+        assert!(s.validate().is_ok());
+        // 코어 밖 0.001 — 특성 길이가 커서 "위치 차이" 임계 안쪽으로 들어온다.
+        let p = v(1000.001, 0.0, 0.0);
+        // 전제: 이 구성이 정말 "위치 차이" 임계 안쪽으로 들어온다(= 지지 함수 경로).
+        // 특성 길이 ≈ 2000이라 eps = 1e-6·2000 = 0.002 > 0.001이다. 이게 깨지면 아래
+        // 단언이 다른 경로를 재게 되므로 테스트가 무의미해진다.
+        let eps = crate::length_eps(crate::characteristic_length(&s, &s));
+        assert!(
+            eps > 0.001,
+            "임계가 좁아 지지 함수 경로에 안 들어간다: {eps}"
+        );
+        let pr = try_project_point(&s, &ident(), p).unwrap();
+        assert!(
+            (pr.point.x - 1000.1).abs() < 3.0e-4,
+            "겉면(x=1000.1)을 지나쳤다: {:?}",
+            pr.point
+        );
+        // 겉면 위 점이므로 재투영이 제자리여야 한다.
+        let again = try_project_point(&s, &ident(), pr.point).unwrap();
+        assert!(
+            (again.point - pr.point).length() < 3.0e-4,
+            "드리프트 {}",
+            (again.point - pr.point).length()
         );
     }
 
