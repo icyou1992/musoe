@@ -509,7 +509,7 @@ fn shape_penetrates_proves_positives_even_with_a_huge_aabb() {
 fn ray_and_point_queries_reject_bad_input_by_value() {
     use maru_collide::QueryReject;
     let empty_hull = Shape::Hull {
-        points: Vec::new(),
+        data: maru_collide::HullData::new(Vec::new()),
         radius: 0.0,
     };
     let empty_compound = Shape::Compound {
@@ -689,7 +689,7 @@ fn aabb_query_rejects_malformed_shapes_instead_of_panicking() {
     use maru_collide::ShapeReject;
     for bad in [
         Shape::Hull {
-            points: Vec::new(),
+            data: maru_collide::HullData::new(Vec::new()),
             radius: 0.0,
         },
         Shape::Compound {
@@ -717,7 +717,10 @@ fn out_of_range_shapes_are_rejected_at_the_query_boundary_too() {
         radius: 0.0,
     };
     let huge_hull = Shape::Hull {
-        points: vec![Vec3::new(f32::MAX, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)],
+        data: maru_collide::HullData::new(vec![
+            Vec3::new(f32::MAX, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ]),
         radius: 0.0,
     };
     let huge_offset = Shape::Compound {
@@ -1271,7 +1274,7 @@ fn project_point_saturation_reports_honestly_when_overlapped() {
         }
     }
     let hull = maru_collide::Shape::Hull {
-        points: pts,
+        data: maru_collide::HullData::new(pts),
         radius: 0.05,
     };
     let sphere = maru_collide::Shape::Sphere { radius: 1.0 };
@@ -1331,7 +1334,7 @@ fn project_point_saturation_still_succeeds_when_bounds_prove_the_answer() {
         }
     }
     let far_hull = maru_collide::Shape::Hull {
-        points: pts,
+        data: maru_collide::HullData::new(pts),
         radius: 0.0,
     };
     // 중심 (5.2,5.2,5.2), 반지름 5 → AABB 최소 모서리가 (0.2,0.2,0.2)라 원점까지 하한 0.346.
@@ -1391,7 +1394,7 @@ fn project_point_saturation_without_proof_is_an_error() {
     }
     // 원점을 **품는** hull 여러 개 — AABB 하한이 0이라 가지치기도 안 되고 증명도 안 된다.
     let hull = maru_collide::Shape::Hull {
-        points: pts,
+        data: maru_collide::HullData::new(pts),
         radius: 0.05,
     };
     let at_origin = maru_collide::Pose {
@@ -1426,7 +1429,7 @@ fn query_point_shares_one_work_budget() {
         }
     }
     let hull = maru_collide::Shape::Hull {
-        points: pts,
+        data: maru_collide::HullData::new(pts),
         radius: 0.05,
     };
     let at_origin = maru_collide::Pose {
@@ -1472,7 +1475,7 @@ fn query_point_charges_gjk_for_distant_hulls() {
         }
     }
     let hull = maru_collide::Shape::Hull {
-        points: pts,
+        data: maru_collide::HullData::new(pts),
         radius: 0.05,
     };
     // 질의점에서 **멀리** — AABB 밖이라 전수 열거는 안 돌지만 GJK는 돈다.

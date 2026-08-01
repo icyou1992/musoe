@@ -1607,13 +1607,13 @@ fn anchor_scale_uses_origin_distance_not_size() {
     // local x≈100m에 놓인 1m 크기 static hull (원점에서 멀지만 합법)
     let far = w.add_body(Body::new_static(
         Shape::Hull {
-            points: vec![
+            data: maru_collide::HullData::new(vec![
                 Vec3::new(99.5, -0.5, -0.5),
                 Vec3::new(100.5, -0.5, -0.5),
                 Vec3::new(99.5, 0.5, -0.5),
                 Vec3::new(99.5, -0.5, 0.5),
                 Vec3::new(100.5, 0.5, 0.5),
-            ],
+            ]),
             radius: 0.0,
         },
         pose(0.0, 0.0, 0.0),

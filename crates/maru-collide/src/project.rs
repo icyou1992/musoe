@@ -264,7 +264,8 @@ fn project_convex_core(
     // 있으므로, 이걸 안 세면 "코어 밖 hull이 수천 개"인 질의가 예산을 한 톨도 안 쓰고
     // 수백만 내적을 돈다(검수 rev_8a258ed3 MAJOR). 보수적으로 상한(점수 × 반복상한)을
     // 선청구한다 — 실제보다 크게 물지만, 예산은 "못 넘게 하는 것"이지 정산이 아니다.
-    if let Shape::Hull { ref points, .. } = *shape {
+    if let Shape::Hull { data: ref hull, .. } = *shape {
+        let points = hull.points();
         let cost = points.len().saturating_mul(GJK_MAX_SUPPORTS);
         if *budget < cost {
             return Err(QueryReject::ResourceLimit);
@@ -356,7 +357,8 @@ pub(crate) fn core_contains(
     // **GJK 비용을 AABB 검사보다 먼저 청구한다.** 호출자는 이미 GJK를 돌린 뒤 들어오므로,
     // AABB 밖에서 조기 반환하면 그 GJK가 통째로 예산 밖이 된다 — "멀리 있는 hull 수만 개"인
     // 질의가 수천만 내적을 돌면서 예산이 한 톨도 안 줄었다(검수 rev_6beb627b MAJOR).
-    if let Shape::Hull { ref points, .. } = *shape {
+    if let Shape::Hull { data: ref hull, .. } = *shape {
+        let points = hull.points();
         let cost = points.len().saturating_mul(GJK_MAX_SUPPORTS);
         if *budget < cost {
             return Err(QueryReject::ResourceLimit);
@@ -397,10 +399,11 @@ pub(crate) fn core_contains(
 /// 비용은 점 수의 4제곱(`C(m,3)·m`)이지만 상한이 32개로 잠겨 있고, 이 경로는 질의점이
 /// 코어 **안**일 때만 돈다(밖이면 위치 차이가 방향을 준다).
 fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32, bool), QueryReject> {
-    let Shape::Hull { ref points, .. } = *shape else {
+    let Shape::Hull { data: ref hull, .. } = *shape else {
         // 다른 셰이프는 해석 경로가 따로 있어 여기 오지 않는다.
         return Ok((TIE_X, 0.0, false));
     };
+    let points = hull.points();
     // **지지 최소화를 먼저 돌린다.** 예전에는 아핀 랭크를 먼저 재서 "저차원이면 여유 0"으로
     // 갈랐는데, 그 판정이 상대 임계라 **얇지만 3차원인** 코어를 평면으로 오판했다. 그러면
     // 그 방향의 진짜 여유(반두께)를 0으로 버려 반환점이 코어 안에 남는다
@@ -913,14 +916,14 @@ mod tests {
             (
                 "hull(각)",
                 Shape::Hull {
-                    points: hull_pts.clone(),
+                    data: crate::HullData::new(hull_pts.clone()),
                     radius: 0.0,
                 },
             ),
             (
                 "hull(둥근)",
                 Shape::Hull {
-                    points: hull_pts,
+                    data: crate::HullData::new(hull_pts),
                     radius: 0.2,
                 },
             ),
@@ -934,12 +937,12 @@ mod tests {
             (
                 "hull(평면 코어+두께)",
                 Shape::Hull {
-                    points: vec![
+                    data: crate::HullData::new(vec![
                         v(-0.9, 0.0, -0.6),
                         v(0.9, 0.0, -0.6),
                         v(0.9, 0.0, 0.6),
                         v(-0.9, 0.0, 0.6),
-                    ],
+                    ]),
                     radius: 0.18,
                 },
             ),
@@ -1074,7 +1077,7 @@ mod tests {
             }
         }
         let hull = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius: 0.0,
         };
         let boxy = Shape::Box {
@@ -1530,12 +1533,12 @@ mod tests {
     #[test]
     fn flat_hull_with_radius_escapes_the_plane() {
         let s = Shape::Hull {
-            points: vec![
+            data: crate::HullData::new(vec![
                 v(-1.0, -1.0, 0.0),
                 v(1.0, -1.0, 0.0),
                 v(1.0, 1.0, 0.0),
                 v(-1.0, 1.0, 0.0),
-            ],
+            ]),
             radius: 0.1,
         };
         assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
@@ -1555,7 +1558,7 @@ mod tests {
         }
         // 선형 코어(두 점)도 같은 계약이다 — 여공간이 2차원이라 방향 선택이 결정적이어야 한다.
         let seg = Shape::Hull {
-            points: vec![v(-1.0, 0.0, 0.0), v(1.0, 0.0, 0.0)],
+            data: crate::HullData::new(vec![v(-1.0, 0.0, 0.0), v(1.0, 0.0, 0.0)]),
             radius: 0.3,
         };
         let pr = try_project_point(&seg, &ident(), v(0.2, 0.0, 0.0)).unwrap();
@@ -1582,7 +1585,7 @@ mod tests {
             }
         }
         let s = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius: 0.1,
         };
         assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
@@ -1617,7 +1620,7 @@ mod tests {
         }
         let radius = 1.0e-6;
         let s = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius,
         };
         assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
@@ -1644,12 +1647,12 @@ mod tests {
     fn budget_counts_gjk_for_points_outside_the_core() {
         // 원점을 품지 않는 tetra: 모든 꼭짓점이 x+y+z >= 1 위에 있다.
         let s = Shape::Hull {
-            points: vec![
+            data: crate::HullData::new(vec![
                 v(1.0, 1.0, 1.0),
                 v(-1.0, 1.0, 1.0),
                 v(1.0, -1.0, 1.0),
                 v(1.0, 1.0, -1.0),
-            ],
+            ]),
             radius: 0.05,
         };
         // 전제: 질의점이 코어 **밖**이라 지지 함수 경로(비싼 쪽)를 안 탄다.
@@ -1691,7 +1694,7 @@ mod tests {
         }
         let radius = 0.1;
         let s = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius,
         };
         let p = v(999.999, 0.25, 0.0);
@@ -1701,10 +1704,10 @@ mod tests {
         // 코어 안쪽 점을 겉면이라고 내놓는다(검수 rev_b16c028d BLOCKER).
         {
             let thin = Shape::Hull {
-                points: match &s {
-                    Shape::Hull { points, .. } => points.clone(),
+                data: crate::HullData::new(match &s {
+                    Shape::Hull { data: hull, .. } => hull.points().to_vec(),
                     _ => unreachable!(),
-                },
+                }),
                 radius: 0.0,
             };
             let pr0 = try_project_point(&thin, &ident(), p).unwrap();
@@ -1751,11 +1754,11 @@ mod tests {
     fn planar_polygon_interior_is_inside_without_gjk() {
         let radius = 0.0005;
         let s = Shape::Hull {
-            points: vec![
+            data: crate::HullData::new(vec![
                 v(-4.0, -913.0, 0.0),
                 v(93.0, -692.0, 0.0),
                 v(487.0, 366.0, 0.0),
-            ],
+            ]),
             radius,
         };
         assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
@@ -1796,7 +1799,7 @@ mod tests {
         }
         for radius in [0.0f32, 0.1] {
             let s = Shape::Hull {
-                points: pts.clone(),
+                data: crate::HullData::new(pts.clone()),
                 radius,
             };
             // +X 면 **위**의 점(코어 경계).
@@ -1827,7 +1830,7 @@ mod tests {
             .map(|i| v(i as f32 * 0.05 - 0.8, 0.0, 0.0))
             .collect();
         let s = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius: 0.001,
         };
         assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
@@ -1895,7 +1898,7 @@ mod tests {
         }
         let radius = 0.001;
         let s = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius,
         };
         assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
@@ -1943,7 +1946,7 @@ mod tests {
             }
         }
         let s = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius: 0.1,
         };
         assert!(s.validate().is_ok());
@@ -1986,7 +1989,7 @@ mod tests {
             }
         }
         let s = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius: 0.05,
         };
         // 예산 없이 한 번은 통과한다.
@@ -2141,7 +2144,7 @@ mod tests {
         );
         // 빈 hull은 GJK를 죽인다 — 질의 경계에서 막혀야 한다.
         let empty = Shape::Hull {
-            points: vec![],
+            data: crate::HullData::new(vec![]),
             radius: 0.0,
         };
         assert_eq!(

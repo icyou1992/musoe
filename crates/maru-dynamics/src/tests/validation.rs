@@ -297,7 +297,7 @@ fn add_body_revalidates_mutated_body() {
     let mut b = Body::new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 1.0, 0.0), 1.0);
     // 크레이트 안에서만 가능한 변조를 흉내 — 밖에서는 컴파일되지 않는다
     b.shape = Shape::Hull {
-        points: vec![],
+        data: maru_collide::HullData::new(vec![]),
         radius: 0.0,
     };
     w.add_body(b);
@@ -397,7 +397,7 @@ fn all_host_input_paths_are_fallible() {
         .is_err());
     // 바디 (dynamic / static / kinematic)
     let bad = Shape::Hull {
-        points: vec![],
+        data: maru_collide::HullData::new(vec![]),
         radius: 0.0,
     };
     assert!(Body::try_new_dynamic(bad.clone(), pose(0.0, 0.0, 0.0), 1.0).is_err());

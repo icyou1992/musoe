@@ -78,7 +78,10 @@ pub(crate) fn write_shape(w: &mut Writer, s: &Shape) {
             // 내부 전용 셰이프는 바디가 될 수 없다(validate가 거부) — 여기 오면 계약 위반.
             unreachable!("triangle is an internal shape and is never serialized")
         }
-        Shape::Hull { points, radius } => {
+        Shape::Hull { data: hull, radius } => {
+            // **점만 저장한다** — 면 구조는 파생물이라 복원에서 다시 만든다
+            // (`TriMeshData`의 BVH·`HeightfieldGrid`의 타일과 같은 정책).
+            let points = hull.points();
             w.u8(3);
             w.u32(points.len() as u32);
             for p in points {
@@ -122,7 +125,8 @@ pub(crate) fn read_shape(r: &mut Reader, allow_compound: bool) -> Result<Shape, 
                 points.push(r.vec3()?);
             }
             Shape::Hull {
-                points,
+                // 면 구조를 여기서 다시 만든다 — 빌더가 결정적이라 같은 점이면 같은 면이다.
+                data: maru_collide::HullData::new(points),
                 radius: r.f32()?,
             }
         }
@@ -539,7 +543,7 @@ pub(crate) fn shape_size(s: &Shape) -> usize {
         Shape::Capsule { .. } => 8,
         Shape::Cylinder { .. } => 8,
         Shape::Box { .. } => 16,
-        Shape::Hull { points, .. } => 4 + points.len() * 12 + 4,
+        Shape::Hull { data: hull, .. } => 4 + hull.points().len() * 12 + 4,
         // nx4 + nz4 + cell4 + count4 + 높이 4바이트씩
         Shape::Heightfield(g) => 4 + 4 + 4 + 4 + g.heights().len() * 4,
         // count4 + 정점 12씩 + count4 + 삼각형 12씩

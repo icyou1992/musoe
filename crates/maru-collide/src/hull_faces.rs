@@ -54,6 +54,44 @@ pub struct HullFace {
     pub verts: Vec<u8>,
 }
 
+/// hull의 **점 + 면 구조**를 불가분으로 묶은 데이터.
+///
+/// 면은 점에서 유도되는 **파생물**이라 둘이 따로 놀면 안 된다 — 점만 바꾸고 면을 안 고치면
+/// 클리핑이 없는 면을 참조한다. 그래서 필드를 비공개로 두고 생성자에서만 함께 만든다
+/// (`TriMeshData`가 정점·BVH를 묶는 것과 같은 패턴).
+///
+/// 스냅샷에는 **점만** 저장하고 복원에서 면을 다시 만든다. 그래서 빌더가 결정적이어야 한다.
+#[derive(Clone, Debug)]
+pub struct HullData {
+    points: Vec<Vec3>,
+    faces: HullFaces,
+}
+
+/// **캐노니컬 데이터만 비교한다** — 면은 점의 함수이므로 점이 같으면 같은 hull이다
+/// (스냅샷 왕복 검증이 이 비교를 쓴다).
+impl PartialEq for HullData {
+    fn eq(&self, other: &Self) -> bool {
+        self.points == other.points
+    }
+}
+
+impl HullData {
+    /// 점에서 hull을 만든다 — 면 구조를 함께 계산한다.
+    pub fn new(points: Vec<Vec3>) -> Self {
+        let faces = HullFaces::build(&points);
+        Self { points, faces }
+    }
+    #[inline]
+    pub fn points(&self) -> &[Vec3] {
+        &self.points
+    }
+    /// 면 구조. 저차원·병리 입력에서는 비어 있다 — 호출자는 witness 경로로 간다.
+    #[inline]
+    pub fn faces(&self) -> &HullFaces {
+        &self.faces
+    }
+}
+
 /// hull의 면 목록. 인덱스가 곧 **면 id**이고, feature 계보가 이 id를 쓴다.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct HullFaces {

@@ -309,7 +309,7 @@ impl Body {
         }
         if self.weld_edges != 0 {
             let is_tri_hull =
-                matches!(&self.shape, Shape::Hull { points, .. } if points.len() == 3);
+                matches!(&self.shape, Shape::Hull { data: hull, .. } if hull.points().len() == 3);
             if self.body_type != BodyType::Static || !is_tri_hull {
                 return Err(ApiError::InvalidValue);
             }
@@ -748,9 +748,10 @@ fn normalized_pose(pose: Pose) -> Pose {
 /// 결과: 질량중심이 pose.pos와 일치 → 평행축 항 0 → 관성곱 0 → 대각 텐서가 정확해진다.
 /// 셋째 반환값 = **원래 셰이프 원점**의 질량중심 로컬 좌표(렌더 오프셋, 리뷰 MAJOR).
 fn recenter_hull(shape: Shape, pose: Pose) -> (Shape, Pose, Vec3) {
-    let Shape::Hull { points, radius } = shape else {
+    let Shape::Hull { data: hull, radius } = shape else {
         return (shape, pose, Vec3::ZERO);
     };
+    let points = hull.points();
     let (mut min, mut max) = (points[0], points[0]);
     for p in &points[1..] {
         min = Vec3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z));
@@ -758,14 +759,22 @@ fn recenter_hull(shape: Shape, pose: Pose) -> (Shape, Pose, Vec3) {
     }
     let c = (max + min) * 0.5;
     if c == Vec3::ZERO {
-        return (Shape::Hull { points, radius }, pose, Vec3::ZERO);
+        return (Shape::Hull { data: hull, radius }, pose, Vec3::ZERO);
     }
-    let points = points.iter().map(|p| *p - c).collect();
+    // 점을 옮겼으므로 면 구조도 다시 만든다 — `HullData::new`가 둘을 함께 잡는다.
+    let moved = maru_collide::HullData::new(points.iter().map(|p| *p - c).collect());
     let pose = Pose {
         pos: pose.pos + pose.rot.rotate(c),
         rot: pose.rot,
     };
-    (Shape::Hull { points, radius }, pose, -c)
+    (
+        Shape::Hull {
+            data: moved,
+            radius,
+        },
+        pose,
+        -c,
+    )
 }
 
 /// 복합 셰이프의 질량 베이킹: (재표현된 셰이프, 새 pose, 원점 오프셋, 질량, 주축 관성 대각).
@@ -797,7 +806,8 @@ fn bake_compound(shape: Shape, pose: Pose, density: f32) -> (Shape, Pose, Vec3, 
             rot: cp.rot.normalize(),
         };
         let (m, i_diag, local_com) = match child {
-            Shape::Hull { points, .. } => {
+            Shape::Hull { data: hull, .. } => {
+                let points = hull.points();
                 let (mut min, mut max) = (points[0], points[0]);
                 for p in &points[1..] {
                     min = Vec3::new(min.x.min(p.x), min.y.min(p.y), min.z.min(p.z));
@@ -928,7 +938,8 @@ fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
         Shape::Compound { .. } => {
             unreachable!("compound 질량은 bake_compound가 계산한다 — new_dynamic 디스패치 확인")
         }
-        Shape::Hull { ref points, .. } => {
+        Shape::Hull { data: ref hull, .. } => {
+            let points = hull.points();
             // [가정] v1: AABB 근사 — hull 정밀 적분은 hull 빌더와 함께.
             // 동적 바디는 `recenter_hull`을 이미 거쳐 d≈0이다(평행축 항은 방어적 잔존).
             // d≠0 경로로 들어오면 관성곱이 빠진 근사임을 알고 쓴다.
@@ -994,7 +1005,7 @@ mod tests {
         ];
         let b = Body::new_dynamic(
             Shape::Hull {
-                points: pts,
+                data: maru_collide::HullData::new(pts),
                 radius: 0.0,
             },
             Pose {
@@ -1006,9 +1017,10 @@ mod tests {
         // 자세가 질량중심으로 이동했다 (같은 월드 위치의 같은 물체)
         assert!((b.pose.pos - Vec3::new(10.0, 20.0, 30.0)).length() < 1e-3);
         // 셰이프 점은 원점 중심
-        let Shape::Hull { ref points, .. } = b.shape else {
+        let Shape::Hull { data: ref hull, .. } = b.shape else {
             panic!()
         };
+        let points = hull.points();
         let (mut mn, mut mx) = (points[0], points[0]);
         for p in &points[1..] {
             mn = Vec3::new(mn.x.min(p.x), mn.y.min(p.y), mn.z.min(p.z));

@@ -218,7 +218,7 @@ mod weld_tests {
     #[test]
     fn real_sphere_edge_contact_gets_welded() {
         let hull = Shape::Hull {
-            points: tri().to_vec(),
+            data: crate::HullData::new(tri().to_vec()),
             radius: 0.05,
         };
         let sphere = Shape::Sphere { radius: 0.3 };

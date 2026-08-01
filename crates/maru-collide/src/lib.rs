@@ -65,7 +65,7 @@ pub use trimesh::{TriMeshData, MAX_TRIMESH_TRIS, MAX_TRIMESH_VERTS};
 // **공개 진입은 `try_*`뿐이다** — `cast_ray`·`contains_point`는 검증된 입력을 가정하는
 // 크레이트 내부용이다. 잘못된 형상을 `None`/`false`로 돌려주면 "맞은 것 없음"으로 위장되고,
 // 빈 hull은 GJK에서 프로세스를 죽인다(확인검수 rev_97887d75 BLOCKER).
-pub use hull_faces::{HullFace, HullFaces};
+pub use hull_faces::{HullData, HullFace, HullFaces};
 pub use project::{
     try_project_point, try_project_point_with_budget, PointProjection, MAX_PROJECT_WORK,
 };

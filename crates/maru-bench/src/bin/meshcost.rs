@@ -77,7 +77,7 @@ fn main() {
                 };
                 wa.add_body(Body::new_static(
                     Shape::Hull {
-                        points: p.to_vec(),
+                        data: maru_collide::HullData::new(p.to_vec()),
                         radius: 0.02,
                     },
                     pose(0.0, 0.0, 0.0),

@@ -28,7 +28,7 @@ pub enum Shape {
     /// 코어=half에서 radius를 뺀 박스. half는 겉면 기준(사용자 관점 치수).
     Box { half: Vec3, radius: f32 },
     /// 코어 포인트 집합(이미 수축됨) + radius.
-    Hull { points: Vec<Vec3>, radius: f32 },
+    Hull { data: crate::HullData, radius: f32 },
     /// 복합 — 자식(로컬 pose + **primitive**) 목록. **볼록이 아니다**: GJK/EPA/support
     /// 경로에 단독으로 들어가면 안 되고, 모든 진입점(내로우·캐스트·레이·질량)이 자식으로
     /// 디스패치한다(`support_core`가 unreachable로 잠근다). 중첩 금지·자식 1..=8은
@@ -246,7 +246,8 @@ impl Shape {
                     && *radius >= 0.0
             }
             // support_core가 `points[0]`을 읽는다 — 비면 패닉이다.
-            Shape::Hull { points, radius } => {
+            Shape::Hull { data: hull, radius } => {
+                let points = hull.points();
                 !points.is_empty()
                     && points.len() <= crate::limits::MAX_HULL_POINTS
                     && points.iter().all(|p| vec_extent_in_range(*p))
@@ -377,7 +378,8 @@ impl Shape {
                 // 내부 전용 — 호스트 입력 경계에서는 언제나 거부한다.
                 return Err("triangle is an internal shape and cannot be added to a world");
             }
-            Shape::Hull { points, .. } => {
+            Shape::Hull { data: hull, .. } => {
+                let points = hull.points();
                 if points.is_empty() {
                     return Err("hull must contain at least one point");
                 }
@@ -435,7 +437,8 @@ impl Shape {
                 radius,
             } => half_height + radius,
             Shape::Box { half, .. } => half.length(), // half는 겉면 기준(radius 포함)
-            Shape::Hull { points, radius } => {
+            Shape::Hull { data: hull, radius } => {
+                let points = hull.points();
                 points.iter().fold(0.0f32, |m, p| m.max(p.length())) + radius
             }
             Shape::Compound { children } => children.iter().fold(0.0f32, |m, (cp, cs)| {
@@ -510,7 +513,9 @@ impl Shape {
                 }
                 m
             }
-            Shape::Hull { points, .. } => points.iter().fold(0.0f32, |m, p| m.max(perp(*p))),
+            Shape::Hull { data: hull, .. } => {
+                hull.points().iter().fold(0.0f32, |m, p| m.max(perp(*p)))
+            }
             Shape::Compound { children } => children.iter().fold(0.0f32, |m, (cp, cs)| {
                 // 자식 원점의 축 수직 거리 + 자식 자체의 스윕 반지름(자식 로컬 축).
                 // 자식 회전 정규화 — 근거는 `cast.rs`의 compose 주석에.
@@ -590,7 +595,8 @@ impl Shape {
                 }
                 best
             }
-            Shape::Hull { points, .. } => {
+            Shape::Hull { data: hull, .. } => {
+                let points = hull.points();
                 // 선형 스캔 (v1 — hill climbing은 벤치 증명 시 도입). 동률은 낮은 인덱스 우선(결정론).
                 let mut best = points[0];
                 let mut best_d = best.dot(d);
@@ -689,7 +695,8 @@ impl Shape {
                 }
                 acc.expect("validate가 자식 ≥1을 강제한다")
             }
-            Shape::Hull { points, .. } => {
+            Shape::Hull { data: hull, .. } => {
+                let points = hull.points();
                 let mut min = points[0];
                 let mut max = points[0];
                 for p in &points[1..] {
@@ -765,11 +772,11 @@ mod tests {
     #[test]
     fn a_triangle_is_a_three_point_hull() {
         let tri = |r: f32| Shape::Hull {
-            points: vec![
+            data: crate::HullData::new(vec![
                 Vec3::new(0.0, 0.0, 0.0),
                 Vec3::new(2.0, 0.0, 0.0),
                 Vec3::new(0.0, 0.0, 2.0),
-            ],
+            ]),
             radius: r,
         };
         // 두께 = 2r 이 최소 특징 크기를 넘어야 통과한다
@@ -805,7 +812,7 @@ mod tests {
     #[test]
     fn invalid_shapes_are_rejected() {
         assert!(Shape::Hull {
-            points: vec![],
+            data: crate::HullData::new(vec![]),
             radius: 0.0
         }
         .validate()
@@ -865,12 +872,12 @@ mod tests {
     fn hull_support_tie_prefers_lower_index() {
         // d=(1,0,0)에 대해 dot이 모두 1.0인 서로 다른 점들
         let s = Shape::Hull {
-            points: vec![
+            data: crate::HullData::new(vec![
                 Vec3::new(1.0, 0.5, 0.0),  // idx 0 (선택되어야 함)
                 Vec3::new(1.0, -0.5, 0.0), // idx 1 동률
                 Vec3::new(1.0, 0.0, 0.7),  // idx 2 동률
                 Vec3::new(-1.0, 0.0, 0.0),
-            ],
+            ]),
             radius: 0.0,
         };
         let d = Vec3::new(1.0, 0.0, 0.0);
@@ -882,11 +889,11 @@ mod tests {
         );
         // 순서를 바꾸면 선택도 바뀌어야 관측이 유효함을 증명
         let s2 = Shape::Hull {
-            points: vec![
+            data: crate::HullData::new(vec![
                 Vec3::new(1.0, -0.5, 0.0),
                 Vec3::new(1.0, 0.5, 0.0),
                 Vec3::new(-1.0, 0.0, 0.0),
-            ],
+            ]),
             radius: 0.0,
         };
         assert_eq!(s2.support_core(d), Vec3::new(1.0, -0.5, 0.0));
@@ -896,18 +903,18 @@ mod tests {
     fn support_is_extreme_point() {
         // support의 정의 검증: 모든 점에 대해 dot(d, support) >= dot(d, p)
         let s = Shape::Hull {
-            points: vec![
+            data: crate::HullData::new(vec![
                 Vec3::new(1.0, 1.0, -1.0),
                 Vec3::new(-1.0, 2.0, 0.5),
                 Vec3::new(0.0, -1.0, 2.0),
                 Vec3::new(0.5, 0.5, 0.5),
-            ],
+            ]),
             radius: 0.0,
         };
         let d = Vec3::new(0.3, -0.7, 0.9);
         let sup = s.support_core(d);
-        if let Shape::Hull { points, .. } = &s {
-            for p in points {
+        if let Shape::Hull { data: hull, .. } = &s {
+            for p in hull.points() {
                 assert!(sup.dot(d) >= p.dot(d) - 1e-6);
             }
         }

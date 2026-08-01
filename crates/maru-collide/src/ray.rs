@@ -746,7 +746,7 @@ mod tests {
             Vec3::new(0.0, 0.0, -0.5),
         ];
         let hull = Shape::Hull {
-            points: pts,
+            data: crate::HullData::new(pts),
             radius: 0.25,
         };
         // +x로 쏘면 코어 최원점 0.5 + radius 0.25 = 0.75 에서 맞는다
@@ -803,12 +803,12 @@ mod tests {
                 radius: 0.02,
             },
             Shape::Hull {
-                points: vec![
+                data: crate::HullData::new(vec![
                     Vec3::new(0.6, 0.0, 0.0),
                     Vec3::new(-0.6, 0.0, 0.0),
                     Vec3::new(0.0, 0.03, 0.5),
                     Vec3::new(0.0, -0.03, -0.5),
-                ],
+                ]),
                 radius: 0.05,
             },
         ];

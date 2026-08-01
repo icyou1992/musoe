@@ -999,7 +999,7 @@ impl World {
             let c = (pts[0] + pts[1] + pts[2]) * (1.0 / 3.0);
             let local: Vec<Vec3> = pts.iter().map(|p| *p - c).collect();
             let shape = maru_collide::Shape::Hull {
-                points: local,
+                data: maru_collide::HullData::new(local),
                 radius,
             };
             shape.validate().map_err(|_| ApiError::InvalidValue)?;
@@ -5852,11 +5852,12 @@ fn narrow_chunk(cx: &NarrowCtx, pairs: &[(u32, u32)], mut ti: usize, out: &mut N
         // 접점 법선 용접(§4.2 ghost edge)은 매니폴드 생성 직후, 소비(prepare) 전이다.
         // 지형은 항상 static = B 쪽이다(validate가 static 3점 hull에만 마스크 허용).
         let weld = match &cx.bodies[b_id].shape {
-            maru_collide::Shape::Hull { points, radius }
-                if cx.bodies[b_id].weld_edges != 0 && points.len() == 3 =>
+            maru_collide::Shape::Hull { data: hull, radius }
+                if cx.bodies[b_id].weld_edges != 0 && hull.points().len() == 3 =>
             {
                 let pb = &cx.bodies[b_id].pose;
                 let t = |p: Vec3| pb.pos + pb.rot.rotate(p);
+                let points = hull.points();
                 Some((
                     [t(points[0]), t(points[1]), t(points[2])],
                     *radius,

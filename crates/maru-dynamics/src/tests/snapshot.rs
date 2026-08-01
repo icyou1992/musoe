@@ -406,13 +406,13 @@ fn snapshot_size_preflight_is_exact() {
     let a = dyn_box(&mut w, 0.0, 3.0);
     let b = w.add_body(Body::new_dynamic(
         Shape::Hull {
-            points: vec![
+            data: maru_collide::HullData::new(vec![
                 Vec3::new(-0.4, -0.4, -0.4),
                 Vec3::new(0.4, -0.4, -0.4),
                 Vec3::new(-0.4, 0.4, -0.4),
                 Vec3::new(-0.4, -0.4, 0.4),
                 Vec3::new(0.4, 0.4, 0.4),
-            ],
+            ]),
             radius: 0.0,
         },
         pose(2.0, 3.0, 0.0),
@@ -970,12 +970,12 @@ fn weld_mask_roundtrips_and_is_rejected_off_terrain() {
     // 3점이 아닌 hull도 거부 — 면 법선·에지 인덱스 의미가 없다.
     let mut bad = Body::new_static(
         Shape::Hull {
-            points: vec![
+            data: maru_collide::HullData::new(vec![
                 Vec3::new(0.0, 0.0, 0.0),
                 Vec3::new(1.0, 0.0, 0.0),
                 Vec3::new(0.0, 0.0, 1.0),
                 Vec3::new(0.3, 1.0, 0.3),
-            ],
+            ]),
             radius: 0.02,
         },
         pose(0.0, 1.0, 0.0),

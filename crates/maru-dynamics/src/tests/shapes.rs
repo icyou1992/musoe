@@ -406,7 +406,7 @@ fn dispatchers_handle_heightfields_and_convex_only_apis_are_not_public() {
 fn malformed_shapes_are_rejected_by_value_on_public_paths() {
     use maru_collide::CastReject;
     let empty_hull = Shape::Hull {
-        points: Vec::new(),
+        data: maru_collide::HullData::new(Vec::new()),
         radius: 0.0,
     };
     let empty_compound = Shape::Compound {
@@ -448,7 +448,7 @@ fn malformed_shapes_are_rejected_by_value_on_public_paths() {
     }
     // **음성 대조** — 점 하나만 넣어 정상 hull로 만들면 곧바로 통과하고 실제로 맞춘다.
     let tiny_hull = Shape::Hull {
-        points: vec![Vec3::ZERO],
+        data: maru_collide::HullData::new(vec![Vec3::ZERO]),
         radius: 0.4,
     };
     let hit = maru_collide::try_shape_cast_dispatch(&tiny_hull, &pa, m, &ok, &pb, 0.02)
@@ -614,13 +614,13 @@ fn hull_recenter_exposes_render_offset() {
     let origin = pose(1.0, 2.0, 3.0);
     let b = Body::new_dynamic(
         Shape::Hull {
-            points: vec![
+            data: maru_collide::HullData::new(vec![
                 Vec3::new(9.5, -0.5, -0.5),
                 Vec3::new(10.5, -0.5, -0.5),
                 Vec3::new(9.5, 0.5, -0.5),
                 Vec3::new(9.5, -0.5, 0.5),
                 Vec3::new(10.5, 0.5, 0.5),
-            ],
+            ]),
             radius: 0.0,
         },
         origin,
@@ -644,7 +644,7 @@ fn oversized_hull_rejected() {
         .collect();
     Body::new_dynamic(
         Shape::Hull {
-            points,
+            data: maru_collide::HullData::new(points),
             radius: 0.0,
         },
         pose(0.0, 0.0, 0.0),
@@ -667,7 +667,7 @@ fn min_feature_size_applies_to_every_shape() {
     // 반지름 0의 단일점 hull = 모든 축에서 퇴화
     assert!(Body::try_new_static(
         Shape::Hull {
-            points: vec![Vec3::ZERO],
+            data: maru_collide::HullData::new(vec![Vec3::ZERO]),
             radius: 0.0
         },
         pose(0.0, 0.0, 0.0)
@@ -676,7 +676,10 @@ fn min_feature_size_applies_to_every_shape() {
     // 한 축만 얇은 hull도 거부 (월드 경계에서 AABB가 반올림으로 퇴화)
     assert!(Body::try_new_static(
         Shape::Hull {
-            points: vec![Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0)],
+            data: maru_collide::HullData::new(vec![
+                Vec3::new(-1.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, 1.0)
+            ]),
             radius: 0.0
         },
         pose(0.0, 0.0, 0.0)
@@ -685,7 +688,10 @@ fn min_feature_size_applies_to_every_shape() {
     // 두께가 반지름으로 채워지면 합법
     assert!(Body::try_new_static(
         Shape::Hull {
-            points: vec![Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0)],
+            data: maru_collide::HullData::new(vec![
+                Vec3::new(-1.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, 1.0)
+            ]),
             radius: maru_collide::MIN_SHAPE_EXTENT
         },
         pose(0.0, 0.0, 0.0)
@@ -707,7 +713,7 @@ fn rotated_coplanar_hull_is_rejected() {
     assert!(
         Body::try_new_static(
             Shape::Hull {
-                points: coplanar.clone(),
+                data: maru_collide::HullData::new(coplanar.clone()),
                 radius: 0.0
             },
             pose(0.0, 0.0, 0.0)
@@ -720,7 +726,7 @@ fn rotated_coplanar_hull_is_rejected() {
     thick.push(Vec3::new(0.5, 0.5, 0.0));
     assert!(Body::try_new_static(
         Shape::Hull {
-            points: thick,
+            data: maru_collide::HullData::new(thick),
             radius: 0.0
         },
         pose(0.0, 0.0, 0.0)
@@ -741,7 +747,7 @@ fn sliver_hull_is_rejected_by_multi_face_screen() {
     assert!(
         Body::try_new_static(
             Shape::Hull {
-                points: pts,
+                data: maru_collide::HullData::new(pts),
                 radius: 0.0
             },
             pose(0.0, 0.0, 0.0)
@@ -763,7 +769,7 @@ fn hull_support_limit_matches_exact_verification() {
         .collect();
     assert!(Body::try_new_static(
         Shape::Hull {
-            points: too_many,
+            data: maru_collide::HullData::new(too_many),
             radius: 0.0
         },
         pose(0.0, 0.0, 0.0)
@@ -1266,5 +1272,92 @@ fn degenerate_cylinder_is_rejected() {
             radius: r,
         };
         assert!(s.validate().is_err(), "({hh}, {r})를 통과시켰다");
+    }
+}
+
+/// **면 구조는 파생물이라 스냅샷에 안 들어간다** — 복원에서 다시 만들어야 하고,
+/// 빌더가 결정적이므로 원본과 **같은 면**이 나와야 한다. 안 그러면 복원한 월드의
+/// 접촉 feature 계보가 어긋나 warm start가 끊긴다.
+///
+/// 포맷은 안 바뀐다(예전에도 점만 저장했다) — 그래서 스냅샷 버전도 그대로다.
+#[test]
+fn hull_faces_are_rebuilt_identically_on_restore() {
+    let pts: Vec<Vec3> = {
+        let mut v = Vec::new();
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    v.push(Vec3::new(0.7 * sx, 1.3 * sy, 0.4 * sz));
+                }
+            }
+        }
+        v
+    };
+    let mut w = World::new(WorldParams::default());
+    let h = w.add_body(Body::new_dynamic(
+        maru_collide::Shape::Hull {
+            data: maru_collide::HullData::new(pts),
+            radius: 0.0,
+        },
+        pose(1.0, 2.0, 3.0),
+        1.0,
+    ));
+    let before = match w.body(h).shape() {
+        maru_collide::Shape::Hull { data, .. } => data.faces().clone(),
+        other => panic!("hull이 아니다: {other:?}"),
+    };
+    assert_eq!(before.len(), 6, "박스 모양 hull은 면이 6개다");
+
+    let snap = w.snapshot();
+    let mut w2 = World::new(WorldParams::default());
+    w2.restore(&snap).expect("복원");
+    let after = match w2.body(h).shape() {
+        maru_collide::Shape::Hull { data, .. } => data.faces().clone(),
+        other => panic!("복원 후 hull이 아니다: {other:?}"),
+    };
+    assert_eq!(before, after, "복원한 면 구조가 원본과 다르다");
+    assert_eq!(w.state_hash(), w2.state_hash());
+}
+
+/// 질량 재중심화는 점을 옮긴다 — **면 구조도 함께 다시 만들어져야** 한다.
+/// 옮긴 점과 옛 면이 남으면 클리핑이 없는 자리를 참조한다.
+#[test]
+fn recentering_a_hull_rebuilds_its_faces() {
+    // 원점에서 벗어난 박스 — 생성자가 질량중심으로 재중심화한다.
+    let pts: Vec<Vec3> = {
+        let mut v = Vec::new();
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    v.push(Vec3::new(5.0 + 0.5 * sx, 0.5 * sy, 0.5 * sz));
+                }
+            }
+        }
+        v
+    };
+    let b = Body::new_dynamic(
+        maru_collide::Shape::Hull {
+            data: maru_collide::HullData::new(pts),
+            radius: 0.0,
+        },
+        pose(0.0, 0.0, 0.0),
+        1.0,
+    );
+    let maru_collide::Shape::Hull { data, .. } = b.shape() else {
+        panic!("hull이 아니다")
+    };
+    // 점이 원점 중심으로 옮겨졌다.
+    for p in data.points() {
+        assert!(p.x.abs() <= 0.5 + 1e-5, "재중심화가 안 됐다: {p:?}");
+    }
+    // 그리고 면 구조가 **옮긴 점 기준**이어야 한다 — 모든 점이 모든 면 안쪽.
+    assert_eq!(data.faces().len(), 6);
+    for face in data.faces().faces() {
+        for p in data.points() {
+            assert!(
+                face.normal.dot(*p) <= face.offset + 1e-4,
+                "옛 면이 남았다: 점 {p:?}이 {face:?} 바깥"
+            );
+        }
     }
 }
