@@ -167,16 +167,39 @@ fn project_convex_core(shape: &Shape, p: Vec3, radius: f32) -> PointProjection {
         rot: Quat::IDENTITY,
     };
     match gjk(&point, &at, shape, &ident) {
-        GjkResult::Separated {
-            distance,
-            on_b,
-            normal,
-            ..
-        } => PointProjection {
-            // `normal`은 B→A(= 셰이프→점) 단위 방향이다.
-            point: on_b + normal * radius,
-            inside: distance <= radius,
-        },
+        GjkResult::Separated { distance, on_b, .. } => {
+            let inside = distance <= radius;
+            if radius <= 0.0 {
+                // 두께가 없으면 코어가 곧 겉면이다 — 방향이 필요 없다.
+                return PointProjection {
+                    point: on_b,
+                    inside,
+                };
+            }
+            // **방향은 GJK 법선이 아니라 위치 차이로 만든다.**
+            //
+            // 코어가 평면·선처럼 낮은 차원일 수 있다(그래도 convex radius가 두께를 주므로
+            // 합법 셰이프다). 그런 코어 **안**의 점에 대해 GJK는 거리를 거의 0으로 주는데,
+            // 그때 법선은 반올림이 만든 **코어 평면 안** 방향일 수 있다. 그 방향으로 radius
+            // 만큼 밀면 여전히 물체 안이라 "겉면 위 점" 계약이 깨진다
+            // (검수 rev_6429a223 BLOCKER: z=0 사각형 hull + radius 0.1의 중심 투영이
+            //  (-0.07, 0.07, 0)으로 나왔다 — 겉면은 z=±0.1이다).
+            //
+            // 위치 차이는 그런 착시가 없다: 코어 밖이면 진짜 바깥 방향이고, 코어 안이면
+            // 길이가 0에 붙어 **여기서 걸러진다**. 그때만 이탈 방향을 따로 구한다.
+            let v = p - on_b;
+            let l = v.length();
+            let eps = crate::length_eps(crate::characteristic_length(shape, shape));
+            let dir = if l > eps {
+                v * (1.0 / l)
+            } else {
+                core_exit_dir(shape, p)
+            };
+            PointProjection {
+                point: on_b + dir * radius,
+                inside,
+            }
+        }
         GjkResult::Intersecting(seed) => {
             let pen = crate::epa::epa(seed, &point, &at, shape, &ident);
             // `pen.normal`은 A(점)를 밀어 분리하는 방향 = 코어에서 나가는 방향.
@@ -194,6 +217,94 @@ fn project_convex_core(shape: &Shape, p: Vec3, radius: f32) -> PointProjection {
     }
 }
 
+/// 코어 **위**에 있는 점에서 겉면으로 나가는 결정적 방향.
+///
+/// 코어의 아핀 껍질이 3차원보다 낮으면(평면·선·점) 여공간이 있고, 그 방향이 답이다.
+/// 3차원이면 여공간이 없다 — 그건 점이 코어 **경계 위**에 정확히 놓인 경우이므로
+/// (안쪽이었다면 GJK가 교차를 줬다) 중심 쪽으로 아주 조금 당겨 교차 상태를 만들고
+/// EPA에 최소 이탈 방향을 묻는다.
+fn core_exit_dir(shape: &Shape, p: Vec3) -> Vec3 {
+    let Shape::Hull { ref points, .. } = *shape else {
+        // 다른 셰이프는 해석 경로가 따로 있어 여기 오지 않는다.
+        return TIE_X;
+    };
+    if let Some(d) = affine_complement_dir(points) {
+        return d;
+    }
+    // 3차원 코어 — 중심은 반드시 내부다(전체 차원이므로).
+    let mut c = Vec3::ZERO;
+    for q in points {
+        c += *q;
+    }
+    let c = c * (1.0 / points.len().max(1) as f32);
+    let at = Pose {
+        pos: p + (c - p) * 1.0e-3,
+        rot: Quat::IDENTITY,
+    };
+    let ident = Pose {
+        pos: Vec3::ZERO,
+        rot: Quat::IDENTITY,
+    };
+    let probe = Shape::Sphere { radius: 0.0 };
+    match gjk(&probe, &at, shape, &ident) {
+        GjkResult::Intersecting(seed) => {
+            let pen = crate::epa::epa(seed, &probe, &at, shape, &ident);
+            pen.normal.try_normalize().unwrap_or(TIE_X)
+        }
+        // 도달 불가(중심이 내부인데 분리가 나올 수 없다) — 계약을 지키려 결정적 축.
+        GjkResult::Separated { .. } => TIE_X,
+    }
+}
+
+/// 점 집합의 아핀 껍질이 3차원보다 낮으면 그 **직교 여공간**의 단위 벡터, 아니면 `None`.
+///
+/// 임계는 점 집합의 지름에 상대적이다 — 절대 상수는 장면 스케일에서 깨진다(설계 §8).
+fn affine_complement_dir(points: &[Vec3]) -> Option<Vec3> {
+    let &p0 = points.first()?;
+    let mut span = 0.0f32;
+    for q in points {
+        span = span.max((*q - p0).length());
+    }
+    if span <= 0.0 || span.is_nan() {
+        return Some(TIE_X); // 모든 점이 한 자리(또는 비유한) — 코어는 점으로 본다
+    }
+    let eps = crate::length_eps(span);
+    let mut basis = [Vec3::ZERO; 2];
+    let mut rank = 0usize;
+    for q in points {
+        let mut v = *q - p0;
+        for e in basis.iter().take(rank) {
+            v = v - *e * e.dot(v);
+        }
+        let Some(u) = v.try_normalize() else { continue };
+        if v.length() <= eps {
+            continue;
+        }
+        if rank == 2 {
+            return None; // 세 번째 독립 방향 — 전체 차원이다
+        }
+        basis[rank] = u;
+        rank += 1;
+    }
+    Some(match rank {
+        0 => TIE_X,
+        1 => perpendicular_to(basis[0]),
+        _ => basis[0].cross(basis[1]).try_normalize().unwrap_or(TIE_X),
+    })
+}
+
+/// `d`에 수직인 결정적 단위 벡터 — 가장 덜 정렬된 축과 외적한다(퇴화 없음).
+fn perpendicular_to(d: Vec3) -> Vec3 {
+    let a = if d.x.abs() <= d.y.abs() && d.x.abs() <= d.z.abs() {
+        Vec3::new(1.0, 0.0, 0.0)
+    } else if d.y.abs() <= d.z.abs() {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(0.0, 0.0, 1.0)
+    };
+    d.cross(a).try_normalize().unwrap_or(TIE_X)
+}
+
 /// 복합 — **자식 겉면들의 합집합** 위 최근접점.
 ///
 /// 자식이 서로 겹치지 않으면 이것이 곧 복합 전체의 겉면이다(정상적인 복합 셰이프).
@@ -206,9 +317,14 @@ fn project_compound(children: &[(Pose, Shape)], p: Vec3) -> Result<PointProjecti
     let mut best: Option<(f32, Vec3)> = None;
     let mut inside = false;
     for (cp, cs) in children {
-        let local = cp.rot.conjugate().rotate(p - cp.pos);
+        // **자식 회전을 정규화한다** — `contains_point`·`cast_ray`가 쓰는 것과 같은
+        // 변환이어야 한다. 형상 검증은 단위에서 길이제곱 1e-3까지 벗어난 자식 자세를
+        // 통과시키므로, 정규화를 빼면 같은 합법 형상에서 안팎 판정이 다른 질의와 갈린다
+        // (검수 rev_6429a223 MAJOR).
+        let rot = cp.rot.try_normalize().ok_or(QueryReject::InvalidInput)?;
+        let local = rot.conjugate().rotate(p - cp.pos);
         let sub = project_local(cs, local)?;
-        let world = cp.pos + cp.rot.rotate(sub.point);
+        let world = cp.pos + rot.rotate(sub.point);
         inside |= sub.inside;
         let d2 = (world - p).length_sq();
         // 동률은 **먼저 온 자식**이 이긴다(엄격 부등호) — 순서만이 결정한다.
@@ -252,6 +368,14 @@ impl NearestTri {
     }
 }
 
+/// 확장 검색 **전체**의 후보 예산 — 라운드마다가 아니라 누적이다.
+///
+/// 없으면 합법적인 단일 질의 하나가 백만 삼각형을 훑는다: 평평한 지형에 아주 높은 점을
+/// 질의하면 첫 반경이 이미 AABB 전체를 덮어 모든 셀이 후보가 된다(검수 rev_6429a223 MAJOR).
+/// BVH 스택 포화는 **깊이**만 막지 후보 수를 막지 않는다. 캐스트·매니폴드 경로와 같은
+/// 상수를 써서 엔진 전체가 한 예산 정책을 쓰게 한다.
+const PROJECT_TRI_BUDGET: usize = crate::MAX_HEIGHTFIELD_CELLS_PER_QUERY;
+
 /// 확장 검색의 반경 수열: AABB까지의 거리에서 시작해 배로 늘리고, 전체를 덮으면 멈춘다.
 fn search_radii(p: Vec3, bounds: Aabb) -> (f32, f32) {
     let clamped = Vec3::new(
@@ -275,15 +399,23 @@ fn project_trimesh(
     let bounds = mesh.local_aabb();
     let (mut r, full) = search_radii(p, bounds);
     let mut acc;
+    let mut budget = PROJECT_TRI_BUDGET;
     loop {
         acc = NearestTri::new();
         let q = Aabb::new(p - splat(r), p + splat(r));
-        // 순회 스택 포화는 **후보 누락**이다 — 그대로 답을 내면 "더 먼 겉면"을 최근접이라
-        // 우기게 된다. 오답 대신 자원 오류로 드러낸다.
-        if !mesh.for_each_candidate(q, |i| {
+        let mut over = false;
+        // 순회 스택 포화도 예산 소진도 **후보 누락**이다 — 그대로 답을 내면 "더 먼 겉면"을
+        // 최근접이라 우기게 된다. 오답 대신 자원 오류로 드러낸다.
+        let complete = mesh.for_each_candidate(q, |i| {
+            if budget == 0 {
+                over = true;
+                return false;
+            }
+            budget -= 1;
             acc.feed(p, mesh.triangle(i));
             true
-        }) {
+        });
+        if over || !complete {
             return Err(QueryReject::ResourceLimit);
         }
         if acc.best_d2.sqrt() <= r || r >= full {
@@ -309,15 +441,25 @@ fn project_heightfield(
     let bounds = hf.local_aabb();
     let (mut r, full) = search_radii(p, bounds);
     let mut acc;
+    let mut budget = PROJECT_TRI_BUDGET;
     loop {
         acc = NearestTri::new();
         let q = Aabb::new(p - splat(r), p + splat(r));
+        let mut over = false;
         if let Some(range) = hf.cell_range(q) {
             crate::heightfield::for_each_overlapping_cell(hf, range, p.y - r, p.y + r, |cx, cz| {
+                if budget == 0 {
+                    over = true;
+                    return false;
+                }
+                budget -= 1;
                 acc.feed(p, hf.triangle(cx, cz, 0));
                 acc.feed(p, hf.triangle(cx, cz, 1));
                 true
             });
+        }
+        if over {
+            return Err(QueryReject::ResourceLimit);
         }
         if acc.best_d2.sqrt() <= r || r >= full {
             break;
@@ -487,6 +629,18 @@ mod tests {
                 Shape::Hull {
                     points: hull_pts,
                     radius: 0.2,
+                },
+            ),
+            (
+                "hull(평면 코어+두께)",
+                Shape::Hull {
+                    points: vec![
+                        v(-0.9, 0.0, -0.6),
+                        v(0.9, 0.0, -0.6),
+                        v(0.9, 0.0, 0.6),
+                        v(-0.9, 0.0, 0.6),
+                    ],
+                    radius: 0.18,
                 },
             ),
             (
@@ -867,6 +1021,119 @@ mod tests {
     }
 
     // ---------- 입력 검증 ----------
+
+    // ---------- 검수 rev_6429a223 회귀 ----------
+
+    /// **저차원 코어 + 두께**: z=0 평면 hull에 convex radius를 주면 겉면은 z=±r인데,
+    /// GJK 법선을 그대로 쓰면 반올림이 만든 **평면 안** 방향으로 밀어 물체 안에 머문다.
+    #[test]
+    fn flat_hull_with_radius_escapes_the_plane() {
+        let s = Shape::Hull {
+            points: vec![
+                v(-1.0, -1.0, 0.0),
+                v(1.0, -1.0, 0.0),
+                v(1.0, 1.0, 0.0),
+                v(-1.0, 1.0, 0.0),
+            ],
+            radius: 0.1,
+        };
+        assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
+        for p in [v(0.0, 0.0, 0.0), v(0.5, -0.3, 0.0), v(-0.9, 0.9, 0.0)] {
+            let pr = try_project_point(&s, &ident(), p).unwrap();
+            assert!(pr.inside, "코어 안인데 밖이라고 했다 p={p:?}");
+            assert!(
+                (pr.point.z.abs() - 0.1).abs() < 1e-4,
+                "겉면(z=±0.1)이 아니다: {:?} (p={p:?})",
+                pr.point
+            );
+            assert!(
+                ((pr.point - p).length() - 0.1).abs() < 1e-4,
+                "겉면까지 거리가 radius가 아니다: {} (p={p:?})",
+                (pr.point - p).length()
+            );
+        }
+        // 선형 코어(두 점)도 같은 계약이다 — 여공간이 2차원이라 방향 선택이 결정적이어야 한다.
+        let seg = Shape::Hull {
+            points: vec![v(-1.0, 0.0, 0.0), v(1.0, 0.0, 0.0)],
+            radius: 0.3,
+        };
+        let pr = try_project_point(&seg, &ident(), v(0.2, 0.0, 0.0)).unwrap();
+        assert!(pr.inside);
+        assert!(
+            ((pr.point - v(0.2, 0.0, 0.0)).length() - 0.3).abs() < 1e-4,
+            "{:?}",
+            pr.point
+        );
+    }
+
+    /// 복합 자식 회전은 **다른 질의와 같은 정규화**를 거쳐야 한다 — 검증이 허용하는
+    /// 비단위 자세에서 안팎 판정이 갈리면 안 된다.
+    #[test]
+    fn compound_child_rotation_is_normalized_like_other_queries() {
+        let k = (1.0f32 + 9.0e-4).sqrt();
+        let q = Quat::from_axis_angle(v(0.0, 0.0, 1.0), std::f32::consts::FRAC_PI_4);
+        let scaled = Quat {
+            x: q.x * k,
+            y: q.y * k,
+            z: q.z * k,
+            w: q.w * k,
+        };
+        let s = Shape::Compound {
+            children: vec![(
+                Pose {
+                    pos: Vec3::ZERO,
+                    rot: scaled,
+                },
+                Shape::Box {
+                    half: v(900.0, 1.0, 1.0),
+                    radius: 0.0,
+                },
+            )],
+        };
+        assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
+        let mut rng = Lcg(2024);
+        for _ in 0..400 {
+            // 상자 표면 근처를 훑는다 — 정규화 차이가 드러나는 자리다.
+            let local = v(
+                (rng.next() - 0.5) * 1900.0,
+                (rng.next() - 0.5) * 2.4,
+                (rng.next() - 0.5) * 2.4,
+            );
+            let p = q.rotate(local);
+            let a = try_project_point(&s, &ident(), p).unwrap();
+            let b = try_contains_point(&s, &ident(), p).unwrap();
+            assert_eq!(a.inside, b, "안팎이 갈렸다 local={local:?}");
+        }
+    }
+
+    /// 확장 검색은 **누적 예산**을 넘으면 답을 지어내지 않고 자원 오류를 낸다.
+    #[test]
+    fn oversized_mesh_query_reports_resource_limit() {
+        // 예산(4096)을 넘는 삼각형을 한 반경 안에 두고, 멀리서 질의해 전부 후보가 되게 한다.
+        let (nx, nz) = (64u32, 64u32);
+        let mut verts = Vec::new();
+        for iz in 0..nz {
+            for ix in 0..nx {
+                verts.push(v(ix as f32, 0.0, iz as f32));
+            }
+        }
+        let mut tris = Vec::new();
+        for iz in 0..(nz - 1) {
+            for ix in 0..(nx - 1) {
+                let a = iz * nx + ix;
+                tris.push([a, a + 1, a + nx]);
+                tris.push([a + 1, a + nx + 1, a + nx]);
+            }
+        }
+        assert!(
+            tris.len() > super::PROJECT_TRI_BUDGET,
+            "전제: 예산 초과 규모"
+        );
+        let mesh = Shape::trimesh(verts, tris).expect("메시");
+        // 격자 한참 위 — 첫 반경이 이미 전체를 덮는다.
+        let r = try_project_point(&mesh, &ident(), v(32.0, 5000.0, 32.0));
+        assert_eq!(r, Err(QueryReject::ResourceLimit));
+    }
 
     #[test]
     fn invalid_input_is_an_error_not_a_far_point() {
