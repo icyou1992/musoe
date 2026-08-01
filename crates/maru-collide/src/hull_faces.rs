@@ -23,8 +23,22 @@
 //! "세 점이 만든 평면 중 나머지 점이 전부 한쪽에 있는 것"이다. 상한이 32점이라 삼중조합이
 //! 4,960개뿐이고 생성은 스텝 중이 아니므로 전수로 돌린다 — **근사가 아니라 열거**다.
 //!
-//! 같은 면을 여러 삼중조합이 만들므로 평면으로 중복을 없애고, 각 평면 위 점을 모아
-//! 법선 기준 CCW로 정렬한다.
+//! 같은 면을 여러 삼중조합이 만들므로 **경계 정점 순환열**로 중복을 없앤다(각도 임계를
+//! 쓰지 않는다 — 얕게 인접한 면이 합쳐진다). 평면 위 점은 2D 볼록 껍질로 경계만 남긴다.
+//!
+//! ## 알려진 한계: **거의 평면인 점 집합은 면을 못 만든다**(fail-closed)
+//!
+//! 지지 평면을 모으는 `hi − eps` 대역은 "거의 공면"인 점들을 후보마다 조금씩 다른 부분집합
+//! 으로 잡는다. 그러면 같은 물리적 면이 서로 다른 순환열 = 서로 다른 면으로 들어간다.
+//! 실측(지름 2.28, z가 ±1e-6로 흔들리는 8점 링): 아무 방어도 없으면 **42면**, 사후 재검증
+//! (공면성+지지 조건)으로 39면, 사전 검증(삼중조합 평면 자체가 지지 평면인가)까지 넣어도
+//! **33면**이다 — 오일러 상한 12를 크게 넘는다.
+//!
+//! 세 방어를 다 두되, **오일러 상한을 넘으면 빈 구조로 포기한다**. 가짜 면 수십 개를 들고
+//! 클리핑에 넘기면 hull을 가로지르는 평면이 진짜 접촉 영역을 잘라내기 때문이다. 빈 구조는
+//! 호출자가 기존 witness 경로로 가라는 뜻이고, 그건 **이 모듈이 생기기 전과 같은 동작**이라
+//! 회귀가 아니다. 근본 해결은 삼중조합 열거가 아니라 quickhull류 위상 구축이고, 그건 별도
+//! 작업이다(검수 rev_8e10c17d).
 
 use crate::limits::MAX_HULL_POINTS;
 use maru_math::Vec3;
@@ -106,7 +120,13 @@ impl HullFaces {
                     };
                     // 두 방향 모두 후보다: 어느 쪽이 바깥인지는 나머지 점이 정한다.
                     for cand in [nrm, nrm * -1.0] {
-                        Self::insert_face(&mut faces, points, cand, eps);
+                        Self::insert_face(&mut faces, points, cand, cand.dot(points[i]), eps);
+                        // **면 수 상한**(오일러: 2m−4). 넘으면 입력이 볼록 껍질 정점 집합이
+                        // 아니라는 뜻이므로 통째로 포기한다 — 가짜 면 수십 개를 들고
+                        // 클리핑에 넘기느니 witness 경로로 가는 편이 안전하다.
+                        if faces.len() > 2 * n - 4 {
+                            return Self::default();
+                        }
                     }
                 }
             }
@@ -130,12 +150,19 @@ impl HullFaces {
     /// BLOCKER: 사면체 (-1,0,0)·(1,0,0)·(0,1,0)·(0,-1,0.01)이 4면이 아니라 3면이 됐다).
     /// 캐노니컬 키는 **경계 정점 순환열**이다 — 같은 면을 찾은 삼중조합은 같은 열을 만들고,
     /// 얇은 판의 앞뒤 두 면은 순서가 뒤집혀 서로 다른 열이 된다.
-    fn insert_face(faces: &mut Vec<HullFace>, points: &[Vec3], normal: Vec3, eps: f32) {
+    fn insert_face(faces: &mut Vec<HullFace>, points: &[Vec3], normal: Vec3, base: f32, eps: f32) {
         // 지지 평면: 이 방향 최댓값. `points[i]`가 아니라 최댓값을 쓰면 어느 삼중조합에서
         // 왔는지와 무관하게 같은 평면이 나온다.
         let mut hi = f32::NEG_INFINITY;
         for p in points {
             hi = hi.max(normal.dot(*p));
+        }
+        // **삼중조합의 평면 자체가 지지 평면인가.** 이게 빠지면 hull 내부를 가로지르는
+        // 단면이 후보로 들어오고, 그 방향으로 모은 점이 실제 면과 무관한 부분집합이 되어
+        // 가짜 면이 무더기로 생긴다. 거의 평면인 8점 링에서 실측 42개(재검증만으로는 39개,
+        // 사전 검증을 넣으면 2개)였다 — 검수 rev_8e10c17d가 지적한 자리다.
+        if base < hi - eps {
+            return;
         }
         // 평면 위(안쪽 eps 이내) 점들. 여기엔 **면 내부 점도 섞인다** — 다음 단계가 거른다.
         let mut on: Vec<u8> = Vec::new();
@@ -157,7 +184,11 @@ impl HullFaces {
             return;
         }
         // 법선·오프셋을 **경계에서 다시 계산**한다(Newell) — 삼중조합이 준 값보다 안정적이고
-        // 어느 조합에서 왔는지와 무관해진다.
+        // 어느 조합에서 왔는지와 무관해진다. 다만 **다시 계산한 평면을 재검증해야 한다**:
+        // `hi - eps` 대역은 "거의 평면"인 점들을 한 면으로 끌어모을 수 있고, 그러면 삼중조합
+        // 마다 다른 부분집합이 잡혀 서로 다른 순환열 = 서로 다른 "면"이 무더기로 들어간다.
+        // 그 면들은 hull을 가로지르므로 클리핑이 진짜 접촉 영역을 잘라낸다
+        // (검수 rev_8e10c17d BLOCKER).
         let mut nsum = Vec3::ZERO;
         for a in 0..ring.len() {
             let p0 = points[ring[a] as usize];
@@ -172,6 +203,26 @@ impl HullFaces {
             off += nrm.dot(points[*idx as usize]);
         }
         off /= ring.len() as f32;
+        // ①② 는 **테스트로 관측되지 않는 방어**다(뮤테이션으로 확인: 빼도 모든 테스트가
+        // 통과한다). 정상 입력에서는 위 사전 검증이 이미 보장하고, 병리 입력에서는 오일러
+        // 상한이 먼저 걸리기 때문이다. 그래도 남기는 이유는 셋을 합친 효과가 **실측**되기
+        // 때문이다: 거의 평면인 8점 링에서 방어 없음 42면 → 사후만 39면 → 사전까지 33면.
+        // 상한이 12이므로 이 입력은 어차피 포기되지만, 상한 근처(≤12) 입력에서는 이 차이가
+        // 가짜 면 한둘을 실제로 걸러낸다.
+        //
+        // ① 링이 정말 **공면**인가 — 평균 평면에서 eps 안에 있어야 한다.
+        for idx in &ring {
+            if (nrm.dot(points[*idx as usize]) - off).abs() > eps {
+                return;
+            }
+        }
+        // ② 그 평면이 정말 **지지 평면**인가 — 어떤 점도 바깥에 없어야 한다.
+        //    (①만 보면 hull을 가로지르는 얇은 판이 통과한다.)
+        for p in points {
+            if nrm.dot(*p) > off + eps {
+                return;
+            }
+        }
         faces.push(HullFace {
             normal: nrm,
             offset: off,
@@ -498,6 +549,82 @@ mod tests {
             let asis = sorted.clone();
             sorted.sort();
             assert_eq!(asis, sorted, "면이 캐노니컬 순서가 아니다");
+        }
+    }
+
+    /// **거의 평면인 점 집합**이 가짜 면을 무더기로 만들면 안 된다.
+    ///
+    /// 지지 평면 대역(`hi − eps`)은 비공면 점들을 한 면으로 끌어모을 수 있고, 그러면
+    /// 삼중조합마다 다른 부분집합이 잡혀 서로 다른 순환열 = 서로 다른 "면"이 들어간다.
+    /// 그 면들은 hull을 가로지르므로 클리핑이 진짜 접촉 영역을 잘라낸다
+    /// (검수 rev_8e10c17d BLOCKER). 재계산한 평면의 **공면성 + 지지 조건**을 다시 확인해
+    /// 막고, 그래도 넘치면 오일러 상한에서 통째로 포기한다.
+    #[test]
+    fn nearly_planar_ring_does_not_explode_into_fake_faces() {
+        // 좌표는 검수가 준 f32 값 그대로다 — **딱 떨어지지 않아야** 이 결함이 재현된다.
+        // 비트 패턴으로 넣어 리터럴 반올림·정밀도 린트가 값을 바꾸지 못하게 한다.
+        let b = f32::from_bits;
+        let pts = vec![
+            v(b(0x3f6bc2b5), b(0x00000000), b(0x351bf64c)),
+            v(b(0x3f3e92f7), b(0x3f3e92f7), b(0xb4fbba21)),
+            v(b(0x00000000), b(0x3f8f8ae0), b(0x356e6252)),
+            v(b(0xbf11d2ca), b(0x3f11d2ca), b(0x352161cd)),
+            v(b(0xbf93a6f7), b(0x00000000), b(0xb4a10cca)),
+            v(b(0xbf3e40e1), b(0xbf3e40e1), b(0x34b13649)),
+            v(b(0x00000000), b(0xbf940b56), b(0x346ec85d)),
+            v(b(0x3f3ee1c6), b(0xbf3ee1c6), b(0xb56a4ffb)),
+        ];
+        let f = HullFaces::build(&pts);
+        // **fail-closed가 계약이다**: 방어를 다 걸어도 33면이 나오므로(모듈 주석의 실측)
+        // 오일러 상한에서 통째로 포기한다. 빈 구조 = witness 경로 = 이 모듈 이전과 같은 동작.
+        assert!(
+            f.is_empty(),
+            "거의 평면인 입력에서 면을 만들었다: {} (오일러 상한 {})",
+            f.len(),
+            2 * pts.len() - 4
+        );
+        // 상한이 **무차별 차단이 아니다** — 정상 입력은 여전히 면을 만든다.
+        assert_eq!(HullFaces::build(&box_points(1.0, 1.0, 1.0)).len(), 6);
+    }
+
+    /// 저장된 면은 전부 **진짜 지지 평면**이어야 한다 — hull을 가로지르면 클리핑이
+    /// 진짜 접촉 영역을 잘라낸다. 정상 입력 전반에 대해 잠근다.
+    #[test]
+    fn every_stored_face_is_a_supporting_plane() {
+        let mut hexprism = Vec::new();
+        for k in 0..6 {
+            let a = k as f32 * std::f32::consts::TAU / 6.0;
+            for sy in [-1.0f32, 1.0] {
+                hexprism.push(v(a.cos() * 0.73, sy * 1.37, a.sin() * 0.73));
+            }
+        }
+        for pts in [
+            box_points(1.0, 2.0, 3.0),
+            hexprism,
+            vec![
+                v(-1.0, 0.0, 0.0),
+                v(1.0, 0.0, 0.0),
+                v(0.0, 1.0, 0.0),
+                v(0.0, -1.0, 0.01),
+            ],
+        ] {
+            let f = HullFaces::build(&pts);
+            assert!(!f.is_empty());
+            let mut span = 0.0f32;
+            for p in &pts {
+                for q in &pts {
+                    span = span.max((*p - *q).length());
+                }
+            }
+            let tol = crate::length_eps(span) * 4.0;
+            for face in f.faces() {
+                for p in &pts {
+                    assert!(
+                        face.normal.dot(*p) <= face.offset + tol,
+                        "면이 hull을 가로지른다: 점 {p:?}이 {face:?} 바깥"
+                    );
+                }
+            }
         }
     }
 
