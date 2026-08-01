@@ -166,7 +166,11 @@ pub struct ContactForceEvent {
     pub b: BodyHandle,
     /// **A에 작용한** 총 힘(뉴턴). B가 받는 힘은 이것의 반대다.
     pub total_force: Vec3,
-    /// `total_force`의 크기 — 임계와 비교되는 값이다.
+    /// **접점별 힘 크기의 합** — 임계와 비교되는 값이다.
+    ///
+    /// `total_force.length()`가 **아니다**. 마주 보는 접점(복합 셰이프가 양쪽에서 누르는
+    /// 경우)에서 벡터 합은 0에 가까워지지만 실제 하중은 크기 때문이다. 삼각부등식에 따라
+    /// 항상 `>= total_force.length()`다. rapier의 동명 필드와 같은 의미다.
     pub total_force_magnitude: f32,
     /// 가장 센 접점의 힘 **방향**(단위 벡터). 접점이 하나뿐이면 `total_force`와 같은 방향.
     pub max_force_direction: Vec3,
@@ -2518,6 +2522,19 @@ impl World {
         trim!(self.gravity_gate, nbody);
         trim!(self.sleep_bak, nbody);
         trim!(self.sleep_timer_bak, nbody);
+        // **접촉력 출력은 기능이 꺼지면 통째로 반납한다.** 목표가 0인데 용량만 남으면
+        // 128 MiB 회계에서 초과분으로 잡히지도 않고(목표 0 대비 초과라 잡히긴 하지만
+        // 조기 위생이 안 돌면 반납 기회가 없다) 다음 큰 브로드페이즈가 그걸 쥔 채
+        // 새 배열을 먼저 할당한다(검수 rev_230afeaf MAJOR).
+        // 켜져 있으면 다른 버퍼와 같은 부풀림 기준을 쓴다 — 목표는 직전 스텝 사용량 근사.
+        let force_on = (0..self.bodies.len())
+            .any(|i| self.alive[i] && self.bodies[i].contact_force_threshold.is_finite());
+        if !force_on {
+            self.contact_force_events = Vec::new();
+        } else {
+            let need = self.contact_force_events.len();
+            trim!(self.contact_force_events, need);
+        }
         // 블록·참여자 버퍼는 이 시점에 목표를 모른다 — 직전 스텝 사용량(len)을 근사로 쓴다.
         let blocks_need = self.contact_blocks.len();
         trim!(self.contact_blocks, blocks_need);

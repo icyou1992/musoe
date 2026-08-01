@@ -239,8 +239,14 @@ pub(crate) fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
             (local - q).length_sq() <= radius * radius
         }
         Shape::Hull { .. } => {
-            // 코어까지의 거리가 radius 이하인가 — support 기반 최근접점으로 판정한다.
-            closest_core_dist(shape, local).0 <= r
+            // 코어 안이거나, 코어까지의 거리가 radius 이하면 안이다.
+            //
+            // **코어 안 판정에 GJK 거리를 쓰지 않는다** — GJK는 코어 안의 점에도 양의
+            // 거리를 줄 수 있고(같은 support 재등장 시 조기 종료), 그러면 안에 있는 점을
+            // 밖이라고 한다. `project`와 **같은 판정**을 써서 두 질의가 갈리지 않게 한다
+            // (검수 rev_230afeaf BLOCKER).
+            let d = closest_core_dist(shape, local).0;
+            crate::project::core_contains(shape, local, d) || d <= r
         }
         // 삼각형은 부피가 없다 — radius가 있을 때만 코어까지 거리로 판정(hull과 같은 경로).
         Shape::Triangle { .. } => r > 0.0 && closest_core_dist(shape, local).0 <= r,

@@ -787,8 +787,6 @@ fn removing_the_last_threshold_body_turns_the_feature_off() {
         "꺼져 있는데 선점했다"
     );
 
-    let _ = gone;
-
     // 셋째: 임계 바디를 **첫 스텝 전에** 제거하면 새 월드와 똑같이 꺼져야 한다.
     // 죽은 슬롯의 본문은 남으므로(`remove_body`는 `alive=false`만 만든다) 살아있는지
     // 보지 않으면 플래그가 켜진 채 선점까지 간다. 한 번이라도 스텝을 돈 뒤에는 용량이
@@ -832,5 +830,24 @@ fn removing_the_last_threshold_body_turns_the_feature_off() {
         w3.contact_force_events_capacity(),
         0,
         "죽은 슬롯의 임계로 기능이 켜진 채 남았다"
+    );
+
+    // 넷째: **한 번 커진 버퍼는 기능이 꺼지면 반납돼야 한다.** 목표만 0으로 두면 용량이
+    // 그대로 남아, 다음 큰 브로드페이즈가 그걸 쥔 채 새 배열을 먼저 할당한다
+    // (검수 rev_230afeaf MAJOR).
+    let before = w.contact_force_events_capacity();
+    assert!(before > 0, "전제: 켜진 상태에서 버퍼가 잡혀 있다");
+    w.remove_body(gone).unwrap();
+    for _ in 0..30 {
+        w.step(DT);
+        assert!(
+            w.contact_force_events().is_empty(),
+            "제거된 바디의 임계로 이벤트가 났다"
+        );
+    }
+    assert_eq!(
+        w.contact_force_events_capacity(),
+        0,
+        "기능이 꺼졌는데 버퍼를 계속 쥐고 있다 (이전 {before})"
     );
 }

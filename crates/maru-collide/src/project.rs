@@ -227,44 +227,58 @@ fn project_convex_core(
     }
     match gjk(&point, &at, shape, &ident) {
         GjkResult::Separated { distance, on_b, .. } => {
-            let inside = distance <= radius;
             if radius <= 0.0 {
                 // 두께가 없으면 코어가 곧 겉면이다 — 방향이 필요 없다.
                 return Ok(PointProjection {
                     point: on_b,
-                    inside,
+                    inside: distance <= 0.0,
                 });
             }
-            // **코어 밖이냐 안이냐를 GJK의 `distance`로 가른다 — 임계가 없다.**
-            //
-            // 밖이면 답은 "코어 최근접점에서 질의점 방향으로 radius"다. 안이면 그 방향이
-            // 없으니 지지 함수로 이탈 방향과 여유를 구한다.
-            //
-            // 예전에는 `|p − on_b|`를 스케일 상대 임계와 비교해 갈랐는데, 그러면
-            // **모서리·꼭짓점 바로 바깥** 점이 안쪽 경로로 들어간다. 그 경로의 후보는 면
-            // 법선뿐이라 모서리 방향이 없고, 답이 겉면을 벗어난다(검수 rev_2da962df BLOCKER:
-            // 반크기 (1000,1,1) hull·radius 0.001에 p=(1000.0019, 1.0006, 0)).
-            //
-            // `distance`는 코어 안·표면에서 **정확히 0**이다(실측: 평면 코어 내부 0.0,
-            // 긴 상자 내부 0.0, 모서리 밖 1.985e-3). 심플렉스 축약이 최근접 벡터를 0으로
-            // 만들기 때문이라 반올림 여유를 둘 필요가 없다. witness 위치(`on_b`)에는
-            // 반올림이 남지만(내부에서 4e-8) 그건 이 판정에 쓰지 않는다.
-            if distance > 0.0 {
-                let v = p - on_b;
-                let l = v.length();
-                if l > 0.0 {
+            // **코어 AABB 밖이면 확실히 밖이다** — 전수 열거 없이 witness 방향을 쓴다.
+            // (아래 지지 최소화는 C(m,3)·m이라 비싸다. 이 가지치기는 순수 비교라 안전하다.)
+            let bb = shape.local_aabb();
+            let outside_aabb = p.x < bb.min.x
+                || p.x > bb.max.x
+                || p.y < bb.min.y
+                || p.y > bb.max.y
+                || p.z < bb.min.z
+                || p.z > bb.max.z;
+            if !outside_aabb {
+                // **안팎 판정은 지지 여유로 한다 — GJK의 `distance`를 믿지 않는다.**
+                //
+                // GJK는 코어 **안**의 점에도 양의 거리를 돌려줄 수 있다: 같은 support가
+                // 다시 나오면 조기 종료하는데, 그때 심플렉스의 최근접 벡터가 0이 아닐 수
+                // 있다. 실측(검수 rev_230afeaf BLOCKER): 반크기 (1000,1,1) hull의 내부점
+                // (999.999, 0.25, 0)에서 `distance = 0.1768`이 나왔다 — 그걸 믿으면
+                // "밖"으로 분기해 코어 **안쪽** 점을 겉면이라고 돌려준다.
+                //
+                // 지지 여유 `gap = min_n max_p n·(pt − p)`는 그런 착시가 없다: 모든 지지
+                // 반공간 안이면 `gap >= 0`이고, 이 사례에서도 +0.000977로 정확히 안이라고
+                // 답한다. `gap == 0`(지지 평면 위)일 때만 "평면 안이지만 다각형 밖"을
+                // 가려야 해서 `distance`를 보는데, 그 경우는 GJK가 0을 정확히 준다.
+                let (n, gap) = core_exit(shape, p, budget)?;
+                if gap > 0.0 || distance == 0.0 {
                     return Ok(PointProjection {
-                        point: on_b + v * (radius / l),
-                        inside,
+                        point: p + n * (gap + radius),
+                        // 코어 안이면 겉면(코어 ⊕ 반지름 공) 안이기도 하다.
+                        inside: true,
                     });
                 }
             }
-            // 코어 위/안이라 방향이 없다 — 지지 함수로 이탈 방향과 여유를 구한다.
-            // (여기서만 부른다: 전수 열거라 비싸고, 밖에서는 필요 없다.)
+            // 코어 밖 — 최근접점에서 질의점 방향으로 radius.
+            let v = p - on_b;
+            let l = v.length();
+            if l > 0.0 {
+                return Ok(PointProjection {
+                    point: on_b + v * (radius / l),
+                    inside: l <= radius,
+                });
+            }
+            // 방향이 없다(witness가 질의점과 같다) — 지지 방향으로 마감한다.
             let (n, gap) = core_exit(shape, p, budget)?;
             Ok(PointProjection {
                 point: p + n * (gap + radius),
-                inside,
+                inside: true,
             })
         }
         GjkResult::Intersecting(_) => {
@@ -278,6 +292,33 @@ fn project_convex_core(
                 inside: true,
             })
         }
+    }
+}
+
+/// 점이 hull **코어 안**인가 — GJK의 `distance`를 믿지 않는 판정.
+///
+/// GJK는 코어 안의 점에도 양의 거리를 돌려줄 수 있다(같은 support 재등장 시 조기 종료).
+/// 그래서 포함 질의와 투영이 **같은 판정**을 써야 한다 — 안 그러면 호스트가 "안에 있다는데
+/// 투영은 밖"을 본다(검수 rev_230afeaf BLOCKER).
+///
+/// AABB 밖은 즉시 거짓이라 비싼 전수 열거는 애매한 경우에만 돈다.
+pub(crate) fn core_contains(shape: &Shape, p: Vec3, distance: f32) -> bool {
+    let bb = shape.local_aabb();
+    if p.x < bb.min.x
+        || p.x > bb.max.x
+        || p.y < bb.min.y
+        || p.y > bb.max.y
+        || p.z < bb.min.z
+        || p.z > bb.max.z
+    {
+        return false;
+    }
+    // 예산은 한 셰이프에 넉넉하다(32점 hull 최악이 상한의 60% 남짓). 소진은 도달 불가지만
+    // 값으로 받아 **거짓으로 뭉개지 않는다** — 소진되면 GJK 답으로 되돌아간다.
+    let mut budget = MAX_PROJECT_WORK;
+    match core_exit(shape, p, &mut budget) {
+        Ok((_, gap)) => gap > 0.0 || distance == 0.0,
+        Err(_) => distance == 0.0,
     }
 }
 
@@ -1257,6 +1298,52 @@ mod tests {
         assert!(
             limited,
             "코어 밖 질의가 예산을 전혀 쓰지 않았다 (통과 {ok}회)"
+        );
+    }
+
+    /// **GJK의 `distance`는 코어 안에서도 양수일 수 있다.** 같은 support가 다시 나와
+    /// 조기 종료할 때 심플렉스 최근접 벡터가 0이 아닌 경우다 — 그걸 안팎 판정에 쓰면
+    /// 코어 안쪽 점을 "겉면"이라고 돌려준다(검수 rev_230afeaf BLOCKER).
+    #[test]
+    fn interior_point_is_inside_even_when_gjk_reports_distance() {
+        let h = v(1000.0, 1.0, 1.0);
+        let mut pts = Vec::new();
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    pts.push(v(h.x * sx, h.y * sy, h.z * sz));
+                }
+            }
+        }
+        let radius = 0.1;
+        let s = Shape::Hull {
+            points: pts,
+            radius,
+        };
+        let p = v(999.999, 0.25, 0.0);
+        // 전제: 이 점은 코어 안이다(모든 축에서 반크기 안).
+        assert!(p.x.abs() <= h.x && p.y.abs() <= h.y && p.z.abs() <= h.z);
+        let pr = try_project_point(&s, &ident(), p).unwrap();
+        assert!(pr.inside, "코어 안인데 밖이라고 했다: {pr:?}");
+        // 겉면은 코어 표면에서 radius만큼 밖이다. 가장 가까운 면은 +X(여유 0.001)이므로
+        // 답은 x ≈ 1000 + radius 근처여야 하고, **코어 안(|x| < 1000)이면 안 된다**.
+        assert!(
+            pr.point.x > h.x,
+            "겉면이 아니라 코어 안쪽 점을 돌려줬다: {:?}",
+            pr.point
+        );
+        assert!(
+            ((pr.point - p).length() - (0.001 + radius)).abs() < 1.0e-3,
+            "겉면까지 거리가 여유+radius가 아니다: {} (점 {:?})",
+            (pr.point - p).length(),
+            pr.point
+        );
+        // 안팎 판정은 `contains_point`와도 같아야 한다 — 두 질의가 갈리면 호스트가
+        // "안에 있다는데 투영은 밖"을 보게 된다.
+        assert_eq!(
+            pr.inside,
+            try_contains_point(&s, &ident(), p).unwrap(),
+            "안팎이 갈렸다"
         );
     }
 
