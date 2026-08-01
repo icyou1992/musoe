@@ -33,6 +33,16 @@ pub(crate) fn write_shape(w: &mut Writer, s: &Shape) {
             w.vec3(*half);
             w.f32(*radius);
         }
+        // v19: 원기둥. 태그는 **뒤에 붙인다** — 기존 태그를 재배치하면 옛 저장본이 다른
+        // 셰이프로 읽힌다(조용한 손상).
+        Shape::Cylinder {
+            half_height,
+            radius,
+        } => {
+            w.u8(8);
+            w.f32(*half_height);
+            w.f32(*radius);
+        }
         // 타일은 높이의 파생물이라 **직렬화하지 않는다** — 복원에서 생성자가 다시 만든다.
         // 파생을 저장하면 "바이트는 같은데 파생이 다른" 상태가 생길 수 있다.
         Shape::Heightfield(g) => {
@@ -98,6 +108,10 @@ pub(crate) fn read_shape(r: &mut Reader, allow_compound: bool) -> Result<Shape, 
         },
         2 => Shape::Box {
             half: r.vec3()?,
+            radius: r.f32()?,
+        },
+        8 => Shape::Cylinder {
+            half_height: r.f32()?,
             radius: r.f32()?,
         },
         3 => {
@@ -523,6 +537,7 @@ pub(crate) fn shape_size(s: &Shape) -> usize {
     1 + match s {
         Shape::Sphere { .. } => 4,
         Shape::Capsule { .. } => 8,
+        Shape::Cylinder { .. } => 8,
         Shape::Box { .. } => 16,
         Shape::Hull { points, .. } => 4 + points.len() * 12 + 4,
         // nx4 + nz4 + cell4 + count4 + 높이 4바이트씩

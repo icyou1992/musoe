@@ -19,6 +19,12 @@ pub enum Shape {
     Sphere { radius: f32 },
     /// Y축 정렬 세그먼트 코어 [-half_height, +half_height] + radius.
     Capsule { half_height: f32, radius: f32 },
+    /// **Y축 정렬 원기둥** — 밑면 반지름 `radius`, 높이 `2*half_height`, 중심이 원점.
+    ///
+    /// convex radius가 **0인 날카로운 셰이프**다(박스의 `radius: 0.0`과 같은 계열).
+    /// rapier의 `Cylinder`와 같은 정의라 치수를 그대로 옮길 수 있다. 캡슐과 달리 끝이
+    /// 평평해 세워 두면 면접촉으로 안정하게 선다 — 바퀴·기둥·통에 쓴다.
+    Cylinder { half_height: f32, radius: f32 },
     /// 코어=half에서 radius를 뺀 박스. half는 겉면 기준(사용자 관점 치수).
     Box { half: Vec3, radius: f32 },
     /// 코어 포인트 집합(이미 수축됨) + radius.
@@ -202,6 +208,15 @@ impl Shape {
             // 거절한다 — 같은 형상에 두 정책이 되고, 45° 자세의 `transformed_aabb`에서
             // 두 항의 합이 `Inf`가 된다(확인검수 rev_201e3d20 MAJOR).
             Shape::Sphere { radius } => extent_in_range(*radius) && *radius >= 0.0,
+            Shape::Cylinder {
+                half_height,
+                radius,
+            } => {
+                extent_in_range(*half_height)
+                    && *half_height > 0.0
+                    && extent_in_range(*radius)
+                    && *radius > 0.0
+            }
             Shape::Capsule {
                 half_height,
                 radius,
@@ -283,6 +298,21 @@ impl Shape {
                     return Err(
                         "sphere radius must be within [MIN_SHAPE_EXTENT, MAX_SHAPE_EXTENT]",
                     );
+                }
+            }
+            Shape::Cylinder {
+                half_height,
+                radius,
+            } => {
+                // 원기둥은 **두 치수 다 실체**여야 한다(캡슐은 half_height 0이 구가 되지만
+                // 원기둥은 0이면 원판, 즉 부피가 없다). 최소 특징 크기로 함께 막는다.
+                if !extent_in_range(*half_height) || *half_height < MIN_SHAPE_EXTENT {
+                    return Err(
+                        "cylinder half_height must be finite and at least MIN_SHAPE_EXTENT",
+                    );
+                }
+                if !extent_in_range(*radius) || *radius < MIN_SHAPE_EXTENT {
+                    return Err("cylinder radius must be finite and at least MIN_SHAPE_EXTENT");
                 }
             }
             Shape::Capsule { half_height, .. } => {
@@ -376,6 +406,8 @@ impl Shape {
     #[inline]
     pub fn radius(&self) -> f32 {
         match *self {
+            // 원기둥은 **날카롭다** — 겉면이 곧 코어다(박스 radius 0과 같은 계열).
+            Shape::Cylinder { .. } => 0.0,
             Shape::Sphere { radius }
             | Shape::Capsule { radius, .. }
             | Shape::Box { radius, .. }
@@ -393,6 +425,11 @@ impl Shape {
     pub fn bounding_radius(&self) -> f32 {
         match self {
             Shape::Sphere { radius } => *radius,
+            // 원점에서 가장 먼 표면점 = 밑면 테두리.
+            Shape::Cylinder {
+                half_height,
+                radius,
+            } => (half_height * half_height + radius * radius).sqrt(),
             Shape::Capsule {
                 half_height,
                 radius,
@@ -427,6 +464,22 @@ impl Shape {
             // 하이트필드는 캐스트의 **대상**이지 주체가 아니다(static 전용) — 그래도
             // 계약을 만족시키려 외접 반지름으로 상한을 준다(보수적).
             Shape::Heightfield { .. } | Shape::TriMesh { .. } => self.bounding_radius(),
+            // 코어 점 중 축에서 가장 먼 것 = 밑면 테두리(축이 Y면 radius, 축이 XZ면 대각).
+            Shape::Cylinder {
+                half_height,
+                radius,
+            } => {
+                let rim = |sy: f32, sx: f32| perp(Vec3::new(radius * sx, half_height * sy, 0.0));
+                let rim_z = |sy: f32, sz: f32| perp(Vec3::new(0.0, half_height * sy, radius * sz));
+                rim(1.0, 1.0)
+                    .max(rim(1.0, -1.0))
+                    .max(rim(-1.0, 1.0))
+                    .max(rim(-1.0, -1.0))
+                    .max(rim_z(1.0, 1.0))
+                    .max(rim_z(1.0, -1.0))
+                    .max(rim_z(-1.0, 1.0))
+                    .max(rim_z(-1.0, -1.0))
+            }
             Shape::Triangle { points, radius } => {
                 points.iter().fold(0.0f32, |m, p| m.max(perp(*p))) + radius
             }
@@ -466,6 +519,29 @@ impl Shape {
     pub(crate) fn support_core(&self, d: Vec3) -> Vec3 {
         match self {
             Shape::Sphere { .. } => Vec3::ZERO,
+            // 원기둥: 반경 방향은 XZ 평면에서 최대, 축 방향은 부호로 끝면을 고른다.
+            // XZ가 0이면 방향이 없다 — **결정적으로 +X**를 골라 support가 입력만의 함수로 남는다.
+            Shape::Cylinder {
+                half_height,
+                radius,
+            } => {
+                let l2 = d.x * d.x + d.z * d.z;
+                let (ux, uz) = if l2 > 0.0 {
+                    let inv = 1.0 / l2.sqrt();
+                    (d.x * inv, d.z * inv)
+                } else {
+                    (1.0, 0.0)
+                };
+                Vec3::new(
+                    radius * ux,
+                    if d.y >= 0.0 {
+                        *half_height
+                    } else {
+                        -*half_height
+                    },
+                    radius * uz,
+                )
+            }
             Shape::Capsule { half_height, .. } => Vec3::new(
                 0.0,
                 if d.y >= 0.0 {
@@ -561,6 +637,10 @@ impl Shape {
         let r = self.radius();
         match self {
             Shape::Sphere { .. } => Aabb::from_center(Vec3::ZERO, Vec3::new(r, r, r)),
+            Shape::Cylinder {
+                half_height,
+                radius,
+            } => Aabb::from_center(Vec3::ZERO, Vec3::new(*radius, *half_height, *radius)),
             Shape::Capsule { half_height, .. } => {
                 Aabb::from_center(Vec3::ZERO, Vec3::new(r, half_height + r, r))
             }

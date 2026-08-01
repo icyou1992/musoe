@@ -106,6 +106,10 @@ pub(crate) fn project_local(
             Ok(inflate(c, p, radius, TIE_X))
         }
         Shape::Box { half, radius } => Ok(project_box(half, radius, p)),
+        Shape::Cylinder {
+            half_height,
+            radius,
+        } => Ok(project_cylinder(half_height, radius, p)),
         Shape::Triangle { points, radius } => {
             let q = closest_on_triangle(p, points);
             // fallback은 삼각형 **평면의 법선**이다. 외적이 정확히 0(세 점이 한 직선)일
@@ -190,6 +194,48 @@ fn project_box(half: Vec3, radius: f32, p: Vec3) -> PointProjection {
     PointProjection {
         point: Vec3::new(out[0], out[1], out[2]),
         inside: true,
+    }
+}
+
+/// 원기둥 — 겉면이 곧 코어라(날카롭다) 해석해가 그대로 답이다.
+///
+/// 세 영역으로 갈린다: **옆면 밖**(반경 초과)·**끝면 밖**(축 초과)·**안쪽**.
+/// 안쪽에서는 옆면까지 여유와 끝면까지 여유를 견줘 가까운 쪽으로 나간다.
+fn project_cylinder(half_height: f32, radius: f32, p: Vec3) -> PointProjection {
+    let r2 = p.x * p.x + p.z * p.z;
+    let r = r2.sqrt();
+    let outside_side = r > radius;
+    let outside_cap = p.y.abs() > half_height;
+    // 반경 방향 단위 벡터. 축 위(r == 0)면 방향이 없다 — 결정적으로 +X를 쓴다.
+    let (ux, uz) = if r > 0.0 {
+        (p.x / r, p.z / r)
+    } else {
+        (1.0, 0.0)
+    };
+    if outside_side || outside_cap {
+        // 밖 — 반경은 radius로, 축은 ±half_height로 각각 클램프한 점이 최근접이다.
+        let rr = r.min(radius);
+        return PointProjection {
+            point: Vec3::new(ux * rr, p.y.clamp(-half_height, half_height), uz * rr),
+            inside: false,
+        };
+    }
+    // 안쪽 — 옆면까지 `radius − r`, 끝면까지 `half_height − |y|`. 가까운 쪽으로 나간다.
+    // 동률은 **옆면**이 이긴다(결정적 규약).
+    let to_side = radius - r;
+    let to_cap = half_height - p.y.abs();
+    if to_side <= to_cap {
+        PointProjection {
+            point: Vec3::new(ux * radius, p.y, uz * radius),
+            inside: true,
+        }
+    } else {
+        // y == 0이면 위아래가 동률이다 — +Y를 고른다(결정적).
+        let sy = if p.y < 0.0 { -1.0 } else { 1.0 };
+        PointProjection {
+            point: Vec3::new(p.x, sy * half_height, p.z),
+            inside: true,
+        }
     }
 }
 
@@ -879,6 +925,13 @@ mod tests {
                 },
             ),
             (
+                "원기둥",
+                Shape::Cylinder {
+                    half_height: 0.8,
+                    radius: 0.45,
+                },
+            ),
+            (
                 "hull(평면 코어+두께)",
                 Shape::Hull {
                     points: vec![
@@ -1268,6 +1321,144 @@ mod tests {
     }
 
     // ---------- 입력 검증 ----------
+
+    // ---------- 원기둥 ----------
+
+    #[test]
+    fn cylinder_projection_is_analytic() {
+        let (hh, r) = (1.0f32, 0.5f32);
+        let s = Shape::Cylinder {
+            half_height: hh,
+            radius: r,
+        };
+        // 옆면 밖 — 반경만 클램프.
+        let pr = try_project_point(&s, &ident(), v(3.0, 0.5, 0.0)).unwrap();
+        assert!(!pr.inside);
+        assert!(
+            (pr.point - v(0.5, 0.5, 0.0)).length() < 1e-6,
+            "{:?}",
+            pr.point
+        );
+        // 끝면 밖(축 위) — 축만 클램프.
+        let pr = try_project_point(&s, &ident(), v(0.0, 4.0, 0.0)).unwrap();
+        assert!(
+            (pr.point - v(0.0, 1.0, 0.0)).length() < 1e-6,
+            "{:?}",
+            pr.point
+        );
+        // 모서리 밖(둘 다 초과) — 테두리로.
+        let pr = try_project_point(&s, &ident(), v(3.0, 4.0, 0.0)).unwrap();
+        assert!(
+            (pr.point - v(0.5, 1.0, 0.0)).length() < 1e-6,
+            "{:?}",
+            pr.point
+        );
+        // 안쪽: 옆면이 가까우면 옆면으로.
+        let pr = try_project_point(&s, &ident(), v(0.45, 0.0, 0.0)).unwrap();
+        assert!(pr.inside);
+        assert!(
+            (pr.point - v(0.5, 0.0, 0.0)).length() < 1e-6,
+            "{:?}",
+            pr.point
+        );
+        // 안쪽: 끝면이 가까우면 끝면으로.
+        let pr = try_project_point(&s, &ident(), v(0.0, 0.95, 0.0)).unwrap();
+        assert!(pr.inside);
+        assert!(
+            (pr.point - v(0.0, 1.0, 0.0)).length() < 1e-6,
+            "{:?}",
+            pr.point
+        );
+        // 축 위(반경 방향이 없다) — 결정적으로 +X 옆면.
+        let pr = try_project_point(&s, &ident(), Vec3::ZERO).unwrap();
+        assert!(pr.inside);
+        assert!(
+            (pr.point - v(0.5, 0.0, 0.0)).length() < 1e-6,
+            "{:?}",
+            pr.point
+        );
+    }
+
+    /// support는 **입력만의 함수**여야 한다 — XZ가 0인 방향에서도 결정적이어야 GJK가
+    /// 같은 입력에 같은 답을 낸다.
+    #[test]
+    fn cylinder_support_is_analytic_and_deterministic() {
+        let (hh, r) = (2.0f32, 0.75f32);
+        let s = Shape::Cylinder {
+            half_height: hh,
+            radius: r,
+        };
+        let sup = |d: Vec3| {
+            Pose {
+                pos: Vec3::ZERO,
+                rot: Quat::IDENTITY,
+            }
+            .support_core(&s, d)
+        };
+        assert!((sup(v(1.0, 0.0, 0.0)) - v(r, hh, 0.0)).length() < 1e-6);
+        assert!((sup(v(0.0, -1.0, 0.0)) - v(r, -hh, 0.0)).length() < 1e-6);
+        assert!((sup(v(0.0, 1.0, 0.0)) - v(r, hh, 0.0)).length() < 1e-6);
+        let diag = sup(v(1.0, 1.0, 1.0));
+        assert!((diag.y - hh).abs() < 1e-6);
+        assert!(
+            ((diag.x * diag.x + diag.z * diag.z).sqrt() - r).abs() < 1e-6,
+            "{diag:?}"
+        );
+        // 같은 방향을 두 번 물으면 같은 답(축 위 포함).
+        assert_eq!(sup(Vec3::ZERO), sup(Vec3::ZERO));
+    }
+
+    #[test]
+    fn cylinder_ray_hits_side_and_caps() {
+        let s = Shape::Cylinder {
+            half_height: 1.0,
+            radius: 0.5,
+        };
+        let pose = ident();
+        // 옆에서 쏘면 옆면.
+        let h = crate::try_cast_ray(&s, &pose, v(-3.0, 0.0, 0.0), v(1.0, 0.0, 0.0), 10.0)
+            .unwrap()
+            .expect("옆면 히트");
+        assert!((h.toi - 2.5).abs() < 1e-5, "{}", h.toi);
+        assert!(
+            (h.normal - v(-1.0, 0.0, 0.0)).length() < 1e-5,
+            "{:?}",
+            h.normal
+        );
+        // 위에서 쏘면 끝면.
+        let h = crate::try_cast_ray(&s, &pose, v(0.0, 3.0, 0.0), v(0.0, -1.0, 0.0), 10.0)
+            .unwrap()
+            .expect("끝면 히트");
+        assert!((h.toi - 2.0).abs() < 1e-5, "{}", h.toi);
+        assert!(
+            (h.normal - v(0.0, 1.0, 0.0)).length() < 1e-5,
+            "{:?}",
+            h.normal
+        );
+        // 옆으로 비켜 가면 안 맞는다(캡슐이면 맞는 자리 — 끝이 둥글지 않다는 확인).
+        assert!(
+            crate::try_cast_ray(&s, &pose, v(-3.0, 1.4, 0.0), v(1.0, 0.0, 0.0), 10.0)
+                .unwrap()
+                .is_none()
+        );
+        // 안에서 시작하면 toi 0.
+        let h = crate::try_cast_ray(&s, &pose, Vec3::ZERO, v(1.0, 0.0, 0.0), 10.0)
+            .unwrap()
+            .expect("안에서 시작");
+        assert_eq!(h.toi, 0.0);
+    }
+
+    #[test]
+    fn cylinder_contains_point_is_sharp() {
+        let s = Shape::Cylinder {
+            half_height: 1.0,
+            radius: 0.5,
+        };
+        assert!(try_contains_point(&s, &ident(), v(0.49, 0.99, 0.0)).unwrap());
+        // 모서리 바로 밖 — 캡슐이면 안이지만 원기둥은 밖이다.
+        assert!(!try_contains_point(&s, &ident(), v(0.49, 1.01, 0.0)).unwrap());
+        assert!(!try_contains_point(&s, &ident(), v(0.51, 0.99, 0.0)).unwrap());
+    }
 
     // ---------- 검수 rev_6429a223 회귀 ----------
 

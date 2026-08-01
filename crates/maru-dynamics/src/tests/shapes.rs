@@ -1140,3 +1140,131 @@ fn terrain_marks_only_coplanar_shared_edges_internal() {
         assert_eq!(mask(*h, &w), 0, "비-다양체 에지는 용접 금지");
     }
 }
+
+// ---------- 원기둥 (rapier 기능 격차 4번) ----------
+
+/// 균질 원기둥의 질량·관성은 **닫힌 해**다(캡슐과 달리 근사가 아니다).
+#[test]
+fn cylinder_mass_and_inertia_are_closed_form() {
+    let (hh, r, density) = (1.5f32, 0.4f32, 2.0f32);
+    let b = Body::new_dynamic(
+        maru_collide::Shape::Cylinder {
+            half_height: hh,
+            radius: r,
+        },
+        pose(0.0, 0.0, 0.0),
+        density,
+    );
+    let h = 2.0 * hh;
+    let m = density * std::f32::consts::PI * r * r * h;
+    assert!(
+        (1.0 / b.inv_mass() - m).abs() < m * 1e-4,
+        "질량 {} vs {m}",
+        1.0 / b.inv_mass()
+    );
+    let ixz = m * (3.0 * r * r + h * h) / 12.0;
+    let iy = 0.5 * m * r * r;
+    let inv = b.inv_inertia_local();
+    assert!(
+        (1.0 / inv.x - ixz).abs() < ixz * 1e-3,
+        "Ixx {}",
+        1.0 / inv.x
+    );
+    assert!(
+        (1.0 / inv.z - ixz).abs() < ixz * 1e-3,
+        "Izz {}",
+        1.0 / inv.z
+    );
+    assert!((1.0 / inv.y - iy).abs() < iy * 1e-3, "Iyy {}", 1.0 / inv.y);
+}
+
+/// 원기둥은 **아직 평평한 끝면으로 서지 못한다** — 떨어져서 멈추기까지만 보장한다.
+///
+/// 원인은 원기둥이 아니라 **매니폴드 생성 경로**다: 면 클리핑으로 다접점 매니폴드를
+/// 만드는 것은 `manifold/dispatch.rs`에서 **박스-박스 뿐**이고, 나머지 볼록 쌍은
+/// GJK/EPA witness **단일점**으로 떨어진다. 단일점은 평면 접촉을 못 잡는다.
+///
+/// 실측(2026-08-01, 300스텝, 반크기 0.3×0.6×0.3 상당):
+/// - 박스: y=0.5999, 정지 — 클리핑 경로.
+/// - 같은 모양 **hull**(8점): y=0.5935로 가라앉고 vel.y=−0.167이 남는다 — 단일점.
+/// - 원기둥: y=0.6216, 4.6° 기울고 vel.x=0.37 — 단일점 + 테두리 witness가 매 스텝
+///   옮겨 다녀 더 나쁘다.
+///
+/// **hull도 같은 결함을 갖는다** — 원기둥이 새로 만든 문제가 아니다. 고침은 "지지 함수
+/// 기반 일반 볼록 면 클리핑"이고 원기둥·hull을 함께 고치는 별도 작업이다(README 알려진 한계).
+///
+/// 여기서 잠그는 것은 **발산·관통이 없다**는 계약이다 — 그건 지금 성립해야 한다.
+#[test]
+fn cylinder_falls_and_settles_without_tunneling() {
+    let mut params = no_sleep_params();
+    params.gravity = Vec3::new(0.0, -10.0, 0.0);
+    let mut w = World::new(params);
+    ground(&mut w);
+    let (hh, r) = (0.6f32, 0.3f32);
+    let h = w.add_body(Body::new_dynamic(
+        maru_collide::Shape::Cylinder {
+            half_height: hh,
+            radius: r,
+        },
+        pose(0.0, 3.0, 0.0),
+        1.0,
+    ));
+    for _ in 0..400 {
+        w.step(DT);
+        let b = w.body(h);
+        assert!(b.pose().pos.is_finite(), "발산했다: {:?}", b.pose().pos);
+        // 지면 아래로 통과하지 않는다(원기둥의 외접 반지름만큼 여유).
+        assert!(
+            b.pose().pos.y > -b.shape().bounding_radius(),
+            "지면을 통과했다: y={}",
+            b.pose().pos.y
+        );
+    }
+    let b = w.body(h);
+    // 낙하가 끝나 지면 근처에 있다.
+    assert!(
+        b.pose().pos.y < 1.0 && b.pose().pos.y > 0.0,
+        "지면 근처에 없다: y={}",
+        b.pose().pos.y
+    );
+}
+
+/// 원기둥도 스냅샷 왕복에서 살아남아야 한다(새 태그 8).
+#[test]
+fn cylinder_survives_snapshot_roundtrip() {
+    let mut w = World::new(WorldParams::default());
+    let h = w.add_body(Body::new_dynamic(
+        maru_collide::Shape::Cylinder {
+            half_height: 1.25,
+            radius: 0.375,
+        },
+        pose(1.0, 2.0, 3.0),
+        1.0,
+    ));
+    let snap = w.snapshot();
+    let mut w2 = World::new(WorldParams::default());
+    w2.restore(&snap).expect("복원");
+    match w2.body(h).shape() {
+        maru_collide::Shape::Cylinder {
+            half_height,
+            radius,
+        } => {
+            assert_eq!(*half_height, 1.25);
+            assert_eq!(*radius, 0.375);
+        }
+        other => panic!("셰이프가 바뀌었다: {other:?}"),
+    }
+    assert_eq!(w.state_hash(), w2.state_hash());
+}
+
+/// 퇴화 치수는 거절한다 — 반지름이나 높이가 0이면 부피가 없다.
+#[test]
+fn degenerate_cylinder_is_rejected() {
+    for (hh, r) in [(0.0f32, 0.5f32), (0.5, 0.0), (-1.0, 0.5)] {
+        let s = maru_collide::Shape::Cylinder {
+            half_height: hh,
+            radius: r,
+        };
+        assert!(s.validate().is_err(), "({hh}, {r})를 통과시켰다");
+    }
+}

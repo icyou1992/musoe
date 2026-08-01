@@ -28,7 +28,7 @@ pub(crate) const MAGIC: u32 = 0x4d41_5255; // "MARU"
 /// 캐노니컬 상태이고, 옛 버전을 "적당히" 읽으면 빠진 필드가 기본값으로 채워져 **같은
 /// 바이트가 다른 미래**를 만든다(그 사고를 이미 v13→v14에서 겪었다). 버전이 다르면
 /// `BadVersion(found)`으로 거부하고, 호스트가 마이그레이션 여부를 스스로 정한다.
-pub const VERSION: u32 = 18;
+pub const VERSION: u32 = 19;
 
 /// 크레이트 밖으로 나가는 이름(재수출).
 pub use self::VERSION as SNAPSHOT_VERSION;

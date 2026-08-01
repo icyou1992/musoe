@@ -902,6 +902,18 @@ fn mass_properties(shape: &Shape, density: f32) -> (f32, Vec3) {
                 ),
             )
         }
+        Shape::Cylinder {
+            half_height,
+            radius,
+        } => {
+            // 균질 원기둥의 닫힌 해다(캡슐과 달리 근사가 아니다).
+            // m = ρ·π·r²·h,  Ixx = Izz = m(3r² + h²)/12,  Iyy = m·r²/2.
+            let h = 2.0 * half_height;
+            let m = density * core::f32::consts::PI * radius * radius * h;
+            let ixz = m * (3.0 * radius * radius + h * h) / 12.0;
+            let iy = 0.5 * m * radius * radius;
+            (m, Vec3::new(ixz, iy, ixz))
+        }
         Shape::Capsule {
             half_height,
             radius,

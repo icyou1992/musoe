@@ -131,6 +131,10 @@ pub(crate) fn cast_ray(
                 ray_convex_ca(shape, o, d, max_toi)
             }
         }
+        Shape::Cylinder {
+            half_height,
+            radius,
+        } => ray_cylinder(o, d, half_height, radius, max_toi),
         Shape::Hull { .. } => ray_convex_ca(shape, o, d, max_toi),
         Shape::Triangle { points, .. } => crate::heightfield::ray_triangle(o, d, points, max_toi)
             .map(|(toi, n)| Local {
@@ -238,6 +242,12 @@ pub(crate) fn contains_point(
         } => {
             let y = local.y.clamp(-half_height, half_height);
             (local - Vec3::new(0.0, y, 0.0)).length_sq() <= radius * radius
+        }
+        Shape::Cylinder {
+            half_height,
+            radius,
+        } => {
+            local.y.abs() <= half_height && local.x * local.x + local.z * local.z <= radius * radius
         }
         Shape::Box { half, radius } => {
             // 겉면 기준 half가 곧 사용자 관점 치수다 (코어+radius = half).
@@ -399,6 +409,71 @@ fn ray_box(o: Vec3, d: Vec3, half: Vec3, max_toi: f32) -> Option<Local> {
         normal: n,
         started_inside: false,
     })
+}
+
+/// 광선 × **원기둥**(Y축 정렬, 날카로운 끝면).
+///
+/// 두 조각을 각각 풀어 가장 이른 히트를 고른다: 무한 원기둥의 옆면(XZ 평면의 원과의
+/// 2차식)과 위·아래 끝면(평면 교차 뒤 반경 확인). 조각마다 **다른 조각의 범위 조건**을
+/// 확인해야 한다 — 옆면 해는 |y| ≤ half_height, 끝면 해는 반경 ≤ radius여야 진짜 히트다.
+///
+/// 광선이 안에서 시작하면 `started_inside`로 표시하고 toi 0을 준다(다른 셰이프와 같은 규약).
+fn ray_cylinder(o: Vec3, d: Vec3, half_height: f32, radius: f32, max_toi: f32) -> Option<Local> {
+    if o.y.abs() <= half_height && o.x * o.x + o.z * o.z <= radius * radius {
+        return Some(Local {
+            toi: 0.0,
+            normal: Vec3::ZERO,
+            started_inside: true,
+        });
+    }
+    let mut best: Option<Local> = None;
+    let mut take = |toi: f32, normal: Vec3| {
+        if toi < 0.0 || toi > max_toi {
+            return;
+        }
+        // 동률은 먼저 본 조각이 이긴다 — 옆면을 먼저 시험하므로 규약이 결정적이다.
+        if best.as_ref().is_none_or(|b| toi < b.toi) {
+            best = Some(Local {
+                toi,
+                normal,
+                started_inside: false,
+            });
+        }
+    };
+    // ① 옆면: (o.xz + t·d.xz)² = radius²
+    let a = d.x * d.x + d.z * d.z;
+    if a > 0.0 {
+        let b = o.x * d.x + o.z * d.z;
+        let c = o.x * o.x + o.z * o.z - radius * radius;
+        let disc = b * b - a * c;
+        if disc >= 0.0 {
+            let sd = disc.sqrt();
+            // 두 근 모두 본다 — 밖에서 시작해도 접선 근처에서는 작은 근이 음수일 수 있다.
+            for t in [(-b - sd) / a, (-b + sd) / a] {
+                let y = o.y + t * d.y;
+                if y.abs() <= half_height {
+                    let px = o.x + t * d.x;
+                    let pz = o.z + t * d.z;
+                    let n = Vec3::new(px, 0.0, pz)
+                        .try_normalize()
+                        .unwrap_or(Vec3::new(1.0, 0.0, 0.0));
+                    take(t, n);
+                }
+            }
+        }
+    }
+    // ② 끝면: y = ±half_height 평면과의 교차 뒤 반경 확인.
+    if d.y != 0.0 {
+        for sy in [-1.0f32, 1.0] {
+            let t = (sy * half_height - o.y) / d.y;
+            let px = o.x + t * d.x;
+            let pz = o.z + t * d.z;
+            if px * px + pz * pz <= radius * radius {
+                take(t, Vec3::new(0.0, sy, 0.0));
+            }
+        }
+    }
+    best
 }
 
 /// 광선 × 캡슐 (Y축 세그먼트 + radius).
