@@ -72,11 +72,11 @@ impl HullFaces {
         best
     }
 
-    /// 점 집합에서 면 구조를 만든다. 점이 **볼록 위치**에 있다고 가정한다.
+    /// 점 집합에서 면 구조를 만든다. 점이 **볼록 위치**에 있다고 가정하지 않는다 —
+    /// 지지 평면 위에서 2D 볼록 껍질을 다시 돌려 경계만 남기므로 내부점이 섞여도 안전하다.
     ///
-    /// 3차원이 아니면(모두 한 평면·한 직선 위) 면이 0개인 빈 구조를 돌려준다 — 오류가
-    /// 아니다. 그런 hull도 convex radius가 두께를 주면 합법이고, 면 클리핑을 못 할 뿐이다
-    /// (호출자는 `is_empty()`를 보고 기존 witness 경로로 간다).
+    /// 3차원이 아니면(모두 한 직선 위·한 자리) 면이 0개인 빈 구조를 돌려준다 — 오류가
+    /// 아니다. 호출자는 `is_empty()`를 보고 기존 witness 경로로 간다.
     pub fn build(points: &[Vec3]) -> Self {
         let n = points.len();
         if !(4..=MAX_HULL_POINTS).contains(&n) {
@@ -106,16 +106,7 @@ impl HullFaces {
                     };
                     // 두 방향 모두 후보다: 어느 쪽이 바깥인지는 나머지 점이 정한다.
                     for cand in [nrm, nrm * -1.0] {
-                        let off = cand.dot(points[i]);
-                        // **지지 검사**: 모든 점이 `cand` 반대쪽(또는 평면 위)이면 바깥 면이다.
-                        let mut hi = f32::NEG_INFINITY;
-                        for p in points {
-                            hi = hi.max(cand.dot(*p));
-                        }
-                        if hi > off + eps {
-                            continue; // 평면 밖에 점이 있다 — 면이 아니다
-                        }
-                        Self::insert_face(&mut faces, points, cand, off, eps);
+                        Self::insert_face(&mut faces, points, cand, eps);
                     }
                 }
             }
@@ -132,53 +123,136 @@ impl HullFaces {
         Self { faces }
     }
 
-    /// 이미 있는 면이면 버리고, 새 면이면 그 평면 위 정점을 모아 CCW로 정렬해 넣는다.
-    fn insert_face(
-        faces: &mut Vec<HullFace>,
-        points: &[Vec3],
-        normal: Vec3,
-        offset: f32,
-        eps: f32,
-    ) {
-        // 같은 평면인가 — 법선이 거의 같고 오프셋이 거의 같으면 같은 면이다.
-        if faces
-            .iter()
-            .any(|f| f.normal.dot(normal) > 0.999_9 && (f.offset - offset).abs() <= eps)
-        {
-            return;
+    /// 후보 법선 하나를 면으로 만들어 넣는다(이미 있으면 버린다).
+    ///
+    /// **중복 판정에 각도 임계를 쓰지 않는다.** 예전에는 `법선 내적 > 0.9999`로 갈랐는데,
+    /// 그러면 얕은 각으로 인접한 **서로 다른 면**이 하나로 합쳐진다(검수 rev_f601d4f4
+    /// BLOCKER: 사면체 (-1,0,0)·(1,0,0)·(0,1,0)·(0,-1,0.01)이 4면이 아니라 3면이 됐다).
+    /// 캐노니컬 키는 **경계 정점 순환열**이다 — 같은 면을 찾은 삼중조합은 같은 열을 만들고,
+    /// 얇은 판의 앞뒤 두 면은 순서가 뒤집혀 서로 다른 열이 된다.
+    fn insert_face(faces: &mut Vec<HullFace>, points: &[Vec3], normal: Vec3, eps: f32) {
+        // 지지 평면: 이 방향 최댓값. `points[i]`가 아니라 최댓값을 쓰면 어느 삼중조합에서
+        // 왔는지와 무관하게 같은 평면이 나온다.
+        let mut hi = f32::NEG_INFINITY;
+        for p in points {
+            hi = hi.max(normal.dot(*p));
         }
-        // 이 평면 위 정점 전부.
+        // 평면 위(안쪽 eps 이내) 점들. 여기엔 **면 내부 점도 섞인다** — 다음 단계가 거른다.
         let mut on: Vec<u8> = Vec::new();
-        let mut centroid = Vec3::ZERO;
         for (idx, p) in points.iter().enumerate() {
-            if (normal.dot(*p) - offset).abs() <= eps {
+            if normal.dot(*p) >= hi - eps {
                 on.push(idx as u8);
-                centroid += *p;
             }
         }
         if on.len() < 3 {
-            return; // 면이 되려면 정점 3개 이상
+            return;
         }
-        centroid = centroid * (1.0 / on.len() as f32);
-        // 면 평면 안의 기준축 — **첫 정점**으로 잡아 입력만의 함수로 만든다.
-        let Some(u) = (points[on[0] as usize] - centroid).try_normalize() else {
-            return; // 첫 정점이 중심과 겹친다(퇴화)
+        // **경계만 남긴다.** 평면 위 점을 그대로 쓰면 면 내부 점이 경계에 끼어들어 오목한
+        // 사슬이 되고, 나중 Sutherland–Hodgman이 진짜 면의 일부를 잘라낸다. 게다가 내부
+        // 점이 중심과 겹치면 기준축을 못 만들어 면이 통째로 사라졌다(같은 검수 BLOCKER).
+        let Some(ring) = convex_ring(points, &on, normal) else {
+            return;
         };
-        let v = normal.cross(u);
-        // 법선에서 봤을 때 CCW. 각도 동률(같은 자리 중복점)은 인덱스가 가른다.
-        on.sort_by(|a, b| {
-            let pa = points[*a as usize] - centroid;
-            let pb = points[*b as usize] - centroid;
-            let aa = pa.dot(v).atan2(pa.dot(u));
-            let ab = pb.dot(v).atan2(pb.dot(u));
-            aa.total_cmp(&ab).then_with(|| a.cmp(b))
-        });
+        if faces.iter().any(|f| f.verts == ring) {
+            return;
+        }
+        // 법선·오프셋을 **경계에서 다시 계산**한다(Newell) — 삼중조합이 준 값보다 안정적이고
+        // 어느 조합에서 왔는지와 무관해진다.
+        let mut nsum = Vec3::ZERO;
+        for a in 0..ring.len() {
+            let p0 = points[ring[a] as usize];
+            let p1 = points[ring[(a + 1) % ring.len()] as usize];
+            nsum += p0.cross(p1);
+        }
+        let Some(nrm) = nsum.try_normalize() else {
+            return; // 면적 0 — 면이 아니다
+        };
+        let mut off = 0.0f32;
+        for idx in &ring {
+            off += nrm.dot(points[*idx as usize]);
+        }
+        off /= ring.len() as f32;
         faces.push(HullFace {
-            normal,
-            offset,
-            verts: on,
+            normal: nrm,
+            offset: off,
+            verts: ring,
         });
     }
+}
+
+/// 법선 `n`에 수직인 **오른손 기저** `(u, v)` — `u × v = n`.
+///
+/// `n`과 가장 덜 정렬된 축에서 만들어 퇴화를 피한다. 각도 함수를 쓰지 않으므로
+/// 플랫폼 간 결과가 같다.
+fn plane_basis(n: Vec3) -> Option<(Vec3, Vec3)> {
+    let a = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+        Vec3::new(1.0, 0.0, 0.0)
+    } else if n.y.abs() <= n.z.abs() {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(0.0, 0.0, 1.0)
+    };
+    let u = (a - n * n.dot(a)).try_normalize()?;
+    Some((u, n.cross(u)))
+}
+
+/// 평면 위 점 인덱스들의 **볼록 경계**를 법선 기준 CCW로 돌려준다.
+///
+/// Andrew monotone chain — 좌표 정렬 + 외적 부호만 쓴다. **각도 함수를 쓰지 않는다**:
+/// `atan2`는 native와 wasm에서 마지막 비트가 갈릴 수 있고, 이 순서가 면 id를 정하므로
+/// 그러면 복원한 월드의 warm start가 끊긴다(검수 rev_f601d4f4 MAJOR).
+///
+/// 공선 중간점·중복점·면 내부 점은 여기서 빠진다.
+/// 시작 인덱스를 **최소 인덱스로 회전**해 순환열을 캐노니컬하게 만든다(중복 판정 키).
+fn convex_ring(points: &[Vec3], on: &[u8], n: Vec3) -> Option<Vec<u8>> {
+    let (u, v) = plane_basis(n)?;
+    let xy = |idx: u8| {
+        let p = points[idx as usize];
+        (p.dot(u), p.dot(v))
+    };
+    let mut idx: Vec<u8> = on.to_vec();
+    idx.sort_by(|a, b| {
+        let (ax, ay) = xy(*a);
+        let (bx, by) = xy(*b);
+        ax.total_cmp(&bx)
+            .then_with(|| ay.total_cmp(&by))
+            .then_with(|| a.cmp(b))
+    });
+    // 외적 부호로 좌회전 판정. 0(공선)도 버려 중간점을 남기지 않는다.
+    let cross = |o: u8, a: u8, b: u8| {
+        let (ox, oy) = xy(o);
+        let (ax, ay) = xy(a);
+        let (bx, by) = xy(b);
+        (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+    };
+    let mut lower: Vec<u8> = Vec::new();
+    for &p in &idx {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<u8> = Vec::new();
+    for &p in idx.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    if lower.len() < 3 {
+        return None;
+    }
+    // 최소 인덱스가 앞에 오도록 회전 — 같은 면이면 같은 열이 되어야 중복 판정이 성립한다.
+    let start = lower
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, x)| **x)
+        .map(|(i, _)| i)?;
+    lower.rotate_left(start);
+    Some(lower)
 }
 
 #[cfg(test)]
@@ -274,17 +348,60 @@ mod tests {
         }
     }
 
-    /// **면 위에 여분 정점이 있어도 하나의 면**이어야 한다 — 삼각형으로 쪼개지면
-    /// 클리핑이 같은 면을 여러 번 처리하고 feature 계보가 흔들린다.
+    /// **면 안쪽 점은 경계에서 빠져야 한다.** 평면 위 점을 그대로 쓰면 오목한 사슬이
+    /// 되고, 나중 클리핑이 진짜 면의 일부를 잘라낸다. 게다가 그 점이 배열 앞에 오면
+    /// 중심과 겹쳐 면이 통째로 사라졌다(검수 rev_f601d4f4 BLOCKER).
+    /// **점 순서와 무관**해야 하므로 앞·뒤 두 배치를 모두 시험한다.
     #[test]
-    fn coplanar_extra_vertex_joins_one_face() {
-        let mut pts = box_points(1.0, 1.0, 1.0);
-        // +Z 면 한가운데에 점을 하나 더 얹는다(볼록 위치를 깨지 않는다).
-        pts.push(v(0.0, 0.0, 1.0));
+    fn interior_coplanar_point_is_excluded_from_the_face() {
+        for center_first in [false, true] {
+            let mut pts = if center_first {
+                vec![v(0.0, 0.0, 1.0)]
+            } else {
+                Vec::new()
+            };
+            pts.extend(box_points(1.0, 1.0, 1.0));
+            if !center_first {
+                pts.push(v(0.0, 0.0, 1.0));
+            }
+            let f = HullFaces::build(&pts);
+            assert_eq!(
+                f.len(),
+                6,
+                "면 수가 다르다(center_first={center_first}): {}",
+                f.len()
+            );
+            let zface = f
+                .faces()
+                .iter()
+                .find(|f| f.normal.z > 0.9)
+                .unwrap_or_else(|| panic!("+Z 면이 사라졌다(center_first={center_first})"));
+            assert_eq!(
+                zface.verts.len(),
+                4,
+                "면 안쪽 점이 경계에 끼었다(center_first={center_first}): {zface:?}"
+            );
+        }
+    }
+
+    /// **얕은 각으로 인접한 면이 합쳐지면 안 된다.** 각도 임계로 중복을 판정하면
+    /// 사면체가 4면이 아니라 3면이 된다(검수 rev_f601d4f4 BLOCKER).
+    #[test]
+    fn shallow_adjacent_faces_are_not_merged() {
+        let pts = vec![
+            v(-1.0, 0.0, 0.0),
+            v(1.0, 0.0, 0.0),
+            v(0.0, 1.0, 0.0),
+            v(0.0, -1.0, 0.01),
+        ];
         let f = HullFaces::build(&pts);
-        assert_eq!(f.len(), 6, "면이 쪼개졌다: {}", f.len());
-        let zface = f.faces().iter().find(|f| f.normal.z > 0.9).expect("+Z 면");
-        assert_eq!(zface.verts.len(), 5, "여분 정점이 면에 안 들어갔다");
+        assert_eq!(f.len(), 4, "면이 합쳐졌다: {} (기대 4)", f.len());
+        for a in 0..4 {
+            for b in (a + 1)..4 {
+                let d = f.faces()[a].normal.dot(f.faces()[b].normal);
+                assert!(d < 0.999_99, "면 {a}·{b} 법선이 사실상 같다: {d}");
+            }
+        }
     }
 
     /// **평면 점 집합은 앞뒤 두 면**을 만든다 — 얇은 판의 양면이고, convex radius가 두께를
