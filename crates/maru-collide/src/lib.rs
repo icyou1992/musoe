@@ -54,6 +54,10 @@ pub use limits::{
     vec_in_state_range, vec_speed_in_range, MAX_ANCHOR, MAX_ANGULAR, MAX_DT, MAX_HULL_POINTS,
     MAX_INPUT, MAX_SHAPE_EXTENT, MAX_SPEED, MAX_STATE, MIN_DT, MIN_INV_MASS, MIN_SHAPE_EXTENT,
 };
+pub use manifold::feature::{
+    pack as pack_face_feature, unpack as unpack_face_feature, ClipKind, FaceFeature, FACE_CODE_MAX,
+    FEATURE_INDEX_MAX,
+};
 pub use manifold::{
     any_contact, for_each_contact, for_each_contact_with_budget, weld_internal_edges, ContactPoint,
     ContactWalk, FeatureId, Manifold, FEATURE_ANALYTIC, FEATURE_CHILD_MASK, FEATURE_CHILD_SHIFT,

@@ -133,6 +133,8 @@ impl Manifold {
     }
 }
 
+pub mod feature;
+
 mod clip;
 mod container;
 mod dispatch;
