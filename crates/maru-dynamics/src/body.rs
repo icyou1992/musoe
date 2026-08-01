@@ -72,17 +72,27 @@ pub struct Body {
     pub(crate) filter: u32,
     /// 감지 전용(트리거). 접촉 이벤트는 내지만 임펄스는 주고받지 않는다.
     pub(crate) sensor: bool,
-    /// 지형 삼각형의 **내부 에지 비트마스크**(비트 i = 에지 (pᵢ, p₍ᵢ₊₁₎%₃)이 이웃
-    /// 삼각형과 공면 공유 — 접점 법선을 면 법선으로 용접한다, §4.2 ghost edge).
-    /// 0 = 용접 없음(일반 바디 전부). 비영은 **static 3점 hull에만** 허용(validate).
-    /// 캐노니컬 상태다 — 법선을 바꾸므로 스냅샷에 빠지면 복원 궤적이 갈린다.
     /// **회전 잠금 마스크** — 비트 0/1/2 = 월드 X/Y/Z 축 회전을 막는다.
     ///
     /// rapier의 `LockedAxes` 회전 절반에 해당한다. 직립 캐릭터(전부 잠금)나 문·바퀴처럼
     /// 한 축만 도는 물체(둘 잠금)에 쓴다. 월드 축 기준이라 몸체가 돌아도 잠긴 축은 그대로다 —
     /// 그래서 로컬 관성에 구울 수 없고 월드 역관성에 투영으로 건다.
     pub(crate) locked_rot: u8,
+    /// 지형 삼각형의 **내부 에지 비트마스크**(비트 i = 에지 (pᵢ, p₍ᵢ₊₁₎%₃)이 이웃
+    /// 삼각형과 공면 공유 — 접점 법선을 면 법선으로 용접한다, §4.2 ghost edge).
+    /// 0 = 용접 없음(일반 바디 전부). 비영은 **static 3점 hull에만** 허용(validate).
+    /// 캐노니컬 상태다 — 법선을 바꾸므로 스냅샷에 빠지면 복원 궤적이 갈린다.
     pub(crate) weld_edges: u8,
+    /// **접촉력 이벤트 임계**(뉴턴). 이 물체가 낀 접촉의 총 힘이 임계를 넘으면
+    /// `World::contact_force_events()`에 실린다.
+    ///
+    /// 기본은 `f32::INFINITY` = **꺼짐**이다. rapier는 0을 기본으로 두고 별도 opt-in
+    /// 플래그를 요구하는데, 여기서는 임계 자체가 opt-in이라 플래그가 하나 준다.
+    /// 꺼져 있으면 합산 자체를 건너뛰므로 안 쓰는 호스트는 비용이 0이다.
+    ///
+    /// 페어 임계는 두 물체 임계의 **min**이다 — 더 민감한 쪽이 이긴다. 한쪽만 알고 싶어
+    /// 켰는데 상대가 꺼져 있어 못 듣는 것이 더 놀랍기 때문이다.
+    pub(crate) contact_force_threshold: f32,
     /// CCD linear cast opt-in (설계 §4 CCD 계약 v0.5, 대상 static 한정).
     /// 고속 소형 바디(총알)가 얇은 static을 관통하지 않도록 서브스텝 적분마다
     /// 이동 경로를 static 트리에 캐스트해 TOI에서 위치를 절단한다. dynamic 전용 의미 —
@@ -195,6 +205,21 @@ impl Body {
         )
     }
 
+    /// **접촉력 이벤트 임계**(뉴턴) — 이 값을 넘는 접촉만 이벤트가 된다.
+    ///
+    /// `f32::INFINITY`(기본)면 꺼짐. 페어 임계는 두 물체 임계의 min이다.
+    /// 0 이상 유한값이나 무한대만 받는다(음수·NaN은 `validate`가 거절한다).
+    pub fn with_contact_force_threshold(mut self, newtons: f32) -> Self {
+        self.contact_force_threshold = newtons;
+        self
+    }
+
+    /// 접촉력 이벤트 임계(뉴턴). `f32::INFINITY`면 꺼짐.
+    #[inline]
+    pub fn contact_force_threshold(&self) -> f32 {
+        self.contact_force_threshold
+    }
+
     /// 회전 잠금 마스크 (비트 0/1/2 = 월드 X/Y/Z).
     pub fn locked_rotation(&self) -> (bool, bool, bool) {
         (
@@ -252,6 +277,13 @@ impl Body {
         // **회전 잠금의 예약 비트는 0이어야 한다** (교차검수 rev_bb593ab5 MINOR).
         // 안 막으면 상위 비트가 켜진 스냅샷이 복원·재직렬화되면서 물리적으로 같은
         // 무잠금 상태가 서로 다른 바이트와 상태 해시를 갖는다(비정규 상태 고착).
+        // 임계는 음수·NaN이면 안 된다 — 음수면 모든 접촉이 이벤트가 되어 버퍼가 넘치고,
+        // NaN이면 비교가 항상 거짓이라 **조용히 꺼진다**(꺼짐은 무한대로 명시해야 한다).
+        // NaN은 `>= 0.0`이 거짓이라 여기서 걸린다 — 그게 목적이다(NaN 임계는 비교가
+        // 항상 거짓이라 이벤트가 **조용히 꺼진다**; 꺼짐은 무한대로 명시해야 한다).
+        if self.contact_force_threshold.is_nan() || self.contact_force_threshold < 0.0 {
+            return Err(ApiError::InvalidValue);
+        }
         if self.locked_rot & !0b111 != 0 {
             return Err(ApiError::InvalidValue);
         }
@@ -421,6 +453,7 @@ impl Body {
             ccd: false,
             weld_edges: 0,
             locked_rot: 0,
+            contact_force_threshold: f32::INFINITY,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -480,6 +513,7 @@ impl Body {
             ccd: false,
             weld_edges: 0,
             locked_rot: 0,
+            contact_force_threshold: f32::INFINITY,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -566,6 +600,7 @@ impl Body {
             ccd: false,
             weld_edges: 0,
             locked_rot: 0,
+            contact_force_threshold: f32::INFINITY,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };
@@ -607,6 +642,7 @@ impl Body {
             ccd: false,
             weld_edges: 0,
             locked_rot: 0,
+            contact_force_threshold: f32::INFINITY,
             linear_damping: 0.0,
             angular_damping: 0.0,
         };

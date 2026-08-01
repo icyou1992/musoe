@@ -20,8 +20,8 @@ pub use joint::{Joint, JointKind, Motor};
 pub use snapshot::{SnapshotError, SNAPSHOT_VERSION};
 pub use solver::SolverParams;
 pub use world::{
-    ApiError, ContactEvent, ContactEventKind, Diagnostics, PointHit, QueryFilter, RayHit, SweepHit,
-    World, WorldParams,
+    ApiError, ContactEvent, ContactEventKind, ContactForceEvent, Diagnostics, PointHit,
+    QueryFilter, RayHit, SweepHit, World, WorldParams,
 };
 
 #[cfg(test)]

@@ -314,3 +314,232 @@ fn contact_event_buffers_do_not_grow_during_a_step() {
         "이벤트가 거의 없어 검증이 성립하지 않는다: {event_steps}스텝, 최대 {max_events}건"
     );
 }
+
+// ---------- 접촉력 이벤트 ----------
+
+/// 지면 + 그 위 박스. `threshold`는 지면에만 건다(페어 임계는 min이므로 그걸로 충분하다).
+fn force_world(threshold: f32) -> (World, BodyHandle) {
+    let params = WorldParams {
+        gravity: Vec3::new(0.0, -10.0, 0.0),
+        // 수면이 켜져 있으면 정착 후 접촉이 사라져 힘이 0이 된다.
+        ..no_sleep_params()
+    };
+    let mut w = World::new(params);
+    w.add_body(
+        Body::new_static(
+            Shape::Box {
+                half: Vec3::new(50.0, 1.0, 50.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        )
+        .with_contact_force_threshold(threshold),
+    );
+    // 반크기 0.5 박스, 밀도 1 → 부피 1.0, 질량 1.0. 무게 = 10 N.
+    let b = w.add_body(Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(0.5, 0.5, 0.5),
+            radius: 0.0,
+        },
+        pose(0.0, 0.6, 0.0),
+        1.0,
+    ));
+    (w, b)
+}
+
+/// 임계를 켠 물체가 없으면 이벤트가 아예 없다 — 기본이 꺼짐이라는 계약.
+#[test]
+fn contact_force_events_are_off_by_default() {
+    let (mut w, _) = force_world(f32::INFINITY);
+    for _ in 0..120 {
+        w.step(DT);
+        assert!(w.contact_force_events().is_empty());
+    }
+}
+
+/// 임계를 넘긴 접촉이 실린다. 받치는 힘은 대략 무게(m·g)여야 한다.
+#[test]
+fn contact_force_reports_weight_at_rest() {
+    let (mut w, b) = force_world(0.1);
+    let mut seen: Option<f32> = None;
+    for _ in 0..240 {
+        w.step(DT);
+        if let Some(e) = w.contact_force_events().first() {
+            seen = Some(e.total_force_magnitude);
+            let l = e.max_force_direction.length();
+            assert!((l - 1.0).abs() < 1e-3, "최대 힘 방향이 단위가 아니다: {l}");
+            assert!(e.max_force_magnitude <= e.total_force_magnitude + 1e-3);
+            assert!(e.a == b || e.b == b, "이벤트 대상이 다르다");
+            // 총 힘 벡터의 크기가 보고된 크기와 일치해야 한다.
+            assert!((e.total_force.length() - e.total_force_magnitude).abs() < 1e-3);
+        }
+    }
+    let f = seen.expect("정착한 박스의 접촉력 이벤트가 없다");
+    let want = 10.0f32; // 질량 1.0 × 중력 10
+    assert!(
+        (f - want).abs() < want * 0.25,
+        "받치는 힘이 무게와 다르다: {f} (기대 ≈ {want})"
+    );
+}
+
+/// 임계가 실제로 문지기 역할을 한다 — 높이면 조용해져야 한다.
+#[test]
+fn contact_force_threshold_gates_the_event() {
+    let run = |threshold: f32| {
+        let (mut w, _) = force_world(threshold);
+        let mut any = false;
+        for _ in 0..240 {
+            w.step(DT);
+            any |= !w.contact_force_events().is_empty();
+        }
+        any
+    };
+    assert!(run(0.1), "낮은 임계에서 이벤트가 없다");
+    assert!(!run(1.0e6), "높은 임계인데 이벤트가 났다");
+}
+
+/// 임계는 바디 상태다 — 스냅샷 왕복에서 살아남아야 한다(기본값 무한대 포함).
+#[test]
+fn contact_force_threshold_survives_snapshot() {
+    let mut w = World::new(WorldParams::default());
+    let a = w.add_body(
+        Body::new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 3.0, 0.0), 1.0)
+            .with_contact_force_threshold(42.5),
+    );
+    let b = w.add_body(Body::new_dynamic(
+        Shape::Sphere { radius: 1.0 },
+        pose(5.0, 3.0, 0.0),
+        1.0,
+    ));
+    let snap = w.snapshot();
+    let mut w2 = World::new(WorldParams::default());
+    w2.restore(&snap).expect("복원");
+    assert_eq!(w2.body(a).contact_force_threshold(), 42.5);
+    assert_eq!(
+        w2.body(b).contact_force_threshold(),
+        f32::INFINITY,
+        "기본값(꺼짐)이 왕복에서 살아남지 못했다"
+    );
+}
+
+/// 음수·NaN 임계는 거절한다 — NaN은 비교가 항상 거짓이라 **조용히 꺼진다**.
+#[test]
+fn invalid_thresholds_are_rejected() {
+    for bad in [-1.0f32, f32::NAN, f32::NEG_INFINITY] {
+        let b = Body::new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 3.0, 0.0), 1.0)
+            .with_contact_force_threshold(bad);
+        assert!(b.validate().is_err(), "임계 {bad}를 통과시켰다");
+    }
+    // 0과 무한대는 정상 값이다.
+    for ok in [0.0f32, 1.0, f32::INFINITY] {
+        let b = Body::new_dynamic(Shape::Sphere { radius: 1.0 }, pose(0.0, 3.0, 0.0), 1.0)
+            .with_contact_force_threshold(ok);
+        assert!(b.validate().is_ok(), "임계 {ok}를 거절했다");
+    }
+}
+
+/// **보고되는 힘은 서브스텝 수에 무관해야 한다.**
+///
+/// 접점 임펄스는 스텝 전체가 아니라 한 서브스텝 분이라, 스텝 dt로 나누면 서브스텝 수만큼
+/// 작게 나온다. 서브스텝만 바꿔 같은 장면을 두 번 돌리면 그 실수가 바로 드러난다
+/// (처음 구현이 4서브스텝에서 10 N을 2.5 N으로 보고했다).
+#[test]
+fn contact_force_is_independent_of_substep_count() {
+    let measure = |substeps: u32| -> f32 {
+        let params = WorldParams {
+            gravity: Vec3::new(0.0, -10.0, 0.0),
+            substeps,
+            ..no_sleep_params()
+        };
+        let mut w = World::new(params);
+        w.add_body(
+            Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(50.0, 1.0, 50.0),
+                    radius: 0.0,
+                },
+                pose(0.0, -1.0, 0.0),
+            )
+            .with_contact_force_threshold(0.1),
+        );
+        w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.6, 0.0),
+            1.0,
+        ));
+        let mut last = 0.0;
+        for _ in 0..300 {
+            w.step(DT);
+            if let Some(e) = w.contact_force_events().first() {
+                last = e.total_force_magnitude;
+            }
+        }
+        last
+    };
+    let (a, b) = (measure(2), measure(8));
+    assert!(a > 1.0 && b > 1.0, "정착 힘이 안 잡혔다: {a} / {b}");
+    assert!(
+        (a - b).abs() < a.max(b) * 0.2,
+        "서브스텝 수가 보고 값을 바꾼다: 2서브스텝 {a} vs 8서브스텝 {b}"
+    );
+}
+
+/// **마찰 성분이 총 힘에 들어가야 한다.** 미끄러지는 물체는 법선 힘 말고도 접선 힘을 받는다.
+/// 법선만 세면 그 차이가 보고에서 사라진다.
+#[test]
+fn contact_force_includes_the_friction_component() {
+    let measure = |vx: f32| -> Vec3 {
+        let params = WorldParams {
+            gravity: Vec3::new(0.0, -10.0, 0.0),
+            ..no_sleep_params()
+        };
+        let mut w = World::new(params);
+        w.add_body(
+            Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(50.0, 1.0, 50.0),
+                    radius: 0.0,
+                },
+                pose(0.0, -1.0, 0.0),
+            )
+            .with_contact_force_threshold(0.1),
+        );
+        let b = w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.5, 0.0),
+            1.0,
+        ));
+        // 먼저 정착시킨 뒤 옆으로 민다 — 미끄러지는 동안 마찰 임펄스가 돈다.
+        for _ in 0..120 {
+            w.step(DT);
+        }
+        w.set_linear_velocity(b, Vec3::new(vx, 0.0, 0.0)).unwrap();
+        let mut best = Vec3::ZERO;
+        for _ in 0..10 {
+            w.step(DT);
+            if let Some(e) = w.contact_force_events().first() {
+                if e.total_force.x.abs() > best.x.abs() {
+                    best = e.total_force;
+                }
+            }
+        }
+        best
+    };
+    let still = measure(0.0);
+    let sliding = measure(8.0);
+    // 정지 상태에서는 접선 힘이 거의 없고, 미끄러질 때는 뚜렷해야 한다.
+    assert!(
+        still.x.abs() < 1.0,
+        "정지 상태인데 접선 힘이 크다: {still:?}"
+    );
+    assert!(
+        sliding.x.abs() > 1.0,
+        "미끄러지는데 접선 힘이 안 잡혔다: {sliding:?}"
+    );
+}

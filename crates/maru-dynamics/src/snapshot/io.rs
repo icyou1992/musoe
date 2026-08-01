@@ -28,7 +28,7 @@ pub(crate) const MAGIC: u32 = 0x4d41_5255; // "MARU"
 /// 캐노니컬 상태이고, 옛 버전을 "적당히" 읽으면 빠진 필드가 기본값으로 채워져 **같은
 /// 바이트가 다른 미래**를 만든다(그 사고를 이미 v13→v14에서 겪었다). 버전이 다르면
 /// `BadVersion(found)`으로 거부하고, 호스트가 마이그레이션 여부를 스스로 정한다.
-pub const VERSION: u32 = 17;
+pub const VERSION: u32 = 18;
 
 /// 크레이트 밖으로 나가는 이름(재수출).
 pub use self::VERSION as SNAPSHOT_VERSION;
@@ -48,9 +48,28 @@ pub(crate) mod min_bytes {
     pub(crate) const SHAPE: usize = 5;
     /// 바디 본문: 타입1 + pos12 + rot16 + lin12 + ang12 + invM4 + invI12 + fric4 + rest4
     /// + offset12 + force12 + torque12 + membership4 + filter4 + sensor1 + ccd1(v11)
-    /// + weld1(v12) + lock1(v17) + damp8
-    pub(crate) const BODY_CORE: usize =
-        1 + 12 + 16 + 12 + 12 + 4 + 12 + 4 + 4 + 12 + 12 + 12 + 4 + 4 + 1 + 1 + 1 + 1 + 8 + SHAPE;
+    /// + weld1(v12) + lock1(v17) + cfthresh4(v18) + damp8
+    pub(crate) const BODY_CORE: usize = 1
+        + 12
+        + 16
+        + 12
+        + 12
+        + 4
+        + 12
+        + 4
+        + 4
+        + 12
+        + 12
+        + 12
+        + 4
+        + 4
+        + 1
+        + 1
+        + 1
+        + 1
+        + 4
+        + 8
+        + SHAPE;
     /// 슬롯 레코드: alive1 + oob1 + reserved1 + gen4 + 본문 + sleep4 + asleep1 + island4
     pub const SLOT: usize = 1 + 1 + 1 + 4 + BODY_CORE + 4 + 1 + 4;
     /// 조인트: 핸들 8+8 + 앵커 24 + kind태그1 + collide1 + lin12 + ang12 + limit4 + motor4
@@ -214,6 +233,20 @@ impl Reader<'_> {
         let v = self.raw_f32()?;
         if maru_collide::in_state_range(v) {
             Ok(v)
+        } else {
+            Err(SnapshotError::NonFinite)
+        }
+    }
+    /// **임계값 정책** — 유한 음이 아닌 값 또는 `+∞`("절대 발화 안 함")만 받는다.
+    ///
+    /// 다른 f32는 비유한을 전부 막는다(물리 상태에 들어가면 월드가 오염된다). 임계는
+    /// 물리 상태가 아니라 **비교 상수**라서 `+∞`가 정상 값이다 — "꺼짐"을 그렇게 쓴다.
+    /// NaN과 −∞는 여전히 거절한다: NaN은 비교가 항상 거짓이라 **조용히 꺼지고**,
+    /// −∞는 모든 접촉을 이벤트로 만들어 버퍼를 넘긴다.
+    pub(crate) fn threshold_f32(&mut self) -> Result<f32, SnapshotError> {
+        let v = self.raw_f32()?;
+        if v >= 0.0 {
+            Ok(v) // NaN은 이 비교에서 거짓이라 자동으로 걸린다
         } else {
             Err(SnapshotError::NonFinite)
         }

@@ -153,6 +153,27 @@ pub struct CcdHit {
 /// `Diagnostics::ccd_hits_dropped`로 보고한다 — 조용히 사라지지 않는다.
 pub const MAX_CCD_HITS: usize = 1024;
 
+/// **접촉력 이벤트** — 한 페어가 이번 스텝에 주고받은 힘이 임계를 넘었다.
+///
+/// 힘은 스텝 동안 누적된 임펄스를 `dt`로 나눈 **평균 힘**이다(뉴턴). 서브스텝으로 나누지
+/// 않는다 — 호스트가 보는 시간 단위가 스텝이고, 충돌음 세기·파괴 판정도 스텝 단위다.
+///
+/// 임계는 `Body::with_contact_force_threshold`로 켠다(기본 꺼짐). 페어 임계는 두 물체
+/// 임계의 min이다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContactForceEvent {
+    pub a: BodyHandle,
+    pub b: BodyHandle,
+    /// **A에 작용한** 총 힘(뉴턴). B가 받는 힘은 이것의 반대다.
+    pub total_force: Vec3,
+    /// `total_force`의 크기 — 임계와 비교되는 값이다.
+    pub total_force_magnitude: f32,
+    /// 가장 센 접점의 힘 **방향**(단위 벡터). 접점이 하나뿐이면 `total_force`와 같은 방향.
+    pub max_force_direction: Vec3,
+    /// 그 접점의 힘 크기.
+    pub max_force_magnitude: f32,
+}
+
 /// 최근접점 투영 결과 — 어느 물체의 겉면 위 어디인가.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointHit {
@@ -347,6 +368,8 @@ pub struct World {
     damping: Vec<(f32, f32)>,
     /// 이번 스텝의 접촉 이벤트. 스텝 시작에 비우고 스텝 안에서 채운다.
     contact_events: Vec<ContactEvent>,
+    /// 이번 스텝의 접촉력 이벤트. 임계를 켠 물체가 하나도 없으면 항상 비어 있다.
+    contact_force_events: Vec<ContactForceEvent>,
     /// 이벤트 방출 진입 시점의 `contact_events` 용량 (테스트 관측용).
     #[cfg(test)]
     ev_cap_at_emit: usize,
@@ -652,6 +675,7 @@ impl World {
             ext_force: Vec::new(),
             damping: Vec::new(),
             contact_events: Vec::new(),
+            contact_force_events: Vec::new(),
             #[cfg(test)]
             ev_cap_at_emit: 0,
             ccd_hits: Vec::new(),
@@ -2314,6 +2338,14 @@ impl World {
                 contact_event_target,
                 core::mem::size_of::<ContactEvent>(),
             ))
+            // 접촉력 출력도 영속 버퍼다 — 회계에서 빠지면 128 MiB 상한이 실제 선점보다
+            // 낮게 계산돼, 거절해야 할 입력이 allocator 실패로 끝난다(이 세션에만 세 번
+            // 빠뜨렸던 자리다). 상한은 **키**당 하나이므로 페어 수 상한과 같다.
+            .saturating_add(ex(
+                self.contact_force_events.capacity(),
+                contact_event_target,
+                core::mem::size_of::<ContactForceEvent>(),
+            ))
             .saturating_add(ex(self.sleep_bak.capacity(), nbody, 1))
             .saturating_add(ex(
                 self.sleep_timer_bak.capacity(),
@@ -2399,6 +2431,7 @@ impl World {
         // 되돌릴 방법이 없어 "반납 후 재측정" 회복 경로가 작동하지 않는다.
         // 이 시점은 스텝 시작(이미 `clear`됨)이라 버릴 내용이 없다.
         self.contact_events = Vec::new();
+        self.contact_force_events = Vec::new();
         // 페어 핑퐁 두 벌 — 살아있는 목록은 지역 `pairs`가 들고 있다.
         self.bp_pairs = Vec::new();
         self.bp_pairs_scratch = Vec::new();
@@ -2681,6 +2714,7 @@ impl World {
         //  성공 복원이면 둘 다 비우고, 실패면 둘 다 보존한다. 실패는 여기 도달하지 않는다.)
         // 용량은 재사용하고 길이만 비운다.
         self.contact_events.clear();
+        self.contact_force_events.clear();
         self.ccd_hits.clear();
         self.resource_limit = false;
         self.invalidate_bp();
@@ -2840,6 +2874,14 @@ impl World {
         &self.contact_events
     }
 
+    /// 이번 스텝의 **접촉력 이벤트** (페어 키 오름차순).
+    ///
+    /// `Body::with_contact_force_threshold`로 켠 물체가 낀 접촉만 실린다 — 아무도 안 켰으면
+    /// 항상 비어 있고 합산 비용도 0이다. 접촉 이벤트와 같은 수명(다음 `step`이 비운다).
+    pub fn contact_force_events(&self) -> &[ContactForceEvent] {
+        &self.contact_force_events
+    }
+
     /// 이번 스텝의 CCD 절단 히트. 스텝 시작에 비워지므로 **스텝 사이에만 유효**하다
     /// (접촉 이벤트와 같은 수명). `Diagnostics::ccd_hits_dropped`가 0이 아니면
     /// 상한을 넘겨 잘린 목록이다.
@@ -2850,6 +2892,7 @@ impl World {
     fn step_inner(&mut self, dt: f32) {
         // 이벤트는 **스텝 단위 출력**이다 — 매 스텝 비운다.
         self.contact_events.clear();
+        self.contact_force_events.clear();
         self.ccd_hits.clear();
         // 자원 초과 플래그는 **매 스텝 초기화**한다(리뷰 BLOCKER): 생성·복원에서만 지우면
         // 한 번 초과한 뒤 바디를 지우거나 예산을 올려 실제로 성공해도 계속
@@ -3075,11 +3118,13 @@ impl World {
             + 2 * core::mem::size_of::<(u32, u32)>()                     // cache_written(해시 여유)
             + core::mem::size_of::<(u32, u32)>()                         // started (≤ 이번 스텝 페어 수)
             + core::mem::size_of::<ContactEvent>()                       // started 쪽 출력
+            + core::mem::size_of::<ContactForceEvent>()                  // 접촉력 이벤트 출력
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
         let per_constraint_bytes = core::mem::size_of::<ContactConstraint>() // constraints
             + maru_collide::MAX_MANIFOLD_POINTS
                 * core::mem::size_of::<solver::ContactPointConstraint>() // 접점 힙 원소
             + core::mem::size_of::<(u32, u32)>()                         // constraint_keys
+            + core::mem::size_of::<((u32, u32), Vec3, Vec3, f32)>()      // force_rows
             + core::mem::size_of::<u32>()                                // 컬러 order
             + core::mem::size_of::<(u32, u32)>()                         // 컬러 endpoints
             + core::mem::size_of::<u32>()                                // color_of
@@ -3411,6 +3456,11 @@ impl World {
         let njoint = self.joints.len();
         let mut constraints: Vec<ContactConstraint> = Vec::new();
         let mut constraint_keys: Vec<(u32, u32)> = Vec::new();
+        // 접촉력 합산 스크래치 — 제약마다 한 줄(키, 총 임펄스, 최대 접점 임펄스, 그 크기²).
+        // **맵을 쓰지 않는다**: 스텝 중 할당 0 계약 아래라 해시 맵을 새로 만들 수 없다.
+        // 제약 순서로 밀어 넣고 나중에 키로 정렬해 병합하면, 같은 키의 제약이 흩어져 있어도
+        // 정확하고 출력 순서까지 **키 오름차순으로 결정**된다(접촉 이벤트와 같은 규약).
+        let mut force_rows: Vec<((u32, u32), Vec3, Vec3, f32)> = Vec::new();
         let mut live_keys: IntSet<(u32, u32)> = IntSet::default();
         let mut joint_pairs: Vec<(usize, usize)> = Vec::new();
         let mut active_joints: Vec<usize> = Vec::new();
@@ -3514,6 +3564,12 @@ impl World {
             // 이벤트 델타와 출력 버퍼 — 상한은 wake 이전 값으로 정한다.
             // 출력은 두 델타의 합이 상한이다(같은 키가 양쪽에 동시에 들지 않는다).
             || started.try_reserve(ncap).is_err()
+            // 접촉력: 행은 제약당 하나, 출력은 **키**당 하나(페어 수 상한 = ncap).
+            || force_rows.try_reserve(constraint_cap).is_err()
+            || self
+                .contact_force_events
+                .try_reserve(ncap.saturating_sub(self.contact_force_events.len()))
+                .is_err()
             || stopped.try_reserve(self.touching.len()).is_err()
             // `try_reserve(additional)`는 **`len + additional`**을 보장한다 — 목표에서
             // `capacity`를 빼서 넘기면 용량이 목표에 못 미친다(첫 스텝에만 우연히 맞는다).
@@ -4844,6 +4900,21 @@ impl World {
         // feature가 자식쌍 네임스페이스로 유일하므로 병합 목록 안에서 충돌하지 않는다.
         // 용량은 스텝 시작에 선점됐다 — `clear` 뒤 `insert`는 재할당하지 않는다.
         cache_written.clear();
+        // **접촉력 이벤트 합산** — PCM 갱신과 같은 순회에서 한다. 접점 임펄스가 여기서만
+        // 한자리에 모이고(법선 크기 + 월드 마찰 벡터), 따로 훑으면 같은 데이터를 두 번 읽는다.
+        //
+        // 임계를 켠 물체가 하나도 없으면 아래 `pair_threshold`가 항상 무한이라 합산이 통째로
+        // 빠진다 — 안 쓰는 호스트의 비용은 0이다.
+        // **서브스텝 길이로 나눈다.** 접점의 누적 임펄스는 스텝 전체가 아니라 **한 서브스텝**
+        // 분이다(다음 서브스텝이 다시 warm start부터 쌓는다). 스텝 dt로 나누면 서브스텝 수
+        // 배만큼 작게 나온다 — 4서브스텝 기본값에서 무게 10 N짜리 박스가 2.5 N으로 보고됐다.
+        // 정상 상태에서는 서브스텝마다 같은 임펄스가 쌓이므로, 서브스텝 평균 힘이 곧 스텝
+        // 평균 힘이다.
+        let inv_h = if dt > 0.0 {
+            self.params.substeps as f32 / dt
+        } else {
+            0.0
+        };
         for (c, key) in constraints.iter().zip(&constraint_keys) {
             let first = cache_written.insert(*key);
             // 접점 → 캐시 엔트리 변환. **자리에서 채우기 위해** 클로저로 뽑아 뒀다:
@@ -4886,6 +4957,41 @@ impl World {
                     },
                 )
             };
+            // 접촉력: 이 제약이 페어에 더한 임펄스를 한 줄로 남긴다. 복합 페어는 같은 키에
+            // 제약이 여럿인데, 여기서 합치지 않고 **나중에 키로 정렬해 병합**한다 —
+            // 같은 키의 제약이 배열에서 붙어 있다는 보장이 없기 때문이다.
+            let (ai, bi) = (key.0 as usize, (key.1 & !STATIC_BIT) as usize);
+            let pair_threshold = if ai < self.bodies.len() && bi < self.bodies.len() {
+                self.bodies[ai]
+                    .contact_force_threshold
+                    .min(self.bodies[bi].contact_force_threshold)
+            } else {
+                f32::INFINITY
+            };
+            if pair_threshold.is_finite() {
+                let mut total = Vec3::ZERO;
+                let mut max_p = Vec3::ZERO;
+                let mut max_m2 = 0.0f32;
+                for p in &c.points {
+                    // 접점 임펄스 = 법선 성분 + 월드 마찰 벡터. 마찰은 이미 월드 벡터라
+                    // 접선 기저를 다시 곱하지 않는다(기저는 법선에서 유도돼 회전한다).
+                    let imp = c.normal * p.normal_impulse
+                        + c.tangents[0] * p.tangent_impulse[0]
+                        + c.tangents[1] * p.tangent_impulse[1];
+                    total += imp;
+                    let m2 = imp.length_sq();
+                    if m2 > max_m2 {
+                        max_m2 = m2;
+                        max_p = imp;
+                    }
+                }
+                // 용량은 스텝 시작에 `constraint_cap`으로 선점됐다 — 재할당하지 않는다.
+                debug_assert!(
+                    force_rows.len() < force_rows.capacity(),
+                    "접촉력 행 선점 부족"
+                );
+                force_rows.push((*key, total, max_p, max_m2));
+            }
             match self.contact_cache.get_mut(key) {
                 // 살아남은 키 — 용량을 그대로 재사용한다. 같은 키의 첫 제약만 비우고,
                 // 복합 페어의 나머지 제약은 **덧붙인다**(insert로 덮으면 앞 자식의
@@ -4920,6 +5026,64 @@ impl World {
                         c.points.iter().map(&mut make).collect();
                     self.contact_cache.insert(*key, entry);
                 }
+            }
+        }
+        // 접촉력 이벤트 방출 — 키로 정렬해 같은 페어의 행을 병합한다.
+        //
+        // 임펄스는 스텝 누적이므로 `1/dt`를 곱하면 그 스텝의 **평균 힘**이다. 서브스텝으로
+        // 나누지 않는다: 호스트가 보는 시간 단위가 스텝이고, 충돌음·파괴 판정도 스텝 단위다.
+        if !force_rows.is_empty() {
+            // 안정 정렬은 임시 버퍼를 할당할 수 있다 — 키가 유일 순서를 주므로 불안정 정렬로
+            // 충분하다(같은 키 안의 순서는 합산에 영향이 없다).
+            force_rows.sort_unstable_by_key(|r| r.0);
+            let mut i = 0usize;
+            while i < force_rows.len() {
+                let key = force_rows[i].0;
+                let mut total = Vec3::ZERO;
+                let mut max_p = Vec3::ZERO;
+                let mut max_m2 = 0.0f32;
+                while i < force_rows.len() && force_rows[i].0 == key {
+                    let (_, t, mp, m2) = force_rows[i];
+                    total += t;
+                    if m2 > max_m2 {
+                        max_m2 = m2;
+                        max_p = mp;
+                    }
+                    i += 1;
+                }
+                let (ai, bi) = (key.0 as usize, (key.1 & !STATIC_BIT) as usize);
+                if ai >= self.bodies.len() || bi >= self.bodies.len() {
+                    continue;
+                }
+                // 죽은 슬롯은 이벤트를 내지 않는다 — 접촉 이벤트와 같은 규약이다.
+                if !self.alive[ai] || !self.alive[bi] {
+                    continue;
+                }
+                let threshold = self.bodies[ai]
+                    .contact_force_threshold
+                    .min(self.bodies[bi].contact_force_threshold);
+                let force = total * inv_h;
+                let mag = force.length();
+                // NaN은 여기 못 온다(`validate`가 임계에서 막고, 힘은 상태 위생을 거친다).
+                if mag <= threshold {
+                    continue;
+                }
+                let max_force = max_p * inv_h;
+                let max_mag = max_force.length();
+                debug_assert!(
+                    self.contact_force_events.len() < self.contact_force_events.capacity(),
+                    "접촉력 이벤트 출력 용량 부족"
+                );
+                self.contact_force_events.push(ContactForceEvent {
+                    a: self.handle_of(ai),
+                    b: self.handle_of(bi),
+                    total_force: force,
+                    total_force_magnitude: mag,
+                    // 방향은 단위 벡터다 — 크기가 0이면 방향이 없으므로 0을 그대로 준다
+                    // (임계를 넘겼는데 최대 접점이 0인 경우는 없지만 계약은 지킨다).
+                    max_force_direction: max_force.try_normalize().unwrap_or(maru_math::Vec3::ZERO),
+                    max_force_magnitude: max_mag,
+                });
             }
         }
         self.diag.post_ns[2] = _t_pcm.ns();

@@ -273,13 +273,14 @@ fn snapshot_rejects_type_mass_mismatch() {
 
     // 슬롯(Box): alive1+oob1+reserved1+gen4
     //            + 본문(106 + force12 + torque12 + membership4 + filter4 + sensor1
-    //                   + ccd1(v11) + weld1(v12) + lock1(v17) + damping8 = 150)
-    //            + sleep4+asleep1+island4 = 166
+    //                   + ccd1(v11) + weld1(v12) + lock1(v17) + cfthresh4(v18)
+    //                   + damping8 = 154)
+    //            + sleep4+asleep1+island4 = 170
     //
     // **이 상수는 포맷이 바뀔 때마다 손으로 고쳐야 한다.** 아래 단언이 그 장치다 —
     // 슬롯1의 타입 바이트가 dynamic(1)이 아니면 레이아웃 가정이 깨진 것이고,
     // 실제로 v17에서 회전 잠금 1바이트를 더하며 여기서 걸렸다.
-    const SLOT: usize = 166;
+    const SLOT: usize = 170;
     let type_off = HDR + 4 + SLOT + 1 + 1 + 1 + 4;
     assert_eq!(
         good[type_off], 1,
