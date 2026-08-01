@@ -215,6 +215,78 @@ pub(super) fn clip_convex_face(
     true
 }
 
+/// **선분** 입사 특징을 참조면 측면 평면들로 자른다 (매개변수 클리핑).
+///
+/// 다각형 클리퍼는 정점을 순환으로 돌기 때문에 정점 2개를 넣으면 같은 에지를 두 번
+/// 훑는다 — 선분은 닫힌 폴리곤이 아니라 **열린 구간**이라 전용 경로가 맞다.
+/// 남은 구간의 두 끝점과 각 끝점의 계보를 준다. 구간이 통째로 밖이면 `None`.
+///
+/// 계보: 원래 끝점이 살아남으면 `IncidentVertex { a: 끝점 번호 }`, 측면 s가 잘랐으면
+/// `EdgeCross { a: 0(선분은 에지 하나), b: s }`.
+fn clip_segment(rverts: &[Vec3], rn: Vec3, p0: Vec3, p1: Vec3) -> Option<[GenVertex; 2]> {
+    let k = rverts.len();
+    if !(3..=MAX_FACE_VERTS).contains(&k) {
+        return None;
+    }
+    let mut center = Vec3::ZERO;
+    for v in rverts {
+        center += *v;
+    }
+    center = center * (1.0 / k as f32);
+
+    let dir = p1 - p0;
+    let (mut t_lo, mut t_hi) = (0.0f32, 1.0f32);
+    // 각 끝을 무엇이 잘랐나. `None`이면 원래 끝점 그대로다.
+    let (mut lo_side, mut hi_side): (Option<u8>, Option<u8>) = (None, None);
+
+    for side in 0..k {
+        let e0 = rverts[side];
+        let e1 = rverts[(side + 1) % k];
+        let mut pn = rn.cross(e1 - e0);
+        if pn.dot(center - e0) < 0.0 {
+            pn = -pn;
+        }
+        let d0 = pn.dot(p0 - e0);
+        let denom = pn.dot(dir);
+        if denom == 0.0 {
+            // 측면과 평행하다 — 밖이면 구간 전체가 밖이고, 안이면 이 측면은 안 자른다.
+            if d0 < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let t = -d0 / denom;
+        if denom > 0.0 {
+            // 들어오는 쪽: 이 t보다 앞은 밖이다.
+            if t > t_lo {
+                t_lo = t;
+                lo_side = Some(side as u8);
+            }
+        } else if t < t_hi {
+            t_hi = t;
+            hi_side = Some(side as u8);
+        }
+        if t_lo > t_hi {
+            return None;
+        }
+    }
+
+    let make = |t: f32, cut: Option<u8>, end: u8| GenVertex {
+        position: p0 + dir * t,
+        kind: match cut {
+            Some(_) => ClipKind::EdgeCross,
+            None => ClipKind::IncidentVertex,
+        },
+        a: match cut {
+            Some(_) => 0, // 선분은 에지가 하나다
+            None => end,
+        },
+        b: cut.unwrap_or(0),
+        edge: EdgeSrc::Incident(0),
+    };
+    Some([make(t_lo, lo_side, 0), make(t_hi, hi_side, 1)])
+}
+
 /// 셰이프의 `dir`(월드) 방향 지지면을 월드 좌표 정점 배열로 채운다.
 ///
 /// 성공하면 `(정점 수, 면 코드, 면 바깥 법선(월드))`. 면을 낼 수 없으면 `None`:
@@ -273,7 +345,20 @@ fn support_face(
             let axis = m.c[1];
             let d = axis.dot(dir);
             if d.abs() < super::FACE_DOT_MIN {
-                return None; // 옆면 지배 — 아직 witness 단일점 경로다(README 한계)
+                // **옆면 지지 특징은 선분이다** — 면이 아니다. 방향 `dir`의 축 수직 성분이
+                // 지배적이면 옆면 모선(생성선) 하나가 통째로 지지 집합이므로, 정점 2개짜리
+                // "면"으로 넘긴다(호출자가 선분 전용 클리핑으로 보낸다). 둘 다 지배적이지
+                // 않은 테두리(rim) 접촉은 계보를 특정할 수 없어 기존 witness 경로로 둔다.
+                let perp = dir - Vec3::new(axis.x * d, axis.y * d, axis.z * d);
+                let pl = perp.length();
+                if pl < super::FACE_DOT_MIN {
+                    return None; // 테두리 지배 — witness 단일점
+                }
+                let u = perp * (1.0 / pl);
+                out[0] = pose.pos - axis * *half_height + u * *radius;
+                out[1] = pose.pos + axis * *half_height + u * *radius;
+                // 면 코드 2 = 옆면. 뚜껑(0·1)과 겹치지 않는다.
+                return Some((2, 2, u));
             }
             let s = if d >= 0.0 { 1.0 } else { -1.0 };
             for (i, (cx, cz)) in CAP_RING.iter().enumerate() {
@@ -344,8 +429,17 @@ pub(super) fn convex_face_manifold(
     if da.max(db) < super::FACE_DOT_MIN {
         return None; // 에지-에지 지배 — witness 단일점 경로
     }
-    // reference = 더 정렬된 쪽 (동률 = A — 결정론)
-    let ref_is_a = da >= db;
+    // **참조면은 다각형이어야 한다** — 선분(원기둥 옆면)은 자를 측면 평면을 못 만든다.
+    // 그래서 정렬도보다 이 조건이 먼저다. 둘 다 다각형이면 더 정렬된 쪽(동률 = A — 결정론).
+    let ref_is_a = match (na >= 3, nb >= 3) {
+        (true, true) => da >= db,
+        (true, false) => true,
+        (false, true) => false,
+        // 선분 대 선분(원기둥 둘이 옆으로 맞닿음) — witness 단일점.
+        // **이 갈래는 아래 `clip_segment`의 `k >= 3` 검사와 등가다**(참조면이 선분이면
+        // 거기서 거절된다). 뮤테이션으로 관측되지 않는다 — 의도를 여기 남기려고 둔다.
+        (false, false) => return None,
+    };
     let (rverts, rn, ref_face, iverts, inc_face) = if ref_is_a {
         (&va[..na], nrm_a, fa, &vb[..nb], fb)
     } else {
@@ -353,7 +447,11 @@ pub(super) fn convex_face_manifold(
     };
 
     let mut clipped = GenClip::new();
-    if !clip_convex_face(rverts, rn, iverts, &mut clipped) {
+    if iverts.len() == 2 {
+        let seg = clip_segment(rverts, rn, iverts[0], iverts[1])?;
+        clipped.verts[..2].copy_from_slice(&seg);
+        clipped.len = 2;
+    } else if !clip_convex_face(rverts, rn, iverts, &mut clipped) {
         return None;
     }
 
@@ -755,17 +853,15 @@ mod tests {
         );
     }
 
-    /// 세워 둔 원기둥은 뚜껑이 지지 특징이라 **다접점**이 나오고, 옆으로 누우면
-    /// 뚜껑이 지지 특징이 아니라 기존 witness **단일점**으로 떨어져야 한다.
+    /// 원기둥은 **자세에 따라 다른 지지 특징**을 써야 한다: 세우면 뚜껑(면 코드 0·1),
+    /// 누우면 옆면 모선(면 코드 2). 뚜껑 지지 판정을 빼면 모서리로 선 뚜껑 다각형이
+    /// 참조면에 눕는 꼴이 되어 접점이 엉뚱한 곳에 생긴다.
     ///
-    /// 지지 판정을 빼면 모서리로 선 뚜껑 다각형이 참조면에 눕는 꼴이 되어 접점이 엉뚱한
-    /// 곳에 생긴다. 300스텝 동역학으로는 두 경우가 y=0.2844 대 0.2706으로만 갈려
-    /// 판정이 아슬아슬하다 — 접점 개수와 계보로 직접 겨눈다.
-    ///
-    /// **옆면 접촉 자체는 아직 결함이다**(단일점이라 안 가라앉게 못 막는다).
-    /// 그건 이 시험의 대상이 아니라 다음 단계(옆면 선분 매니폴드)의 대상이다.
+    /// 300스텝 동역학으로는 두 경우가 y=0.2844 대 0.2706으로만 갈려 판정이 아슬아슬했다
+    /// — 계보의 **면 코드**로 직접 겨눈다.
     #[test]
-    fn cylinder_uses_the_cap_face_only_when_the_cap_is_the_support_feature() {
+    fn cylinder_picks_the_cap_or_the_side_by_its_pose() {
+        use crate::manifold::feature::unpack;
         use crate::{Pose, Shape};
         use maru_math::Quat;
         let floor = Shape::Box {
@@ -780,6 +876,8 @@ mod tests {
             half_height: 0.6,
             radius: 0.3,
         };
+
+        // 세우면: 뚜껑이 참조면(정렬 동률이면 A가 이긴다)이고 면 코드는 0 또는 1이다.
         let upright = Pose {
             pos: Vec3::new(0.0, 0.599, 0.0),
             rot: Quat::IDENTITY,
@@ -792,14 +890,17 @@ mod tests {
             m.points().len()
         );
         for p in m.points() {
-            assert_ne!(
-                p.feature.0,
-                crate::FEATURE_GENERIC,
-                "뚜껑 접점에 계보가 없다"
+            let f = unpack(p.feature).expect("뚜껑 접점에 계보가 없다");
+            assert!(f.ref_is_a, "세운 원기둥이 참조면이 아니다: {f:?}");
+            assert!(
+                f.ref_face <= 1,
+                "뚜껑이 아닌 면 코드를 썼다: {} ({f:?})",
+                f.ref_face
             );
         }
 
-        // 축(로컬 Y)을 Z축 둘레로 90° 돌려 눕힌다 — 뚜껑은 모서리로 선다.
+        // 눕히면: 옆면 선분이 입사 특징이고 면 코드는 2다. 참조면은 바닥이어야 한다
+        // (선분은 자를 측면 평면을 못 만든다).
         let lying = Pose {
             pos: Vec3::new(0.0, 0.299, 0.0),
             rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), core::f32::consts::FRAC_PI_2),
@@ -808,14 +909,160 @@ mod tests {
             .expect("누운 원기둥이 바닥에 닿아야 한다");
         assert_eq!(
             m.points().len(),
+            2,
+            "옆면 선분은 접점 2개다: {:?}",
+            m.points()
+        );
+        for p in m.points() {
+            let f = unpack(p.feature).expect("옆면 접점에 계보가 없다");
+            assert!(!f.ref_is_a, "선분이 참조면이 됐다: {f:?}");
+            assert_eq!(f.inc_face, 2, "옆면 코드가 아니다: {f:?}");
+        }
+        // 두 접점은 서로 다른 ID여야 한다 — 같으면 warm start가 한쪽에 몰린다.
+        assert_ne!(m.points()[0].feature, m.points()[1].feature);
+    }
+
+    /// 선분 클리퍼 자체를 직접 겨눈다. 참조면을 **완전히 빗나가는** 구간은 실제 셰이프
+    /// 배치로는 만들기 미묘하다 — 접촉 법선 방향의 지지 선분은 늘 최근접 특징 근처에
+    /// 내려앉기 때문이다. 그래도 빈 구간 판정이 없으면 참조면 **밖**의 두 점이 접점으로
+    /// 나가므로(뒤집힌 구간의 양 끝), 함수 층에서 잠근다.
+    #[test]
+    fn segment_clipping_covers_inside_clipped_and_missed() {
+        let r = square(0.0, 0.0, 1.0, 0.0);
+        let n = Vec3::new(0.0, 0.0, 1.0);
+
+        // ① 안에 완전히 들어간 구간 — 양 끝이 원본 끝점 그대로다.
+        let seg = clip_segment(&r, n, Vec3::new(-0.5, 0.0, 0.1), Vec3::new(0.5, 0.0, 0.1))
+            .expect("안쪽 구간이 거절됐다");
+        for (i, v) in seg.iter().enumerate() {
+            assert_eq!(v.kind, ClipKind::IncidentVertex, "{v:?}");
+            assert_eq!(v.a as usize, i, "끝점 번호가 어긋났다: {v:?}");
+        }
+
+        // ② 양쪽으로 삐져나온 구간 — 양 끝이 서로 다른 측면에 잘린다.
+        let seg = clip_segment(&r, n, Vec3::new(-3.0, 0.25, 0.1), Vec3::new(3.0, 0.25, 0.1))
+            .expect("가로지르는 구간이 거절됐다");
+        for v in &seg {
+            assert_eq!(v.kind, ClipKind::EdgeCross, "{v:?}");
+            assert!(v.position.x.abs() <= 1.0 + 1e-5, "{v:?}");
+        }
+        assert_ne!(seg[0].b, seg[1].b, "양 끝이 같은 측면에 잘렸다");
+        assert!(
+            (seg[0].position.x + 1.0).abs() < 1e-5 && (seg[1].position.x - 1.0).abs() < 1e-5,
+            "잘린 자리가 참조면 경계가 아니다: {seg:?}"
+        );
+
+        // ③ 코너 **바깥을 스치는 대각선** — 어떤 측면과도 평행하지 않아 평행 갈래에
+        //    걸리지 않고, 들어오는 t(0.6)가 나가는 t(0.4)를 넘어서야 비로소 거절된다.
+        //    축 평행 구간으로 시험하면 평행 갈래가 먼저 잡아 빈 구간 판정이 관측되지
+        //    않는다(뮤테이션 실측: 판정을 지워도 통과했다).
+        assert!(
+            clip_segment(&r, n, Vec3::new(2.5, 0.0, 0.1), Vec3::new(0.0, 2.5, 0.1)).is_none(),
+            "코너 밖을 스친 구간이 접점을 냈다"
+        );
+        // ③' 음성 대조 — 같은 대각선을 안쪽으로 밀면 잘려서 남는다.
+        assert!(
+            clip_segment(&r, n, Vec3::new(1.5, 0.0, 0.1), Vec3::new(0.0, 1.5, 0.1)).is_some(),
+            "안쪽을 지나는 대각선이 거절됐다"
+        );
+        // ④ 측면과 평행하면서 밖에 있는 구간도 마찬가지다(denom == 0 갈래).
+        assert!(
+            clip_segment(&r, n, Vec3::new(-5.0, 1.5, 0.1), Vec3::new(5.0, 1.5, 0.1)).is_none(),
+            "평행-바깥 구간이 접점을 냈다"
+        );
+        // ⑤ 퇴화 참조면(정점 2개)은 자를 측면 평면을 못 만든다.
+        let two = vec![Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)];
+        assert!(
+            clip_segment(&two, n, Vec3::new(0.0, 0.0, 0.1), Vec3::new(1.0, 0.0, 0.1)).is_none()
+        );
+    }
+
+    /// **선분이 실제로 잘리는** 배치. 위 시험은 바닥이 넓어 선분이 한 번도 안 잘렸고,
+    /// 그래서 매개변수 클리핑 코드에 도달하지 못했다(뮤테이션 실측: `t_hi` 비교를
+    /// 뒤집어도, 빈 구간 판정을 지워도 전부 통과했다). 좁은 발판 위에 긴 원기둥을
+    /// 가로놓아 양 끝이 서로 다른 측면에 잘리게 한다.
+    #[test]
+    fn a_side_segment_hanging_off_both_edges_is_clipped_to_the_reference_face() {
+        use crate::manifold::feature::unpack;
+        use crate::{Pose, Shape};
+        use maru_math::Quat;
+        // 발판은 x 방향으로 반폭 0.2뿐이다 — 원기둥(반높이 0.6)이 양쪽으로 삐져나온다.
+        let ledge = Shape::Box {
+            half: Vec3::new(0.2, 0.5, 5.0),
+            radius: 0.0,
+        };
+        let pf = Pose {
+            pos: Vec3::new(0.0, -0.5, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        let cyl = Shape::Cylinder {
+            half_height: 0.6,
+            radius: 0.3,
+        };
+        // 축(로컬 Y)을 Z축 둘레로 90° 돌리면 축이 월드 X를 향한다.
+        let lying = Pose {
+            pos: Vec3::new(0.0, 0.299, 0.0),
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), core::f32::consts::FRAC_PI_2),
+        };
+        let m = crate::manifold::dispatch::contact(&cyl, &lying, &ledge, &pf, 0.02)
+            .expect("원기둥이 발판에 닿아야 한다");
+        assert_eq!(m.points().len(), 2, "{:?}", m.points());
+        let mut sides = Vec::new();
+        for p in m.points() {
+            let f = unpack(p.feature).expect("계보가 없다");
+            assert_eq!(
+                f.kind,
+                ClipKind::EdgeCross,
+                "삐져나온 끝이 안 잘렸다: {f:?}"
+            );
+            sides.push(f.b);
+            assert!(
+                p.position.x.abs() <= 0.2 + 1e-4,
+                "접점이 발판 밖에 있다: {:?}",
+                p.position
+            );
+        }
+        assert_ne!(sides[0], sides[1], "양 끝이 같은 측면에 잘렸다: {sides:?}");
+        // 잘린 구간은 발판 폭 전체다 — 한쪽으로 쏠리면 클리핑이 틀린 것이다.
+        let span = (m.points()[0].position.x - m.points()[1].position.x).abs();
+        assert!(span > 0.35, "잘린 구간이 너무 짧다: {span}");
+    }
+
+    /// 테두리(rim)로 서면 뚜껑도 옆면도 지지 특징이 아니다 — 기존 witness 단일점으로
+    /// 떨어져야 한다. 계보를 지어내면 회전할 때마다 엉뚱한 ID가 생긴다.
+    #[test]
+    fn a_cylinder_on_its_rim_falls_back_to_the_witness_point() {
+        use crate::{Pose, Shape};
+        use maru_math::Quat;
+        let floor = Shape::Box {
+            half: Vec3::new(5.0, 0.5, 5.0),
+            radius: 0.0,
+        };
+        let pf = Pose {
+            pos: Vec3::new(0.0, -0.5, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        let cyl = Shape::Cylinder {
+            half_height: 0.6,
+            radius: 0.3,
+        };
+        // 45° 기울이면 |축·법선| = 0.707이라 뚜껑(0.95)도 옆면(0.95)도 지배하지 않는다.
+        let tilted = Pose {
+            pos: Vec3::new(0.0, 0.63, 0.0),
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), core::f32::consts::FRAC_PI_4),
+        };
+        let m = crate::manifold::dispatch::contact(&cyl, &tilted, &floor, &pf, 0.05)
+            .expect("기운 원기둥이 바닥에 닿아야 한다");
+        assert_eq!(
+            m.points().len(),
             1,
-            "누운 원기둥이 뚜껑 면을 썼다: {:?}",
+            "테두리 접촉이 다접점을 냈다: {:?}",
             m.points()
         );
         assert_eq!(
             m.points()[0].feature.0,
             crate::FEATURE_GENERIC,
-            "누운 원기둥 접점이 witness가 아니다"
+            "테두리 접점에 지어낸 계보가 붙었다"
         );
     }
 

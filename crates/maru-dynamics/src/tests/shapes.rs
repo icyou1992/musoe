@@ -1451,3 +1451,47 @@ fn upright_cylinder_stays_upright_on_a_flat_floor() {
         b.linvel()
     );
 }
+
+/// **원기둥 옆면 매니폴드의 완료 판정**: 옆으로 누운 원기둥이 반지름 높이에 정지한다.
+///
+/// 옆면의 지지 특징은 면이 아니라 **선분**(모선 하나)이라 다각형 클리퍼에 못 넣는다.
+/// 그 전에는 witness 단일점이라 반지름 0.3인데 y=0.2844로 가라앉고 300스텝에도
+/// 정지하지 않았다(vel 0.113).
+#[test]
+fn cylinder_lying_on_its_side_rests_at_its_radius() {
+    let mut w = World::new(WorldParams::default());
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(5.0, 0.5, 5.0),
+            radius: 0.0,
+        },
+        pose(0.0, -0.5, 0.0),
+    ));
+    // 축(로컬 Y)을 Z축 둘레로 90° 돌려 옆으로 눕힌다.
+    let lying = Pose {
+        pos: Vec3::new(0.0, 0.35, 0.0),
+        rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), core::f32::consts::FRAC_PI_2),
+    };
+    let h = w.add_body(Body::new_dynamic(
+        Shape::Cylinder {
+            half_height: 0.6,
+            radius: 0.3,
+        },
+        lying,
+        1.0,
+    ));
+    for _ in 0..300 {
+        w.step(1.0 / 60.0);
+    }
+    let b = w.body(h);
+    assert!(
+        (b.pose().pos.y - 0.3).abs() < 0.005,
+        "옆으로 누운 원기둥이 반지름 높이에 없다: y={}",
+        b.pose().pos.y
+    );
+    assert!(
+        b.linvel().length() < 0.02,
+        "옆으로 누운 원기둥이 정지하지 않았다: vel {:?}",
+        b.linvel()
+    );
+}
