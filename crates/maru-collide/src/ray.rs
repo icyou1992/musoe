@@ -36,6 +36,12 @@ pub enum QueryReject {
     /// 형상 불변식이 깨졌거나(빈 hull → GJK 패닉, 빈 복합 → 미스 위장) 산술 입력이
     /// 비유한이거나 자세를 정규화할 수 없다.
     InvalidInput,
+    /// 가지치기 구조 순회가 **포화**해 후보를 다 못 봤다 — 답을 낼 수 없다.
+    ///
+    /// 이걸 "가장 가까운 건 못 찾았지만 이 정도"로 뭉개면 안 된다: 최근접 질의는 못 본
+    /// 후보가 더 가까울 수 있으므로 조용한 오답이 된다(레이는 "안 맞음"이 보수적이지만
+    /// 최근접은 보수적인 방향이 아예 없다).
+    ResourceLimit,
 }
 
 /// 공개 레이 캐스트 — 형상·산술 입력을 검사하고 자세를 정규화한 뒤 푼다.
@@ -212,9 +218,25 @@ pub(crate) fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
             let y = local.y.clamp(-half_height, half_height);
             (local - Vec3::new(0.0, y, 0.0)).length_sq() <= radius * radius
         }
-        Shape::Box { half, .. } => {
+        Shape::Box { half, radius } => {
             // 겉면 기준 half가 곧 사용자 관점 치수다 (코어+radius = half).
-            local.x.abs() <= half.x && local.y.abs() <= half.y && local.z.abs() <= half.z
+            //
+            // **모서리는 깎여 있다**: 둥근 박스의 겉면은 "코어 상자 ⊕ 반지름 공"이라
+            // 꼭짓점 근방이 구의 8분면이다. half 상자로만 재면 그 깎인 자리를 안이라고
+            // 우긴다(예: half=(1,1,1)·radius=1인 구에서 (1,1,1)은 중심에서 √3 떨어져
+            // 밖인데 half 판정은 통과한다). 코어까지의 거리로 재야 옳고, 그래야
+            // `project_point`의 안팎 판정과도 같은 답이 된다.
+            let core = Vec3::new(
+                (half.x - radius).max(0.0),
+                (half.y - radius).max(0.0),
+                (half.z - radius).max(0.0),
+            );
+            let q = Vec3::new(
+                local.x.clamp(-core.x, core.x),
+                local.y.clamp(-core.y, core.y),
+                local.z.clamp(-core.z, core.z),
+            );
+            (local - q).length_sq() <= radius * radius
         }
         Shape::Hull { .. } => {
             // 코어까지의 거리가 radius 이하인가 — support 기반 최근접점으로 판정한다.
