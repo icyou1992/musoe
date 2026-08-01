@@ -255,8 +255,17 @@ fn project_convex_core(
                 // 반공간 안이면 `gap >= 0`이고, 이 사례에서도 +0.000977로 정확히 안이라고
                 // 답한다. `gap == 0`(지지 평면 위)일 때만 "평면 안이지만 다각형 밖"을
                 // 가려야 해서 `distance`를 보는데, 그 경우는 GJK가 0을 정확히 준다.
-                let (n, gap) = core_exit(shape, p, budget)?;
-                if gap > 0.0 || distance == 0.0 {
+                let (n, gap, full_dim) = core_exit(shape, p, budget)?;
+                // 3차원 코어면 `gap >= 0`만으로 "안/경계"가 증명된다 — GJK 거리를 볼 필요가
+                // 없다. 저차원이면 아핀 껍질 위 어디서나 `gap == 0`이라 "다각형 안"인지를
+                // 가릴 다른 근거가 필요하고, 그때만 GJK가 0을 주는지 본다(그 경우 GJK는
+                // 정확하다 — 실측).
+                let inside_core = if full_dim {
+                    gap >= 0.0
+                } else {
+                    gap > 0.0 || distance == 0.0
+                };
+                if inside_core {
                     return Ok(PointProjection {
                         point: p + n * (gap + radius),
                         // 코어 안이면 겉면(코어 ⊕ 반지름 공) 안이기도 하다.
@@ -274,7 +283,7 @@ fn project_convex_core(
                 });
             }
             // 방향이 없다(witness가 질의점과 같다) — 지지 방향으로 마감한다.
-            let (n, gap) = core_exit(shape, p, budget)?;
+            let (n, gap, _) = core_exit(shape, p, budget)?;
             Ok(PointProjection {
                 point: p + n * (gap + radius),
                 inside: true,
@@ -285,7 +294,7 @@ fn project_convex_core(
             // 만들 수 있을 때만 돌고, 그 판정은 최대 에지 길이에 **상대적**이라 얇고 긴
             // 코어(예: 반크기 (1000, 0.002, 0.002))에서는 전체 차원인데도 시드를 못 만든다.
             // 지지 함수 경로는 그 문턱이 없다.
-            let (n, gap) = core_exit(shape, p, budget)?;
+            let (n, gap, _) = core_exit(shape, p, budget)?;
             Ok(PointProjection {
                 point: p + n * (gap + radius),
                 inside: true,
@@ -317,10 +326,24 @@ pub(crate) fn core_contains(
     {
         return Ok(false);
     }
+    // **GJK 비용도 청구한다** — 호출자(`contains_point`)가 이미 GJK를 돌린 뒤 들어오는데,
+    // 그걸 안 세면 "hull이 수천 개"인 질의가 GJK만으로 수억 번 내적을 돌면서 예산이
+    // 그대로 남는다(검수 rev_bb1b7abe MAJOR).
+    if let Shape::Hull { ref points, .. } = *shape {
+        let cost = points.len().saturating_mul(GJK_MAX_SUPPORTS);
+        if *budget < cost {
+            return Err(QueryReject::ResourceLimit);
+        }
+        *budget -= cost;
+    }
     // 예산은 **호출자가 들고 다닌다** — 물체마다 새로 주면 "질의점을 품는 hull 수천 개"인
     // 월드가 한 번의 질의에서 수억 번 내적을 돈다. 소진은 거짓으로 뭉개지 않고 오류다.
-    let (_, gap) = core_exit(shape, p, budget)?;
-    Ok(gap > 0.0 || distance == 0.0)
+    let (_, gap, full_dim) = core_exit(shape, p, budget)?;
+    Ok(if full_dim {
+        gap >= 0.0
+    } else {
+        gap > 0.0 || distance == 0.0
+    })
 }
 
 /// 코어 **위/안**의 점 `q`에서 나가는 방향과, 그 방향으로 코어 표면까지의 여유.
@@ -340,10 +363,10 @@ pub(crate) fn core_contains(
 ///
 /// 비용은 점 수의 4제곱(`C(m,3)·m`)이지만 상한이 32개로 잠겨 있고, 이 경로는 질의점이
 /// 코어 **안**일 때만 돈다(밖이면 위치 차이가 방향을 준다).
-fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32), QueryReject> {
+fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32, bool), QueryReject> {
     let Shape::Hull { ref points, .. } = *shape else {
         // 다른 셰이프는 해석 경로가 따로 있어 여기 오지 않는다.
-        return Ok((TIE_X, 0.0));
+        return Ok((TIE_X, 0.0, false));
     };
     // **지지 최소화를 먼저 돌린다.** 예전에는 아핀 랭크를 먼저 재서 "저차원이면 여유 0"으로
     // 갈랐는데, 그 판정이 상대 임계라 **얇지만 3차원인** 코어를 평면으로 오판했다. 그러면
@@ -355,9 +378,25 @@ fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32), 
     // 그대로 나온다. 같은 식이 두 경우를 다 맞힌다.
     let mut best: Option<(f32, Vec3)> = None;
     let mut exhausted = false;
+    // **코어가 3차원이라는 증거를 봤는가.** 어떤 후보 법선 방향으로든 점들이 두께를 가지면
+    // (`hi > lo`) 3차원이다. 저차원(평면·선)이면 모든 후보에서 두께가 0이라 증거가 없다.
+    //
+    // 왜 필요한가: 3차원 코어에서는 `gap >= 0`이 곧 "코어 안/경계"의 증거다. 저차원이면
+    // 아핀 껍질 위 **어디서나** `gap == 0`이라 "다각형 안"과 "평면 위 다각형 밖"이 안 갈려
+    // 다른 근거가 더 필요하다. 둘을 같은 규칙으로 다루면 3차원 코어의 **면 위** 점이
+    // 밖으로 오판된다(검수 rev_bb1b7abe BLOCKER).
+    let mut full_dim = false;
     'outer: for i in 0..points.len() {
         for j in (i + 1)..points.len() {
             for k in (j + 1)..points.len() {
+                // **외적·정규화 앞에서 청구한다.** 뒤에 두면 공선 삼중조합이 `continue`로
+                // 빠져나가 `C(m,3)`번의 검사가 통째로 예산 밖이 된다 — 전부 공선인 hull은
+                // 점 순회를 한 번도 안 돌아 예산이 0만큼 깎인다(검수 rev_bb1b7abe MAJOR).
+                if *budget == 0 {
+                    exhausted = true;
+                    break 'outer;
+                }
+                *budget -= 1;
                 let Some(n) = (points[j] - points[i])
                     .cross(points[k] - points[i])
                     .try_normalize()
@@ -384,6 +423,8 @@ fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32), 
                         break;
                     }
                 }
+                // 부분 순회여도 `hi > lo`는 3차원의 **증거**다(반증은 못 된다).
+                full_dim |= hi > lo;
                 // 동률은 먼저 본 후보가 이긴다 — 순회가 결정적이므로 답도 결정적이다.
                 for (h, cand) in [(hi, n), (-lo, n * -1.0)] {
                     if h.is_finite() && best.is_none_or(|(bh, _)| h < bh) {
@@ -402,10 +443,10 @@ fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32), 
         // (검수 rev_8a258ed3 BLOCKER: 반크기 (1000,1,1) hull·radius 0.1에 p=(1000.001,0,0)
         //  → 겉면 x=1000.1인데 x=1000.101이 나왔다). 부호를 살리면 같은 식
         //  `p + n·(gap + radius)`가 안팎 모두에서 정확한 표면을 준다.
-        Some((h, n)) => (n, h),
+        Some((h, n)) => (n, h, full_dim),
         // 면 후보가 하나도 없다 = 모든 점이 한 직선 위(또는 3점 미만). 그 직선에는 지지
         // 평면이 무한히 많아 위 최소화가 방향을 못 고르므로 수직 방향을 준다.
-        None => (collinear_exit_dir(points), 0.0),
+        None => (collinear_exit_dir(points), 0.0, false),
     })
 }
 
@@ -1369,6 +1410,85 @@ mod tests {
             try_contains_point(&s, &ident(), p).unwrap(),
             "안팎이 갈렸다"
         );
+    }
+
+    /// **코어 면 위** 점은 3차원 코어에서 `gap == 0`이다 — 그때 GJK 거리를 추가 근거로
+    /// 요구하면 같은 중복-support 결함에 다시 걸려 경계를 밖으로 오판한다
+    /// (검수 rev_bb1b7abe BLOCKER). 3차원이 확인되면 `gap >= 0`만으로 충분하다.
+    #[test]
+    fn point_on_a_core_face_is_inside() {
+        let h = v(1000.0, 1.0, 1.0);
+        let mut pts = Vec::new();
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    pts.push(v(h.x * sx, h.y * sy, h.z * sz));
+                }
+            }
+        }
+        for radius in [0.0f32, 0.1] {
+            let s = Shape::Hull {
+                points: pts.clone(),
+                radius,
+            };
+            // +X 면 **위**의 점(코어 경계).
+            let p = v(1000.0, 0.25, 0.0);
+            let pr = try_project_point(&s, &ident(), p).unwrap();
+            assert!(pr.inside, "radius {radius}: 경계인데 밖이라고 했다: {pr:?}");
+            // 겉면은 면에서 radius만큼 밖이다.
+            assert!(
+                (pr.point.x - (h.x + radius)).abs() < 1.0e-3,
+                "radius {radius}: 겉면이 아니다: {:?}",
+                pr.point
+            );
+            assert_eq!(
+                pr.inside,
+                try_contains_point(&s, &ident(), p).unwrap(),
+                "radius {radius}: 안팎이 갈렸다"
+            );
+        }
+    }
+
+    /// 전부 공선인 hull은 유효 법선이 하나도 안 나오는데, 그 삼중조합 검사 자체가 일이다.
+    /// 예산이 점 순회에서만 깎이면 그 작업이 **공짜로** 계산돼 상한이 무력화된다
+    /// (검수 rev_bb1b7abe MAJOR).
+    #[test]
+    fn collinear_hull_triples_consume_budget() {
+        // x축 위 32점 — 모든 삼중조합이 공선이라 법선이 안 나온다.
+        let pts: Vec<Vec3> = (0..32)
+            .map(|i| v(i as f32 * 0.05 - 0.8, 0.0, 0.0))
+            .collect();
+        let s = Shape::Hull {
+            points: pts,
+            radius: 0.001,
+        };
+        assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
+        // 한 번의 질의가 **삼중조합 수만큼은** 먹어야 한다. GJK 선청구(32×64=2048)만
+        // 세면 이 값이 그 아래로 떨어진다 — 그래서 횟수가 아니라 **소모량**을 잰다.
+        let mut probe = usize::MAX;
+        try_project_point_with_budget(&s, &ident(), Vec3::ZERO, &mut probe).unwrap();
+        let used = usize::MAX - probe;
+        let triples = 32 * 31 * 30 / 6; // C(32,3) = 4960
+        assert!(
+            used >= triples,
+            "공선 삼중조합 검사가 예산을 안 먹었다: {used} < {triples}"
+        );
+        // 그리고 반복하면 실제로 막혀야 한다.
+        let mut budget = super::MAX_PROJECT_WORK;
+        let mut ok = 0usize;
+        let mut limited = false;
+        for _ in 0..4096 {
+            match try_project_point_with_budget(&s, &ident(), Vec3::ZERO, &mut budget) {
+                Ok(_) => ok += 1,
+                Err(QueryReject::ResourceLimit) => {
+                    limited = true;
+                    break;
+                }
+                Err(e) => panic!("예상 밖 오류 {e:?}"),
+            }
+        }
+        assert!(ok > 0, "첫 질의부터 막히면 예산이 너무 빡빡하다");
+        assert!(limited, "반복 질의가 예산에 안 걸렸다 (통과 {ok}회)");
     }
 
     /// **모서리 바로 바깥** 점은 면 법선 후보로 풀 수 없다 — 실제 최근접 방향이 모서리에서

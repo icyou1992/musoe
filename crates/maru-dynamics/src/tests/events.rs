@@ -910,3 +910,57 @@ fn active_force_scene_does_not_release_its_buffer_every_step() {
         "정착한 활성 장면인데 버퍼를 계속 해제하고 있다"
     );
 }
+
+/// 큰 장면을 돌린 월드에 **빈 스냅샷**을 복원하면 접촉력 버퍼가 반납돼야 한다.
+///
+/// 복원은 길이만 비우고 용량을 남긴다. 스텝이 "바디 없음"에서 조기 반환하면 반납할
+/// 기회가 영영 없어 수십 MiB가 힙에 남는다(검수 rev_bb1b7abe MAJOR).
+#[test]
+fn empty_restore_releases_the_force_buffer() {
+    let params = WorldParams {
+        gravity: Vec3::new(0.0, -10.0, 0.0),
+        ..no_sleep_params()
+    };
+    let mut w = World::new(params.clone());
+    w.add_body(
+        Body::new_static(
+            Shape::Box {
+                half: Vec3::new(60.0, 1.0, 60.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        )
+        .with_contact_force_threshold(0.1),
+    );
+    for ix in 0..12 {
+        for iz in 0..12 {
+            w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.5, 0.5),
+                    radius: 0.0,
+                },
+                pose(ix as f32 * 1.2 - 7.0, 0.6, iz as f32 * 1.2 - 7.0),
+                1.0,
+            ));
+        }
+    }
+    for _ in 0..60 {
+        w.step(DT);
+    }
+    assert!(
+        w.contact_force_events_capacity() > 0,
+        "전제: 큰 장면이 버퍼를 잡았다"
+    );
+    // 빈 월드 스냅샷을 복원한다.
+    let empty = World::new(params).snapshot();
+    w.restore(&empty).expect("복원");
+    // 바디가 없어도 스텝은 반납 기회를 줘야 한다.
+    for _ in 0..3 {
+        w.step(DT);
+    }
+    assert_eq!(
+        w.contact_force_events_capacity(),
+        0,
+        "빈 월드가 된 뒤에도 접촉력 버퍼를 쥐고 있다"
+    );
+}

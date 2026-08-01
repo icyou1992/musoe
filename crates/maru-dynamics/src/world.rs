@@ -3096,12 +3096,17 @@ impl World {
         // 걸면 pending `SetLinearVelocity`가 그 뒤에 적용돼 sweep AABB를 부풀린 채
         // 브로드페이즈로 들어간다(O(N²) 페어 → 오류 반환 전 OOM).
         self.clamp_velocities();
+        // 브로드페이즈가 새 페어 배열을 잡기 **전에** 과거 장면이 남긴 부풀린 스크래치를
+        // 놓아준다(위 함수 주석 — 그 할당은 fallible이 아니라 검사 전에 죽을 수 있다).
+        //
+        // **빈 월드 조기 반환보다 앞에 둔다.** 큰 장면을 돌린 월드에 빈 스냅샷을 복원하면
+        // `restore_parts`는 길이만 비우고 용량을 남기는데, 여기서 반환해 버리면 반납할
+        // 기회가 영영 없다 — 수십 MiB가 힙에 남아 다른 할당을 실패시킨다
+        // (검수 rev_bb1b7abe MAJOR).
+        self.release_stale_scratch(self.bodies.len());
         if self.bodies.is_empty() {
             return;
         }
-        // 브로드페이즈가 새 페어 배열을 잡기 **전에** 과거 장면이 남긴 부풀린 스크래치를
-        // 놓아준다(위 함수 주석 — 그 할당은 fallible이 아니라 검사 전에 죽을 수 있다).
-        self.release_stale_scratch(self.bodies.len());
         let n_sub = self.params.substeps.max(1);
         let h = dt / n_sub as f32;
         let inv_h = 1.0 / h;
