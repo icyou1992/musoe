@@ -1169,14 +1169,14 @@ MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyra
 **있는 것**: 셰이프 8종(구·캡슐·박스·볼록hull·복합·하이트필드·트리메시·삼각형, 전부 round 지원) ·
 바디 3종(static/dynamic/kinematic) · 조인트 5종(point/hinge/fixed/distance/prismatic)과
 한계·모터 · 질의(레이·AABB·점 포함·셰이프 스윕, 각각 필터판) · 캐릭터 컨트롤러 ·
-센서 · 충돌 그룹 · 접촉 이벤트(Started/Stopped) · CCD · 수면 · 감쇠 · 스냅샷/복원 · 결정성 계약.
+센서 · 충돌 그룹 · 접촉 이벤트(Started/Stopped) · CCD · 수면 · 감쇠 · 스냅샷/복원 · 결정성 계약 ·
+**월드축 회전 잠금**(`Body::with_locked_rotation`) · **최근접점 투영**(`World::project_point`).
 
 **없는 것** (rapier 0.34 기준, 흔히 쓰이는 순):
 
 | 기능 | rapier | maru | 비고 |
 |---|---|---|---|
-| **축 잠금**(LockedAxes) | 있음 | **없음** | 2.5D·직립 캐릭터에 필수급. inv_mass/inv_inertia에 축 마스크 |
-| **최근접점 투영**(project_point) | 있음 | 없음 | `query_point`는 포함 판정만 |
+| **축 잠금**(LockedAxes) | 있음 | **회전만** | 회전 3축은 있다(월드축). 병진 잠금은 `inv_m`을 스칼라→Vec3로 넓혀야 해 비용 측정이 먼저다 |
 | **접촉력 이벤트**(ContactForce + 임계) | 있음 | 없음 | Started/Stopped만 있다 |
 | 원기둥·원뿔 셰이프 | 있음 | 없음 | hull로 근사 가능(면 수만큼 비용) |
 | 솔버 그룹(충돌 그룹과 별도) | 있음 | 없음 | 지금은 그룹 하나가 둘을 겸한다 |
