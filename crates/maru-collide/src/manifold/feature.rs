@@ -44,27 +44,49 @@ const KIND_MASK: u32 = 0x3;
 /// `ab`의 하위 9비트가 사는 곳 (비트 0..8).
 const AB_LO_MASK: u32 = 0x1FF;
 
+/// kind 값 0은 **이 코덱이 아니라는 표식**으로 예약한다 (검수 rev_65fca6a1 MAJOR).
+///
+/// 판별자가 없으면 박스 전용 클립 ID가 새 디코더를 그냥 통과한다 — 예컨대 박스가 만든
+/// `0x0000_0011`은 `IncidentVertex { a: 17 }`로 "성공"해서, 뒤에 오는 코드가
+/// `unpack(id).is_some()`으로 계보 유무를 물으면 박스 접점을 일반면 계보로 오인한다.
+/// 박스 인코딩은 비트 31·28..30·25..27·0..7만 쓰므로 **kind 비트(17..18)가 항상 0**이다.
+/// 그래서 0을 비워 두는 것만으로 완전한 판별자가 된다.
+const KIND_NOT_THIS_CODEC: u32 = 0;
+
 /// 클리핑 접점의 계보 종류.
 ///
 /// 순번이나 면 쌍만 남기면 서로 다른 접점이 같은 ID로 충돌해 warm start가 끊긴다
 /// (검수 rev_ae6d97b1) — 그래서 "무엇에서 나온 점인가"를 명시한다.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClipKind {
-    /// incident 면의 원본 정점 `a`가 그대로 살아남았다 (`b` 미사용, 0).
-    IncidentVertex = 0,
+    /// incident 면의 원본 정점 `a`가 그대로 살아남았다 (`b`는 반드시 0).
+    IncidentVertex = 1,
     /// incident 에지 `a`가 reference 측면 `b`와 만나 생긴 교점.
-    EdgeCross = 1,
-    /// reference 면의 원본 정점 `a`가 incident 다각형 안에 들었다 (`b` 미사용, 0).
-    ReferenceVertex = 2,
+    EdgeCross = 2,
+    /// reference 면의 원본 정점 `a`가 incident 다각형 안에 들었다 (`b`는 반드시 0).
+    ReferenceVertex = 3,
 }
 
+/// 어떤 종류도 예약값을 쓰지 않는다 — 누가 kind를 0으로 되돌리면 **컴파일이 깨진다**.
+/// 주석으로만 적어 두면 판별자가 조용히 무력해진다.
+const _: () = assert!(
+    ClipKind::IncidentVertex as u32 != KIND_NOT_THIS_CODEC
+        && ClipKind::EdgeCross as u32 != KIND_NOT_THIS_CODEC
+        && ClipKind::ReferenceVertex as u32 != KIND_NOT_THIS_CODEC,
+    "kind 값 0은 '이 코덱이 아님' 판별자로 예약돼 있다"
+);
+
 impl ClipKind {
+    /// 이 종류가 `b`를 쓰는가. 안 쓰는 종류는 `b == 0`만 캐노니컬이다.
+    fn uses_b(self) -> bool {
+        matches!(self, Self::EdgeCross)
+    }
     fn from_bits(v: u32) -> Option<Self> {
         match v {
-            0 => Some(Self::IncidentVertex),
-            1 => Some(Self::EdgeCross),
-            2 => Some(Self::ReferenceVertex),
-            _ => None,
+            1 => Some(Self::IncidentVertex),
+            2 => Some(Self::EdgeCross),
+            3 => Some(Self::ReferenceVertex),
+            _ => None, // KIND_NOT_THIS_CODEC 포함
         }
     }
 }
@@ -85,12 +107,21 @@ pub struct FaceFeature {
 ///
 /// 범위를 벗어나면 `None`. 자르거나 감싸지 않는다: 면 코드를 60 이상으로 자르면
 /// 센티널과 같은 값이 되고, 인덱스를 감싸면 서로 다른 접점이 같은 ID를 갖는다.
+/// 면 코드가 모자라는 셰이프가 생기면 여기서 `None`이 나므로 억지로 우겨넣지 말고
+/// 별도 형식으로 분기해야 한다(검수 rev_65fca6a1).
+///
+/// **비에지 종류는 `b != 0`을 거절한다** — 같은 물리 계보가 `b` 쓰레기값 때문에 여러 ID를
+/// 갖게 되면, 한 프레임은 `b=0`, 다음 프레임은 `b=1`이 되어 직전 임펄스를 못 찾는다
+/// (검수 rev_65fca6a1 MAJOR). 코덱이 캐노니컬 표현을 강제한다.
 pub fn pack(f: FaceFeature) -> Option<FeatureId> {
     if f.ref_face > FACE_CODE_MAX
         || f.inc_face > FACE_CODE_MAX
         || f.a > FEATURE_INDEX_MAX
         || f.b > FEATURE_INDEX_MAX
     {
+        return None;
+    }
+    if !f.kind.uses_b() && f.b != 0 {
         return None;
     }
     let ab = f.a | (f.b << 5);
@@ -106,9 +137,10 @@ pub fn pack(f: FaceFeature) -> Option<FeatureId> {
 
 /// feature ID를 계보로 디코딩한다. 자식 네임스페이스 비트는 무시한다.
 ///
-/// 면 접점이 아니면(센티널·박스 전용 인코딩·미지의 kind) `None`. 박스 클립 인코딩은
-/// 면 코드에 3비트만 써서 상위 3비트가 0이므로 여기서도 값이 나오긴 하지만, 같은 바디
-/// 페어가 두 경로를 동시에 타지 않으므로(디스패치가 셰이프 쌍으로 갈린다) 섞이지 않는다.
+/// 이 코덱이 만든 값이 아니면 `None`이며, 그 판정은 세 겹이다:
+/// **kind 비트 0**(박스 전용 인코딩 — 그쪽은 17..18을 절대 안 쓴다),
+/// **예약 면 코드 60..63**(센티널 GENERIC/ANALYTIC), **비에지 종류의 `b != 0`**
+/// (캐노니컬 아님). 셋 다 `pack()`이 만들 수 없는 값이므로 왕복이 유지된다.
 pub fn unpack(id: FeatureId) -> Option<FaceFeature> {
     let v = id.0;
     let ref_face = (v >> REF_FACE_SHIFT) & FACE_MASK;
@@ -118,13 +150,17 @@ pub fn unpack(id: FeatureId) -> Option<FaceFeature> {
     }
     let kind = ClipKind::from_bits((v >> KIND_SHIFT) & KIND_MASK)?;
     let ab = (v & AB_LO_MASK) | (((v >> AB_HI_SHIFT) & 1) << 9);
+    let b = (ab >> 5) & 0x1F;
+    if !kind.uses_b() && b != 0 {
+        return None;
+    }
     Some(FaceFeature {
         ref_is_a: (v >> REF_IS_A_SHIFT) & 1 == 1,
         ref_face,
         inc_face,
         kind,
         a: ab & 0x1F,
-        b: (ab >> 5) & 0x1F,
+        b,
     })
 }
 
@@ -146,15 +182,21 @@ mod tests {
             for ref_face in [0, 1, 7, 58, FACE_CODE_MAX] {
                 for inc_face in [0, 3, 59] {
                     for kind in KINDS {
+                        // 비에지 종류는 b=0만 캐노니컬이다 — 코덱이 그것을 강제한다.
+                        let bs: &[u32] = if kind == ClipKind::EdgeCross {
+                            &[0, 2, 16, FEATURE_INDEX_MAX]
+                        } else {
+                            &[0]
+                        };
                         for a in [0, 1, 15, 16, FEATURE_INDEX_MAX] {
-                            for b in [0, 2, 16, FEATURE_INDEX_MAX] {
+                            for b in bs {
                                 out.push(FaceFeature {
                                     ref_is_a,
                                     ref_face,
                                     inc_face,
                                     kind,
                                     a,
-                                    b,
+                                    b: *b,
                                 });
                             }
                         }
@@ -239,7 +281,7 @@ mod tests {
     #[test]
     fn reserved_face_codes_are_rejected_even_with_a_valid_kind() {
         for face in 60u32..=63 {
-            for kind in 0u32..=2 {
+            for kind in 1u32..=3 {
                 let ref_reserved = (face << REF_FACE_SHIFT) | (kind << KIND_SHIFT) | 7;
                 assert_eq!(
                     unpack(FeatureId(ref_reserved)),
@@ -256,10 +298,100 @@ mod tests {
             }
         }
         // 바로 안쪽(59)은 통과해야 한다 — 가드가 무조건 거절로 바뀌면 여기서 걸린다.
-        let ok = (FACE_CODE_MAX << REF_FACE_SHIFT) | (FACE_CODE_MAX << INC_FACE_SHIFT);
+        let ok = (FACE_CODE_MAX << REF_FACE_SHIFT)
+            | (FACE_CODE_MAX << INC_FACE_SHIFT)
+            | ((ClipKind::IncidentVertex as u32) << KIND_SHIFT);
         assert!(
             unpack(FeatureId(ok)).is_some(),
             "경계 안쪽 면 코드가 거절됐다"
+        );
+    }
+
+    /// **실제 박스-박스 접점**의 feature ID는 이 코덱으로 읽히면 안 된다.
+    /// 생산자를 직접 돌려서 판정한다 — 손으로 만든 값은 실제 인코딩과 어긋날 수 있다.
+    #[test]
+    fn real_box_contact_features_are_not_read_as_face_lineage() {
+        use crate::{Pose, Shape};
+        use maru_math::{Quat, Vec3};
+        let a = Shape::Box {
+            half: Vec3::new(0.5, 0.5, 0.5),
+            radius: 0.0,
+        };
+        let mut seen = 0usize;
+        for (dx, dy, angle) in [
+            (0.0f32, 0.94f32, 0.0f32),
+            (0.13, 0.95, 0.0),
+            (0.0, 0.9, 0.37),
+            (0.21, 0.88, 0.61),
+        ] {
+            let pa = Pose {
+                pos: Vec3::ZERO,
+                rot: Quat::IDENTITY,
+            };
+            let pb = Pose {
+                pos: Vec3::new(dx, dy, 0.0),
+                rot: Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), angle),
+            };
+            let m = crate::manifold::dispatch::contact(&a, &pa, &a, &pb, 0.02)
+                .expect("박스 둘이 접촉해야 한다");
+            for p in m.points() {
+                seen += 1;
+                assert_eq!(
+                    unpack(p.feature),
+                    None,
+                    "박스 접점 {:#010x}이 일반면 계보로 읽혔다",
+                    p.feature.0
+                );
+            }
+        }
+        assert!(seen >= 8, "박스 접점을 충분히 못 봤다: {seen}");
+    }
+
+    /// 비에지 종류에서 `b != 0`은 만들 수도, 읽을 수도 없어야 한다 —
+    /// 같은 계보가 여러 ID를 갖게 되면 warm start가 프레임마다 끊긴다.
+    #[test]
+    fn non_edge_kinds_reject_a_nonzero_b_on_both_sides() {
+        for kind in [ClipKind::IncidentVertex, ClipKind::ReferenceVertex] {
+            let canonical = FaceFeature {
+                ref_is_a: false,
+                ref_face: 5,
+                inc_face: 9,
+                kind,
+                a: 7,
+                b: 0,
+            };
+            let id = pack(canonical).expect("캐노니컬이 거절됐다");
+            assert_eq!(unpack(id), Some(canonical));
+            for b in [1u32, 16, FEATURE_INDEX_MAX] {
+                assert_eq!(
+                    pack(FaceFeature { b, ..canonical }),
+                    None,
+                    "{kind:?}에서 b={b}가 통과했다"
+                );
+                // 디코드 쪽도 막는다: b 비트를 직접 세운 값은 이 코덱의 값이 아니다.
+                // `ab`는 물리적으로 0..8 + 비트16에 흩어져 있으므로 그 배치대로 세운다
+                // (`id.0 | (b << 5)`로 쓰면 자식 네임스페이스 비트를 건드린다).
+                let ab = 7u32 | (b << 5);
+                let forged = FeatureId(
+                    (id.0 & !(AB_LO_MASK | (1 << AB_HI_SHIFT)))
+                        | (ab & AB_LO_MASK)
+                        | ((ab >> 9) << AB_HI_SHIFT),
+                );
+                assert_eq!(unpack(forged), None, "{kind:?}에서 위조 b={b}가 읽혔다");
+            }
+        }
+        // EdgeCross는 b를 쓴다 — 무조건 거절로 바뀌면 여기서 걸린다.
+        let edge = FaceFeature {
+            ref_is_a: false,
+            ref_face: 5,
+            inc_face: 9,
+            kind: ClipKind::EdgeCross,
+            a: 7,
+            b: 19,
+        };
+        assert_eq!(
+            unpack(pack(edge).expect("에지 계보가 거절됐다")),
+            Some(edge)
         );
     }
 

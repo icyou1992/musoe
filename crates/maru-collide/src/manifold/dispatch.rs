@@ -306,6 +306,13 @@ pub fn contact(sa: &Shape, pa: &Pose, sb: &Shape, pb: &Pose, margin: f32) -> Opt
         }
     }
 
+    // **일반 볼록 면 접촉** — hull(·박스) 쌍의 다접점 매니폴드. 박스-박스는 위 전용
+    // 경로가 이미 처리했고(비트 동일 보장) 여기서도 한 번 더 걸러진다. 면을 못 내거나
+    // 에지-에지 지배면 None이라 아래 witness 단일점으로 떨어진다 — 기존 동작 그대로다.
+    if let Some(m) = genclip::convex_face_manifold(sa, pa, sb, pb, normal, margin) {
+        return Some(m);
+    }
+
     // 폴백: witness 단일점 (radius 재팽창 — 설계 shrink-then-reinflate의 reinflate 지점)
     let surface_a = on_a - normal * ra; // A 표면: 코어점에서 −normal(=B쪽)로 radius만큼
     let surface_b = on_b + normal * rb;

@@ -138,6 +138,7 @@ pub mod feature;
 mod clip;
 mod container;
 mod dispatch;
+mod genclip;
 mod sat;
 #[cfg(test)]
 mod tests;

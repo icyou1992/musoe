@@ -1361,3 +1361,51 @@ fn recentering_a_hull_rebuilds_its_faces() {
         }
     }
 }
+
+/// **일반 볼록 면 매니폴드의 완료 판정**: 박스 모양 hull이 박스와 **같은 높이**에 선다.
+///
+/// 이 시험 전에는 박스만 면 클리핑으로 다접점을 냈고 나머지 볼록 쌍은 GJK/EPA witness
+/// **단일점**이었다. 단일점은 회전을 못 막아 hull이 지면으로 가라앉았다(실측 2026-08-01:
+/// 박스 y=0.5999 정지 vs 같은 모양 hull y=0.5935에 vel.y −0.167 잔류).
+#[test]
+fn box_shaped_hull_rests_at_the_same_height_as_a_box() {
+    let half = Vec3::new(0.3, 0.6, 0.3);
+    let corners: Vec<Vec3> = (0..8)
+        .map(|i| {
+            Vec3::new(
+                if i & 1 == 0 { -half.x } else { half.x },
+                if i & 2 == 0 { -half.y } else { half.y },
+                if i & 4 == 0 { -half.z } else { half.z },
+            )
+        })
+        .collect();
+    let run = |shape: Shape| -> (f32, Vec3) {
+        let mut w = World::new(WorldParams::default());
+        w.add_body(Body::new_static(
+            Shape::Box {
+                half: Vec3::new(5.0, 0.5, 5.0),
+                radius: 0.0,
+            },
+            pose(0.0, -0.5, 0.0),
+        ));
+        let h = w.add_body(Body::new_dynamic(shape, pose(0.0, 0.65, 0.0), 1.0));
+        for _ in 0..300 {
+            w.step(1.0 / 60.0);
+        }
+        let b = w.body(h);
+        (b.pose().pos.y, b.linvel())
+    };
+    let (box_y, _) = run(Shape::Box { half, radius: 0.0 });
+    let (hull_y, hull_v) = run(Shape::Hull {
+        data: maru_collide::HullData::new(corners),
+        radius: 0.0,
+    });
+    assert!(
+        (hull_y - box_y).abs() <= 0.005,
+        "hull이 박스와 다른 높이에 섰다: hull {hull_y} vs box {box_y}"
+    );
+    assert!(
+        hull_v.length() < 0.02,
+        "hull이 정지하지 않았다: vel {hull_v:?}"
+    );
+}
