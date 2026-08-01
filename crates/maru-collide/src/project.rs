@@ -227,13 +227,12 @@ fn project_convex_core(
     }
     match gjk(&point, &at, shape, &ident) {
         GjkResult::Separated { distance, on_b, .. } => {
-            if radius <= 0.0 {
-                // 두께가 없으면 코어가 곧 겉면이다 — 방향이 필요 없다.
-                return Ok(PointProjection {
-                    point: on_b,
-                    inside: distance <= 0.0,
-                });
-            }
+            // **반지름이 0이어도 같은 경로를 탄다.** 예전에는 "두께가 없으면 코어가 곧
+            // 겉면"이라며 GJK `on_b`를 그대로 돌려줬는데, 아래에서 보듯 GJK는 코어 안의
+            // 점에도 양의 거리를 준다 — 그러면 코어 **안쪽** 점을 겉면이라고 내놓는다
+            // (검수 rev_b16c028d BLOCKER). radius가 0이면 아래 식이 자연히
+            // `p + n·gap`(코어 표면)과 `on_b`(밖일 때)로 떨어진다.
+            //
             // **코어 AABB 밖이면 확실히 밖이다** — 전수 열거 없이 witness 방향을 쓴다.
             // (아래 지지 최소화는 C(m,3)·m이라 비싸다. 이 가지치기는 순수 비교라 안전하다.)
             let bb = shape.local_aabb();
@@ -302,7 +301,12 @@ fn project_convex_core(
 /// 투영은 밖"을 본다(검수 rev_230afeaf BLOCKER).
 ///
 /// AABB 밖은 즉시 거짓이라 비싼 전수 열거는 애매한 경우에만 돈다.
-pub(crate) fn core_contains(shape: &Shape, p: Vec3, distance: f32) -> bool {
+pub(crate) fn core_contains(
+    shape: &Shape,
+    p: Vec3,
+    distance: f32,
+    budget: &mut usize,
+) -> Result<bool, QueryReject> {
     let bb = shape.local_aabb();
     if p.x < bb.min.x
         || p.x > bb.max.x
@@ -311,15 +315,12 @@ pub(crate) fn core_contains(shape: &Shape, p: Vec3, distance: f32) -> bool {
         || p.z < bb.min.z
         || p.z > bb.max.z
     {
-        return false;
+        return Ok(false);
     }
-    // 예산은 한 셰이프에 넉넉하다(32점 hull 최악이 상한의 60% 남짓). 소진은 도달 불가지만
-    // 값으로 받아 **거짓으로 뭉개지 않는다** — 소진되면 GJK 답으로 되돌아간다.
-    let mut budget = MAX_PROJECT_WORK;
-    match core_exit(shape, p, &mut budget) {
-        Ok((_, gap)) => gap > 0.0 || distance == 0.0,
-        Err(_) => distance == 0.0,
-    }
+    // 예산은 **호출자가 들고 다닌다** — 물체마다 새로 주면 "질의점을 품는 hull 수천 개"인
+    // 월드가 한 번의 질의에서 수억 번 내적을 돈다. 소진은 거짓으로 뭉개지 않고 오류다.
+    let (_, gap) = core_exit(shape, p, budget)?;
+    Ok(gap > 0.0 || distance == 0.0)
 }
 
 /// 코어 **위/안**의 점 `q`에서 나가는 방향과, 그 방향으로 코어 표면까지의 여유.
@@ -1323,6 +1324,29 @@ mod tests {
         let p = v(999.999, 0.25, 0.0);
         // 전제: 이 점은 코어 안이다(모든 축에서 반크기 안).
         assert!(p.x.abs() <= h.x && p.y.abs() <= h.y && p.z.abs() <= h.z);
+        // **반지름 0 hull도 같은 계약이다** — 두께가 없다고 GJK 답을 그대로 쓰면
+        // 코어 안쪽 점을 겉면이라고 내놓는다(검수 rev_b16c028d BLOCKER).
+        {
+            let thin = Shape::Hull {
+                points: match &s {
+                    Shape::Hull { points, .. } => points.clone(),
+                    _ => unreachable!(),
+                },
+                radius: 0.0,
+            };
+            let pr0 = try_project_point(&thin, &ident(), p).unwrap();
+            assert!(pr0.inside, "radius 0: 코어 안인데 밖이라고 했다: {pr0:?}");
+            assert!(
+                pr0.point.x >= h.x - 1.0e-3,
+                "radius 0: 코어 표면이 아니라 안쪽 점을 돌려줬다: {:?}",
+                pr0.point
+            );
+            assert_eq!(
+                pr0.inside,
+                try_contains_point(&thin, &ident(), p).unwrap(),
+                "radius 0: 안팎이 갈렸다"
+            );
+        }
         let pr = try_project_point(&s, &ident(), p).unwrap();
         assert!(pr.inside, "코어 안인데 밖이라고 했다: {pr:?}");
         // 겉면은 코어 표면에서 radius만큼 밖이다. 가장 가까운 면은 +X(여유 0.001)이므로

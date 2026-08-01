@@ -851,3 +851,62 @@ fn removing_the_last_threshold_body_turns_the_feature_off() {
         "기능이 꺼졌는데 버퍼를 계속 쥐고 있다 (이전 {before})"
     );
 }
+
+/// **활성 장면은 접촉력 버퍼를 매 스텝 해제하면 안 된다.**
+///
+/// 반납 판정이 `len()`을 보면 항상 0이다 — 스텝 시작에 이미 비웠기 때문이다. 그러면
+/// 용량이 256을 넘는 장면이 매 스텝 해제하고 선점 블록에서 다시 잡아 "스텝 중 할당 0"
+/// 계약이 깨진다(검수 rev_b16c028d MAJOR). 밖에서는 용량만 보이는데 재할당 뒤에도 값이
+/// 같아 관측되지 않으므로 **반납 횟수**를 센다.
+#[test]
+fn active_force_scene_does_not_release_its_buffer_every_step() {
+    let params = WorldParams {
+        gravity: Vec3::new(0.0, -10.0, 0.0),
+        ..no_sleep_params()
+    };
+    let mut w = World::new(params);
+    w.add_body(
+        Body::new_static(
+            Shape::Box {
+                half: Vec3::new(60.0, 1.0, 60.0),
+                radius: 0.0,
+            },
+            pose(0.0, -1.0, 0.0),
+        )
+        .with_contact_force_threshold(0.1),
+    );
+    // 용량이 256을 넘어야 반납 기준(4×max(need,64))에 걸린다 — 20×20 격자.
+    for ix in 0..20 {
+        for iz in 0..20 {
+            w.add_body(Body::new_dynamic(
+                Shape::Box {
+                    half: Vec3::new(0.5, 0.5, 0.5),
+                    radius: 0.0,
+                },
+                pose(ix as f32 * 1.2 - 12.0, 0.6, iz as f32 * 1.2 - 12.0),
+                1.0,
+            ));
+        }
+    }
+    for _ in 0..90 {
+        w.step(DT);
+    }
+    assert!(
+        w.contact_force_events_capacity() > 256,
+        "전제: 용량이 반납 기준을 넘는다 ({})",
+        w.contact_force_events_capacity()
+    );
+    assert!(
+        !w.contact_force_events().is_empty(),
+        "전제: 힘 이벤트가 실제로 난다"
+    );
+    let before = w.contact_force_events_released();
+    for _ in 0..30 {
+        w.step(DT);
+    }
+    assert_eq!(
+        w.contact_force_events_released(),
+        before,
+        "정착한 활성 장면인데 버퍼를 계속 해제하고 있다"
+    );
+}

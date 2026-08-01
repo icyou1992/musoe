@@ -1407,3 +1407,49 @@ fn project_point_saturation_without_proof_is_an_error() {
         "증명 없이 답을 냈다"
     );
 }
+
+/// `query_point`도 **질의 하나 전체**가 예산을 공유해야 한다 — hull 포함 판정이 지지 함수를
+/// 전수로 돌 수 있어서, 물체마다 새 예산을 주면 한 번의 동기 질의가 프레임을 삼킨다
+/// (검수 rev_b16c028d MAJOR).
+#[test]
+fn query_point_shares_one_work_budget() {
+    let mut pts = Vec::new();
+    let mut rng = 8080u32;
+    let mut next = || {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) as f32 / (1u32 << 24) as f32
+    };
+    while pts.len() < 32 {
+        let d = Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5);
+        if let Some(u) = d.try_normalize() {
+            pts.push(u);
+        }
+    }
+    let hull = maru_collide::Shape::Hull {
+        points: pts,
+        radius: 0.05,
+    };
+    let at_origin = maru_collide::Pose {
+        pos: Vec3::ZERO,
+        rot: maru_math::Quat::IDENTITY,
+    };
+    // 질의점을 **품는** hull 여럿 — 매번 지지 함수 전수를 돈다.
+    let mut w = World::new(WorldParams::default());
+    for _ in 0..64 {
+        w.add_body(Body::new_dynamic(hull.clone(), at_origin, 1.0));
+    }
+    let mut out = Vec::new();
+    assert!(
+        matches!(
+            w.query_point(Vec3::ZERO, &mut out),
+            Err(ApiError::ResourceLimit)
+        ),
+        "예산이 공유되지 않아 무한히 돌았다"
+    );
+
+    // 적은 수는 정상 통과해야 한다 — 예산이 너무 빡빡하면 안 된다.
+    let mut w2 = World::new(WorldParams::default());
+    w2.add_body(Body::new_dynamic(hull.clone(), at_origin, 1.0));
+    w2.query_point(Vec3::ZERO, &mut out).expect("한 개는 통과");
+    assert_eq!(out.len(), 1);
+}

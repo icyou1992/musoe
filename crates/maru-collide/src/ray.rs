@@ -79,6 +79,22 @@ pub fn try_cast_ray(
 
 /// 공개 점 포함 판정 — `try_cast_ray`와 같은 검증 규약.
 pub fn try_contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> Result<bool, QueryReject> {
+    let mut work = crate::MAX_PROJECT_WORK;
+    try_contains_point_with_budget(shape, pose, p, &mut work)
+}
+
+/// **작업 예산을 공유하는** 포함 판정 — 여러 물체를 훑는 호출자용.
+///
+/// hull 포함 판정은 GJK를 믿을 수 없어 지지 함수를 전수로 돌 수 있다(`project::core_contains`).
+/// 물체마다 새 예산을 주면 "질의점을 품는 hull 수천 개"인 월드가 한 번의 동기 질의에서
+/// 수억 번 내적을 돈다(검수 rev_b16c028d MAJOR). `try_project_point_with_budget`과
+/// 같은 계약이다: 소진되면 답을 지어내지 않고 `ResourceLimit`.
+pub fn try_contains_point_with_budget(
+    shape: &Shape,
+    pose: &Pose,
+    p: Vec3,
+    budget: &mut usize,
+) -> Result<bool, QueryReject> {
     if !shape.is_castable() || !crate::vec_in_range(p) || !crate::vec_in_range(pose.pos) {
         return Err(QueryReject::InvalidInput);
     }
@@ -86,7 +102,7 @@ pub fn try_contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> Result<bool, Q
         pos: pose.pos,
         rot: pose.rot.try_normalize().ok_or(QueryReject::InvalidInput)?,
     };
-    Ok(contains_point(shape, &pose, p))
+    contains_point(shape, &pose, p, budget)
 }
 
 /// **검증된 입력 전용**(크레이트 내부·월드 경계 통과분). 공개 진입은 `try_cast_ray`다 —
@@ -206,10 +222,15 @@ pub(crate) fn cast_ray(
 
 /// 점이 셰이프 안에 있는가 (겉면 기준 — convex radius 포함).
 /// **검증된 입력 전용** — 공개 진입은 `try_contains_point`다.
-pub(crate) fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
+pub(crate) fn contains_point(
+    shape: &Shape,
+    pose: &Pose,
+    p: Vec3,
+    budget: &mut usize,
+) -> Result<bool, QueryReject> {
     let local = pose.rot.conjugate().rotate(p - pose.pos);
     let r = shape.radius();
-    match *shape {
+    Ok(match *shape {
         Shape::Sphere { radius } => local.length_sq() <= radius * radius,
         Shape::Capsule {
             half_height,
@@ -246,7 +267,7 @@ pub(crate) fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
             // 밖이라고 한다. `project`와 **같은 판정**을 써서 두 질의가 갈리지 않게 한다
             // (검수 rev_230afeaf BLOCKER).
             let d = closest_core_dist(shape, local).0;
-            crate::project::core_contains(shape, local, d) || d <= r
+            crate::project::core_contains(shape, local, d, budget)? || d <= r
         }
         // 삼각형은 부피가 없다 — radius가 있을 때만 코어까지 거리로 판정(hull과 같은 경로).
         Shape::Triangle { .. } => r > 0.0 && closest_core_dist(shape, local).0 <= r,
@@ -269,16 +290,21 @@ pub(crate) fn contains_point(shape: &Shape, pose: &Pose, p: Vec3) -> bool {
                 None => false,
             }
         }
-        // 복합: 어느 자식이든 포함하면 포함.
-        Shape::Compound { ref children } => children.iter().any(|(cp, child)| {
-            let world_child = Pose {
-                pos: pose.pos + pose.rot.rotate(cp.pos),
-                // 자식 회전 정규화 — 근거는 `cast.rs`의 compose 주석에.
-                rot: pose.rot * cp.rot.normalize(),
-            };
-            contains_point(child, &world_child, p)
-        }),
-    }
+        // 복합: 어느 자식이든 포함하면 포함. 예산은 자식 사이에서 **공유**한다.
+        Shape::Compound { ref children } => {
+            for (cp, child) in children {
+                let world_child = Pose {
+                    pos: pose.pos + pose.rot.rotate(cp.pos),
+                    // 자식 회전 정규화 — 근거는 `cast.rs`의 compose 주석에.
+                    rot: pose.rot * cp.rot.normalize(),
+                };
+                if contains_point(child, &world_child, p, budget)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+    })
 }
 
 // ---------- 셰이프별 해석해 (로컬 좌표) ----------
@@ -758,10 +784,11 @@ mod tests {
             half: Vec3::new(1.0, 2.0, 3.0),
             radius: 0.0,
         };
-        assert!(contains_point(&s, &ident(), Vec3::new(0.9, 1.9, 2.9)));
-        assert!(!contains_point(&s, &ident(), Vec3::new(1.1, 0.0, 0.0)));
+        let mut w = usize::MAX;
+        assert!(contains_point(&s, &ident(), Vec3::new(0.9, 1.9, 2.9), &mut w).unwrap());
+        assert!(!contains_point(&s, &ident(), Vec3::new(1.1, 0.0, 0.0), &mut w).unwrap());
         let sp = Shape::Sphere { radius: 1.0 };
-        assert!(contains_point(&sp, &ident(), Vec3::new(0.5, 0.5, 0.5)));
-        assert!(!contains_point(&sp, &ident(), Vec3::new(0.7, 0.7, 0.7)));
+        assert!(contains_point(&sp, &ident(), Vec3::new(0.5, 0.5, 0.5), &mut w).unwrap());
+        assert!(!contains_point(&sp, &ident(), Vec3::new(0.7, 0.7, 0.7), &mut w).unwrap());
     }
 }

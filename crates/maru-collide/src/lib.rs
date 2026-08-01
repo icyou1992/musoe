@@ -67,7 +67,9 @@ pub use trimesh::{TriMeshData, MAX_TRIMESH_TRIS, MAX_TRIMESH_VERTS};
 pub use project::{
     try_project_point, try_project_point_with_budget, PointProjection, MAX_PROJECT_WORK,
 };
-pub use ray::{try_cast_ray, try_contains_point, QueryReject, RayCast};
+pub use ray::{
+    try_cast_ray, try_contains_point, try_contains_point_with_budget, QueryReject, RayCast,
+};
 pub use shape::{transformed_aabb, Shape, ShapeReject, MAX_COMPOUND_CHILDREN};
 pub use tolerance::{
     area_eps, bary_denom_eps, characteristic_length, length_eps, length_sq_eps, min_feature_size,

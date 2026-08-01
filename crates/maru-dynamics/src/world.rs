@@ -457,6 +457,16 @@ pub struct World {
     contact_events: Vec<ContactEvent>,
     /// 이번 스텝의 접촉력 이벤트. 임계를 켠 물체가 하나도 없으면 항상 비어 있다.
     contact_force_events: Vec<ContactForceEvent>,
+    /// 직전 스텝의 접촉력 이벤트 수 — 스텝 시작에 비우기 **전** 값이다.
+    /// 반납 판정이 `len()`을 쓰면 항상 0이라 매 스텝 해제·재할당이 난다.
+    force_events_prev_len: usize,
+    /// 접촉력 출력 버퍼를 **반납한 횟수**(테스트 관측용).
+    ///
+    /// 정상 상태의 활성 장면에서는 0이어야 한다 — 1 이상이면 스텝마다 해제하고 다시
+    /// 잡는다는 뜻이고, 그건 "스텝 중 할당 0" 계약을 깬다. 밖에서는 용량만 보이는데
+    /// 용량은 재할당 뒤에도 같은 값이라 **이 카운터 없이는 관측되지 않는다**.
+    #[cfg(test)]
+    force_events_released: usize,
     /// 이벤트 방출 진입 시점의 `contact_events` 용량 (테스트 관측용).
     #[cfg(test)]
     ev_cap_at_emit: usize,
@@ -763,6 +773,9 @@ impl World {
             damping: Vec::new(),
             contact_events: Vec::new(),
             contact_force_events: Vec::new(),
+            force_events_prev_len: 0,
+            #[cfg(test)]
+            force_events_released: 0,
             #[cfg(test)]
             ev_cap_at_emit: 0,
             ccd_hits: Vec::new(),
@@ -1805,6 +1818,11 @@ impl World {
         if out.try_reserve(self.bodies.len()).is_err() {
             return Err(ApiError::ResourceLimit);
         }
+        // 작업 예산은 **질의 하나 전체**가 공유한다 — hull 포함 판정은 GJK를 믿을 수 없어
+        // 지지 함수를 전수로 돌 수 있고, 물체마다 새 예산을 주면 "질의점을 품는 hull이
+        // 수천 개"인 월드가 한 번의 동기 질의에서 수억 번 내적을 돈다
+        // (검수 rev_b16c028d MAJOR — `project_point`와 같은 계약이다).
+        let mut budget = maru_collide::MAX_PROJECT_WORK;
         for i in 0..self.bodies.len() {
             if !self.passes(i, filter) {
                 continue;
@@ -1813,9 +1831,14 @@ impl World {
             // 월드 바디의 형상·자세는 삽입·복원 경계에서 검증됐으므로 `try_` 오류는
             // 도달 불가다. 그래도 값으로 받아 **미스로 뭉개지 않는다** — 언젠가 경계가
             // 갈리면 "점이 안 들어 있다"가 아니라 오류로 드러나야 한다.
-            if maru_collide::try_contains_point(&b.shape, &b.pose, p)
-                .map_err(|_| ApiError::InvalidValue)?
-            {
+            // 예산 소진은 "안 들어 있다"로 뭉개지 않는다 — 못 본 물체가 품고 있을 수 있다.
+            let hit =
+                maru_collide::try_contains_point_with_budget(&b.shape, &b.pose, p, &mut budget)
+                    .map_err(|e| match e {
+                        maru_collide::QueryReject::ResourceLimit => ApiError::ResourceLimit,
+                        maru_collide::QueryReject::InvalidInput => ApiError::InvalidValue,
+                    })?;
+            if hit {
                 out.push(self.handle_of(i));
             }
         }
@@ -2035,6 +2058,12 @@ impl World {
             .values()
             .map(|v| (v.len(), v.capacity()))
             .max_by_key(|(l, c)| c.saturating_sub(*l))
+    }
+
+    /// 접촉력 출력 버퍼를 반납한 누적 횟수 (테스트 관측용).
+    #[cfg(test)]
+    pub fn contact_force_events_released(&self) -> usize {
+        self.force_events_released
     }
 
     /// 접촉력 이벤트 출력 버퍼의 현재 보유 용량.
@@ -2530,9 +2559,20 @@ impl World {
         let force_on = (0..self.bodies.len())
             .any(|i| self.alive[i] && self.bodies[i].contact_force_threshold.is_finite());
         if !force_on {
+            #[cfg(test)]
+            if self.contact_force_events.capacity() > 0 {
+                self.force_events_released += 1;
+            }
             self.contact_force_events = Vec::new();
         } else {
-            let need = self.contact_force_events.len();
+            // **`len()`을 쓰면 안 된다** — `step_inner`가 스텝 시작에 이 벡터를 비운 뒤
+            // 여기를 부르므로 항상 0이고, 그러면 용량 256 초과인 활성 장면이 매 스텝
+            // 해제·재할당을 반복한다(검수 rev_b16c028d MAJOR). 비우기 **전** 길이를 쓴다.
+            let need = self.force_events_prev_len;
+            #[cfg(test)]
+            if bloated(self.contact_force_events.capacity(), need) {
+                self.force_events_released += 1;
+            }
             trim!(self.contact_force_events, need);
         }
         // 블록·참여자 버퍼는 이 시점에 목표를 모른다 — 직전 스텝 사용량(len)을 근사로 쓴다.
@@ -3032,6 +3072,7 @@ impl World {
     fn step_inner(&mut self, dt: f32) {
         // 이벤트는 **스텝 단위 출력**이다 — 매 스텝 비운다.
         self.contact_events.clear();
+        self.force_events_prev_len = self.contact_force_events.len();
         self.contact_force_events.clear();
         self.ccd_hits.clear();
         // 자원 초과 플래그는 **매 스텝 초기화**한다(리뷰 BLOCKER): 생성·복원에서만 지우면
