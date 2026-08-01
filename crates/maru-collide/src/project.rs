@@ -74,7 +74,12 @@ pub(crate) fn project_local(shape: &Shape, p: Vec3) -> Result<PointProjection, Q
         Shape::Box { half, radius } => Ok(project_box(half, radius, p)),
         Shape::Triangle { points, radius } => {
             let q = closest_on_triangle(p, points);
-            let mut proj = inflate(q, p, radius, triangle_normal(points));
+            // fallback은 **아핀 여공간**이다 — 면적이 0이면 삼각형 법선이 0이라 고정축으로
+            // 마감되는데, 그 축이 퇴화한 선분과 나란할 수 있다(검수 rev_ef5d1868 MAJOR:
+            // (-1,0,0)·(1,0,0)·(0,0,0)에 radius 0.1, 원점 질의가 (0.1,0,0)을 냈다 —
+            // 여전히 코어 선분 안이다). 세 점의 아핀 랭크는 2 이하라 항상 여공간이 있다.
+            let fallback = affine_complement_dir(&points).unwrap_or(TIE_X);
+            let mut proj = inflate(q, p, radius, fallback);
             // 삼각형은 **부피가 없다** — radius가 0이면 어떤 점도 안이 아니다
             // (`contains_point`의 삼각형 분기와 같은 계약).
             proj.inside &= radius > 0.0;
@@ -190,30 +195,89 @@ fn project_convex_core(shape: &Shape, p: Vec3, radius: f32) -> PointProjection {
             let v = p - on_b;
             let l = v.length();
             let eps = crate::length_eps(crate::characteristic_length(shape, shape));
-            let dir = if l > eps {
-                v * (1.0 / l)
-            } else {
-                core_exit_dir(shape, p)
-            };
+            if l > eps {
+                return PointProjection {
+                    point: on_b + v * (radius / l),
+                    inside,
+                };
+            }
+            // 코어 **위/안**이라 방향이 없다 — 지지 함수로 이탈 방향과 여유를 구한다.
+            let (n, gap) = core_exit(shape, p);
             PointProjection {
-                point: on_b + dir * radius,
+                point: p + n * (gap + radius),
                 inside,
             }
         }
-        GjkResult::Intersecting(seed) => {
-            let pen = crate::epa::epa(seed, &point, &at, shape, &ident);
-            // `pen.normal`은 A(점)를 밀어 분리하는 방향 = 코어에서 나가는 방향.
-            // 퇴화 시드에서 0이 나오면 계약(겉면 위 점)을 지키기 위해 결정적 축을 쓴다.
-            let n = if pen.normal.length_sq() > 0.0 {
-                pen.normal
-            } else {
-                TIE_X
-            };
+        GjkResult::Intersecting(_) => {
+            // 코어 안이다. **EPA를 쓰지 않는다** — EPA는 GJK가 부피 있는 사면체 시드를
+            // 만들 수 있을 때만 돌고, 그 판정은 최대 에지 길이에 **상대적**이라 얇고 긴
+            // 코어(예: 반크기 (1000, 0.002, 0.002))에서는 전체 차원인데도 시드를 못 만든다.
+            // 지지 함수 경로는 그 문턱이 없다.
+            let (n, gap) = core_exit(shape, p);
             PointProjection {
-                point: pen.on_b + n * radius,
+                point: p + n * (gap + radius),
                 inside: true,
             }
         }
+    }
+}
+
+/// 코어 **위/안**의 점 `q`에서 나가는 방향과, 그 방향으로 코어 표면까지의 여유.
+///
+/// 겉면 위 점은 `q + dir * (gap + radius)`다.
+///
+/// 왜 GJK/EPA를 쓰지 않나: 둘 다 **상대 임계**에 걸린다. 코어가 평면·선이면 법선이
+/// 코어 안 방향으로 나오고(검수 rev_6429a223), 전체 차원이어도 종횡비가 크면 EPA 시드
+/// 조건(`부피 > 1e-6·최대에지³`)을 못 넘겨 관통 경로 자체가 안 열린다(rev_ef5d1868).
+/// 두 실패 모두 "그럴듯하게 틀린" 값이라 0-검사로는 안 걸린다.
+///
+/// 대신 **지지 함수**로 푼다. 볼록체 안의 점에서 표면까지의 거리는
+/// `min_n ( max_p n·(p − q) )` 이고, 최솟값을 주는 `n`이 곧 가장 가까운 면의 바깥 법선이다.
+/// 임의의 `n`에 대해 `max_p n·(p − q)`는 그 방향 지지 평면까지의 거리이므로 **항상 답 이상**
+/// 이다 — 후보에 진짜 면 법선만 들어 있으면 최솟값이 정확한 답이 된다. 그리고 볼록 껍질의
+/// 모든 면은 껍질 점 3개가 이룬다. 임계도 분기도 없다.
+///
+/// 비용은 점 수의 4제곱(`C(m,3)·m`)이지만 상한이 32개로 잠겨 있고, 이 경로는 질의점이
+/// 코어 **안**일 때만 돈다(밖이면 위치 차이가 방향을 준다).
+fn core_exit(shape: &Shape, q: Vec3) -> (Vec3, f32) {
+    let Shape::Hull { ref points, .. } = *shape else {
+        // 다른 셰이프는 해석 경로가 따로 있어 여기 오지 않는다.
+        return (TIE_X, 0.0);
+    };
+    // 코어가 저차원이면 표면까지 여유가 0이고, 방향은 아핀 껍질의 직교 여공간이다
+    // (그쪽으로는 지지 평면이 무한히 많아 위 최소화가 방향을 못 고른다).
+    if let Some(d) = affine_complement_dir(points) {
+        return (d, 0.0);
+    }
+    let mut best: Option<(f32, Vec3)> = None;
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            for k in (j + 1)..points.len() {
+                let Some(n) = (points[j] - points[i])
+                    .cross(points[k] - points[i])
+                    .try_normalize()
+                else {
+                    continue; // 세 점이 한 직선 위 — 면을 이루지 못한다
+                };
+                for cand in [n, n * -1.0] {
+                    // `p − q`를 먼저 빼서 지지 거리를 한 번의 반올림으로 만든다.
+                    let mut h = f32::NEG_INFINITY;
+                    for pt in points {
+                        h = h.max(cand.dot(*pt - q));
+                    }
+                    // 동률은 먼저 본 후보가 이긴다 — 순회가 결정적이므로 답도 결정적이다.
+                    if h.is_finite() && best.is_none_or(|(bh, _)| h < bh) {
+                        best = Some((h, cand));
+                    }
+                }
+            }
+        }
+    }
+    match best {
+        // 여유는 음수가 될 수 없다(볼록체 안의 점) — 반올림이 만든 음수는 0으로 본다.
+        Some((h, n)) => (n, h.max(0.0)),
+        // 도달 불가(전체 차원인데 면이 하나도 안 나올 수 없다) — 계약을 지켜 결정적 축.
+        None => (TIE_X, 0.0),
     }
 }
 
@@ -223,39 +287,6 @@ fn project_convex_core(shape: &Shape, p: Vec3, radius: f32) -> PointProjection {
 /// 3차원이면 여공간이 없다 — 그건 점이 코어 **경계 위**에 정확히 놓인 경우이므로
 /// (안쪽이었다면 GJK가 교차를 줬다) 중심 쪽으로 아주 조금 당겨 교차 상태를 만들고
 /// EPA에 최소 이탈 방향을 묻는다.
-fn core_exit_dir(shape: &Shape, p: Vec3) -> Vec3 {
-    let Shape::Hull { ref points, .. } = *shape else {
-        // 다른 셰이프는 해석 경로가 따로 있어 여기 오지 않는다.
-        return TIE_X;
-    };
-    if let Some(d) = affine_complement_dir(points) {
-        return d;
-    }
-    // 3차원 코어 — 중심은 반드시 내부다(전체 차원이므로).
-    let mut c = Vec3::ZERO;
-    for q in points {
-        c += *q;
-    }
-    let c = c * (1.0 / points.len().max(1) as f32);
-    let at = Pose {
-        pos: p + (c - p) * 1.0e-3,
-        rot: Quat::IDENTITY,
-    };
-    let ident = Pose {
-        pos: Vec3::ZERO,
-        rot: Quat::IDENTITY,
-    };
-    let probe = Shape::Sphere { radius: 0.0 };
-    match gjk(&probe, &at, shape, &ident) {
-        GjkResult::Intersecting(seed) => {
-            let pen = crate::epa::epa(seed, &probe, &at, shape, &ident);
-            pen.normal.try_normalize().unwrap_or(TIE_X)
-        }
-        // 도달 불가(중심이 내부인데 분리가 나올 수 없다) — 계약을 지키려 결정적 축.
-        GjkResult::Separated { .. } => TIE_X,
-    }
-}
-
 /// 점 집합의 아핀 껍질이 3차원보다 낮으면 그 **직교 여공간**의 단위 벡터, 아니면 `None`.
 ///
 /// 임계는 점 집합의 지름에 상대적이다 — 절대 상수는 장면 스케일에서 깨진다(설계 §8).
@@ -474,18 +505,6 @@ fn project_heightfield(
     // 반지름 근방 판정이 아니라 높이 비교가 답이다.
     proj.inside = hf.height_at(p.x, p.z).is_some_and(|h| p.y <= h);
     Ok(proj)
-}
-
-/// 삼각형의 단위 법선 — 퇴화(면적 0)면 결정적 축.
-#[inline]
-fn triangle_normal(tri: [Vec3; 3]) -> Vec3 {
-    let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
-    let l2 = n.length_sq();
-    if l2 > 0.0 {
-        n * (1.0 / l2.sqrt())
-    } else {
-        TIE_X
-    }
 }
 
 /// 점 → 삼각형 최근접점 (보로노이 영역 분해).
@@ -1064,6 +1083,70 @@ mod tests {
             "{:?}",
             pr.point
         );
+    }
+
+    /// **전체 차원이지만 얇고 긴 코어**: EPA 시드 조건(`부피 > 1e-6·최대에지³`)이
+    /// 최대 에지에 상대적이라, 종횡비가 크면 관통 경로가 아예 안 열린다. 지지 함수
+    /// 경로는 그 문턱이 없어야 한다(검수 rev_ef5d1868 BLOCKER).
+    #[test]
+    fn sliver_hull_exits_through_the_thin_axis() {
+        let h = v(1000.0, 0.002, 0.002);
+        let mut pts = Vec::new();
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    pts.push(v(h.x * sx, h.y * sy, h.z * sz));
+                }
+            }
+        }
+        let s = Shape::Hull {
+            points: pts,
+            radius: 0.1,
+        };
+        assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
+        let pr = try_project_point(&s, &ident(), Vec3::ZERO).unwrap();
+        assert!(pr.inside);
+        // 얇은 축(±Y·±Z)으로 나가야 한다 — 긴 축으로 나가면 코어 안에 그대로 남는다.
+        assert!(
+            pr.point.x.abs() < 1.0e-4,
+            "긴 축으로 나갔다(코어 안에 남는다): {:?}",
+            pr.point
+        );
+        let d = pr.point.length();
+        assert!(
+            (d - 0.102).abs() < 1.0e-4,
+            "겉면까지 거리가 반두께+radius가 아니다: {d}"
+        );
+    }
+
+    /// 면적 0 삼각형(사실상 선분)도 `is_castable`을 통과한다 — fallback이 코어와
+    /// **나란한** 축이면 반환점이 코어 안에 남는다(검수 rev_ef5d1868 MAJOR).
+    #[test]
+    fn degenerate_triangle_exits_perpendicular_to_its_core() {
+        let s = Shape::Triangle {
+            points: [v(-1.0, 0.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 0.0)],
+            radius: 0.1,
+        };
+        assert!(
+            s.is_castable_pub_for_test(),
+            "질의 입력으로 수용된다는 전제"
+        );
+        for q in [Vec3::ZERO, v(0.5, 0.0, 0.0), v(-1.0, 0.0, 0.0)] {
+            let pr = try_project_point(&s, &ident(), q).unwrap();
+            let d = pr.point - q;
+            assert!(
+                (d.length() - 0.1).abs() < 1.0e-5,
+                "겉면까지 거리가 radius가 아니다: {} (q={q:?})",
+                d.length()
+            );
+            assert!(
+                d.x.abs() < 1.0e-5,
+                "코어 선분과 나란한 방향으로 나갔다: {d:?} (q={q:?})"
+            );
+            // 겉면 위 점이므로 재투영이 제자리여야 한다.
+            let again = try_project_point(&s, &ident(), pr.point).unwrap();
+            assert!((again.point - pr.point).length() < 1.0e-5, "q={q:?}");
+        }
     }
 
     /// 복합 자식 회전은 **다른 질의와 같은 정규화**를 거쳐야 한다 — 검증이 허용하는
