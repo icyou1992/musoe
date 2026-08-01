@@ -983,3 +983,44 @@ fn weld_mask_roundtrips_and_is_rejected_off_terrain() {
     bad.weld_edges = 1;
     assert!(bad.validate().is_err(), "4점 hull에 용접 마스크가 허용됨");
 }
+
+/// **hull 면 구조의 힙도 디코딩 예산에 든다** — 다만 과금이 **과하면** 안 된다.
+///
+/// `HullData::new`가 복원에서 최대 `2n−4`개 면을 infallible하게 잡는다. 그 힙이 장부 밖이면
+/// 장부상 한도 안인 스냅샷이 실제로는 allocator abort로 끝난다(검수 rev_8eacf4a5 BLOCKER).
+/// 그래서 만들기 전에 최악 크기를 신고한다.
+///
+/// **장부 초과를 실제로 유발하는 테스트는 넣지 않았다**: 32점 hull 하나의 면 힙이 4,320B라
+/// 192 MiB 장부를 넘기려면 hull이 약 44,000개 필요하고, 그건 스위트에 넣기엔 너무 무겁다.
+/// 대신 여기서는 **반대 방향**을 잠근다 — 과금이 잘못 스케일되면(예: 1000배) 평범한
+/// hull 스냅샷이 거절되는데, 그건 싸게 관측된다.
+#[test]
+fn hull_face_charge_does_not_reject_ordinary_snapshots() {
+    let mut pts = Vec::new();
+    let mut rng = 99u32;
+    let mut next = || {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+    };
+    while pts.len() < 32 {
+        if let Some(u) = Vec3::new(next(), next(), next()).try_normalize() {
+            pts.push(u);
+        }
+    }
+    let hull = maru_collide::Shape::Hull {
+        data: maru_collide::HullData::new(pts),
+        radius: 0.0,
+    };
+    let mut w = World::new(WorldParams::default());
+    for k in 0..500 {
+        w.add_body(Body::new_dynamic(
+            hull.clone(),
+            pose((k % 50) as f32 * 3.0, (k / 50) as f32 * 3.0, 0.0),
+            1.0,
+        ));
+    }
+    let snap = w.snapshot();
+    let mut w2 = World::new(WorldParams::default());
+    w2.restore(&snap).expect("평범한 hull 스냅샷이 거절됐다");
+    assert_eq!(w.state_hash(), w2.state_hash());
+}

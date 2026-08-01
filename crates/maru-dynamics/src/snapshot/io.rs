@@ -298,6 +298,23 @@ impl Reader<'_> {
     }
     /// **입력 길이에서 유도한 상한**으로 개수를 검증한다(고정 상수 금지 — 리뷰 BLOCKER).
     /// n개를 담으려면 최소 `n * min_each` 바이트가 남아 있어야 한다.
+    /// **파생물 힙을 명시적으로 과금한다.**
+    ///
+    /// `count`는 "원소 수 × 원소 크기"만 센다. 복원이 원소에서 **파생물**을 만들면
+    /// (hull의 면 구조·메시의 BVH 같은 것) 그 힙은 장부 밖이라, 장부상 한도 안인 스냅샷이
+    /// 실제로는 수백 MiB를 잡고 allocator abort로 끝날 수 있다(검수 rev_8eacf4a5 BLOCKER).
+    /// 파생물을 만드는 자리는 만들기 **전에** 최악 크기를 여기로 신고한다.
+    pub(crate) fn charge_decoded(&mut self, bytes: usize) -> Result<(), SnapshotError> {
+        self.decoded = self
+            .decoded
+            .checked_add(bytes)
+            .ok_or(SnapshotError::CountTooLarge)?;
+        if self.decoded > MAX_DECODED_BYTES {
+            return Err(SnapshotError::CountTooLarge);
+        }
+        Ok(())
+    }
+
     pub(crate) fn count(
         &mut self,
         min_each: usize,

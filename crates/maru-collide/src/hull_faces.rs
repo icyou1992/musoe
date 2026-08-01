@@ -159,15 +159,29 @@ impl HullFaces {
                     // 두 방향 모두 후보다: 어느 쪽이 바깥인지는 나머지 점이 정한다.
                     for cand in [nrm, nrm * -1.0] {
                         Self::insert_face(&mut faces, points, cand, cand.dot(points[i]), eps);
-                        // **면 수 상한**(오일러: 2m−4). 넘으면 입력이 볼록 껍질 정점 집합이
-                        // 아니라는 뜻이므로 통째로 포기한다 — 가짜 면 수십 개를 들고
-                        // 클리핑에 넘기느니 witness 경로로 가는 편이 안전하다.
-                        if faces.len() > 2 * n - 4 {
+                        // **메모리 상한**은 절대 최댓값으로 잡는다(입력 상한 32점 → 60면).
+                        // 진짜 판정(아래 오일러 검사)은 순회가 끝난 뒤에 한다 — 도중에 하면
+                        // "아직 정점을 다 안 본" 초기 상태에서 잘못 발화한다.
+                        if faces.len() > 2 * MAX_HULL_POINTS - 4 {
                             return Self::default();
                         }
                     }
                 }
             }
+        }
+        // **오일러 상한 판정은 실제 정점 수 기준이다.** 입력 길이를 쓰면 내부점 패딩으로
+        // 상한이 부풀어 가짜 면이 통과한다 — 8극점 + 내부점 24개인 합법 32점 hull에서
+        // 상한이 12가 아니라 60이 되어 33개 가짜 면이 살아남는다(검수 rev_8eacf4a5 BLOCKER).
+        // 경계 링에 실제로 쓰인 정점만 센다(내부점은 2D 껍질이 이미 걸렀다).
+        let mut used = [false; MAX_HULL_POINTS];
+        for face in &faces {
+            for idx in &face.verts {
+                used[*idx as usize] = true;
+            }
+        }
+        let extreme = used.iter().filter(|u| **u).count();
+        if extreme < 4 || faces.len() > 2 * extreme - 4 {
+            return Self::default();
         }
         // 면 순서를 **입력만의 함수**로 고정한다. 삼중조합 순회 순서가 이미 결정적이지만,
         // 정렬을 명시해 두면 나중에 순회를 바꿔도 id가 안 흔들린다(feature 계보가 이 id다).
@@ -662,6 +676,33 @@ mod tests {
                         "면이 hull을 가로지른다: 점 {p:?}이 {face:?} 바깥"
                     );
                 }
+            }
+        }
+    }
+
+    /// **내부점이 섞여도 정상 hull은 정확히 잡혀야 한다** — 오일러 상한을 실제 극점 수로
+    /// 재기 때문에, 그 계산이 내부점을 세면 상한이 부풀고(가짜 면 통과) 반대로 너무 좁으면
+    /// 정상 hull을 거절한다. 여기서 잠그는 것은 **거절하지 않는다** 쪽이다.
+    ///
+    /// 병리 입력(거의 평면인 링 + 내부점)은 실측 390면이라 절대 메모리 상한(60)에서 이미
+    /// 걸린다 — 그 경로는 `nearly_planar_ring_does_not_explode_into_fake_faces`가 잠근다.
+    #[test]
+    fn interior_padding_does_not_break_a_valid_hull() {
+        let mut pts = box_points(1.0, 1.0, 1.0);
+        // 중심과 각 꼭짓점의 볼록 조합 — 정의상 hull 안이고 경계에 안 나온다.
+        for t in [0.3f32, 0.6] {
+            for k in 0..8 {
+                pts.push(pts[k] * t);
+            }
+        }
+        assert_eq!(pts.len(), 24);
+        let f = HullFaces::build(&pts);
+        assert_eq!(f.len(), 6, "내부점 때문에 면이 달라졌다: {}", f.len());
+        for face in f.faces() {
+            assert_eq!(face.verts.len(), 4, "내부점이 경계에 끼었다: {face:?}");
+            // 그리고 쓰인 정점은 전부 원래 꼭짓점(인덱스 0..8)이어야 한다.
+            for idx in &face.verts {
+                assert!(*idx < 8, "내부점이 면 정점이 됐다: {idx}");
             }
         }
     }
