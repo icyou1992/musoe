@@ -249,11 +249,12 @@ fn clip_segment(rverts: &[Vec3], rn: Vec3, p0: Vec3, p1: Vec3) -> Option<[GenVer
     let (mut t_lo, mut t_hi) = (0.0f32, 1.0f32);
     // 각 끝을 무엇이 잘랐나. `None`이면 원래 끝점 그대로다.
     let (mut lo_side, mut hi_side): (Option<u8>, Option<u8>) = (None, None);
-    // **같은 t를 만든 두 번째 측면** — 선분이 참조면 코너를 정확히 통과하면 인접한 두
-    // 측면이 같은 t를 낸다. 먼저 순회한 쪽만 기록하면, 1 ulp 다른 자세에서 어느 t가
-    // 조금 더 큰지가 뒤집히며 `EdgeCross { b: s }`가 `b: s+1`로 바뀐다 — 위치는 사실상
-    // 같은데 ID만 흔들려 warm start가 매 프레임 끊긴다(검수 rev_7992e5a3 MAJOR).
-    let (mut lo_tie, mut hi_tie): (Option<u8>, Option<u8>) = (None, None);
+    // 코너 판정용 길이 척도 — 참조면 크기에 상대적이어야 한다(절대 상수는 장면 스케일에서 깨진다).
+    let mut span = 0.0f32;
+    for v in rverts {
+        span = span.max((*v - rverts[0]).length());
+    }
+    let corner_eps = crate::tolerance::length_eps(span);
 
     for side in 0..k {
         let e0 = rverts[side];
@@ -277,46 +278,50 @@ fn clip_segment(rverts: &[Vec3], rn: Vec3, p0: Vec3, p1: Vec3) -> Option<[GenVer
             if t > t_lo {
                 t_lo = t;
                 lo_side = Some(side as u8);
-                lo_tie = None;
-            } else if t == t_lo && lo_side.is_some() {
-                lo_tie = Some(side as u8);
             }
         } else if t < t_hi {
             t_hi = t;
             hi_side = Some(side as u8);
-            hi_tie = None;
-        } else if t == t_hi && hi_side.is_some() {
-            hi_tie = Some(side as u8);
         }
         if t_lo > t_hi {
             return None;
         }
     }
 
-    let make = |t: f32, cut: Option<u8>, tie: Option<u8>, end: u8| {
-        let (kind, a, b) = match (cut, tie) {
-            // 두 측면이 같은 t를 냈다 = 코너를 정확히 통과했다. 순회 순서로 한쪽을 고르면
-            // ID가 흔들리므로 **코너 자체**로 정규화한다. 인접이 아니면(수치 퇴화)
-            // 지어내지 않고 모른다고 표시한다 → 코덱이 거절해 GENERIC으로 내려간다.
-            (Some(s), Some(t2)) => match shared_ref_vertex(s as usize, t2 as usize, k) {
-                Some(v) => (ClipKind::ReferenceVertex, v as u8, 0),
-                None => (ClipKind::ReferenceVertex, UNKNOWN_INDEX, 0),
-            },
-            (Some(s), None) => (ClipKind::EdgeCross, 0, s), // 선분은 에지가 하나다
-            (None, _) => (ClipKind::IncidentVertex, end, 0),
+    // **코너 판정은 `t`의 비트 동일성이 아니라 위치로 한다** (검수 rev_83950af0 MAJOR).
+    // 선분이 참조면 정점을 정확히 지나면 인접한 두 측면이 같은 t를 내야 하지만, 실제로는
+    // dot/나눗셈 반올림이 달라 1 ulp 어긋난다(실측: 평행사변형 정점에서 0.5 vs 0.49999997).
+    // 그러면 `t == t_lo` 비교는 절대 발동하지 않고, 사실상 같은 자리에 `EdgeCross` 두 개가
+    // 서로 다른 측면 ID로 생겨 1 ulp 자세 변화에 ID가 뒤집힌다.
+    // 잘린 점이 그 측면의 **양 끝 정점 중 하나**에 붙어 있으면 코너로 정규화한다.
+    let make = |t: f32, cut: Option<u8>, end: u8| {
+        let position = p0 + dir * t;
+        let (kind, a, b) = match cut {
+            Some(s) => {
+                let si = s as usize;
+                // **참조 평면 안에서 잰다** — 입사 선분은 참조면과 다른 평면에 있으므로
+                // 3D 거리로 재면 법선 방향 간격이 섞여 코너를 절대 못 알아본다.
+                let corner = [si, (si + 1) % k].into_iter().find(|&c| {
+                    let d = position - rverts[c];
+                    let inplane = d - rn * d.dot(rn);
+                    inplane.length() <= corner_eps
+                });
+                match corner {
+                    Some(c) => (ClipKind::ReferenceVertex, c as u8, 0),
+                    None => (ClipKind::EdgeCross, 0, s), // 선분은 에지가 하나다
+                }
+            }
+            None => (ClipKind::IncidentVertex, end, 0),
         };
         GenVertex {
-            position: p0 + dir * t,
+            position,
             kind,
             a,
             b,
             edge: EdgeSrc::Incident(0),
         }
     };
-    Some([
-        make(t_lo, lo_side, lo_tie, 0),
-        make(t_hi, hi_side, hi_tie, 1),
-    ])
+    Some([make(t_lo, lo_side, 0), make(t_hi, hi_side, 1)])
 }
 
 /// 면 패치가 클리핑에 쓸 수 없을 만큼 퇴화했나 — 넓이가 임계 이하면 참.
@@ -410,8 +415,24 @@ fn support_face(
                 return Some((2, 2, u));
             }
             let s = if d >= 0.0 { 1.0 } else { -1.0 };
+            let cap_n = Vec3::new(axis.x * s, axis.y * s, axis.z * s);
+            let center = pose.pos + cap_n * *half_height;
+            // **링을 접촉 방향에 맞춘다** (검수 rev_83950af0 MAJOR). 원판의 `dir` 방향
+            // 지지점은 `center + r·normalize(dir의 접평면 성분)`이다. 링 정점 0을 그 방향에
+            // 두면 **최심 테두리점이 정확히 다각형 정점**이 되어, 기울어 닿을 때 생기던
+            // 침투 방향 누락(`r·(1−cos(π/N))·sin θ`)이 0이 된다. 고정 N으로는 그 오차가
+            // 반지름에 비례해서(≈0.006·r) 큰 원기둥에서 접점을 통째로 잃었다 —
+            // 반지름 10 m·sin θ=0.312면 59 mm로 기본 margin 50 mm를 넘는다.
+            //
+            // 접평면 성분이 0이면(뚜껑이 평면과 평행) 방향을 못 정하는데, 그때는 오차도
+            // 0이므로 **물체에 붙은 기저**로 떨어진다 — 세워 둔 원기둥에서 링이 프레임마다
+            // 흔들려 ID가 튀는 것을 막는다.
+            let u = (dir - cap_n * dir.dot(cap_n))
+                .try_normalize()
+                .unwrap_or(m.c[0]);
+            let v = cap_n.cross(u);
             for (i, (cx, cz)) in CAP_RING.iter().enumerate() {
-                out[i] = pose.pos + m.mul_vec(Vec3::new(radius * cx, s * half_height, radius * cz));
+                out[i] = center + u * (radius * cx) + v * (radius * cz);
             }
             // 면 코드: +Y 뚜껑 0, −Y 뚜껑 1. (옆면은 뒤에 2..를 쓴다)
             let code = if s > 0.0 { 0 } else { 1 };
@@ -425,29 +446,16 @@ fn support_face(
     }
 }
 
-/// 원기둥 뚜껑의 **내접 정16각형** 단위 좌표(로컬 XZ). 삼각함수를 부르지 않는다
+/// 원기둥 뚜껑 다각형의 단위 좌표(접평면 기저 기준). 삼각함수를 부르지 않는다
 /// (결정론 정책 L1: 상태에 닿는 경로에서 libm 금지 — native와 wasm의 마지막 ulp가 다르다).
 ///
-/// **왜 내접 다각형이어도 되나**: 뚜껑이 평면에 **평행하게** 닿을 때 다각형은 원과 같은
-/// 평면에 있으므로 침투 방향 오차가 0이다. 접점은 전부 반지름 `r` 위에 있으므로 회전
-/// 저항의 팔 길이도 정확하다.
+/// **링은 접촉 방향에 정렬해 놓는다**(`support_face` 참조). 그래서 정점 0이 원판의 지지점과
+/// 정확히 일치하고, **침투 방향 오차가 0**이다 — 기울기·반지름과 무관하다. 남는 근사는
+/// 정점 사이를 잇는 현이 호보다 안쪽이라는 것뿐이고, 그건 뚜껑이 참조면 **모서리에
+/// 걸쳤을 때의 클리핑 범위**에만 영향을 준다(최대 `r·(1 − cos(π/16)) = 0.019·r`).
 ///
-/// **기울어 닿으면 오차가 침투 방향으로 샌다** (검수 rev_7992e5a3 MAJOR). 접촉 법선이
-/// 뚜껑 법선과 각 θ를 이루면 현-호 오차가 `sin θ`만큼 법선 방향으로 투영된다:
-///
-/// ```text
-/// 누락 높이 = r · (1 − cos(π/N)) · sin θ
-/// ```
-///
-/// 뚜껑 경로의 허용 끝(`|축·법선| = 0.95`, 즉 sin θ = 0.312)에서 `r = 0.3`이면
-/// N=8일 때 7.1 mm, **N=16일 때 1.8 mm**다. 기본 speculative margin이 0.05 m(50 mm)라
-/// 기본값에서는 접점을 잃지 않지만, margin을 좁게 잡은 호스트에서는 다접점이 통째로
-/// 필터돼 단일 witness로 되돌아갈 수 있다. 그래서 N을 16으로 잡았다. 남은 오차는
-/// 위 식으로 예측 가능하며, 더 줄이려면 N을 키우거나 뚜껑 경로의 임계를 조이면 된다.
-///
-/// **접점 상한이 4**라 축약이 어차피 4개를 고르므로, N을 늘려도 평행하게 선 자세의
-/// 안정성은 안 변한다 — 늘어나는 건 기울어 닿을 때의 침투 정확도와 뚜껑이 참조면
-/// 모서리에 걸쳤을 때의 클리핑 정확도다.
+/// N=16인 이유: 접점 상한이 4라 축약이 어차피 4개를 고르므로 안정성은 N에 안 변한다.
+/// 남은 것은 위의 모서리 클리핑 정확도와 클리핑 비용(측면 루프 N회)의 교환이다.
 const CAP_RING: [(f32, f32); 16] = {
     const C1: f32 = 0.923_879_5; // cos(22.5°)
     const C2: f32 = core::f32::consts::FRAC_1_SQRT_2; // cos(45°)
@@ -622,35 +630,26 @@ pub(super) fn convex_face_manifold(
     Some(super::Manifold::from_points(m_normal, final_pts))
 }
 
-/// 접촉 법선에 수직인 결정적 기저. 가장 덜 정렬된 축과 외적을 잡는다(삼각함수 없음).
-fn plane_basis(n: Vec3) -> Option<(Vec3, Vec3)> {
-    let (ax, ay, az) = (n.x.abs(), n.y.abs(), n.z.abs());
-    let a = if ax <= ay && ax <= az {
-        Vec3::new(1.0, 0.0, 0.0)
-    } else if ay <= az {
-        Vec3::new(0.0, 1.0, 0.0)
-    } else {
-        Vec3::new(0.0, 0.0, 1.0)
-    };
-    let u = n.cross(a).try_normalize()?;
-    Some((u, n.cross(u)))
-}
-
 /// 접점 다수를 4개로 줄인다 — 박스 경로와 **같은 규칙**(최심점 고정 + 면적 최대 조합).
 ///
 /// 후보가 많으면 그 규칙이 O(n³)이라 정점 64개에서 조합이 39,711개가 된다. 그래서 8개를
 /// 넘으면 후보를 먼저 8개로 줄인다. 줄이는 방법이 중요하다:
 ///
-/// **순환 인덱스 균등 간격은 쓰지 않는다** — 기하 퍼짐을 보장하지 못한다(검수 rev_68687b10
-/// MAJOR). 정점 8개가 아주 작은 호에 몰리고 하나만 반대편 극점인 9각형이면, 균등 간격
-/// 표본이 그 유일한 극점을 버려 접촉 패치가 지름 전체인데도 제약이 한쪽 모서리에 몰리고
-/// 회전 저항이 사라진다.
+/// **순환 인덱스 균등 간격은 안 된다** — 기하 퍼짐을 보장하지 못한다(검수 rev_68687b10).
+/// 정점 8개가 작은 호에 몰리고 하나만 반대편 극점인 9각형이면 그 유일한 극점을 버린다.
 ///
-/// 대신 **접평면 8방향의 지지 극점**을 고른다. 볼록 집합의 지름을 만드는 점은 반드시 어느
-/// 방향의 극점이므로 퍼짐이 구조적으로 보장된다. 최심점은 항상 포함한다(박스 규칙의 전제).
-/// 방향 표는 뚜껑 팔각형과 같은 상수를 재사용한다 — 삼각함수를 부르지 않는다.
-/// 탐욕 선택으로 바꾸지 않는 이유: 탐욕은 면적 최대를 보장하지 못해 박스 경로에서 이미
-/// 한 번 리뷰로 기각된 규칙이다.
+/// **고정 방향 극점도 안 된다** — "지름 끝점은 8개 고정 방향 중 하나의 극점"이라는 주장은
+/// 거짓이고, 방향 사이에 법선 원뿔이 좁은 정점은 빠진다. 게다가 최심점이 첫 칸을 차지하면
+/// 방향을 7개만 보게 된다(검수 rev_83950af0 MAJOR — 실측: 정16각형에서 1번만 더 깊게 두면
+/// 표본이 `1,4,8,12`가 되어 면적 3.8478, 전수 최대 `0,4,8,12`의 4.0000을 놓쳤다).
+///
+/// 그래서 **최원점 표본**(farthest-point sampling)을 쓴다: 최심점에서 시작해, 이미 고른
+/// 집합까지의 **최소 거리가 최대**인 점을 하나씩 더한다. 두 번째 선택이 곧 최심점에서
+/// 가장 먼 점이므로 지름이 구조적으로 보장되고, 고정 방향이 없어 어떤 분포에서도 퍼진다.
+/// 비용은 8 × n(≤ 512회)이고 힙을 쓰지 않는다. 동률은 낮은 feature가 이긴다(결정론).
+///
+/// 최종 4점 선택은 여전히 전수 면적 최대다 — 탐욕은 면적 최대를 보장하지 못해 박스 경로에서
+/// 이미 한 번 리뷰로 기각된 규칙이다.
 pub(super) fn reduce_to_4_general(
     pts: &[super::ContactPoint],
     n: Vec3,
@@ -670,46 +669,33 @@ pub(super) fn reduce_to_4_general(
         .map(|(i, _)| i)
         .unwrap();
     let mut sel = [deepest; SAMPLE];
-    let mut len = 1usize;
-    if let Some((u, v)) = plane_basis(n) {
-        // 뚜껑 표를 재사용하되 **한 칸 걸러** 45° 간격 8방향만 쓴다 — 표본이 8개라
-        // 16방향을 앞에서부터 쓰면 방향이 반원(0..157.5°)에만 깔린다.
-        // (뮤테이션으로는 관측되지 않는다: 반원 8방향으로도 군집에서 먼 점은 어느 한
-        //  방향의 극점이 되기 때문이다. 그래도 원 전체에 고르게 까는 쪽을 남긴다.)
-        for (cx, cz) in CAP_RING.iter().step_by(2) {
-            if len == SAMPLE {
-                break;
+    // 각 후보의 "이미 고른 집합까지의 최소 거리". 매번 전수로 다시 재지 않고 갱신한다.
+    let mut mind = [f32::INFINITY; GEN_CLIP_CAP];
+    for len in 1..SAMPLE {
+        let anchor = pts[sel[len - 1]].position;
+        let mut best = usize::MAX;
+        let mut best_d = -1.0f32;
+        for (i, p) in pts.iter().enumerate() {
+            let d = (p.position - anchor).length_sq();
+            if d < mind[i] {
+                mind[i] = d;
             }
-            let (cx, cz) = (*cx, *cz);
-            let d = u * cx + v * cz;
-            // 동률은 낮은 feature가 이긴다 — 결정적이어야 한다.
-            let best = pts
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| {
-                    d.dot(a.position)
-                        .total_cmp(&d.dot(b.position))
-                        .then(b.feature.cmp(&a.feature))
-                })
-                .map(|(i, _)| i)
-                .unwrap();
-            if !sel[..len].contains(&best) {
-                sel[len] = best;
-                len += 1;
+            if sel[..len].contains(&i) {
+                continue;
+            }
+            let better = match mind[i].total_cmp(&best_d) {
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Equal => best != usize::MAX && p.feature < pts[best].feature,
+                core::cmp::Ordering::Less => false,
+            };
+            if better {
+                best = i;
+                best_d = mind[i];
             }
         }
+        debug_assert!(best != usize::MAX, "입력이 8을 넘으므로 남은 후보가 있다");
+        sel[len] = best;
     }
-    // 극점이 모자라면(퇴화·기저 실패) 남은 자리를 앞에서부터 채운다 — 4점 축약은 입력이
-    // 최소 4개여야 성립한다.
-    let mut i = 0usize;
-    while len < SAMPLE && i < pts.len() {
-        if !sel[..len].contains(&i) {
-            sel[len] = i;
-            len += 1;
-        }
-        i += 1;
-    }
-    debug_assert_eq!(len, SAMPLE, "입력이 8을 넘으므로 표본은 늘 8개다");
     sel.sort_unstable(); // 순환 순서 보존 — 면적 계산의 전제다
                          // **힙을 쓰지 않는다** — 스텝 중 할당 0 계약(설계 §6). 길이가 상수라 배열로 족하다.
     let sample: [super::ContactPoint; SAMPLE] = core::array::from_fn(|j| pts[sel[j]]);
@@ -1647,6 +1633,132 @@ mod tests {
             (sagitta - 0.019_215).abs() < 1e-4,
             "sagitta가 문서값과 다르다: {sagitta}"
         );
+    }
+
+    /// **MAJOR (검수 rev_83950af0)**: 코너 판정을 `t`의 비트 동일성으로 하면 안 된다.
+    /// 선분이 참조면 정점을 기하학적으로 정확히 지나도 인접 두 측면의 dot/나눗셈 반올림이
+    /// 달라 `t`가 1 ulp 어긋난다 — 아래 반례에서 0.5와 0.49999997이 나온다. 그러면 사실상
+    /// 같은 자리에 `EdgeCross` 두 개가 서로 다른 측면 ID로 생기고, 1 ulp 자세 변화에
+    /// 어느 쪽이 남는지가 뒤집혀 warm start가 끊긴다.
+    #[test]
+    fn a_corner_hit_is_recognised_even_when_the_two_sides_disagree_by_an_ulp() {
+        // 검수가 준 반례: f32 중점이 정확히 첫 정점인 평행사변형과 선분.
+        let r = vec![
+            Vec3::new(-3.170_453_8, -1.380_239_6, 0.0),
+            Vec3::new(-1.958_739, -2.208_727_4, 0.0),
+            Vec3::new(3.170_453_8, 1.380_239_6, 0.0),
+            Vec3::new(1.958_739, 2.208_727_4, 0.0),
+        ];
+        let p0 = Vec3::new(-2.903_672_7, 1.612_034, 0.1);
+        let p1 = Vec3::new(-3.437_234_9, -4.372_513_3, 0.1);
+        let seg =
+            clip_segment(&r, Vec3::new(0.0, 0.0, 1.0), p0, p1).expect("선분이 참조면을 가로지른다");
+        let corner = seg
+            .iter()
+            .find(|v| v.kind == ClipKind::ReferenceVertex)
+            .unwrap_or_else(|| panic!("코너를 못 알아봤다: {seg:?}"));
+        assert_eq!(corner.a, 0, "정점 0을 지난다: {corner:?}");
+        // 같은 자리에 접점이 둘이면 솔버가 그 지점에 제약을 두 번 건다.
+        let d = seg[0].position - seg[1].position;
+        assert!(
+            d.length() > 1e-4 || seg[0].kind == seg[1].kind,
+            "사실상 같은 자리에 서로 다른 계보가 둘 생겼다: {seg:?}"
+        );
+    }
+
+    /// **MAJOR (검수 rev_83950af0)**: 후보 축약이 고정 방향 극점이면 최심점이 첫 칸을
+    /// 차지할 때 방향을 **7개만** 본다. 실측: 정16각형에서 1번 정점만 조금 더 깊게 두면
+    /// 표본이 `1,4,8,12`가 되어 면적 3.8478이 되고, 전수 최대 `0,4,8,12`의 4.0000을 놓쳤다.
+    /// 최원점 표본은 지름을 먼저 잡으므로 전수 최대를 되찾는다.
+    #[test]
+    fn reduction_recovers_the_maximum_area_quad_on_a_16_gon() {
+        use super::super::{ContactPoint, FeatureId};
+        let n = Vec3::new(0.0, 0.0, 1.0);
+        let pts: Vec<ContactPoint> = CAP_RING
+            .iter()
+            .enumerate()
+            .map(|(i, (cx, cz))| ContactPoint {
+                position: Vec3::new(*cx, *cz, 0.0),
+                // 1번만 조금 더 깊게 — 최심점이 방향 극점과 겹치지 않게 만든다.
+                separation: if i == 1 { -0.02 } else { -0.01 },
+                feature: FeatureId(i as u32),
+            })
+            .collect();
+        let out = reduce_to_4_general(&pts, n);
+        let o = out[0].position;
+        let area = ((out[1].position - o).cross(out[2].position - o).dot(n)
+            + (out[2].position - o).cross(out[3].position - o).dot(n))
+        .abs();
+        assert!(
+            area > 3.99,
+            "전수 최대(4.0)에 못 미친다: {area} — 고른 정점 {:?}",
+            out.iter().map(|p| p.feature.0).collect::<Vec<_>>()
+        );
+        // 최심점은 반드시 들어간다(박스 규칙의 전제).
+        assert!(
+            out.iter().any(|p| p.feature.0 == 1),
+            "최심점이 빠졌다: {:?}",
+            out.iter().map(|p| p.feature.0).collect::<Vec<_>>()
+        );
+    }
+
+    /// **MAJOR (검수 rev_83950af0)**: 고정 N의 뚜껑 다각형은 오차가 **반지름에 비례**한다
+    /// (누락 높이 `r·(1−cos(π/N))·sin θ` ≈ 0.006·r). 원기둥 반지름은 1000 m까지 합법이고
+    /// speculative margin은 0까지 합법이라, N=16으로 줄여도 계약 전체를 못 덮는다.
+    /// 실측: 반지름 10 m 뚜껑을 평면에 1 mm 침투시키면 물체 고정 링에서는 최저 후보가
+    /// margin 밖이라 **다접점이 통째로 필터되고 단일 witness로 떨어진다**.
+    ///
+    /// 그래서 링을 접촉 방향에 정렬한다 — 정점 0이 원판의 지지점과 정확히 일치하므로
+    /// 침투 방향 누락이 0이 된다. 아래는 링 정점 사이 한가운데(11.25°)로 원기둥을 축 둘레로
+    /// 돌린 최악 배치다. 물체 고정 링이면 spin=0에서만 맞고 11.25°에서는 계보가 사라진다
+    /// (실측: sep −0.001 → +0.00372, 계보 None).
+    #[test]
+    fn a_large_tilted_cap_reports_the_true_deepest_point_at_any_spin() {
+        use crate::manifold::feature::unpack;
+        use crate::{Pose, Shape};
+        use maru_math::Quat;
+        let floor = Shape::Box {
+            half: Vec3::new(50.0, 0.5, 50.0),
+            radius: 0.0,
+        };
+        let pf = Pose {
+            pos: Vec3::new(0.0, -0.5, 0.0),
+            rot: Quat::IDENTITY,
+        };
+        let (hh, r) = (2.0f32, 10.0f32);
+        // 뚜껑 경로 안쪽(|축·법선| = 0.96)으로 기울인다. sin θ = 0.28.
+        let cost = 0.96f32;
+        let sint = (1.0 - cost * cost).sqrt();
+        let theta = sint.atan2(cost);
+        let cyl = Shape::Cylinder {
+            half_height: hh,
+            radius: r,
+        };
+        // spin 0 = 링 정점이 최급강하 방향과 겹치는 최선, 11.25° = 정점 사이 한가운데 최악.
+        for spin in [0.0f32, core::f32::consts::PI / 16.0] {
+            let rot = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), theta)
+                * Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), spin);
+            // 최저 테두리점이 바닥(y=0)을 1 mm 뚫도록 높이를 잡는다.
+            let y = -0.001 + hh * cost + r * sint;
+            let pa = Pose {
+                pos: Vec3::new(0.0, y, 0.0),
+                rot,
+            };
+            let m = crate::manifold::dispatch::contact(&cyl, &pa, &floor, &pf, 0.05)
+                .unwrap_or_else(|| panic!("spin={spin}에서 접촉이 있어야 한다"));
+            let f = unpack(m.points()[0].feature)
+                .unwrap_or_else(|| panic!("spin={spin}에서 뚜껑 다접점을 잃고 witness로 떨어졌다"));
+            assert_eq!(f.inc_face, 1, "−Y 뚜껑이어야 한다: {f:?}");
+            let deepest = m
+                .points()
+                .iter()
+                .map(|p| p.separation)
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                (deepest + 0.001).abs() < 1e-4,
+                "spin={spin}에서 최심 접점이 실제 1 mm 침투와 다르다: {deepest}"
+            );
+        }
     }
 
     /// 분리된 면끼리는 폴리곤이 비고 `false` — 호출자가 witness로 폴백한다.
