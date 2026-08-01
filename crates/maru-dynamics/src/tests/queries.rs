@@ -1453,3 +1453,43 @@ fn query_point_shares_one_work_budget() {
     w2.query_point(Vec3::ZERO, &mut out).expect("한 개는 통과");
     assert_eq!(out.len(), 1);
 }
+
+/// **멀리 있는** hull도 GJK 비용을 예산에 물어야 한다 — AABB 조기 반환 뒤에 청구하면
+/// "멀리 있는 hull 수만 개"인 질의가 GJK만으로 수천만 내적을 돌면서 예산이 안 줄어든다
+/// (검수 rev_6beb627b MAJOR).
+#[test]
+fn query_point_charges_gjk_for_distant_hulls() {
+    let mut pts = Vec::new();
+    let mut rng = 606u32;
+    let mut next = || {
+        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (rng >> 8) as f32 / (1u32 << 24) as f32
+    };
+    while pts.len() < 32 {
+        let d = Vec3::new(next() - 0.5, next() - 0.5, next() - 0.5);
+        if let Some(u) = d.try_normalize() {
+            pts.push(u);
+        }
+    }
+    let hull = maru_collide::Shape::Hull {
+        points: pts,
+        radius: 0.05,
+    };
+    // 질의점에서 **멀리** — AABB 밖이라 전수 열거는 안 돌지만 GJK는 돈다.
+    let far = maru_collide::Pose {
+        pos: Vec3::new(500.0, 0.0, 0.0),
+        rot: maru_math::Quat::IDENTITY,
+    };
+    let mut w = World::new(WorldParams::default());
+    for _ in 0..300 {
+        w.add_body(Body::new_dynamic(hull.clone(), far, 1.0));
+    }
+    let mut out = Vec::new();
+    assert!(
+        matches!(
+            w.query_point(Vec3::ZERO, &mut out),
+            Err(ApiError::ResourceLimit)
+        ),
+        "멀리 있는 hull의 GJK가 예산을 안 먹었다"
+    );
+}

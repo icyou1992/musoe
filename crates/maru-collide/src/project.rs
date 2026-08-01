@@ -226,7 +226,7 @@ fn project_convex_core(
         *budget -= cost;
     }
     match gjk(&point, &at, shape, &ident) {
-        GjkResult::Separated { distance, on_b, .. } => {
+        GjkResult::Separated { on_b, .. } => {
             // **반지름이 0이어도 같은 경로를 탄다.** 예전에는 "두께가 없으면 코어가 곧
             // 겉면"이라며 GJK `on_b`를 그대로 돌려줬는데, 아래에서 보듯 GJK는 코어 안의
             // 점에도 양의 거리를 준다 — 그러면 코어 **안쪽** 점을 겉면이라고 내놓는다
@@ -255,16 +255,8 @@ fn project_convex_core(
                 // 반공간 안이면 `gap >= 0`이고, 이 사례에서도 +0.000977로 정확히 안이라고
                 // 답한다. `gap == 0`(지지 평면 위)일 때만 "평면 안이지만 다각형 밖"을
                 // 가려야 해서 `distance`를 보는데, 그 경우는 GJK가 0을 정확히 준다.
-                let (n, gap, full_dim) = core_exit(shape, p, budget)?;
-                // 3차원 코어면 `gap >= 0`만으로 "안/경계"가 증명된다 — GJK 거리를 볼 필요가
-                // 없다. 저차원이면 아핀 껍질 위 어디서나 `gap == 0`이라 "다각형 안"인지를
-                // 가릴 다른 근거가 필요하고, 그때만 GJK가 0을 주는지 본다(그 경우 GJK는
-                // 정확하다 — 실측).
-                let inside_core = if full_dim {
-                    gap >= 0.0
-                } else {
-                    gap > 0.0 || distance == 0.0
-                };
+                // 안팎은 `core_exit`이 끝낸다 — GJK 거리는 여기서 쓰지 않는다.
+                let (n, gap, inside_core) = core_exit(shape, p, budget)?;
                 if inside_core {
                     return Ok(PointProjection {
                         point: p + n * (gap + radius),
@@ -313,9 +305,18 @@ fn project_convex_core(
 pub(crate) fn core_contains(
     shape: &Shape,
     p: Vec3,
-    distance: f32,
     budget: &mut usize,
 ) -> Result<bool, QueryReject> {
+    // **GJK 비용을 AABB 검사보다 먼저 청구한다.** 호출자는 이미 GJK를 돌린 뒤 들어오므로,
+    // AABB 밖에서 조기 반환하면 그 GJK가 통째로 예산 밖이 된다 — "멀리 있는 hull 수만 개"인
+    // 질의가 수천만 내적을 돌면서 예산이 한 톨도 안 줄었다(검수 rev_6beb627b MAJOR).
+    if let Shape::Hull { ref points, .. } = *shape {
+        let cost = points.len().saturating_mul(GJK_MAX_SUPPORTS);
+        if *budget < cost {
+            return Err(QueryReject::ResourceLimit);
+        }
+        *budget -= cost;
+    }
     let bb = shape.local_aabb();
     if p.x < bb.min.x
         || p.x > bb.max.x
@@ -326,24 +327,10 @@ pub(crate) fn core_contains(
     {
         return Ok(false);
     }
-    // **GJK 비용도 청구한다** — 호출자(`contains_point`)가 이미 GJK를 돌린 뒤 들어오는데,
-    // 그걸 안 세면 "hull이 수천 개"인 질의가 GJK만으로 수억 번 내적을 돌면서 예산이
-    // 그대로 남는다(검수 rev_bb1b7abe MAJOR).
-    if let Shape::Hull { ref points, .. } = *shape {
-        let cost = points.len().saturating_mul(GJK_MAX_SUPPORTS);
-        if *budget < cost {
-            return Err(QueryReject::ResourceLimit);
-        }
-        *budget -= cost;
-    }
     // 예산은 **호출자가 들고 다닌다** — 물체마다 새로 주면 "질의점을 품는 hull 수천 개"인
     // 월드가 한 번의 질의에서 수억 번 내적을 돈다. 소진은 거짓으로 뭉개지 않고 오류다.
-    let (_, gap, full_dim) = core_exit(shape, p, budget)?;
-    Ok(if full_dim {
-        gap >= 0.0
-    } else {
-        gap > 0.0 || distance == 0.0
-    })
+    let (_, _, inside) = core_exit(shape, p, budget)?;
+    Ok(inside)
 }
 
 /// 코어 **위/안**의 점 `q`에서 나가는 방향과, 그 방향으로 코어 표면까지의 여유.
@@ -437,17 +424,108 @@ fn core_exit(shape: &Shape, q: Vec3, budget: &mut usize) -> Result<(Vec3, f32, b
     if exhausted {
         return Err(QueryReject::ResourceLimit);
     }
+    // **안팎 판정은 여기서 끝낸다** — 호출자가 GJK 거리로 보정하지 않게.
+    //
+    // 3차원 코어: `gap >= 0`이면 모든 지지 반공간 안이므로 코어 안/경계다.
+    // 저차원 코어: 아핀 껍질 위 어디서나 `gap == 0`이라 그것만으로는 "다각형 안"인지
+    //   모른다. 한 차원 낮춰 같은 열거를 돌린다 — 평면 코어의 "면"은 **에지**이고 그
+    //   바깥 법선은 `cross(에지, 평면법선)`이다. GJK를 안 쓰므로 중복-support 결함이 없다
+    //   (검수 rev_6beb627b BLOCKER: 평면 삼각형의 내부점에서 GJK가 0.0147을 줘 밖으로 갈렸다).
     Ok(match best {
         // **부호를 살린다.** 이 함수는 "코어에 아주 가까운 점"까지 받는데, 그 점이 코어
         // 바깥이면 지지 여유가 음수다. 0으로 자르면 그만큼 겉면을 지나친다
         // (검수 rev_8a258ed3 BLOCKER: 반크기 (1000,1,1) hull·radius 0.1에 p=(1000.001,0,0)
         //  → 겉면 x=1000.1인데 x=1000.101이 나왔다). 부호를 살리면 같은 식
         //  `p + n·(gap + radius)`가 안팎 모두에서 정확한 표면을 준다.
-        Some((h, n)) => (n, h, full_dim),
+        Some((h, n)) => {
+            let inside = if full_dim {
+                h >= 0.0
+            } else if h == 0.0 {
+                // 평면 위다 — 다각형 안인지 에지 열거로 가린다.
+                in_plane_contains(points, q, n, budget)?
+            } else {
+                false // 평면 밖
+            };
+            (n, h, inside)
+        }
         // 면 후보가 하나도 없다 = 모든 점이 한 직선 위(또는 3점 미만). 그 직선에는 지지
         // 평면이 무한히 많아 위 최소화가 방향을 못 고르므로 수직 방향을 준다.
-        None => (collinear_exit_dir(points), 0.0, false),
+        // 면 후보가 하나도 없다 = 모든 점이 한 직선 위(또는 3점 미만).
+        None => (
+            collinear_exit_dir(points),
+            0.0,
+            on_core_segment(points, q, budget)?,
+        ),
     })
+}
+
+/// 평면 코어에서 `q`가 **다각형 안**인가 — 에지 바깥 법선으로 지지 열거를 한 차원 낮춰 돈다.
+///
+/// 평면 법선 `n`에 수직인 에지 법선 `cross(에지, n)`에 대해 모든 점이 `q` 쪽에 있으면
+/// 그 에지는 지지선이고, 모든 지지선 안쪽이면 다각형 안이다. 3차원 면 열거와 같은 논증이다.
+fn in_plane_contains(
+    points: &[Vec3],
+    q: Vec3,
+    n: Vec3,
+    budget: &mut usize,
+) -> Result<bool, QueryReject> {
+    let mut worst = f32::INFINITY;
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            // 차감은 정규화 **앞**이다 — 뒤에 두면 퇴화 에지가 공짜로 검사된다.
+            if *budget == 0 {
+                return Err(QueryReject::ResourceLimit);
+            }
+            *budget -= 1;
+            let Some(e) = (points[j] - points[i]).cross(n).try_normalize() else {
+                continue; // 에지가 평면 법선과 나란(퇴화) — 지지선을 못 만든다
+            };
+            let mut hi = f32::NEG_INFINITY;
+            let mut lo = f32::INFINITY;
+            for pt in points {
+                if *budget == 0 {
+                    return Err(QueryReject::ResourceLimit);
+                }
+                *budget -= 1;
+                let d = e.dot(*pt - q);
+                hi = hi.max(d);
+                lo = lo.min(d);
+            }
+            // `+e`가 바깥이면 여유는 hi, `-e`가 바깥이면 −lo다. 둘 중 작은 쪽이 이 에지의 여유.
+            worst = worst.min(hi.min(-lo));
+        }
+    }
+    // 지지선이 하나도 없으면(모든 에지 퇴화) 판정할 근거가 없다 — 안이라고 우기지 않는다.
+    Ok(worst.is_finite() && worst >= 0.0)
+}
+
+/// 모든 점이 한 직선 위일 때 `q`가 **그 선분 위**인가.
+fn on_core_segment(points: &[Vec3], q: Vec3, budget: &mut usize) -> Result<bool, QueryReject> {
+    let Some(&p0) = points.first() else {
+        return Ok(false);
+    };
+    let mut dir = None;
+    for pt in points {
+        if let Some(d) = (*pt - p0).try_normalize() {
+            dir = Some(d);
+            break;
+        }
+    }
+    let Some(d) = dir else {
+        return Ok(q == p0); // 모든 점이 한 자리 — 코어는 점이다
+    };
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for pt in points {
+        if *budget == 0 {
+            return Err(QueryReject::ResourceLimit);
+        }
+        *budget -= 1;
+        let t = d.dot(*pt - p0);
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    let t = d.dot(q - p0).clamp(lo, hi);
+    Ok(q == p0 + d * t)
 }
 
 /// 모든 점이 **한 직선**(또는 한 자리)에 있을 때의 이탈 방향 — 그 직선에 수직인 벡터.
@@ -1412,6 +1490,42 @@ mod tests {
         );
     }
 
+    /// **평면 코어의 다각형 내부** 점도 GJK 거리로 가리면 안 된다 — 같은 중복-support
+    /// 결함이 평면에서도 양의 거리를 준다(검수 rev_6beb627b BLOCKER).
+    /// 한 차원 낮춘 에지 열거로 풀어야 한다.
+    #[test]
+    fn planar_polygon_interior_is_inside_without_gjk() {
+        let radius = 0.0005;
+        let s = Shape::Hull {
+            points: vec![
+                v(-4.0, -913.0, 0.0),
+                v(93.0, -692.0, 0.0),
+                v(487.0, 366.0, 0.0),
+            ],
+            radius,
+        };
+        assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
+        // 무게중심 근방 — 명백한 다각형 내부.
+        let p = v(270.6, -207.20001, 0.0);
+        let pr = try_project_point(&s, &ident(), p).unwrap();
+        assert!(pr.inside, "다각형 안인데 밖이라고 했다: {pr:?}");
+        // 겉면은 평면에서 radius만큼 떨어진 자리다.
+        assert!(
+            (pr.point.z.abs() - radius).abs() < 1.0e-5,
+            "겉면(z=±{radius})이 아니다: {:?}",
+            pr.point
+        );
+        assert_eq!(
+            pr.inside,
+            try_contains_point(&s, &ident(), p).unwrap(),
+            "안팎이 갈렸다"
+        );
+        // 평면 위지만 다각형 **밖**인 점은 여전히 밖이다.
+        let out = v(-500.0, 500.0, 0.0);
+        let pr_out = try_project_point(&s, &ident(), out).unwrap();
+        assert!(!pr_out.inside, "다각형 밖인데 안이라고 했다: {pr_out:?}");
+    }
+
     /// **코어 면 위** 점은 3차원 코어에서 `gap == 0`이다 — 그때 GJK 거리를 추가 근거로
     /// 요구하면 같은 중복-support 결함에 다시 걸려 경계를 밖으로 오판한다
     /// (검수 rev_bb1b7abe BLOCKER). 3차원이 확인되면 `gap >= 0`만으로 충분하다.
@@ -1463,6 +1577,26 @@ mod tests {
             radius: 0.001,
         };
         assert!(s.validate().is_ok(), "합법 셰이프라는 전제가 깨졌다");
+        // 선분 위 점은 안, 벗어난 점은 밖이어야 한다 — 저차원 코어의 포함 판정이
+        // "항상 안"으로 무너지면 여기서 걸린다.
+        assert!(
+            try_project_point(&s, &ident(), Vec3::ZERO).unwrap().inside,
+            "선분 위인데 밖이라고 했다"
+        );
+        // AABB **안**이면서 선분 밖인 점 — 이것만이 저차원 포함 판정에 도달한다
+        // (AABB 밖은 그 전에 잘려 판정을 안 탄다).
+        for outside in [v(2.0, 0.0, 0.0), v(0.0, 0.5, 0.0), v(0.7509, 0.0009, 0.0)] {
+            let pr = try_project_point(&s, &ident(), outside).unwrap();
+            assert!(
+                !pr.inside,
+                "선분 밖인데 안이라고 했다: {outside:?} → {pr:?}"
+            );
+            assert_eq!(
+                pr.inside,
+                try_contains_point(&s, &ident(), outside).unwrap(),
+                "안팎이 갈렸다 {outside:?}"
+            );
+        }
         // 한 번의 질의가 **삼중조합 수만큼은** 먹어야 한다. GJK 선청구(32×64=2048)만
         // 세면 이 값이 그 아래로 떨어진다 — 그래서 횟수가 아니라 **소모량**을 잰다.
         let mut probe = usize::MAX;

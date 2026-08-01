@@ -1185,6 +1185,16 @@ MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyra
 | 멀티바디 조인트(관절 체인) | 있음 | 없음 | 큰 작업 |
 | 셰이프 스케일링 | 있음 | 없음 | |
 
+- **투영·포함 질의는 GJK 거리를 안팎 판정에 쓰지 않는다.** GJK는 코어 **안**의 점에도
+  양의 거리를 돌려줄 수 있다(같은 support가 재등장해 조기 종료할 때 심플렉스 최근접 벡터가
+  0이 아니다). 실측: 반크기 (1000,1,1) hull 내부점에서 0.1768, 평면 삼각형 내부점에서 0.0147.
+  그래서 `project_point`·`query_point`는 **지지 함수**로 판정한다(3차원 코어는 면 법선
+  전수, 평면 코어는 에지 전수). 비용이 있어 질의 하나가 `MAX_PROJECT_WORK` 예산을 공유하고,
+  못 끝내면 `ResourceLimit`이다. **내로우페이즈는 이 경로를 쓰지 않는다** — GJK를 그대로
+  쓰며, 위 결함은 접촉 생성에서 speculative margin 안의 미세 오차로만 나타난다.
+- **극단 종횡비 코어의 바깥점 투영은 GJK witness 정밀도만큼 어긋난다** — 좌표 크기 1000에서
+  약 2e-5(f32 간격의 절반 수준). 이건 witness 자체의 한계다.
+
 - **`Tree` 위상은 결정적이지 않다** (`select_nth_unstable_by`의 분할 내부 순서는
   규정되지 않는다). 이는 의도된 것이다: 페어 집합은 트리 위상에 비의존이고
   (설계 §4.1) `pair_set_is_tree_topology_independent`가 그 계약을 잠근다.

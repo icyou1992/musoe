@@ -267,7 +267,7 @@ pub(crate) fn contains_point(
             // 밖이라고 한다. `project`와 **같은 판정**을 써서 두 질의가 갈리지 않게 한다
             // (검수 rev_230afeaf BLOCKER).
             let d = closest_core_dist(shape, local).0;
-            crate::project::core_contains(shape, local, d, budget)? || d <= r
+            crate::project::core_contains(shape, local, budget)? || d <= r
         }
         // 삼각형은 부피가 없다 — radius가 있을 때만 코어까지 거리로 판정(hull과 같은 경로).
         Shape::Triangle { .. } => r > 0.0 && closest_core_dist(shape, local).0 <= r,
