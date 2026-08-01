@@ -653,3 +653,184 @@ fn squeeze_is_reported_even_though_the_vector_sum_cancels() {
          (크기합 {mag}, 벡터합 {vec_len})"
     );
 }
+
+/// **접점이 하나뿐이면 최대 접점 힘 = 총 힘**이고, 둘 다 서브스텝 수에 무관해야 한다.
+/// 서브스텝 값을 접점 구분 없이 합치면 "가장 센 접점"이 한 서브스텝 분이 되어 1/n로
+/// 작아진다(검수 rev_58b090ed MAJOR).
+#[test]
+fn max_force_matches_total_for_a_single_contact_point() {
+    let measure = |substeps: u32| -> (f32, f32) {
+        let params = WorldParams {
+            gravity: Vec3::new(0.0, -10.0, 0.0),
+            substeps,
+            ..no_sleep_params()
+        };
+        let mut w = World::new(params);
+        w.add_body(
+            Body::new_static(
+                Shape::Box {
+                    half: Vec3::new(50.0, 1.0, 50.0),
+                    radius: 0.0,
+                },
+                pose(0.0, -1.0, 0.0),
+            )
+            .with_contact_force_threshold(0.1),
+        );
+        // 구는 지면과 접점이 **하나**다 — 두 크기가 같아야 하는 유일한 형상.
+        w.add_body(Body::new_dynamic(
+            Shape::Sphere { radius: 0.5 },
+            pose(0.0, 0.55, 0.0),
+            1.0,
+        ));
+        let mut last = (0.0, 0.0);
+        for _ in 0..300 {
+            w.step(DT);
+            if let Some(e) = w.contact_force_events().first() {
+                last = (e.total_force_magnitude, e.max_force_magnitude);
+            }
+        }
+        last
+    };
+    for substeps in [2u32, 4, 8] {
+        let (total, max) = measure(substeps);
+        assert!(
+            total > 1.0,
+            "서브스텝 {substeps}: 접촉력이 안 잡혔다 ({total})"
+        );
+        assert!(
+            (total - max).abs() < total * 0.05,
+            "서브스텝 {substeps}: 접점이 하나인데 최대({max})가 총합({total})과 다르다"
+        );
+    }
+    // 그리고 서브스텝을 바꿔도 최대 힘이 그대로여야 한다.
+    let (_, a) = measure(2);
+    let (_, b) = measure(8);
+    assert!(
+        (a - b).abs() < a.max(b) * 0.2,
+        "최대 접점 힘이 서브스텝 수에 끌려간다: 2→{a}, 8→{b}"
+    );
+}
+
+/// **기능이 꺼져 있으면 선점도 하지 않는다.** 임계 바디를 제거하면 본문은 슬롯에 남으므로
+/// (`remove_body`는 `alive=false`만 만든다) 살아있는지 보지 않으면 플래그가 영구히 켜진 채로
+/// 서브스텝마다 스캐터·누적을 돌고 버퍼도 계속 잡는다(검수 rev_58b090ed MAJOR).
+#[test]
+fn removing_the_last_threshold_body_turns_the_feature_off() {
+    let mut params = no_sleep_params();
+    params.gravity = Vec3::new(0.0, -10.0, 0.0);
+    let mut w = World::new(params);
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(50.0, 1.0, 50.0),
+            radius: 0.0,
+        },
+        pose(0.0, -1.0, 0.0),
+    ));
+    // 임계를 켠 바디 — 이걸 지우면 기능이 꺼져야 한다.
+    let gone = w.add_body(
+        Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.6, 0.0),
+            1.0,
+        )
+        .with_contact_force_threshold(0.1),
+    );
+    // 임계 없는 바디들 — 페어를 만들어 `ncap > 0`이 되게 한다(선점 대상이 있어야 관측된다).
+    for k in 0..4 {
+        w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(3.0 + k as f32 * 1.01, 0.6, 0.0),
+            1.0,
+        ));
+    }
+    for _ in 0..60 {
+        w.step(DT);
+    }
+    assert!(
+        w.contact_force_events_capacity() > 0,
+        "켜져 있는데 선점을 안 했다"
+    );
+
+    // 같은 장면을 임계 바디 **없이** 지으면 선점이 0이어야 한다.
+    let mut params2 = no_sleep_params();
+    params2.gravity = Vec3::new(0.0, -10.0, 0.0);
+    let mut w2 = World::new(params2);
+    w2.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(50.0, 1.0, 50.0),
+            radius: 0.0,
+        },
+        pose(0.0, -1.0, 0.0),
+    ));
+    for k in 0..4 {
+        w2.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(3.0 + k as f32 * 1.01, 0.6, 0.0),
+            1.0,
+        ));
+    }
+    for _ in 0..60 {
+        w2.step(DT);
+    }
+    assert_eq!(
+        w2.contact_force_events_capacity(),
+        0,
+        "꺼져 있는데 선점했다"
+    );
+
+    let _ = gone;
+
+    // 셋째: 임계 바디를 **첫 스텝 전에** 제거하면 새 월드와 똑같이 꺼져야 한다.
+    // 죽은 슬롯의 본문은 남으므로(`remove_body`는 `alive=false`만 만든다) 살아있는지
+    // 보지 않으면 플래그가 켜진 채 선점까지 간다. 한 번이라도 스텝을 돈 뒤에는 용량이
+    // 이미 잡혀 있어 관측이 안 되므로, **스텝 전에** 지워야 이 차이가 보인다.
+    let mut params3 = no_sleep_params();
+    params3.gravity = Vec3::new(0.0, -10.0, 0.0);
+    let mut w3 = World::new(params3);
+    w3.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(50.0, 1.0, 50.0),
+            radius: 0.0,
+        },
+        pose(0.0, -1.0, 0.0),
+    ));
+    let doomed = w3.add_body(
+        Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.6, 0.0),
+            1.0,
+        )
+        .with_contact_force_threshold(0.1),
+    );
+    for k in 0..4 {
+        w3.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(3.0 + k as f32 * 1.01, 0.6, 0.0),
+            1.0,
+        ));
+    }
+    w3.remove_body(doomed).unwrap();
+    for _ in 0..60 {
+        w3.step(DT);
+    }
+    assert_eq!(
+        w3.contact_force_events_capacity(),
+        0,
+        "죽은 슬롯의 임계로 기능이 켜진 채 남았다"
+    );
+}

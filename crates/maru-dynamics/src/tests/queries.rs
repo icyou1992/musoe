@@ -1247,14 +1247,17 @@ fn project_point_tie_goes_to_lower_slot() {
     assert_eq!(w.project_point(p).unwrap().unwrap().body, hs[0]);
 }
 
-/// 예산 포화가 **슬롯 순서로 성공/오류를 가르면 안 된다**.
+/// 포화 후보가 질의점을 **감싸고 있으면** 답을 증명할 수 없다 — 그때는 순서에 따라
+/// "증명됨(Ok)"과 "증명 불가(오류)"가 갈리는데, **둘 다 옳다**.
 ///
-/// 비싼 물체(hull) 여럿과 값싼 물체(질의점이 겉면 위인 구)를 같은 월드에 두고, 삽입
-/// 순서만 바꿔 두 번 만든다. 구가 거리 0을 주므로 어느 순서든 답은 그 구여야 한다
-/// (거리 0은 못 본 후보와 무관하게 전역 최소다).
+/// 값싼 구를 먼저 넣으면 최선이 거리 0이 되고, 뒤따르는 hull은 AABB 하한이 0이라 동률
+/// 가지치기(낮은 슬롯 우선)로 잘려 나가 포화 자체가 없다 → `Ok(구)`.
+/// hull을 먼저 넣으면 그것들이 예산을 소진하고, 못 본 후보가 같은 거리(0)에 **더 낮은
+/// 슬롯**으로 있을 수 있으므로 승자를 증명할 수 없다 → `ResourceLimit`.
+///
+/// 이 테스트가 잠그는 것은 "순서가 같으면 답도 같다"와 **틀린 답을 내지 않는다**이다.
 #[test]
-fn project_point_saturation_is_not_slot_order_dependent() {
-    // 32점 hull — 코어 안쪽 질의가 예산을 크게 먹는다.
+fn project_point_saturation_reports_honestly_when_overlapped() {
     let mut pts = Vec::new();
     let mut rng = 777u32;
     let mut next = || {
@@ -1271,14 +1274,12 @@ fn project_point_saturation_is_not_slot_order_dependent() {
         points: pts,
         radius: 0.05,
     };
-    // 질의점이 겉면 위인 구 — 거리 0.
     let sphere = maru_collide::Shape::Sphere { radius: 1.0 };
     let at = |x: f32| maru_collide::Pose {
         pos: Vec3::new(x, 0.0, 0.0),
         rot: maru_math::Quat::IDENTITY,
     };
     let p = Vec3::ZERO;
-
     let build = |sphere_first: bool| {
         let mut w = World::new(WorldParams::default());
         if sphere_first {
@@ -1292,16 +1293,20 @@ fn project_point_saturation_is_not_slot_order_dependent() {
         }
         w
     };
-
-    let a = build(true).project_point(p);
-    let b = build(false).project_point(p);
-    assert!(a.is_ok(), "구가 먼저면 성공해야 한다: {a:?}");
+    // 구가 먼저: 가지치기가 hull을 전부 잘라 포화가 없다 → 답이 나온다.
+    let a = build(true)
+        .project_point(p)
+        .expect("구 먼저는 성공해야 한다");
+    let a = a.expect("후보가 없다");
+    assert!((a.point - p).length() < 1e-5);
+    // hull이 먼저: 증명할 수 없으므로 **오답 대신 오류**다.
     assert!(
-        b.is_ok(),
-        "구가 나중이면 오류가 났다 — 슬롯 순서가 결과를 갈랐다: {b:?}"
+        matches!(build(false).project_point(p), Err(ApiError::ResourceLimit)),
+        "증명이 안 되는데 답을 냈다"
     );
-    let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
-    assert!((a.point - p).length() < 1e-5 && (b.point - p).length() < 1e-5);
+    // 같은 순서를 두 번 지으면 답도 같다(결정론).
+    let again = build(true).project_point(p).unwrap().unwrap();
+    assert_eq!(again.body, a.body);
 }
 
 /// 포화해도 **하한으로 정답이 증명되면** 성공해야 한다.

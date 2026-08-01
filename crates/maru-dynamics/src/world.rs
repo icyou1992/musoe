@@ -174,19 +174,49 @@ pub struct ContactForceEvent {
     pub max_force_magnitude: f32,
 }
 
-/// 한 페어(또는 그 안의 한 제약)가 이번 스텝에 실은 접촉력 누적값.
+/// 한 제약이 이번 스텝에 실은 **접점별** 누적 임펄스.
 ///
-/// 튜플을 이름 있는 구조체로 둔 이유는 자리를 헷갈리지 않기 위해서다 — 벡터 합과 크기 합은
-/// 의미가 다른데(마주 보는 접점에서 상쇄 여부가 갈린다) 둘 다 같은 자리에 놓이면 섞인다.
-#[derive(Clone, Copy, Default)]
+/// **접점마다 따로 쌓는다.** 서브스텝 값을 접점 구분 없이 합치면 "가장 센 접점"이
+/// 한 서브스텝 분이 되어 서브스텝 수에 반비례한다 — 접점이 하나뿐인 페어에서도
+/// `max_force_magnitude`가 `total_force_magnitude`의 1/n이 됐다(검수 rev_58b090ed MAJOR).
+/// 접점별로 스텝 전체를 누적한 뒤에 합·최대를 뽑아야 둘이 맞물린다.
+///
+/// 길이는 `MAX_MANIFOLD_POINTS`로 고정 — 제약의 접점 수가 그 이하임을 매니폴드가 보장한다.
+#[derive(Clone, Copy)]
 struct ForceAcc {
+    pts: [Vec3; maru_collide::MAX_MANIFOLD_POINTS],
+}
+
+impl Default for ForceAcc {
+    fn default() -> Self {
+        Self {
+            pts: [Vec3::ZERO; maru_collide::MAX_MANIFOLD_POINTS],
+        }
+    }
+}
+
+impl ForceAcc {
     /// 임펄스 **벡터** 합 (A가 받는 방향).
-    total: Vec3,
-    /// 접점별 임펄스 **크기**의 합 — 상쇄되지 않는다.
-    mag_sum: f32,
-    /// 가장 큰 접점 임펄스와 그 크기².
-    max_imp: Vec3,
-    max_m2: f32,
+    fn total(&self) -> Vec3 {
+        self.pts.iter().fold(Vec3::ZERO, |a, b| a + *b)
+    }
+    /// 접점별 임펄스 **크기**의 합 — 마주 보는 접점에서도 상쇄되지 않는다.
+    fn mag_sum(&self) -> f32 {
+        self.pts.iter().map(|v| v.length()).sum()
+    }
+    /// 가장 센 접점의 누적 임펄스.
+    fn max_point(&self) -> Vec3 {
+        let mut best = Vec3::ZERO;
+        let mut best_m2 = 0.0f32;
+        for v in &self.pts {
+            let m2 = v.length_sq();
+            if m2 > best_m2 {
+                best_m2 = m2;
+                best = *v;
+            }
+        }
+        best
+    }
 }
 
 /// 블록(SoA)의 누적 임펄스를 스칼라 제약으로 되쓴다.
@@ -216,21 +246,13 @@ fn scatter_block_impulses(
 fn accumulate_contact_forces(constraints: &[ContactConstraint], acc: &mut [ForceAcc]) {
     for (ci, c) in constraints.iter().enumerate() {
         let a = &mut acc[ci];
-        for p in &c.points {
+        for (pi, p) in c.points.iter().enumerate() {
             // 접점 임펄스 = 법선 성분 + 접선 두 성분(월드 기저).
             let imp = c.normal * p.normal_impulse
                 + c.tangents[0] * p.tangent_impulse[0]
                 + c.tangents[1] * p.tangent_impulse[1];
-            a.total += imp;
-            let m2 = imp.length_sq();
-            // **크기의 합**을 따로 센다. 벡터 합만 보면 서로 마주 보는 두 접점이 상쇄돼
-            // "100 N으로 짓눌리는데 총 힘 0"이 된다(검수 rev_26dffa4b MAJOR).
-            // rapier의 `total_force_magnitude`도 크기의 합이다.
-            a.mag_sum += m2.sqrt();
-            if m2 > a.max_m2 {
-                a.max_m2 = m2;
-                a.max_imp = imp;
-            }
+            // 접점 목록은 스텝 안에서 고정이라(제약 준비가 스텝당 1회) 인덱스가 안정적이다.
+            a.pts[pi] += imp;
         }
     }
 }
@@ -1671,13 +1693,16 @@ impl World {
         if !maru_collide::vec_in_range(p) {
             return Err(ApiError::InvalidValue);
         }
-        let mut best: Option<(f32, PointHit)> = None;
+        // 최선은 (거리², 슬롯, 히트)다 — 슬롯은 **동률 승자 판정**에 쓴다.
+        let mut best: Option<(f32, usize, PointHit)> = None;
         // 작업 예산은 **질의 하나 전체**가 공유한다. 물체마다 상한을 두면 겹친 hull이
         // 많은 질의가 그 상한을 물체 수만큼 곱해 한 프레임을 삼킨다(검수 rev_c30d32fd).
         let mut budget = maru_collide::MAX_PROJECT_WORK;
-        // 예산이 모자라 **못 본** 후보들의 AABB 하한 중 최솟값(제곱). 최종 최선이 이 값
-        // 이하면 못 본 후보가 더 가까울 수 없으므로 답이 확정된다.
+        // 예산이 모자라 **못 본** 후보들의 AABB 하한 중 최솟값(제곱)과, 그 최솟값을 갖는
+        // 후보 중 가장 낮은 슬롯. 하한은 "더 가까울 수 있는가"를, 슬롯은 **동률에서 누가
+        // 이기는가**를 판정한다(전수 계산의 동률 규칙이 낮은 슬롯 우선이다).
         let mut unseen_lb2 = f32::INFINITY;
+        let mut unseen_slot = usize::MAX;
         for i in 0..self.bodies.len() {
             if !self.passes(i, filter) {
                 continue;
@@ -1696,7 +1721,7 @@ impl World {
                 p.z.clamp(bb.min.z, bb.max.z),
             );
             let lb2 = (c - p).length_sq();
-            if let Some((bd2, _)) = best {
+            if let Some((bd2, _, _)) = best {
                 // 동률에서 건너뛰는 것이 옳다 — 아래 승자 판정도 엄격 부등호라
                 // 어차피 **낮은 슬롯**이 이긴다. 두 규칙이 같아야 결정론이 성립한다.
                 if lb2 >= bd2 {
@@ -1716,15 +1741,21 @@ impl World {
             ) {
                 Ok(proj) => proj,
                 Err(maru_collide::QueryReject::ResourceLimit) => {
-                    unseen_lb2 = unseen_lb2.min(lb2);
+                    if lb2 < unseen_lb2 {
+                        unseen_lb2 = lb2;
+                        unseen_slot = i;
+                    } else if lb2 == unseen_lb2 {
+                        unseen_slot = unseen_slot.min(i);
+                    }
                     continue;
                 }
                 Err(maru_collide::QueryReject::InvalidInput) => return Err(ApiError::InvalidValue),
             };
             let d2 = (proj.point - p).length_sq();
-            if best.is_none_or(|(bd2, _)| d2 < bd2) {
+            if best.is_none_or(|(bd2, _, _)| d2 < bd2) {
                 best = Some((
                     d2,
+                    i,
                     PointHit {
                         body: self.handle_of(i),
                         point: proj.point,
@@ -1734,12 +1765,20 @@ impl World {
             }
         }
         // 포화가 있었으면 "최선"이 진짜 최소라는 **증명**이 필요하다: 못 본 후보들의 AABB
-        // 하한보다 가까우면 그들 중 누구도 더 가까울 수 없으므로 확정이다. 증명이 안 되면
-        // 그럴듯한 답 대신 자원 오류를 낸다.
+        // 하한보다 **엄격히** 가까우면 그들 중 누구도 더 가깝거나 같을 수 없으므로 확정이다.
+        // 증명이 안 되면 그럴듯한 답 대신 자원 오류를 낸다.
+        //
+        // 동률(`d2 == unseen_lb2`)은 증명이 아니다 — 못 본 후보가 정확히 같은 거리일 수
+        // 있고, 그게 **낮은 슬롯**이면 전수 계산에서는 그쪽이 승자다. 거리는 맞아도
+        // **어느 물체냐**가 갈린다(검수 rev_58b090ed BLOCKER).
         match best {
-            Some((d2, h)) if d2 <= unseen_lb2 => Ok(Some(h)),
+            // 하한보다 엄격히 가까우면 확정. 하한과 **같으면** 슬롯이 갈라준다 —
+            // 못 본 후보가 정확히 같은 거리여도 슬롯이 뒤면 전수 계산에서도 최선이 이긴다.
+            Some((d2, slot, h)) if d2 < unseen_lb2 || (d2 == unseen_lb2 && slot < unseen_slot) => {
+                Ok(Some(h))
+            }
             _ if unseen_lb2.is_finite() => Err(ApiError::ResourceLimit),
-            other => Ok(other.map(|(_, h)| h)),
+            other => Ok(other.map(|(_, _, h)| h)),
         }
     }
 
@@ -1992,6 +2031,15 @@ impl World {
             .values()
             .map(|v| (v.len(), v.capacity()))
             .max_by_key(|(l, c)| c.saturating_sub(*l))
+    }
+
+    /// 접촉력 이벤트 출력 버퍼의 현재 보유 용량.
+    ///
+    /// 테스트가 "**기능이 꺼져 있으면 선점도 안 한다**"를 관측하는 유일한 창이다 —
+    /// 이벤트가 비어 있는 것만으로는 선점 여부를 알 수 없다.
+    #[cfg(test)]
+    pub fn contact_force_events_capacity(&self) -> usize {
+        self.contact_force_events.capacity()
     }
 
     /// 접촉 이벤트 출력 버퍼의 현재 보유 용량.
@@ -3193,14 +3241,13 @@ impl World {
             + 2 * core::mem::size_of::<(u32, u32)>()                     // cache_written(해시 여유)
             + core::mem::size_of::<(u32, u32)>()                         // started (≤ 이번 스텝 페어 수)
             + core::mem::size_of::<ContactEvent>()                       // started 쪽 출력
-            + core::mem::size_of::<ContactForceEvent>()                  // 접촉력 이벤트 출력
+
             + 48; // live_keys(HashSet) + PCM 엔트리 여유
         let per_constraint_bytes = core::mem::size_of::<ContactConstraint>() // constraints
             + maru_collide::MAX_MANIFOLD_POINTS
                 * core::mem::size_of::<solver::ContactPointConstraint>() // 접점 힙 원소
             + core::mem::size_of::<(u32, u32)>()                         // constraint_keys
-            + core::mem::size_of::<((u32, u32), ForceAcc)>()             // force_rows
-            + core::mem::size_of::<ForceAcc>()                           // force_acc
+
             + core::mem::size_of::<u32>()                                // 컬러 order
             + core::mem::size_of::<(u32, u32)>()                         // 컬러 endpoints
             + core::mem::size_of::<u32>()                                // color_of
@@ -3480,11 +3527,32 @@ impl World {
             .saturating_mul(pair_bytes)
             .saturating_add(self.bp_pairs.capacity().saturating_mul(pair_bytes))
             .saturating_add(self.bp_pairs_scratch.capacity().saturating_mul(pair_bytes));
+        // **접촉력 이벤트가 켜져 있는가** — 임계가 유한한 **살아있는** 물체가 있어야 한다.
+        // 죽은 슬롯의 본문은 남으므로(`remove_body`는 `alive=false`만 만든다) alive를 안 보면
+        // 임계 바디를 지운 뒤에도 플래그가 영구히 true다(검수 rev_58b090ed MAJOR).
+        //
+        // 여기서(선점 블록 **앞에서**) 한 번 정한다 — 선점·회계·서브스텝 누적이 같은 답을
+        // 써야 하고, 꺼져 있으면 셋 다 통째로 빠져야 한다("안 켰으면 비용 0" 계약).
+        let force_events_on = (0..self.bodies.len())
+            .any(|i| self.alive[i] && self.bodies[i].contact_force_threshold.is_finite());
         let contact_event_target = ncap.saturating_add(self.touching.len());
+        // 꺼져 있으면 접촉력 버퍼 목표는 0이다 — 선점도 회계도 하지 않는다.
+        let force_event_target = if force_events_on { ncap } else { 0 };
+        let force_row_target = if force_events_on { constraint_cap } else { 0 };
+        // 접촉력 버퍼는 **켜져 있을 때만** 예산에 든다 — 꺼진 월드가 기능 도입 전보다
+        // 좁은 한계를 갖는 일이 없어야 한다(검수 rev_58b090ed MAJOR).
+        let force_bytes = force_row_target
+            .saturating_mul(
+                core::mem::size_of::<((u32, u32), ForceAcc)>() + core::mem::size_of::<ForceAcc>(),
+            )
+            .saturating_add(
+                force_event_target.saturating_mul(core::mem::size_of::<ContactForceEvent>()),
+            );
         let step_bytes = |this: &Self, narrow_held: usize| {
             fixed_bytes
                 .saturating_add(ncap.saturating_mul(per_pair_bytes))
                 .saturating_add(constraint_cap.saturating_mul(per_constraint_bytes))
+                .saturating_add(force_bytes)
                 .saturating_add(narrow_held)
                 .saturating_add(narrow_new)
                 .saturating_add(pair_held_extra)
@@ -3492,7 +3560,7 @@ impl World {
                     nbody,
                     constraint_cap,
                     contact_event_target,
-                    ncap,
+                    force_event_target,
                 ))
         };
         if step_bytes(self, narrow_held) > MAX_STEP_SCRATCH_BYTES {
@@ -3515,6 +3583,7 @@ impl World {
             let after = fixed_bytes
                 .saturating_add(ncap.saturating_mul(per_pair_bytes))
                 .saturating_add(constraint_cap.saturating_mul(per_constraint_bytes))
+                .saturating_add(force_bytes)
                 .saturating_add(narrow_held)
                 .saturating_add(narrow_new)
                 .saturating_add(pair_held_extra)
@@ -3522,7 +3591,7 @@ impl World {
                     nbody,
                     constraint_cap,
                     contact_event_target,
-                    ncap,
+                    force_event_target,
                 ));
             if after > MAX_STEP_SCRATCH_BYTES {
                 // 참여자 버퍼는 아직 self가 들고 있다(아래에서 take한다) — 되돌릴 것이 없다.
@@ -3646,11 +3715,11 @@ impl World {
             // 출력은 두 델타의 합이 상한이다(같은 키가 양쪽에 동시에 들지 않는다).
             || started.try_reserve(ncap).is_err()
             // 접촉력: 행은 제약당 하나, 출력은 **키**당 하나(페어 수 상한 = ncap).
-            || force_rows.try_reserve(constraint_cap).is_err()
-            || force_acc.try_reserve(constraint_cap).is_err()
+            || force_rows.try_reserve(force_row_target).is_err()
+            || force_acc.try_reserve(force_row_target).is_err()
             || self
                 .contact_force_events
-                .try_reserve(ncap.saturating_sub(self.contact_force_events.len()))
+                .try_reserve(force_event_target.saturating_sub(self.contact_force_events.len()))
                 .is_err()
             || stopped.try_reserve(self.touching.len()).is_err()
             // `try_reserve(additional)`는 **`len + additional`**을 보장한다 — 목표에서
@@ -4337,12 +4406,6 @@ impl World {
         // 서브스텝 말 갱신 시점의 자세 — 다음 서브스텝 시작에서 "안 바뀌었다"를 확인한다.
         #[cfg(debug_assertions)]
         let mut rot_at_prev_refresh: Vec<maru_math::Quat> = Vec::new();
-        // 접촉력 이벤트가 **켜져 있는가** — 임계가 유한한 물체가 하나라도 있으면 켜진 것이다.
-        // 꺼져 있으면 서브스텝 누적이 통째로 빠져 안 쓰는 호스트의 비용이 0이다.
-        let force_events_on = self
-            .bodies
-            .iter()
-            .any(|b| b.contact_force_threshold.is_finite());
         if force_events_on {
             // 용량은 스텝 시작에 `constraint_cap`으로 선점됐다 — 재할당하지 않는다.
             debug_assert!(
@@ -5125,11 +5188,13 @@ impl World {
                 let mut max_m2 = 0.0f32;
                 while i < force_rows.len() && force_rows[i].0 == key {
                     let a = force_rows[i].1;
-                    total += a.total;
-                    mag_sum += a.mag_sum;
-                    if a.max_m2 > max_m2 {
-                        max_m2 = a.max_m2;
-                        max_p = a.max_imp;
+                    total += a.total();
+                    mag_sum += a.mag_sum();
+                    let mp = a.max_point();
+                    let m2 = mp.length_sq();
+                    if m2 > max_m2 {
+                        max_m2 = m2;
+                        max_p = mp;
                     }
                     i += 1;
                 }
