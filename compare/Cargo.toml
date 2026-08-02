@@ -5,7 +5,7 @@ name = "musoe-compare"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Maru vs 외부 엔진 성능·안정성 대조 (엔진 워크스페이스 밖 — 의존성 격리)"
+description = "musoe vs 외부 엔진 성능·안정성 대조 (엔진 워크스페이스 밖 — 의존성 격리)"
 
 [dependencies]
 musoe-dynamics = { path = "../crates/musoe-dynamics" }

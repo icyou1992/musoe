@@ -213,17 +213,17 @@ fn main() {
     let no_sleep = args.get(5).map(|s| s != "sleep").unwrap_or(true);
     let max_per_step: Option<f64> = args.get(6).and_then(|s| s.parse().ok());
 
-    let threads_override: Option<usize> = std::env::var("MARU_THREADS")
+    let threads_override: Option<usize> = std::env::var("MUSOE_THREADS")
         .ok()
         .and_then(|v| v.parse().ok());
 
     // 추적 모드: 지목된 버킷의 할당 **호출 스택**을 찍는다. 크기 분포는 정황이고 스택은 근거다.
     // 창 안에서 출력하므로 이 모드의 계수값은 오염된다(추적용이지 측정용이 아니다).
-    let trace = std::env::var("MARU_ALLOC_TRACE_BUCKET")
+    let trace = std::env::var("MUSOE_ALLOC_TRACE_BUCKET")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|b| {
-            let max = std::env::var("MARU_ALLOC_TRACE_MAX")
+            let max = std::env::var("MUSOE_ALLOC_TRACE_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3);

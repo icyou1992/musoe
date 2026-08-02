@@ -564,7 +564,7 @@ pub struct Diagnostics {
     pub heightfield_saturated: usize,
     /// 접촉 제약 그래프 컬러링이 쓴 **비어 있지 않은** 색 수 = 솔브 패스당 배리어 수.
     pub colors: usize,
-    /// 색 상한(`MARU_COLOR_CAP`)에 밀려 오버플로 버킷에 들어간 제약 수.
+    /// 색 상한(`MUSOE_COLOR_CAP`)에 밀려 오버플로 버킷에 들어간 제약 수.
     ///
     /// 오버플로는 **한 참여자가 순서대로** 푸는 직렬 잔여다 — 병렬 폭을 유계로 사는 대가이고,
     /// 이 수치가 곧 그 대가의 크기다(Amdahl 직렬 분율). 상한을 정하는 판단은 `colors`(배리어
@@ -2674,7 +2674,7 @@ impl World {
     ///
     /// 코어가 많은 기계(8~16)나 접촉이 훨씬 많은 장면에서는 판단이 달라질 수 있다.
     /// 그 판정은 추측이 아니라 계측으로 한다:
-    /// `MARU_THREADS=n cargo run --release -p musoe-bench --bin pyramid100 -- 4 150 60 nosleep`이
+    /// `MUSOE_THREADS=n cargo run --release -p musoe-bench --bin pyramid100 -- 4 150 60 nosleep`이
     /// 단계별 귀속(narrow/solve/refresh/warm/bias/relax)을 찍는다.
     pub fn set_parallel_solver(&mut self, on: bool) {
         self.parallel_solver = on;
@@ -5446,7 +5446,7 @@ impl World {
 /// 그래프 컬러링의 색 상한 = **병렬 솔브의 패스당 배리어 상한**
 /// (근거는 `solver::COLOR_CAP_DEFAULT` 문서).
 ///
-/// `MARU_COLOR_CAP`으로 바꾼다. 프로세스당 1회만 읽는다 — 스텝 중간에 값이 바뀌면 제약
+/// `MUSOE_COLOR_CAP`으로 바꾼다. 프로세스당 1회만 읽는다 — 스텝 중간에 값이 바뀌면 제약
 /// 순서가 스텝마다 달라져 결정론이 깨진다. **스레드 수에 의존해서는 안 된다**(같은 이유).
 ///
 /// 이것이 측정 노브인 이유: 상한은 궤적을 바꾸므로(제약 순서가 바뀐다) 성능만 보고 정할 수
@@ -5458,7 +5458,7 @@ fn color_cap() -> u32 {
     if v != u32::MAX {
         return v;
     }
-    let cap = std::env::var("MARU_COLOR_CAP")
+    let cap = std::env::var("MUSOE_COLOR_CAP")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .map(|c| c.clamp(1, 64))
@@ -5559,7 +5559,7 @@ fn reserve_narrow_bufs(
 /// 페어 하나의 처리가 순수하다는 사실(읽기는 이 구조체, 쓰기는 자기 `NarrowOut`)이
 /// 병렬화의 근거이자 결정론의 근거다. 새 필드를 추가할 때 **가변 상태를 끼워 넣으면
 /// 그 근거가 무너진다** — 누적이 필요하면 `NarrowOut`으로 간다.
-/// **PCM 캐시 조회의 메모리 비용 상한 계측 노브** (`MARU_PCM_PROBE`) — 기본 0(정상).
+/// **PCM 캐시 조회의 메모리 비용 상한 계측 노브** (`MUSOE_PCM_PROBE`) — 기본 0(정상).
 ///
 /// 재려는 것은 "해시맵 조회가 narrow의 얼마인가"이고, 그 답이 해시맵→정렬배열 순차 병합
 /// 구조 변경의 **상한**이다. 그런데 조회를 그냥 없애면 warm start가 꺼져 궤적이 갈라지고,
@@ -5575,7 +5575,7 @@ fn reserve_narrow_bufs(
 /// 한계비용으로 재면 안 되는 이유가 여기 있다: 같은 조회를 두 번 하면 두 번째는 이미
 /// 데워져 있어 과소평가된다([[feedback_microbench_undermeasures_in_situ_cost.md]]).
 ///
-/// 읽기는 페어당 원자 로드 1회이고 파싱은 프로세스당 1회다(`MARU_SCALAR_EFFMASS`와 같은 꼴).
+/// 읽기는 페어당 원자 로드 1회이고 파싱은 프로세스당 1회다(`MUSOE_SCALAR_EFFMASS`와 같은 꼴).
 /// 기본 경로(0)에 대한 비용은 두 바이너리 교차실행으로 확인했다: **+0.11%, 쌍대 52%** —
 /// 잡음과 구분되지 않는다.
 ///
@@ -5606,13 +5606,13 @@ fn pcm_probe_mode() -> u8 {
     if v != u8::MAX {
         return v;
     }
-    let raw = std::env::var("MARU_PCM_PROBE").unwrap_or_else(|_| "0".into());
+    let raw = std::env::var("MUSOE_PCM_PROBE").unwrap_or_else(|_| "0".into());
     let m = match raw.trim().parse::<u8>() {
         Ok(m @ 0..=3) => m,
-        _ => panic!("MARU_PCM_PROBE={raw:?} — 지원하는 값은 0·1·2·3뿐이다"),
+        _ => panic!("MUSOE_PCM_PROBE={raw:?} — 지원하는 값은 0·1·2·3뿐이다"),
     };
     if m != 0 {
-        eprintln!("!! MARU_PCM_PROBE={m} — 계측 전용 팔이다. warm start가 꺼져 물리가 달라진다.");
+        eprintln!("!! MUSOE_PCM_PROBE={m} — 계측 전용 팔이다. warm start가 꺼져 물리가 달라진다.");
     }
     CACHED.store(m, Ordering::Relaxed);
     m

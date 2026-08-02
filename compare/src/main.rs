@@ -1,4 +1,4 @@
-//! Maru vs Rapier3D — **같은 장면·같은 하드웨어·같은 릴리스 프로파일** 대조.
+//! musoe vs Rapier3D — **같은 장면·같은 하드웨어·같은 릴리스 프로파일** 대조.
 //!
 //! # 왜 성능만 재면 안 되는가
 //! 스택이 무너지는 엔진은 접촉이 사라져 **더 빨라진다**. 그래서 매 시나리오에서
@@ -8,7 +8,7 @@
 //! # 공정성에 대한 정직한 진술
 //! - 두 엔진 모두 **각자의 기본 설정**으로 돌린다. 서로의 파라미터를 맞추면 어느 한쪽의
 //!   튜닝을 다른 쪽에 강제하는 셈이라 오히려 왜곡된다. 설정은 출력에 명시한다.
-//! - Maru는 M2(단일 스레드·CCD 없음·셰이프 4종)다. Rapier는 CCD·다양한 조인트·쿼리
+//! - musoe는 M2(단일 스레드·CCD 없음·셰이프 4종)다. Rapier는 CCD·다양한 조인트·쿼리
 //!   파이프라인을 **함께 돌린다** — 기능 차이가 있으므로 "같은 일을 하는" 비교가 아니다.
 //! - 측정은 워밍업 후 창(window)의 평균이다. 첫 스텝은 캐시·할당이 섞여 제외한다.
 
@@ -17,10 +17,10 @@ use std::time::Instant;
 const DT: f32 = 1.0 / 60.0;
 
 /// **정착 모드의 수면 파라미터는 양쪽을 맞춘다.**
-/// 각 엔진 기본값으로 재면 엔진이 아니라 튜닝을 재게 된다 — 실제로 Maru 기본은
+/// 각 엔진 기본값으로 재면 엔진이 아니라 튜닝을 재게 된다 — 실제로 musoe 기본은
 /// 0.03 m/s인데 rapier 0.34 기본은 0.4 m/s로 **13배** 차이였고, 그 상태로 잰
 /// 정착 수치는 like-for-like가 아니었다(2026-07-27 발견).
-/// 여기서는 rapier 기본(0.4/0.5/2초)보다 엄격하고 Maru 기본보다 느슨한 공통값을 쓴다.
+/// 여기서는 rapier 기본(0.4/0.5/2초)보다 엄격하고 musoe 기본보다 느슨한 공통값을 쓴다.
 const SLEEP_LIN: f32 = 0.1;
 const SLEEP_ANG: f32 = 0.15;
 const SLEEP_TIME: f32 = 0.5;
@@ -43,7 +43,7 @@ struct Result_ {
     detail: String,
 }
 
-// ─────────────────────────── Maru ───────────────────────────
+// ─────────────────────────── musoe ───────────────────────────
 mod musoe_side {
     use super::*;
     use musoe_collide::{Pose, Shape};
@@ -58,7 +58,7 @@ mod musoe_side {
     }
 
     pub fn pyramid(mode: Mode, tiers: usize, steps: usize, warmup: usize) -> Result_ {
-        let sub: u32 = std::env::var("MARU_SUB")
+        let sub: u32 = std::env::var("MUSOE_SUB")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(WorldParams::default().substeps);
@@ -286,12 +286,12 @@ mod musoe_side {
     }
 
     pub fn pile(mode: Mode, n: usize, steps: usize, warmup: usize) -> Result_ {
-        let sub: u32 = std::env::var("MARU_SUB")
+        let sub: u32 = std::env::var("MUSOE_SUB")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(WorldParams::default().substeps);
         let _ = mode;
-        let thr: f32 = std::env::var("MARU_SLEEP")
+        let thr: f32 = std::env::var("MUSOE_SLEEP")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0);
@@ -794,15 +794,15 @@ fn main() {
     let warmup: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(60);
     let reps: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
 
-    println!("Maru(M2) vs Rapier3D 0.34 — dt=1/60, release(lto=thin, cgu=1), 단일 스레드");
+    println!("musoe(M2) vs Rapier3D 0.34 — dt=1/60, release(lto=thin, cgu=1), 단일 스레드");
     println!(
-        "설정: Maru=기본({} 서브스텝·{}Hz 접촉) / Rapier=IntegrationParameters::default()",
+        "설정: musoe=기본({} 서브스텝·{}Hz 접촉) / Rapier=IntegrationParameters::default()",
         musoe_dynamics::WorldParams::default().substeps,
         musoe_dynamics::WorldParams::default().solver.contact_hertz
     );
     // **정정**: 이 하네스의 Rapier 설정은 CCD를 켜지 않고 QueryPipeline도 만들지 않으며
     // event handler도 `()`다. 이전 문구는 Rapier가 더 많은 일을 하는 것처럼 과장했다.
-    println!("주의: 양쪽 모두 CCD·쿼리 파이프라인 **없이** 돈다. Maru는 M2(셰이프 4종·단일 스레드).");
+    println!("주의: 양쪽 모두 CCD·쿼리 파이프라인 **없이** 돈다. musoe는 M2(셰이프 4종·단일 스레드).");
     println!("주의: 이 벤치는 '정착 품질 + 처리량'을 **함께** 잰다 — 한쪽이 잠들고 다른 쪽이");
     println!("      깨어 있으면 알고리즘 처리량 격차가 아니라 정착 성공 여부를 재는 것이다.");
     println!("측정: 워밍업 {warmup} + {steps} 스텝, {reps}회 반복의 **최소값**. UNSTABLE이면 수치는 무의미하다.\n");

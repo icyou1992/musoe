@@ -1,4 +1,4 @@
-//! Maru 웹 바인딩 — **flat buffer + C ABI**.
+//! musoe 웹 바인딩 — **flat buffer + C ABI**.
 //!
 //! 설계 §5: JS↔WASM 경계가 제1 성능 변수다(Rapier 2025 실측에서 JS 패키지 2–5× 고속화의
 //! 주 출처가 마샬링 계층이었다). 그래서 이 층의 규칙은 셋뿐이다:

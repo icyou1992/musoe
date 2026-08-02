@@ -633,7 +633,7 @@ pub fn prepare(
 
 /// 유효질량 경로 A/B 노브 (**측정 전용**, 기본 = SIMD).
 ///
-/// `MARU_SCALAR_EFFMASS=1`이면 스칼라 3회 경로로 돈다. 이 노브가 있는 이유는 A/B를
+/// `MUSOE_SCALAR_EFFMASS=1`이면 스칼라 3회 경로로 돈다. 이 노브가 있는 이유는 A/B를
 /// **같은 바이너리·같은 의존성 그래프**에서 번갈아 돌리기 위해서다 — 빌드를 갈아 A/B하면
 /// 그래프가 달라져 가짜 회귀(+80% 실측 사례)가 난다. 두 경로는 비트 동일하므로
 /// 이 노브는 결과를 바꾸지 않는다(결정론 테스트가 두 팔 모두를 지난다).
@@ -647,7 +647,7 @@ fn scalar_effective_mass_path() -> bool {
     if v != u8::MAX {
         return v == 1;
     }
-    let on = std::env::var("MARU_SCALAR_EFFMASS")
+    let on = std::env::var("MUSOE_SCALAR_EFFMASS")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     CACHED.store(on as u8, Ordering::Relaxed);
@@ -1273,7 +1273,7 @@ mod tests {
 
     /// 유효질량 4-wide 경로가 스칼라 3회와 **비트 동일**함을 잠근다.
     ///
-    /// 이 테스트가 A/B 노브(`MARU_SCALAR_EFFMASS`)를 정당화한다 — 두 팔이 비트 동일하지
+    /// 이 테스트가 A/B 노브(`MUSOE_SCALAR_EFFMASS`)를 정당화한다 — 두 팔이 비트 동일하지
     /// 않으면 성능 비교가 애초에 성립하지 않는다(다른 물리를 재는 것이 된다).
     /// 근사 비교(`abs_diff < eps`)를 쓰지 않는 이유: 유효질량은 임펄스 크기를 정하므로
     /// 마지막 ulp 차이가 서브스텝을 타고 궤적을 갈라 결정론(L0)을 깬다.

@@ -1,4 +1,4 @@
-# Maru 웹 데모
+# musoe 웹 데모
 
 ```bash
 cargo build --release -p musoe-wasm --target wasm32-unknown-unknown

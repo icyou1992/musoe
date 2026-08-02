@@ -9,7 +9,7 @@ use crate::joint::Joint;
 use musoe_math::{Quat, Vec3};
 
 /// 포맷 매직·버전 — 다른 빌드/포맷의 바이트를 조용히 먹지 않기 위해.
-pub(crate) const MAGIC: u32 = 0x4d41_5255; // "MARU"
+pub(crate) const MAGIC: u32 = 0x4d41_5255; // "MUSOE"
 /// v11: Body에 CCD linear cast opt-in 플래그(1바이트) 추가.
 /// v5: hull 점 상한 1024→32, 조인트 K 조건수 검증 추가.
 ///

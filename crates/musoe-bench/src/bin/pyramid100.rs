@@ -57,7 +57,7 @@ fn main() {
             slots.push(Vec3::new(x0 + i as f32 * 2.0 * half, y, 0.0));
         }
     }
-    // **배치 지역성 A/B** (`MARU_SHUFFLE_BODIES=1`) — 장면은 그대로 두고 **삽입 순서만** 섞는다.
+    // **배치 지역성 A/B** (`MUSOE_SHUFFLE_BODIES=1`) — 장면은 그대로 두고 **삽입 순서만** 섞는다.
     //
     // 재려는 것: 솔버·내로우가 만지는 바디들이 메모리에서 가까운가가 얼마나 중요한가.
     // 자연 순서는 접촉하는 이웃이 대체로 인접 인덱스에 놓이는 **이미 좋은 배치**이고,
@@ -69,7 +69,7 @@ fn main() {
     // 물리는 갈라진다(인덱스가 바뀌면 컬러링·GS 순서가 바뀐다) — 그래서 **속도만** 비교하고
     // 안정성 판정(vmax·finite)을 함께 본다. 일감(바디 수·접촉 수)은 같다.
     // 셔플은 고정 시드 LCG다 — 실행마다 같은 순열이어야 A/B가 성립한다.
-    if std::env::var("MARU_SHUFFLE_BODIES")
+    if std::env::var("MUSOE_SHUFFLE_BODIES")
         .map(|v| v == "1")
         .unwrap_or(false)
     {
@@ -81,7 +81,7 @@ fn main() {
             slots.swap(i, ((s >> 33) as usize) % (i + 1));
         }
         println!(
-            "!! MARU_SHUFFLE_BODIES=1 — 삽입 순서를 섞었다(배치 지역성 A/B). 물리가 갈라진다."
+            "!! MUSOE_SHUFFLE_BODIES=1 — 삽입 순서를 섞었다(배치 지역성 A/B). 물리가 갈라진다."
         );
     }
     for p in slots {
@@ -98,15 +98,15 @@ fn main() {
         ));
     }
     // 스레드 수 오버라이드 — 병렬 A/B용. 기본은 엔진의 자동 감지 값이다.
-    if let Some(n) = std::env::var("MARU_THREADS")
+    if let Some(n) = std::env::var("MUSOE_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
     {
         w.set_threads(n);
     }
-    // 솔버 색 병렬 스위치 — 기본 off(엔진 기본과 같다). 색 상한(MARU_COLOR_CAP)의 이득은
+    // 솔버 색 병렬 스위치 — 기본 off(엔진 기본과 같다). 색 상한(MUSOE_COLOR_CAP)의 이득은
     // 켠 상태에서만 나타나므로 벤치가 그 팔을 만들 수 있어야 한다.
-    let par_solver = std::env::var("MARU_PARALLEL_SOLVER")
+    let par_solver = std::env::var("MUSOE_PARALLEL_SOLVER")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     w.set_parallel_solver(par_solver);

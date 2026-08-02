@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8" />
-<title>Maru — 수면 도시 포격</title>
+<title>musoe — 수면 도시 포격</title>
 <style>
   body { margin: 0; background: #0b0d14; overflow: hidden; }
   #hud {
@@ -203,7 +203,7 @@ function frame(now) {
   }
   if ((frames++ & 15) === 0) {
     hud.textContent =
-      `Maru 물리엔진 — 수면 도시 포격\n` +
+      `musoe 물리엔진 — 수면 도시 포격\n` +
       `바디 ${boxes.length + balls.length + 1}   물리 ${stepMsAvg.toFixed(2)} ms/step   ` +
       `${fpsAvg.toFixed(0)} fps\n수면 ${window.__ASLEEP__ ?? 0}/${boxes.length}   포탄 ${balls.length}`;
     window.__STATS__ = { stepMs: stepMsAvg, stepMsNow, fps: fpsAvg, bodies: boxes.length + balls.length };

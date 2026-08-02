@@ -1,4 +1,4 @@
-//! musoe-math — Maru 물리엔진 수학 코어 (M0).
+//! musoe-math — musoe 물리엔진 수학 코어 (M0).
 //!
 //! 설계 계약(02-architecture.md):
 //! - §2: f32 단일 코어, SIMD는 stable `wide`(4레인 = WASM SIMD128 동형), FMA 비의존.

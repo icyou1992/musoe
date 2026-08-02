@@ -3,7 +3,7 @@ name = "musoe-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Maru 웹 바인딩 — flat buffer + C ABI (설계 §5: JS↔WASM 경계가 제1 성능 변수)"
+description = "musoe 웹 바인딩 — flat buffer + C ABI (설계 §5: JS↔WASM 경계가 제1 성능 변수)"
 
 [lib]
 # cdylib = 브라우저용 .wasm, rlib = 게이트에서 네이티브로 같은 ABI를 테스트하기 위함.

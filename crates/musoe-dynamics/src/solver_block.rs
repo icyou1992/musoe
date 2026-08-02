@@ -331,7 +331,7 @@ pub fn warm_start_block(v: &SolveView, blk: &ContactBlock) {
 }
 
 /// solve — 블록판. `solver::solve_x4`와 **같은 산술·같은 순서**이고 게더만 없다.
-/// **게더 미스 비용 계측 노브** (`MARU_SOLVE_PROBE`, `solve-probe` 피처 뒤 — 기본 off).
+/// **게더 미스 비용 계측 노브** (`MUSOE_SOLVE_PROBE`, `solve-probe` 피처 뒤 — 기본 off).
 ///
 /// 재려는 것: `bias`/`relax` 루프가 (a) 흩어진 바디 레지스터 게더의 **캐시 미스** 지배인지
 /// (b) 산술 지배인지. 답에 따라 유효한 수단이 갈린다 — 미스 지배면 제약별 바디 인덱스
@@ -359,7 +359,7 @@ pub fn warm_start_block(v: &SolveView, blk: &ContactBlock) {
 /// 이 머신(WSL2)에는 `perf`가 없어 PMU 카운터로 가를 수 없었다.
 ///
 /// **그래서 배치 문제의 판정은 이 프로브가 아니라 `pyramid100`의
-/// `MARU_SHUFFLE_BODIES` A/B가 한다** — 삽입 순서를 통째로 섞어 `pos`/`rot` 게더·
+/// `MUSOE_SHUFFLE_BODIES` A/B가 한다** — 삽입 순서를 통째로 섞어 `pos`/`rot` 게더·
 /// lin/ang 스토어·`warm`·`refresh`까지 **배치의 영향을 받는 전부**를 한 번에 잰다.
 /// 그 결과가 정본이다:
 /// - 40단(821바디, SoA 작업집합 ~75 KB): 셔플 대 자연 **중앙값 −0.35%, 쌍대 47/100** —
@@ -385,13 +385,13 @@ fn solve_probe_mode() -> u8 {
     if c != u8::MAX {
         return c;
     }
-    let raw = std::env::var("MARU_SOLVE_PROBE").unwrap_or_else(|_| "0".into());
+    let raw = std::env::var("MUSOE_SOLVE_PROBE").unwrap_or_else(|_| "0".into());
     let m = match raw.trim().parse::<u8>() {
         Ok(m @ 0..=4) => m,
-        _ => panic!("MARU_SOLVE_PROBE={raw:?} — 지원하는 값은 0·1·2·3·4뿐이다"),
+        _ => panic!("MUSOE_SOLVE_PROBE={raw:?} — 지원하는 값은 0·1·2·3·4뿐이다"),
     };
     if m != 0 {
-        eprintln!("!! MARU_SOLVE_PROBE={m} — 계측 전용 팔이다(추가 게더 1회, 결과는 버린다).");
+        eprintln!("!! MUSOE_SOLVE_PROBE={m} — 계측 전용 팔이다(추가 게더 1회, 결과는 버린다).");
     }
     CACHED.store(m, Ordering::Relaxed);
     m

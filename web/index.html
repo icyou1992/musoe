@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8" />
-<title>Maru — 웹 데모</title>
+<title>musoe — 웹 데모</title>
 <style>
   body { margin: 0; background: #11131a; color: #cbd2e1; font: 13px/1.5 ui-monospace, monospace; }
   #hud { position: fixed; top: 10px; left: 12px; white-space: pre; pointer-events: none; }
@@ -13,7 +13,7 @@
 <div id="hud">불러오는 중…</div>
 <canvas id="c"></canvas>
 <script type="module">
-// Maru 웹 데모 — **wasm-bindgen 없이** 원시 C ABI를 직접 부른다.
+// musoe 웹 데모 — **wasm-bindgen 없이** 원시 C ABI를 직접 부른다.
 // 요점은 핫패스가 함수 호출이 아니라 **선형 메모리 뷰**라는 것이다:
 // 매 프레임 musoe_step 한 번 + Float32Array 한 번 읽기가 전부다.
 const SHAPE_SPHERE = 0, SHAPE_BOX = 1;

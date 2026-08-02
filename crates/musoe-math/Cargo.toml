@@ -3,7 +3,7 @@ name = "musoe-math"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Maru physics engine math core: scalar Vec3/Quat + SIMD128-shaped SoA batches"
+description = "musoe physics engine math core: scalar Vec3/Quat + SIMD128-shaped SoA batches"
 
 [dependencies]
 wide = { workspace = true }

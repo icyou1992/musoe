@@ -3,7 +3,7 @@ name = "musoe-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Maru bench harness (M0: SIMD math microbenches, native + wasm)"
+description = "musoe bench harness (M0: SIMD math microbenches, native + wasm)"
 
 [features]
 # musoe-dynamics의 PCM 상한 계측 팔을 여는 통로 (기본 off).
