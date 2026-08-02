@@ -351,3 +351,46 @@ fn a_cache_entry_is_inherited_by_exactly_one_contact_point() {
         "더 가까운 항목(1번)을 두고 선착순으로 0번을 골랐다"
     );
 }
+
+/// **BLOCKER (검수 rev_f87badcc)**: 소비 표시 비트셋 **밖** 인덱스는 매칭에 쓰면 안 된다.
+///
+/// 라이브 경로는 페어당 최대 64매니폴드 × 4점 = 256이라 도달하지 않지만, **스냅샷 복원은
+/// 호스트가 준 바이트에서 캐시를 읽으므로** 그 상한을 넘길 수 있다. 표시를 못 남기는
+/// 항목을 매칭에 쓰면 같은 항목이 여러 접점에 다시 물려간다(직전 BLOCKER의 부활).
+#[test]
+fn cache_entries_beyond_the_bitset_are_never_matched() {
+    use crate::solver::{match_cache_entry, CACHE_USED_WORDS};
+    const CAP: usize = CACHE_USED_WORDS * 64;
+    let generic = maru_collide::FeatureId(maru_collide::FEATURE_GENERIC);
+    let n = Vec3::new(0.0, 1.0, 0.0);
+    // 앞 CAP개는 **멀리**, CAP번째(비트셋 밖)를 **가장 가깝게** 둔다.
+    let mut cache: Vec<(maru_collide::FeatureId, crate::solver::CachedImpulse)> = (0..CAP)
+        .map(|i| {
+            (
+                generic,
+                crate::solver::CachedImpulse {
+                    position: Vec3::new(0.9, 0.0, i as f32 * 1e-6),
+                    contact_normal: n,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    cache.push((
+        generic,
+        crate::solver::CachedImpulse {
+            position: Vec3::ZERO, // 질의점과 정확히 같은 자리 — 최근접
+            contact_normal: n,
+            ..Default::default()
+        },
+    ));
+    let mut used = [0u64; CACHE_USED_WORDS];
+    let got = match_cache_entry(&cache, &mut used, generic, Vec3::ZERO, n, true, 4.0);
+    assert!(
+        got.is_some_and(|i| i < CAP),
+        "비트셋 밖 항목({CAP}번)을 골랐다: {got:?}"
+    );
+    // 그리고 그 항목은 소비된다 — 다음 접점이 같은 것을 또 받지 않는다.
+    let second = match_cache_entry(&cache, &mut used, generic, Vec3::ZERO, n, true, 4.0);
+    assert_ne!(second, got, "같은 항목이 두 접점에 물려갔다");
+}

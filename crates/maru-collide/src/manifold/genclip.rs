@@ -204,6 +204,10 @@ pub(super) fn clip_convex_face(
                 // ID를 받으면 warm start가 끊긴다.
                 if d0 == 0.0 && d1 <= 0.0 {
                     keep.edge = EdgeSrc::RefSide(side as u8);
+                    // **동적 표식도 같은 출처를 가리켜야 한다** (검수 rev_f87badcc MAJOR).
+                    // 계보만 갈아끼우고 `edge_dyn`을 옛 값으로 두면 안정 측면 위의 에지가
+                    // 동적으로 전파되거나(→ 고정 참조 정점이 generic으로 강등) 그 반대가 된다.
+                    keep.edge_dyn = side_dyn;
                 }
                 dst[out_len] = keep;
                 out_len += 1;
@@ -226,6 +230,14 @@ pub(super) fn clip_convex_face(
                         None => (ClipKind::ReferenceVertex, UNKNOWN_INDEX, 0),
                     },
                 };
+                // **참조면 코너는 그 정점 자신이 apex일 때만 동적이다** (검수 rev_f87badcc).
+                // 인접 측면 하나가 동적이라고 코너까지 내리면, 물체에 고정된 ring0 같은
+                // 정점이 apex가 옆 섹터로 옮겨갈 때마다 generic ↔ exact를 왕복해
+                // 위치가 그대로인데도 warm start를 잃는다.
+                let dyn_flag = match kind {
+                    ClipKind::ReferenceVertex => r_apex && a == CAP_APEX_ID,
+                    _ => v0.edge_dyn || side_dyn,
+                };
                 // 나가는 교차(d0>0)면 x 다음은 이 측면을 따라 간다 → 출발 에지 = 측면 s.
                 // 들어오는 교차(d0<0)면 x 다음은 v1이다 → 출발 에지 = 잘린 에지 그대로.
                 let edge = if d0 > 0.0 {
@@ -240,7 +252,7 @@ pub(super) fn clip_convex_face(
                     b,
                     edge,
                     // 잘린 에지가 동적이거나 자른 측면이 동적이면 이 교점도 동적이다.
-                    dynamic: v0.edge_dyn || side_dyn,
+                    dynamic: dyn_flag,
                     edge_dyn: if d0 > 0.0 { side_dyn } else { v0.edge_dyn },
                 };
                 out_len += 1;
@@ -375,7 +387,11 @@ fn clip_segment(
             a,
             b,
             edge: EdgeSrc::Incident(0),
-            dynamic: side_dyn,
+            dynamic: match kind {
+                // 코너로 정규화된 점은 **그 정점 자신이 apex일 때만** 동적이다(위와 같은 이유).
+                ClipKind::ReferenceVertex => r_apex && a == CAP_APEX_ID,
+                _ => side_dyn,
+            },
             edge_dyn: side_dyn,
         }
     };
@@ -2679,6 +2695,65 @@ mod tests {
         if let Some(v) = stable {
             assert!(!v.dynamic, "apex와 무관한 교점이 동적으로 표시됐다: {v:?}");
         }
+    }
+
+    /// **MAJOR (검수 rev_f87badcc)**: 참조면 코너는 **그 정점 자신이 apex일 때만** 동적이다.
+    /// 인접 측면 하나가 동적이라고 코너까지 내리면, 물체에 고정된 정점이 apex가 옆 섹터로
+    /// 옮겨갈 때마다 generic ↔ exact를 왕복해 위치가 그대로인데도 warm start를 잃는다.
+    #[test]
+    fn a_stable_reference_corner_next_to_a_dynamic_side_stays_stable() {
+        // 참조면 5각형: 정점 2번이 apex다(측면 1→2와 2→3이 동적).
+        let r = vec![
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(1.2, 0.0, 0.0), // apex
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ];
+        let mut rids = IDS;
+        rids[2] = CAP_APEX_ID;
+        rids[3] = 2;
+        rids[4] = 3;
+        // 입사면이 참조면을 완전히 덮으면 참조 코너가 전부 남는다.
+        let i = square(0.0, 0.0, 4.0, 0.1);
+        let mut out = GenClip::new();
+        assert!(clip_convex_face(
+            &r,
+            Vec3::new(0.0, 0.0, 1.0),
+            &rids,
+            true,
+            &i,
+            &IDS,
+            false,
+            &mut out
+        ));
+        let corners: Vec<_> = out
+            .as_slice()
+            .iter()
+            .filter(|v| v.kind == ClipKind::ReferenceVertex)
+            .collect();
+        assert!(
+            corners.len() >= 3,
+            "참조 코너가 남아야 한다: {:?}",
+            out.as_slice()
+        );
+        for v in &corners {
+            let want = v.a == CAP_APEX_ID;
+            assert_eq!(
+                v.dynamic, want,
+                "코너 a={}의 동적 표식이 틀렸다(apex만 참이어야): {v:?}",
+                v.a
+            );
+        }
+        // 전제 확인: apex 코너와 안정 코너가 **둘 다** 나와야 시험이 성립한다.
+        assert!(
+            corners.iter().any(|v| v.a == CAP_APEX_ID),
+            "apex 코너가 없다"
+        );
+        assert!(
+            corners.iter().any(|v| v.a != CAP_APEX_ID),
+            "안정 코너가 없다"
+        );
     }
 
     /// 분리된 면끼리는 폴리곤이 비고 `false` — 호출자가 witness로 폴백한다.

@@ -584,6 +584,13 @@ pub(crate) fn match_cache_entry(
 ) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
     for (i, (f, c)) in cache.iter().enumerate() {
+        // **비트셋 밖 인덱스는 fail-closed로 건너뛴다** (검수 rev_f87badcc BLOCKER).
+        // 소비 표시를 못 남기는 항목을 매칭에 쓰면 같은 항목이 여러 접점에 다시 물려간다.
+        // 라이브 경로는 페어당 최대 64매니폴드 × 4점 = 256이라 도달하지 않지만,
+        // **스냅샷 복원은 호스트가 준 바이트에서 캐시를 읽으므로** 그 상한을 넘길 수 있다.
+        if i >= CACHE_USED_WORDS * 64 {
+            break;
+        }
         if cache_used_get(used, i) || *f != feature {
             continue;
         }
