@@ -6,15 +6,15 @@
 
 | 크레이트 | 내용 |
 |---|---|
-| `maru-math` | 스칼라 `Vec3`/`Quat`/`Mat3` + `Vec3x4`/`Aabbx4`(SoA 4-wide, 핫패스 정본 — 설계 §3) |
-| `maru-collide` | 셰이프(convex radius) · 듀얼 4-ary 트리 브로드페이즈(트리 비의존 canonical 페어) · GJK/EPA · 클리핑 매니폴드(feature ID) |
-| `maru-dynamics` | TGS-soft 솔버(**SoA 제약 블록** — `solver_block`) · PCM warm-start · 아일랜드/슬리핑 · 조인트 5종(point·hinge·fixed·distance·**prismatic**, 한계·모터) · 캐노니컬 스냅샷/L0 리플레이 해시 |
-| `maru-bench` | 마이크로벤치 + 피라미드 스택 벤치 + 진단 계측기(broadsplit·narrowsplit·boxsplit·cliff·spin) |
-| `maru-wasm` | 브라우저 바인딩 — **flat buffer + C ABI**(wasm-bindgen 없음). 데모: `web/` |
+| `musoe-math` | 스칼라 `Vec3`/`Quat`/`Mat3` + `Vec3x4`/`Aabbx4`(SoA 4-wide, 핫패스 정본 — 설계 §3) |
+| `musoe-collide` | 셰이프(convex radius) · 듀얼 4-ary 트리 브로드페이즈(트리 비의존 canonical 페어) · GJK/EPA · 클리핑 매니폴드(feature ID) |
+| `musoe-dynamics` | TGS-soft 솔버(**SoA 제약 블록** — `solver_block`) · PCM warm-start · 아일랜드/슬리핑 · 조인트 5종(point·hinge·fixed·distance·**prismatic**, 한계·모터) · 캐노니컬 스냅샷/L0 리플레이 해시 |
+| `musoe-bench` | 마이크로벤치 + 피라미드 스택 벤치 + 진단 계측기(broadsplit·narrowsplit·boxsplit·cliff·spin) |
+| `musoe-wasm` | 브라우저 바인딩 — **flat buffer + C ABI**(wasm-bindgen 없음). 데모: `web/` |
 
 ### 스택 "안정 봉투"는 솔버 품질이 아니라 **수면과의 경주**다 (2026-07-27 규명)
 
-`cargo run --release -p maru-bench --bin cliff -- <substeps> <steps> <tiers>`
+`cargo run --release -p musoe-bench --bin cliff -- <substeps> <steps> <tiers>`
 
 전에 여기 있던 "서브스텝별 안정 상한" 표는 **잘못 읽은 것이었다.** 수면을 끄고 프레임별
 궤적을 찍자 다음이 드러났다:
@@ -91,9 +91,9 @@ PE가 줄고 있다는 뜻이다: 꼭짓점이 천천히 미끄러져 떨어지�
 아직 지는가"를 보는 것이다 — 지금 지는 곳은 활성 처리량(1.4~1.7×)과 혼합 장면(2.2~2.5×)이다.
 
 **"우리가 더 많이 일해서 느리다"는 가설은 죽었다.** rapier 0.34의 기본
-`IntegrationParameters`는 `num_solver_iterations: 4`이고 maru 기본도 서브스텝 4다 —
+`IntegrationParameters`는 `num_solver_iterations: 4`이고 musoe 기본도 서브스텝 4다 —
 솔버 반복 수가 같다. 즉 격차는 **일의 양이 아니라 반복 하나의 효율**이다.
-40단에서 maru의 `solve`만(2.74 ms) rapier의 **스텝 전체**(2.94 ms)와 맞먹고, narrow(2.45 ms)가
+40단에서 musoe의 `solve`만(2.74 ms) rapier의 **스텝 전체**(2.94 ms)와 맞먹고, narrow(2.45 ms)가
 거의 그만큼 또 붙는다. 그래서 미시 최적화(이번 세션 narrow −4~6%)로는 1.8배가 닫히지 않는다 —
 narrow와 solve가 **각각 절반**이 되어야 대등해진다.
 
@@ -164,7 +164,7 @@ Jolt 수면 0/3000은 엔진 비교가 아니라 기본 튜닝 차이다(기본 
 ### 활성 처리량: 이 루프는 flop-bound가 아니라 **배치(layout)-bound**다 (2026-07-29 규명)
 
 40단 피라미드 스텝(7.97 ms)을 단계별로 귀속했다 (`Diagnostics::phase_ns`/`solve_ns`,
-`maru-bench --bin boxsplit`):
+`musoe-bench --bin boxsplit`):
 
 | 단계 | us | 비고 |
 |---|---|---|
@@ -444,7 +444,7 @@ narrow −5~6%, 기각 6건(SAT 표·회전 재사용·모듈로 제거·매니�
 그래서 솔버 색 병렬은 **코드는 남기고 기본은 off**로 두고 `World::set_parallel_solver(true)`
 노브로 뺐다. 코어가 많은 기계나 접촉이 훨씬 많은 장면에서는 판정이 달라질 수 있고,
 그 판정은 추측이 아니라 계측으로 한다:
-`MARU_THREADS=4 cargo run --release -p maru-bench --bin pyramid100 -- 4 150 60 nosleep`이
+`MARU_THREADS=4 cargo run --release -p musoe-bench --bin pyramid100 -- 4 150 60 nosleep`이
 단계별 귀속(narrow/solve/refresh/warm/bias/relax)을 찍는다.
 
 ### 아일랜드 병렬·Jolt식 분할 — 둘 다 **실측이 기각**했다 (2026-07-30)
@@ -468,7 +468,7 @@ narrow −5~6%, 기각 6건(SAT 표·회전 재사용·모듈로 제거·매니�
 
 **② Jolt식 대형 아일랜드 분할(= 색 상한) — 4-wide SIMD를 포기하는 값이 배리어 값보다 크다.**
 Jolt의 splitter는 큰 아일랜드를 바디 비공유 그룹 P개로 쪼개고 남는 것을 직렬 그룹으로 보낸다.
-maru에서 그것은 곧 **색 상한**이다(컬러링이 이미 바디 비공유 그룹을 만들고, 오버플로 버킷이
+musoe에서 그것은 곧 **색 상한**이다(컬러링이 이미 바디 비공유 그룹을 만들고, 오버플로 버킷이
 이미 직렬 잔여다). 그래서 상한을 `MARU_COLOR_CAP`으로 노브화해 쟀다 — 직렬로,
 `narrow`를 대조군으로(narrow는 컬러링 **이전** 단계라 상한과 무관하다), 셀당 표본 5:
 
@@ -485,7 +485,7 @@ maru에서 그것은 곧 **색 상한**이다(컬러링이 이미 바디 비공�
 제약이 SIMD 경로에서 밀려나고, 그 손실이 배리어 절감을 압도한다. 상한 6은 대가가 +1.9%로
 싸지만 **배리어가 하나도 줄지 않는다**(오버플로가 새 색 하나를 차지해 7색 그대로).
 Jolt에서 이 거래가 성립하는 이유는 그쪽 splitter가 SIMD 배칭의 전제가 아니기 때문이고,
-maru에서는 같은 자료구조가 두 목적(레인 독립 + 병렬 안전)을 겸하므로 거래가 뒤집힌다.
+musoe에서는 같은 자료구조가 두 목적(레인 독립 + 병렬 안전)을 겸하므로 거래가 뒤집힌다.
 
 > 병렬 팔의 절대 시간은 이 기계에서 **판정 불가**였다: 완전히 동일한 구성(`cap=8`과 상한 없음 —
 > 둘 다 7색·오버플로 0)이 같은 세션에서 solve 4,344 vs 11,088 us로 2.5배 갈렸다. 부하가 있는
@@ -524,7 +524,7 @@ radius를 밴드로 못 쓰고, 접점은 깊이 파고들수록 에지에서 �
 ### L1 결정론 — libm의 마지막 ulp는 우리 것이 아니다
 
 프로덕션이 부르는 초월함수는 `atan2` **두 곳**뿐이었다(Jacobi 주축 분해, 힌지 각).
-나머지는 `sqrt`(IEEE 정확)와 곱셈이다. `maru_math::det::atan2`(Cephes식 범위 축소 + 4항
+나머지는 `sqrt`(IEEE 정확)와 곱셈이다. `musoe_math::det::atan2`(Cephes식 범위 축소 + 4항
 다항, IEEE 기본 연산만)로 갈아끼웠고 std와의 오차 2e-6을 테스트가 계약으로 잠근다.
 
 **FP 환경은 스레드마다 산다.** 오디오 라이브러리가 FTZ를 켠 스레드에서 `step()`을 부르면
@@ -535,8 +535,8 @@ subnormal이 0으로 밀려 같은 입력이 다른 물리를 낸다. 월드 생
 ### 스냅샷 API — 호스트까지 닿는다
 
 브라우저 바인딩에 스냅샷이 아예 없었다(롤백·리플레이가 1급 시나리오인데). 추가:
-`maru_snapshot_version` · `maru_snapshot`+`maru_snapshot_ptr` · `maru_restore` ·
-`maru_state_hash_lo/hi` · `maru_canonicalize_fp`. 복원 오류는 **원인별**(-20..-25)이다 —
+`musoe_snapshot_version` · `musoe_snapshot`+`musoe_snapshot_ptr` · `musoe_restore` ·
+`musoe_state_hash_lo/hi` · `musoe_canonicalize_fp`. 복원 오류는 **원인별**(-20..-25)이다 —
 옛 버전인지 손상인지를 호스트가 알아야 마이그레이션할지 버릴지 정한다. 포맷은 정확히
 일치해야 복원된다(옛 버전을 적당히 읽으면 빠진 필드가 기본값이 되어 같은 바이트가 다른
 미래를 만든다 — v13→v14에서 겪은 사고다).
@@ -579,7 +579,7 @@ subnormal이 0으로 밀려 같은 입력이 다른 물리를 낸다. 월드 생
   같은 이름의 비-try 함수는 패닉하는 편의 래퍼(테스트·진단용).
   `Joint::try_hinge`가 따로 필요한 이유: 0/NaN 축은 **Joint 생성 시점**에 걸리므로
   `try_add_joint`(이미 만들어진 Joint를 받는다)로는 잡을 수 없다.
-- **지원 범위는 차원별**이다(`maru-collide/limits.rs`). 스칼라 하나로 묶으면 동시에
+- **지원 범위는 차원별**이다(`musoe-collide/limits.rs`). 스칼라 하나로 묶으면 동시에
   너무 넓고 너무 좁다 — 넓으면 큰 위치 × 작은 역질량이 조인트 솔버의 **중간 연산**에서
   먼저 Inf가 되고, 좁으면 정상 물리의 임펄스가 잘려 warm start가 조용히 부족해진다.
 
@@ -683,7 +683,7 @@ w.query_point(p, &mut out)?              // 점을 품은 물체
   월드가 보관하지 않기 때문이고, 3천 바디에서 광선 하나가 수십 us 수준이다.
   트리 재사용은 성능 과제로 남아 있다.
 
-### `maru-collide`의 공개 표면은 **셰이프 무관 디스패처만**이다 (2026-07-30)
+### `musoe-collide`의 공개 표면은 **셰이프 무관 디스패처만**이다 (2026-07-30)
 
 `contact`·`shape_cast`·`shape_cast_rotational`·`gjk`·`epa`·`Shape::support_core`는 볼록 전용
 원시 함수라 크레이트 밖으로 나가지 않는다. 하이트필드·복합을 그 함수에 넣으면 답이 없는데,
@@ -821,22 +821,22 @@ Body::new_static(..).as_sensor(true)                    // 감지 전용(트리�
 ## 웹 바인딩 (2026-07-27 신규)
 
 ```bash
-cargo build --release -p maru-wasm --target wasm32-unknown-unknown
-cd web && cp ../target/wasm32-unknown-unknown/release/maru_wasm.wasm . && python3 -m http.server 8080
+cargo build --release -p musoe-wasm --target wasm32-unknown-unknown
+cd web && cp ../target/wasm32-unknown-unknown/release/musoe_wasm.wasm . && python3 -m http.server 8080
 ```
 
 설계 §5의 "JS↔WASM 경계가 제1 성능 변수"를 그대로 지킨다:
-- **핫패스는 버퍼로만 오간다.** 프레임당 `maru_step` 한 번 + `Float32Array` 한 번 읽기.
+- **핫패스는 버퍼로만 오간다.** 프레임당 `musoe_step` 한 번 + `Float32Array` 한 번 읽기.
   바디마다 함수를 부르지 않는다.
 - **호출당 객체를 만들지 않는다.** 반환은 전부 스칼라 아니면 미리 잡아둔 버퍼다.
 - **패닉이 경계를 넘지 않는다.** 엔진의 `try_*`만 쓰고 실패는 음수 오류 코드다 —
   wasm에서 unwind는 곧 trap이라 호스트가 진단할 수 없다.
-- `maru_transforms_ptr`은 `maru_step` 뒤 **다시 물어봐야 한다**(재할당 시 무효화).
+- `musoe_transforms_ptr`은 `musoe_step` 뒤 **다시 물어봐야 한다**(재할당 시 무효화).
   성공한 add/remove/set_pose도 이전 포인터를 무효화한다(값이 변이 이전 스냅샷) —
-  재취득이 자동 동기화하고, 명시 경로는 `maru_sync_transforms`다. 포인터는 null 검사 후 사용.
+  재취득이 자동 동기화하고, 명시 경로는 `musoe_sync_transforms`다. 포인터는 null 검사 후 사용.
 - 핸들 `u64`는 JS에서 **BigInt**다(Number 아님 — i64 ABI). 센티널 `u64::MAX`는 `-1n`.
 - 스테이징 버퍼 성장도 `try_reserve`다 — 실패는 trap이 아니라 `ERR_STAGING_LIMIT(-7)`
-  (엔진 상태는 정상, 버퍼만 stale). 복구=`maru_sync_transforms`/`maru_sync_events`
+  (엔진 상태는 정상, 버퍼만 stale). 복구=`musoe_sync_transforms`/`musoe_sync_events`
   (이벤트 원본은 다음 스텝까지 월드에 살아 있다 — 그 전에 동기화하면 무유실).
   실행되지 않은 스텝은 이벤트를 재발행하지 않고, 이벤트 getter는 stale이면 자동
   동기화·실패 시 null/0이다.
@@ -848,7 +848,7 @@ cd web && cp ../target/wasm32-unknown-unknown/release/maru_wasm.wasm . && python
 
 ### 브라우저 실측 (2026-07-28, 헤드리스 크로미엄 v1.60 이미지)
 
-`web/bench.html`(브라우저) ↔ `cargo run --release -p maru-wasm --example abi_bench`(네이티브
+`web/bench.html`(브라우저) ↔ `cargo run --release -p musoe-wasm --example abi_bench`(네이티브
 쌍둥이) — 같은 씬·같은 C ABI·같은 기본 파라미터. 드라이버 = `scripts/browser-bench.mjs`
 (호스트에 크로미엄 라이브러리가 없으면 파일 상단의 Docker 명령).
 
@@ -869,7 +869,7 @@ cd web && cp ../target/wasm32-unknown-unknown/release/maru_wasm.wasm . && python
 ### 브라우저에서 rapier.js와 직접 대조 (2026-07-30)
 
 ```bash
-node scripts/browser-bench.mjs                                  # maru
+node scripts/browser-bench.mjs                                  # musoe
 BENCH_PAGE=bench-rapier.html node scripts/browser-bench.mjs     # 같은 씬의 rapier.js
 ```
 
@@ -880,14 +880,14 @@ BENCH_PAGE=bench-rapier.html node scripts/browser-bench.mjs     # 같은 씬의 
 **2026-07-31 재측정 — 그리고 브라우저 빌드가 판정을 바꾼다는 것을 알게 됐다.**
 같은 커밋을 playwright 이미지 두 개(jammy·noble = 크로미엄 빌드가 다르다)에서 돌렸다:
 
-| 씬 | jammy: maru / rapier.js | 판정 | noble: maru / rapier.js | 판정 |
+| 씬 | jammy: musoe / rapier.js | 판정 | noble: musoe / rapier.js | 판정 |
 |---|---|---|---|---|
-| 피라미드 20단 | 0.947 / 1.746 | **maru 1.84×** | 0.697 / 0.670 | rapier 1.04× |
+| 피라미드 20단 | 0.947 / 1.746 | **musoe 1.84×** | 0.697 / 0.670 | rapier 1.04× |
 | 피라미드 40단 | 5.261 / 3.313 | rapier 1.59× | 4.808 / 2.141 | rapier 2.25× |
-| 구 500 | 0.336 / 0.653 | **maru 1.94×** | 0.315 / 0.388 | **maru 1.23×** |
-| 구 3000 | 3.706 / 4.901 | **maru 1.32×** | 2.982 / 3.233 | **maru 1.08×** |
+| 구 500 | 0.336 / 0.653 | **musoe 1.94×** | 0.315 / 0.388 | **musoe 1.23×** |
+| 구 3000 | 3.706 / 4.901 | **musoe 1.32×** | 2.982 / 3.233 | **musoe 1.08×** |
 
-정착(수면 ON)은 두 이미지 모두에서 **maru가 29~100배 빠르다**(jammy 37.7/99.6/74.4/81.6×).
+정착(수면 ON)은 두 이미지 모두에서 **musoe가 29~100배 빠르다**(jammy 37.7/99.6/74.4/81.6×).
 검증값(같은 물리를 풀었는지): 피라미드 40단 top 39.359 vs 39.323 · lowest 0.495 vs 0.490.
 
 **읽는 법.** 한 실행 안의 두 엔진 비교만 유효하다 — 브라우저 빌드가 바뀌면 절대값도 배수도
@@ -908,7 +908,7 @@ BENCH_PAGE=bench-rapier.html node scripts/browser-bench.mjs     # 같은 씬의 
 브라우저에서는 작은 장면 두 개를 이기고 구 3000이 거의 동률이다. 남은 열세는 **큰 활성 장면**
 하나로 좁혀진다. 그리고 **정착 구간은 28~128× 앞선다** — 실사용 씬은 대부분 정착 상태이므로
 이 쪽이 프레임 예산을 지배한다(구 3000에서 rapier.js는 정착 상태로도 60fps 예산의 18%를
-계속 먹고, maru는 0.3%다).
+계속 먹고, musoe는 0.3%다).
 
 주의: 이 벤치는 **스텝 비용만** 잰다. rapier.js는 변환을 바디별 객체 호출로 읽으므로 렌더가
 붙으면 마샬링 비용이 추가되지만(설계 §5의 근거), 여기서는 그것을 재지 않는다 — 엔진 대 엔진의
@@ -999,7 +999,7 @@ TriMesh는 아직 없지만 **하이트필드가 이미 같은 구조**다 — �
 
 크기 분포가 범인을 지목한다 — ~256 B 버킷과 ~32 B 버킷에 각각 스텝당 2천여 회가 몰린다.
 `solver::prepare`가 접촉마다 `let mut points = Vec::new(); points.try_reserve(...)`로
-**접점 버퍼를 새로 잡기** 때문이다(`crates/maru-dynamics/src/solver.rs`). 페어 목록
+**접점 버퍼를 새로 잡기** 때문이다(`crates/musoe-dynamics/src/solver.rs`). 페어 목록
 (`canonical_pairs_bounded`)도 예산 크기 벡터를 매 스텝 새로 잡는다(구 더미에서 884 KB/스텝).
 
 **비용은 3% 안팎으로 추정**한다(6,136 × malloc+free ≈ 40 ns ≈ 245 µs / 8.3 ms). 바이트 수가
@@ -1063,9 +1063,9 @@ TriMesh는 아직 없지만 **하이트필드가 이미 같은 구조**다 — �
 **측정 가능해야 계약**이라 계측기를 정식 벤치로 들였다:
 
 ```bash
-cargo run --release -p maru-bench --bin allocs                    # 기본 두 장면
-MARU_THREADS=1 cargo run --release -p maru-bench --bin allocs -- pyramid 40 80 20
-MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyramid 40 80 1
+cargo run --release -p musoe-bench --bin allocs                    # 기본 두 장면
+MARU_THREADS=1 cargo run --release -p musoe-bench --bin allocs -- pyramid 40 80 20
+MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p musoe-bench --bin allocs -- pyramid 40 80 1
 ```
 
 - `alloc_probe::CountingAlloc`(계수 전역 할당자)는 **이 바이너리에만** 설치한다 —
@@ -1142,7 +1142,7 @@ MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyra
   `prepare`가 프레임 시작 자세로 `normal_mass`·`tangent_mass`를 구하는데 솔버는
   서브스텝마다 갱신된 `inv_i`로 임펄스를 적용한다 — 낡은 K⁻¹, 새 K. 3D 이방성
   관성에서만 나는 계열이다. 고쳐서 재보니 **절벽·봉투 불변**이고, 이 결함을 최대로
-  노출시키려 만든 장면(`maru-bench --bin spin`)에서도 에너지 차 8%에 발산 없음,
+  노출시키려 만든 장면(`musoe-bench --bin spin`)에서도 에너지 차 8%에 발산 없음,
   비용은 **+10%**였다. 관측되는 대가가 없고 10%는 관측되므로 지금은 지불하지 않는다.
   근거와 재현은 `solver.rs`의 `refresh_anchors` 주석에 있다.
 
@@ -1176,7 +1176,7 @@ MARU_ALLOC_TRACE_BUCKET=9 cargo run --release -p maru-bench --bin allocs -- pyra
 
 **없는 것** (rapier 0.34 기준, 흔히 쓰이는 순):
 
-| 기능 | rapier | maru | 비고 |
+| 기능 | rapier | musoe | 비고 |
 |---|---|---|---|
 | **축 잠금**(LockedAxes) | 있음 | **회전만** | 회전 3축은 있다(월드축). 병진 잠금은 `inv_m`을 스칼라→Vec3로 넓혀야 해 비용 측정이 먼저다 |
 | 원뿔 셰이프 | 있음 | 없음 | 원기둥은 있다. 원뿔은 질량중심이 원점이 아니라 재중심화가 필요하다 |

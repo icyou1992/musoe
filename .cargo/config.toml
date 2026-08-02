@@ -1,7 +1,7 @@
 # wasm 타깃은 SIMD128을 항상 켠다 (설계 §2 — 비FMA 기본, relaxed-simd는 별도 feature로만).
 # 강등이 필요한 환경은 이 플래그를 끄는 명시적 빌드를 쓴다 — 조용한 폴백 금지(설계 §6).
 [target.wasm32-wasip1]
-runner = ["node", "--no-warnings", "/home/icyou/workspace/maru/scripts/wasi-run.mjs"]
+runner = ["node", "--no-warnings", "/home/icyou/workspace/musoe/scripts/wasi-run.mjs"]
 rustflags = ["-C", "target-feature=+simd128"]
 
 [target.wasm32-unknown-unknown]

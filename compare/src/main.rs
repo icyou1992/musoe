@@ -44,11 +44,11 @@ struct Result_ {
 }
 
 // ─────────────────────────── Maru ───────────────────────────
-mod maru_side {
+mod musoe_side {
     use super::*;
-    use maru_collide::{Pose, Shape};
-    use maru_dynamics::{Body, World, WorldParams};
-    use maru_math::{Quat, Vec3};
+    use musoe_collide::{Pose, Shape};
+    use musoe_dynamics::{Body, World, WorldParams};
+    use musoe_math::{Quat, Vec3};
 
     fn pose(x: f32, y: f32, z: f32) -> Pose {
         Pose {
@@ -124,7 +124,7 @@ mod maru_side {
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
         eprintln!(
-            "    [maru 평균 us] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0}  pairs={}",
+            "    [musoe 평균 us] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0}  pairs={}",
             acc[0] as f64 / 1000.0 / steps as f64,
             acc[1] as f64 / 1000.0 / steps as f64,
             acc[2] as f64 / 1000.0 / steps as f64,
@@ -133,7 +133,7 @@ mod maru_side {
             pairs_acc / steps
         );
         eprintln!(
-            "    [maru solve 내역 us] inv_i={:.0} anchors={:.0} warm={:.0} bias={:.0} relax={:.0} integ={:.0} joints={:.0}",
+            "    [musoe solve 내역 us] inv_i={:.0} anchors={:.0} warm={:.0} bias={:.0} relax={:.0} integ={:.0} joints={:.0}",
             sv[0] as f64 / 1000.0 / steps as f64,
             sv[1] as f64 / 1000.0 / steps as f64,
             sv[2] as f64 / 1000.0 / steps as f64,
@@ -142,7 +142,7 @@ mod maru_side {
             sv[5] as f64 / 1000.0 / steps as f64,
             sv[6] as f64 / 1000.0 / steps as f64,
         );
-        eprintln!("    [maru bp 재사용] {reused}/{steps}");
+        eprintln!("    [musoe bp 재사용] {reused}/{steps}");
 
         let (mut top, mut vmax, mut finite, mut asleep) = (f32::MIN, 0.0f32, true, 0usize);
         for h in &handles {
@@ -154,7 +154,7 @@ mod maru_side {
                 asleep += 1;
             }
         }
-        eprintln!("    [maru sleep] {asleep}/{} 잠듦", handles.len());
+        eprintln!("    [musoe sleep] {asleep}/{} 잠듦", handles.len());
         let expect = tiers as f32 - 0.5;
         let stable = finite && (top - expect).abs() < 0.02 * tiers as f32 && vmax < 0.5;
         Result_ {
@@ -249,7 +249,7 @@ mod maru_side {
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / steps as f64;
         let sc = steps as f64;
         eprintln!(
-            "    [maru mixed] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us  페어 {}  bp재사용 {reused} 증분 {incr} /{steps}",
+            "    [musoe mixed] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us  페어 {}  bp재사용 {reused} 증분 {incr} /{steps}",
             acc[0] as f64 / 1000.0 / sc,
             acc[1] as f64 / 1000.0 / sc,
             acc[2] as f64 / 1000.0 / sc,
@@ -258,7 +258,7 @@ mod maru_side {
             pairs_acc / steps,
         );
         eprintln!(
-            "    [maru mixed] 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} 기준선정렬={:.0} us",
+            "    [musoe mixed] 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} 기준선정렬={:.0} us",
             sub[0] as f64 / 1000.0 / sc,
             sub[1] as f64 / 1000.0 / sc,
             sub[2] as f64 / 1000.0 / sc,
@@ -266,7 +266,7 @@ mod maru_side {
             sub[4] as f64 / 1000.0 / sc,
         );
         eprintln!(
-            "    [maru mixed] post 하위: 라이트백={:.0} 이벤트={:.0} PCM={:.0} 위생={:.0} us",
+            "    [musoe mixed] post 하위: 라이트백={:.0} 이벤트={:.0} PCM={:.0} 위생={:.0} us",
             post[0] as f64 / 1000.0 / sc,
             post[1] as f64 / 1000.0 / sc,
             post[2] as f64 / 1000.0 / sc,
@@ -349,7 +349,7 @@ mod maru_side {
             let _ = w.try_step(DT);
         }
         // **에너지 궤적**: 감소하면 아직 정착 중, 증가·유지면 주입이다(리뷰가 요구한 판별).
-        let energy = |w: &World, hs: &[maru_dynamics::BodyHandle]| -> (f64, f64) {
+        let energy = |w: &World, hs: &[musoe_dynamics::BodyHandle]| -> (f64, f64) {
             let (mut ke, mut pe) = (0.0f64, 0.0f64);
             for h in hs {
                 let b = w.body(*h);
@@ -421,11 +421,11 @@ mod maru_side {
             vlin = vlin.max(b.linvel().length());
             vang = vang.max(b.angvel().length());
         }
-        eprintln!("    [maru pile] 잔류 vlin={vlin:.4} vang={vang:.4} (임계 {:.2}/{:.2})",
+        eprintln!("    [musoe pile] 잔류 vlin={vlin:.4} vang={vang:.4} (임계 {:.2}/{:.2})",
             WorldParams::default().sleep_linear_threshold,
             WorldParams::default().sleep_angular_threshold);
         eprintln!(
-            "    [maru pile] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us  수면 {asleep}/{}  bp재사용 {reused}/{steps}",
+            "    [musoe pile] aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us  수면 {asleep}/{}  bp재사용 {reused}/{steps}",
             acc[0] as f64 / 1000.0 / steps as f64,
             acc[1] as f64 / 1000.0 / steps as f64,
             acc[2] as f64 / 1000.0 / steps as f64,
@@ -435,7 +435,7 @@ mod maru_side {
         );
         let ls = late_steps.max(1) as f64;
         eprintln!(
-            "    [maru pile] 정착구간({late_steps}스텝): {:.3} ms/step  aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us",
+            "    [musoe pile] 정착구간({late_steps}스텝): {:.3} ms/step  aabb={:.0} broad={:.0} narrow={:.0} solve={:.0} post={:.0} us",
             t_late.as_secs_f64() * 1000.0 / ls,
             acc_late[0] as f64 / 1000.0 / ls,
             acc_late[1] as f64 / 1000.0 / ls,
@@ -444,7 +444,7 @@ mod maru_side {
             acc_late[4] as f64 / 1000.0 / ls,
         );
         eprintln!(
-            "    [maru pile] 정착구간 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us  (그중 기준선정렬={:.0} us, 기준선 {}개)",
+            "    [musoe pile] 정착구간 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us  (그중 기준선정렬={:.0} us, 기준선 {}개)",
             sub_late[0] as f64 / 1000.0 / ls,
             sub_late[1] as f64 / 1000.0 / ls,
             sub_late[2] as f64 / 1000.0 / ls,
@@ -453,21 +453,21 @@ mod maru_side {
             touch_late / late_steps.max(1),
         );
         eprintln!(
-            "    [maru pile] 정착 post 내역: writeback={:.0} 이벤트={:.0} pcm={:.0} 위생={:.0} us",
+            "    [musoe pile] 정착 post 내역: writeback={:.0} 이벤트={:.0} pcm={:.0} 위생={:.0} us",
             post_late[0] as f64 / 1000.0 / ls,
             post_late[1] as f64 / 1000.0 / ls,
             post_late[2] as f64 / 1000.0 / ls,
             post_late[3] as f64 / 1000.0 / ls,
         );
         eprintln!(
-            "    [maru pile] 전체평균 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",
+            "    [musoe pile] 전체평균 하위: 스크래치예약={:.0} wake순회={:.0} narrow순회={:.0} 아일랜드={:.0} us",
             sub[0] as f64 / 1000.0 / steps as f64,
             sub[1] as f64 / 1000.0 / steps as f64,
             sub[2] as f64 / 1000.0 / steps as f64,
             sub[3] as f64 / 1000.0 / steps as f64,
         );
         eprintln!(
-            "    [maru pile] 페어 {}  접점 {}  → 페어당 narrow {:.2} us",
+            "    [musoe pile] 페어 {}  접점 {}  → 페어당 narrow {:.2} us",
             pairs_acc / steps,
             pts_acc / steps,
             acc[1] as f64 / 1000.0 / steps as f64 / (pairs_acc / steps).max(1) as f64
@@ -610,7 +610,7 @@ mod rapier_side {
     }
 
 
-    /// 혼합 씬 — maru_side::mixed와 동일 구성 (정착 더미 n + 공중 낙하 k).
+    /// 혼합 씬 — musoe_side::mixed와 동일 구성 (정착 더미 n + 공중 낙하 k).
     pub fn mixed(n: usize, k: usize, steps: usize, warmup: usize) -> Result_ {
         let mut s = Sim::new();
         let ground = s.bodies.insert(RigidBodyBuilder::fixed().translation(
@@ -731,7 +731,7 @@ mod rapier_side {
             s.step();
         }
         let t0 = Instant::now();
-        // maru 쪽과 **같은 창**으로 정착 구간을 따로 잰다(전체 평균은 앞쪽 정착 과정이 지배한다).
+        // musoe 쪽과 **같은 창**으로 정착 구간을 따로 잰다(전체 평균은 앞쪽 정착 과정이 지배한다).
         let mut t_late = std::time::Duration::ZERO;
         let mut late_steps = 0usize;
         for si in 0..steps {
@@ -797,8 +797,8 @@ fn main() {
     println!("Maru(M2) vs Rapier3D 0.34 — dt=1/60, release(lto=thin, cgu=1), 단일 스레드");
     println!(
         "설정: Maru=기본({} 서브스텝·{}Hz 접촉) / Rapier=IntegrationParameters::default()",
-        maru_dynamics::WorldParams::default().substeps,
-        maru_dynamics::WorldParams::default().solver.contact_hertz
+        musoe_dynamics::WorldParams::default().substeps,
+        musoe_dynamics::WorldParams::default().solver.contact_hertz
     );
     // **정정**: 이 하네스의 Rapier 설정은 CCD를 켜지 않고 QueryPipeline도 만들지 않으며
     // event handler도 `()`다. 이전 문구는 Rapier가 더 많은 일을 하는 것처럼 과장했다.
@@ -815,7 +815,7 @@ fn main() {
         if scenario == "all" || scenario == "pyramid" {
             for tiers in [10usize, 20, 30, 40] {
                 println!("[피라미드 {tiers}단]");
-                row("maru", &best(reps, || maru_side::pyramid(mode, tiers, steps, warmup)));
+                row("musoe", &best(reps, || musoe_side::pyramid(mode, tiers, steps, warmup)));
                 row(
                     "rapier",
                     &best(reps, || rapier_side::pyramid(mode, tiers, steps, warmup)),
@@ -825,14 +825,14 @@ fn main() {
         if scenario == "all" || scenario == "pile" {
             for n in [500usize, 1500, 3000] {
                 println!("[구 더미 {n}개]");
-                row("maru", &best(reps, || maru_side::pile(mode, n, steps, warmup)));
+                row("musoe", &best(reps, || musoe_side::pile(mode, n, steps, warmup)));
                 row("rapier", &best(reps, || rapier_side::pile(mode, n, steps, warmup)));
             }
         }
         if (scenario == "all" || scenario == "mixed") && mode == Mode::Settle {
             for k in [5usize, 25, 100] {
                 println!("[혼합: 정착 3000 + 낙하 {k}]");
-                row("maru", &best(reps, || maru_side::mixed(3000, k, steps, warmup)));
+                row("musoe", &best(reps, || musoe_side::mixed(3000, k, steps, warmup)));
                 row("rapier", &best(reps, || rapier_side::mixed(3000, k, steps, warmup)));
             }
         }

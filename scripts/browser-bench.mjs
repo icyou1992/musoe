@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // 브라우저 wasm 실측 드라이버 — web/bench.html을 헤드리스 크로미엄에서 돌리고 결과를 회수한다.
-//   node scripts/browser-bench.mjs                          # maru
+//   node scripts/browser-bench.mjs                          # musoe
 //   BENCH_PAGE=bench-rapier.html node scripts/browser-bench.mjs   # 같은 씬의 rapier.js 판
 // 의존: workspace/verify/node_modules/playwright-core + ~/.cache/ms-playwright 크로미엄.
 import { createServer } from 'node:http';
@@ -24,9 +24,9 @@ await new Promise(r => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 
 // 호스트에 크로미엄 의존 라이브러리가 없으면 Docker playwright 이미지로:
-//   docker run --rm --network host -v "$PWD":/maru -v /home/icyou/workspace/verify/node_modules:/deps \
+//   docker run --rm --network host -v "$PWD":/musoe -v /home/icyou/workspace/verify/node_modules:/deps \
 //     mcr.microsoft.com/playwright:v1.60.0-noble bash -lc \
-//     'PLAYWRIGHT_CORE=/deps/playwright-core/index.mjs CHROMIUM=$(ls /ms-playwright/chromium-*/chrome-linux/chrome|head -1) node /maru/scripts/browser-bench.mjs'
+//     'PLAYWRIGHT_CORE=/deps/playwright-core/index.mjs CHROMIUM=$(ls /ms-playwright/chromium-*/chrome-linux/chrome|head -1) node /musoe/scripts/browser-bench.mjs'
 const { chromium } = await import(
   process.env.PLAYWRIGHT_CORE ?? '/home/icyou/workspace/verify/node_modules/playwright-core/index.mjs'
 );

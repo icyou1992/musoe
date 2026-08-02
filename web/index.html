@@ -15,30 +15,30 @@
 <script type="module">
 // Maru 웹 데모 — **wasm-bindgen 없이** 원시 C ABI를 직접 부른다.
 // 요점은 핫패스가 함수 호출이 아니라 **선형 메모리 뷰**라는 것이다:
-// 매 프레임 maru_step 한 번 + Float32Array 한 번 읽기가 전부다.
+// 매 프레임 musoe_step 한 번 + Float32Array 한 번 읽기가 전부다.
 const SHAPE_SPHERE = 0, SHAPE_BOX = 1;
 const BODY_STATIC = 0, BODY_DYNAMIC = 1;
 const STRIDE = 7;                 // pos3 + quat4
 const IDENT = [0, 0, 0, 1];
 
 const { instance } = await WebAssembly.instantiateStreaming(
-  fetch('./maru_wasm.wasm'), {}
+  fetch('./musoe_wasm.wasm'), {}
 );
 const m = instance.exports;
 const mem = () => new Float32Array(m.memory.buffer);
 
 // 핸들(u64)은 JS에서 **BigInt**다 — Number로 변환하지 말고 불투명하게 보관·전달한다.
 // 실패 센티널 u64::MAX는 -1n으로 관측된다.
-const world = m.maru_world_create(0, -9.81, 0, 0);
+const world = m.musoe_world_create(0, -9.81, 0, 0);
 
 // 바닥
-m.maru_add_body(world, BODY_STATIC, SHAPE_BOX, 20, 1, 20, 0, 0, -1, 0, ...IDENT, 1);
+m.musoe_add_body(world, BODY_STATIC, SHAPE_BOX, 20, 1, 20, 0, 0, -1, 0, ...IDENT, 1);
 
 // 공 무더기
 const balls = [];
 for (let i = 0; i < 120; i++) {
   const x = (i % 6) * 1.2 - 3, z = ((i / 6) | 0) % 6 * 1.2 - 3, y = 1 + ((i / 36) | 0) * 1.4;
-  balls.push(m.maru_add_body(world, BODY_DYNAMIC, SHAPE_SPHERE, 0.5, 0, 0, 0, x, y, z, ...IDENT, 1));
+  balls.push(m.musoe_add_body(world, BODY_DYNAMIC, SHAPE_SPHERE, 0.5, 0, 0, 0, x, y, z, ...IDENT, 1));
 }
 
 // --- 아주 작은 3D: 원근 투영만 직접 한다 (렌더 라이브러리 없이 동작을 보이는 게 목적) ---
@@ -62,14 +62,14 @@ function frame(now) {
   acc = Math.min(acc + (now - last) / 1000, 0.25);
   last = now;
   const t0 = performance.now();
-  while (acc >= 1 / 60) { m.maru_step(world, 1 / 60); acc -= 1 / 60; }
+  while (acc >= 1 / 60) { m.musoe_step(world, 1 / 60); acc -= 1 / 60; }
   stepMs = stepMs * 0.9 + (performance.now() - t0) * 0.1;
 
   // **핫패스는 여기가 전부다**: 포인터 한 번, 뷰 한 번.
   // (첫 RAF에서 스텝이 한 번도 안 돌아도 안전하다 — 포인터 취득이 콜드 변이를
   // 자동 동기화한다. 부호 없는 시프트: 포인터가 2GiB를 넘으면 >>는 음수가 된다.)
-  const n = m.maru_slot_count(world);
-  const ptr = m.maru_transforms_ptr(world);
+  const n = m.musoe_slot_count(world);
+  const ptr = m.musoe_transforms_ptr(world);
   if (!ptr) {                                 // 스테이징 OOM — null을 base 0으로 읽으면
     requestAnimationFrame(frame);             // 선형 메모리 시작부가 좌표로 보인다.
     return;
@@ -94,7 +94,7 @@ function frame(now) {
   }
   if ((frames++ & 15) === 0) {
     hud.textContent =
-      `바디 ${n}   step ${stepMs.toFixed(2)} ms   접촉 이벤트 ${m.maru_events_len(world)}`;
+      `바디 ${n}   step ${stepMs.toFixed(2)} ms   접촉 이벤트 ${m.musoe_events_len(world)}`;
   }
   requestAnimationFrame(frame);
 }
@@ -104,8 +104,8 @@ requestAnimationFrame(frame);
 addEventListener('pointerdown', (e) => {
   const f = Math.min(cv.width, cv.height) * 0.9;
   const dx = (e.clientX - cv.width / 2) / f, dy = -(e.clientY - cv.height / 2) / f;
-  const hit = m.maru_cast_ray(world, CAM.x, CAM.y, CAM.z, dx, dy, -1, 200);
-  if (hit === 1) m.maru_apply_impulse(world, m.maru_query_hit_handle(world), 0, 12, 0);
+  const hit = m.musoe_cast_ray(world, CAM.x, CAM.y, CAM.z, dx, dy, -1, 200);
+  if (hit === 1) m.musoe_apply_impulse(world, m.musoe_query_hit_handle(world), 0, 12, 0);
 });
 </script>
 </body>

@@ -1,0 +1,17 @@
+[package]
+name = "musoe-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Maru bench harness (M0: SIMD math microbenches, native + wasm)"
+
+[features]
+# musoe-dynamics의 PCM 상한 계측 팔을 여는 통로 (기본 off).
+pcm-probe = ["musoe-dynamics/pcm-probe"]
+solve-probe = ["musoe-dynamics/solve-probe"]
+
+[dependencies]
+musoe-math = { path = "../musoe-math" }
+musoe-collide = { path = "../musoe-collide" }
+musoe-dynamics = { path = "../musoe-dynamics" }
+wide = { workspace = true }

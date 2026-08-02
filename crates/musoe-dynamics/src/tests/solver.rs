@@ -1,0 +1,396 @@
+//! solver 관련 테스트.
+
+use super::*;
+
+/// 붕괴 판정. **상대 기준**(스택 높이의 1%)을 쓴다 — 절대 임계는 단수가 바뀌면 의미가
+/// 달라진다(톨러런스에서 배운 것과 같은 함정). soft 접촉의 하중 비례 침하는 정상 거동이고,
+/// 판정해야 하는 것은 '형상을 잃었는가'다. 100단 붕괴(4.9% 낙하)는 이 기준에서도 실패한다.
+fn assert_pyramid_stable(w: &World, hs: &[BodyHandle], tiers: usize) {
+    for (idx, h) in hs.iter().enumerate() {
+        let b = w.body(*h);
+        assert!(b.pose.pos.y.is_finite(), "box {idx} 발산");
+        assert!(b.linvel.length() < 0.2, "box {idx} 미정착: {:?}", b.linvel);
+    }
+    let top = w.body(*hs.last().unwrap());
+    let expect_y = 0.5 + (tiers - 1) as f32;
+    let sag = expect_y - top.pose.pos.y;
+    let limit = 0.01 * tiers as f32; // 스택 높이의 1%
+    assert!(
+        sag.abs() < limit,
+        "정상 침하 {sag:.3}m > 허용 {limit:.3}m (높이 {expect_y}) — 붕괴"
+    );
+}
+
+/// 질량중심에서 벗어난 점을 때리면 **회전도** 생긴다.
+#[test]
+fn off_center_impulse_creates_spin() {
+    let (mut w, h) = unit_sphere_world();
+    let com = w.body(h).pose().pos;
+    // 중심에서 +y로 0.5 떨어진 점을 +x로 때린다 → z축 각속도가 생겨야 한다
+    w.apply_impulse_at_point(
+        h,
+        musoe_math::Vec3::new(4.0, 0.0, 0.0),
+        com + musoe_math::Vec3::new(0.0, 0.5, 0.0),
+    )
+    .unwrap();
+    let m = 1.0 / w.body(h).inv_mass();
+    let b = w.body(h);
+    assert!(
+        (b.linvel().x - 4.0 / m).abs() < 1e-5,
+        "선속도는 중심 타격과 같다"
+    );
+    assert!(
+        b.angvel().z < -1e-3,
+        "r×J 의 z가 음수여야 한다: {:?}",
+        b.angvel()
+    );
+    assert!(b.angvel().x.abs() < 1e-6 && b.angvel().y.abs() < 1e-6);
+}
+
+/// 정착: 박스가 바닥에 얹혀 침투·점프 없이 정지 상태 유지
+#[test]
+fn box_rests_on_ground_without_sinking() {
+    let mut w = World::new(WorldParams::default());
+    ground(&mut w);
+    let bx = w.add_body(Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(0.5, 0.5, 0.5),
+            radius: 0.0,
+        },
+        pose(0.0, 0.5, 0.0), // 정확히 얹힘
+        1.0,
+    ));
+    for _ in 0..300 {
+        w.step(DT);
+    }
+    let b = w.body(bx);
+    assert!((b.pose.pos.y - 0.5).abs() < 0.01, "y={}", b.pose.pos.y);
+    assert!(b.linvel.length() < 0.05, "v={:?}", b.linvel);
+    assert!(b.angvel.length() < 0.05, "w={:?}", b.angvel);
+}
+
+/// 스택 5단 안정 (M2 피라미드 100단의 축소 선행 게이트)
+#[test]
+fn stack_of_5_boxes_stays_up() {
+    let mut w = World::new(WorldParams::default());
+    ground(&mut w);
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        handles.push(w.add_body(Body::new_dynamic(
+            Shape::Box {
+                half: Vec3::new(0.5, 0.5, 0.5),
+                radius: 0.0,
+            },
+            pose(0.0, 0.5 + i as f32 * 1.0, 0.0),
+            1.0,
+        )));
+    }
+    for _ in 0..600 {
+        w.step(DT);
+    }
+    for (i, h) in handles.iter().enumerate() {
+        let b = w.body(*h);
+        let expect_y = 0.5 + i as f32 * 1.0;
+        assert!(
+            (b.pose.pos.y - expect_y).abs() < 0.05,
+            "box {i}: y={} expect {expect_y}",
+            b.pose.pos.y
+        );
+        assert!(
+            b.pose.pos.x.abs() < 0.05 && b.pose.pos.z.abs() < 0.05,
+            "box {i} drifted: {:?}",
+            b.pose.pos
+        );
+    }
+}
+
+/// restitution: e=0.8 공 낙하 → 반발 apex ≈ e²·h₀ (임팩트 게이트 경유)
+#[test]
+fn restitution_bounce_apex() {
+    let mut w = World::new(WorldParams::default());
+    ground(&mut w);
+    let mut ball = Body::new_dynamic(Shape::Sphere { radius: 0.5 }, pose(0.0, 2.5, 0.0), 1.0);
+    ball.restitution = 0.8;
+    let h0 = 2.0; // 낙하 높이 (표면 기준)
+    let ball = w.add_body(ball);
+    let mut apex: f32 = 0.0;
+    let mut bounced = false;
+    for _ in 0..240 {
+        w.step(DT);
+        let b = w.body(ball);
+        if b.linvel.y > 0.01 {
+            bounced = true;
+        }
+        if bounced {
+            apex = apex.max(b.pose.pos.y - 0.5);
+        }
+    }
+    assert!(bounced, "반발 없음");
+    let expect = 0.8 * 0.8 * h0;
+    assert!(
+        (apex - expect).abs() < 0.25 * expect,
+        "apex={apex} expect≈{expect}"
+    );
+}
+
+/// 피라미드 10단 (55박스) — CI 상시 게이트 (100단의 축소판)
+#[test]
+fn pyramid_10_tiers_stable() {
+    let mut w = World::new(WorldParams::default());
+    ground(&mut w);
+    let hs = pyramid(&mut w, 10);
+    for _ in 0..600 {
+        w.step(DT);
+    }
+    assert_pyramid_stable(&w, &hs, 10);
+}
+
+/// release 전용 — debug는 수 분 걸린다. `cargo test --release -- --ignored`
+#[test]
+#[ignore = "release 전용: cargo test --release -p musoe-dynamics -- --ignored"]
+fn pyramid_40_tiers_long_run_acceptance() {
+    const TIERS: usize = 40;
+    let mut w = World::new(WorldParams::default());
+    // 지면은 `musoe-bench --bin pyramid100`과 **동일**해야 한다 — 같은 수용 기준이 서로 다른
+    // 씬을 재면 README 봉투 표와 CI 게이트가 어긋난다.
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(120.0, 1.0, 20.0),
+            radius: 0.0,
+        },
+        pose(0.0, -1.0, 0.0),
+    ));
+    let hs = pyramid(&mut w, TIERS);
+    for _ in 0..3000 {
+        w.step(DT);
+    }
+    assert_pyramid_stable(&w, &hs, TIERS);
+    let asleep = hs.iter().filter(|h| w.is_asleep(**h)).count();
+    assert_eq!(
+        asleep,
+        hs.len(),
+        "{asleep}/{} 만 잠듦 — 잠들지 않은 스택은 장기적으로 발산한다",
+        hs.len()
+    );
+}
+
+/// 봉투 **밖**(65단)은 실제로 붕괴한다 — 기준이 판별력을 갖는지 잠근다.
+/// 이 테스트가 실패하면 봉투가 넓어진 것이므로 위 기준을 다시 재야 한다.
+#[test]
+#[ignore = "release 전용: cargo test --release -p musoe-dynamics -- --ignored"]
+fn pyramid_65_tiers_is_outside_the_envelope() {
+    let mut w = World::new(WorldParams::default());
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(120.0, 1.0, 20.0),
+            radius: 0.0,
+        },
+        pose(0.0, -1.0, 0.0),
+    ));
+    let hs = pyramid(&mut w, 65);
+    for _ in 0..3000 {
+        w.step(DT);
+    }
+    let top = w.body(*hs.last().unwrap()).pose.pos.y;
+    assert!(
+        top < 0.99 * (0.5 + 64.0),
+        "65단이 버텼다 — 봉투가 넓어졌으니 수용 기준을 재측정할 것 (top_y={top:.2})"
+    );
+}
+
+/// PARTIAL MAJOR: 정상 슬라이딩에서 warm start가 매 프레임 끊기면 안 된다.
+/// 허용치가 기하 척도만 쓰면 60Hz·1m/s(프레임당 16.7mm)가 반두께 허용치를 넘는다.
+#[test]
+fn sliding_contact_keeps_warm_start() {
+    let mut w = World::new(WorldParams::default());
+    // 얇은 판 위를 구가 미끄러진다 — 구·판 접점은 generic witness(위치 매칭 대상)
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(20.0, 0.01, 20.0),
+            radius: 0.0,
+        },
+        pose(0.0, -0.01, 0.0),
+    ));
+    let s = w.add_body(Body::new_dynamic(
+        Shape::Sphere { radius: 0.3 },
+        pose(-5.0, 0.3, 0.0),
+        1.0,
+    ));
+    for _ in 0..60 {
+        w.step(DT); // 안착
+    }
+    w.set_linear_velocity(s, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+    // 진단은 **스텝별로 리셋**되므로 매 스텝 누적한다
+    let (mut hits, mut total) = (0usize, 0usize);
+    for _ in 0..180 {
+        w.step(DT);
+        let d = w.diagnostics();
+        hits += d.warm_hits;
+        total += d.warm_total;
+    }
+    assert!(total > 100, "접촉 표본이 부족: {total}");
+    let ratio = hits as f32 / total as f32;
+    assert!(
+        ratio > 0.8,
+        "슬라이딩 중 warm start 계승률 {ratio:.2} — 매 프레임 끊기고 있다"
+    );
+}
+
+/// 회귀(확인 검수 rev_8672a3eb MAJOR): substeps=64에서 서브스텝당 팁 이동
+/// (30/3840×1.5 ≈ 1.17cm)이 skin/4(1.25cm) 아래로 숨는다 — 게이트가 서브스텝
+/// 단위면 캐스트가 아예 꺼져 스텝 전체 0.75m 회전 스윕이 무검사가 된다.
+/// 게이트는 스텝 전체 봉투여야 한다.
+#[test]
+fn per_substep_gate_cannot_hide_a_full_step_rotation() {
+    let mut w = World::new(WorldParams {
+        gravity: Vec3::ZERO,
+        substeps: 64,
+        ..WorldParams::default()
+    });
+    w.add_body(Body::new_static(
+        Shape::Box {
+            half: Vec3::new(0.05, 3.0, 3.0),
+            radius: 0.0,
+        },
+        pose(1.2, 0.0, 0.0),
+    ));
+    let b = Body::new_dynamic(
+        Shape::Box {
+            half: Vec3::new(1.5, 0.05, 0.05),
+            radius: 0.0,
+        },
+        Pose {
+            pos: Vec3::ZERO,
+            rot: Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), core::f32::consts::FRAC_PI_2),
+        },
+        1.0,
+    )
+    .with_ccd();
+    let h = w.add_body(b);
+    w.set_angular_velocity(h, Vec3::new(0.0, 30.0, 0.0))
+        .unwrap();
+    let skin = w.params().speculative_margin;
+    for step in 0..120 {
+        w.step(DT);
+        let p = w.body(h).pose();
+        let tip = (p.pos + p.rot.rotate(Vec3::new(1.5, 0.0, 0.0)))
+            .x
+            .max((p.pos + p.rot.rotate(Vec3::new(-1.5, 0.0, 0.0))).x);
+        assert!(
+            tip <= 1.15 + skin + 0.02,
+            "step {step}: 서브스텝 게이트 아래로 숨은 회전이 벽을 쓸었다 (tip_x={tip})"
+        );
+    }
+}
+
+/// **BLOCKER (검수 rev_141caff1·rev_0b791000)**: 캐시 항목은 접점 하나에만 물려줘야 한다.
+///
+/// 예전에는 접점마다 `cache.iter().find(...)`를 처음부터 다시 돌려서, 같은 ID를 단 접점
+/// 여럿(generic 다접점 — 메시·복합 폴백과 원기둥 뚜껑 apex가 만든다)이 **같은 이전 접점
+/// 하나를 동시에 계승**했다. 그러면 그 임펄스가 접점 수만큼 중복 적용돼 총 법선 임펄스와
+/// 토크가 부풀고, 반대로 첫 항목이 무하중점이면 전부 cold-start가 된다.
+///
+/// 씬으로는 못 잰다 — 진단(`warm_hits`·`warm_total`)이 **전 페어 합계**라 페어별
+/// 불변식을 세울 수 없다(합계로 세우면 박스가 삼각형 둘에 걸치는 정상 동작을 위반으로
+/// 잡는다). 그래서 매칭을 순수 함수로 떼어 함수 층에서 잰다.
+#[test]
+fn a_cache_entry_is_inherited_by_exactly_one_contact_point() {
+    use crate::solver::{match_cache_entry, CACHE_USED_WORDS};
+    let generic = musoe_collide::FeatureId(musoe_collide::FEATURE_GENERIC);
+    let entry = crate::solver::CachedImpulse {
+        position: Vec3::new(0.0, 0.0, 0.0),
+        contact_normal: Vec3::new(0.0, 1.0, 0.0),
+        ..Default::default()
+    };
+    let cache = [(generic, entry)];
+    let n = Vec3::new(0.0, 1.0, 0.0);
+    let tol2 = 1.0f32; // 두 접점 모두 게이트를 통과할 만큼 넉넉하게
+
+    // ① 같은 generic ID의 접점 둘 — 첫째만 물려받는다.
+    let mut used = [0u64; CACHE_USED_WORDS];
+    let a = match_cache_entry(&cache, &mut used, generic, Vec3::ZERO, n, true, tol2);
+    let b = match_cache_entry(
+        &cache,
+        &mut used,
+        generic,
+        Vec3::new(0.1, 0.0, 0.0),
+        n,
+        true,
+        tol2,
+    );
+    assert_eq!((a, b), (Some(0), None), "한 항목이 두 접점에 물려갔다");
+
+    // ② **소비 상태는 매니폴드 경계를 넘어 이어진다** — 메시는 한 페어에서 매니폴드를
+    //    여럿 내고 같은 캐시를 매번 넘긴다. 같은 `used`로 다시 부르면 못 받아야 한다.
+    let c = match_cache_entry(&cache, &mut used, generic, Vec3::ZERO, n, true, tol2);
+    assert_eq!(c, None, "다음 매니폴드가 이미 쓴 항목을 또 가져갔다");
+
+    // ③ 음성 대조: 새 상태에서는 다시 받는다(무조건 거절이 아니다).
+    let mut fresh = [0u64; CACHE_USED_WORDS];
+    assert_eq!(
+        match_cache_entry(&cache, &mut fresh, generic, Vec3::ZERO, n, true, tol2),
+        Some(0)
+    );
+
+    // ④ **가장 가까운 것**을 고른다 — 선착순이 아니다.
+    let far = crate::solver::CachedImpulse {
+        position: Vec3::new(0.5, 0.0, 0.0),
+        contact_normal: n,
+        ..Default::default()
+    };
+    let near = crate::solver::CachedImpulse {
+        position: Vec3::new(0.01, 0.0, 0.0),
+        contact_normal: n,
+        ..Default::default()
+    };
+    let two = [(generic, far), (generic, near)];
+    let mut u2 = [0u64; CACHE_USED_WORDS];
+    assert_eq!(
+        match_cache_entry(&two, &mut u2, generic, Vec3::ZERO, n, true, tol2),
+        Some(1),
+        "더 가까운 항목(1번)을 두고 선착순으로 0번을 골랐다"
+    );
+}
+
+/// **BLOCKER (검수 rev_f87badcc)**: 소비 표시 비트셋 **밖** 인덱스는 매칭에 쓰면 안 된다.
+///
+/// 라이브 경로는 페어당 최대 64매니폴드 × 4점 = 256이라 도달하지 않지만, **스냅샷 복원은
+/// 호스트가 준 바이트에서 캐시를 읽으므로** 그 상한을 넘길 수 있다. 표시를 못 남기는
+/// 항목을 매칭에 쓰면 같은 항목이 여러 접점에 다시 물려간다(직전 BLOCKER의 부활).
+#[test]
+fn cache_entries_beyond_the_bitset_are_never_matched() {
+    use crate::solver::{match_cache_entry, CACHE_USED_WORDS};
+    const CAP: usize = CACHE_USED_WORDS * 64;
+    let generic = musoe_collide::FeatureId(musoe_collide::FEATURE_GENERIC);
+    let n = Vec3::new(0.0, 1.0, 0.0);
+    // 앞 CAP개는 **멀리**, CAP번째(비트셋 밖)를 **가장 가깝게** 둔다.
+    let mut cache: Vec<(musoe_collide::FeatureId, crate::solver::CachedImpulse)> = (0..CAP)
+        .map(|i| {
+            (
+                generic,
+                crate::solver::CachedImpulse {
+                    position: Vec3::new(0.9, 0.0, i as f32 * 1e-6),
+                    contact_normal: n,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    cache.push((
+        generic,
+        crate::solver::CachedImpulse {
+            position: Vec3::ZERO, // 질의점과 정확히 같은 자리 — 최근접
+            contact_normal: n,
+            ..Default::default()
+        },
+    ));
+    let mut used = [0u64; CACHE_USED_WORDS];
+    let got = match_cache_entry(&cache, &mut used, generic, Vec3::ZERO, n, true, 4.0);
+    assert!(
+        got.is_some_and(|i| i < CAP),
+        "비트셋 밖 항목({CAP}번)을 골랐다: {got:?}"
+    );
+    // 그리고 그 항목은 소비된다 — 다음 접점이 같은 것을 또 받지 않는다.
+    let second = match_cache_entry(&cache, &mut used, generic, Vec3::ZERO, n, true, 4.0);
+    assert_ne!(second, got, "같은 항목이 두 접점에 물려갔다");
+}

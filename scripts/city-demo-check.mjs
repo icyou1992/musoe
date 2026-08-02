@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // city.html 데모 실구동 검증 — 헤드리스 크로미엄에서 로드→정착→포격→수치·스크린샷.
-//   docker run --rm -v "$PWD":/maru -v .../verify/node_modules:/deps mcr.microsoft.com/playwright:v1.60.0-noble \
-//     bash -lc 'PLAYWRIGHT_CORE=/deps/playwright-core/index.mjs CHROMIUM=$(ls /ms-playwright/chromium-*/chrome-linux*/chrome|head -1) node /maru/scripts/city-demo-check.mjs'
+//   docker run --rm -v "$PWD":/musoe -v .../verify/node_modules:/deps mcr.microsoft.com/playwright:v1.60.0-noble \
+//     bash -lc 'PLAYWRIGHT_CORE=/deps/playwright-core/index.mjs CHROMIUM=$(ls /ms-playwright/chromium-*/chrome-linux*/chrome|head -1) node /musoe/scripts/city-demo-check.mjs'
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join, dirname, extname } from 'node:path';

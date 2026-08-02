@@ -21,8 +21,8 @@
                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/" } }
 </script>
 <script type="module">
-// 수면 도시 포격 — maru의 실게임 프로파일(대부분 잠들고 국소만 활성)을 그대로 보여준다.
-// 물리 = maru wasm(C ABI + 선형 메모리 뷰), 렌더 = three.js InstancedMesh(드로우콜 2개).
+// 수면 도시 포격 — musoe의 실게임 프로파일(대부분 잠들고 국소만 활성)을 그대로 보여준다.
+// 물리 = musoe wasm(C ABI + 선형 메모리 뷰), 렌더 = three.js InstancedMesh(드로우콜 2개).
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
@@ -30,15 +30,15 @@ const SHAPE_SPHERE = 0, SHAPE_BOX = 1;
 const BODY_STATIC = 0, BODY_DYNAMIC = 1;
 const STRIDE = 7, IDENT = [0, 0, 0, 1];
 
-const { instance } = await WebAssembly.instantiateStreaming(fetch('./maru_wasm.wasm'), {});
+const { instance } = await WebAssembly.instantiateStreaming(fetch('./musoe_wasm.wasm'), {});
 const m = instance.exports;
-const world = m.maru_world_create(0, -9.81, 0, 0);
+const world = m.musoe_world_create(0, -9.81, 0, 0);
 // 수면 임계를 rapier 기본과 동일선(0.4/0.5)으로 — 대량 잔해 데모는 빨리 잠드는 게
 // 성능·안정 둘 다 이득이다(수면=절벽 해법이라는 실측 결론). 기본값(0.1)은 4배 엄격.
-m.maru_set_sleep_thresholds(world, 0.4, 0.5, 0.4);
+m.musoe_set_sleep_thresholds(world, 0.4, 0.5, 0.4);
 
 // ---- 도시: 바닥 + 타워 그리드 (1m 큐브, 완전 정렬 적층 → 빠르게 정착·수면) ----
-m.maru_add_body(world, BODY_STATIC, SHAPE_BOX, 80, 1, 80, 0, 0, -1, 0, ...IDENT, 1);
+m.musoe_add_body(world, BODY_STATIC, SHAPE_BOX, 80, 1, 80, 0, 0, -1, 0, ...IDENT, 1);
 const boxes = [];        // BigInt 핸들 (u64 ABI)
 const GRID = 20, SPACING = 6.0, BASE = 2, HEIGHT = 6;
 for (let gx = 0; gx < GRID; gx++) {
@@ -48,14 +48,14 @@ for (let gx = 0; gx < GRID; gx++) {
     for (let h = 0; h < HEIGHT; h++) {
       for (let bx = 0; bx < BASE; bx++) {
         for (let bz = 0; bz < BASE; bz++) {
-          const hb = m.maru_add_body(
+          const hb = m.musoe_add_body(
             world, BODY_DYNAMIC, SHAPE_BOX, 0.5, 0.5, 0.5, 0,
             cx + (bx - 0.5) * 1.001, 0.5 + h * 1.0, cz + (bz - 0.5) * 1.001,
             ...IDENT, 1,
           );
           // 가벼운 감쇠(업계 표준 기본값 계열) — 무감쇠 잔해는 넘어진 뒤 오래 굴러
           // 이웃을 계속 깨운다. 도시가 포격 후 다시 잠들려면 잔해가 멈춰야 한다.
-          m.maru_set_damping(world, hb, 0.05, 0.3);
+          m.musoe_set_damping(world, hb, 0.05, 0.3);
           boxes.push(hb);
         }
       }
@@ -121,16 +121,16 @@ addEventListener('pointerdown', (e) => {
   const ray = new THREE.Raycaster();
   ray.setFromCamera(ndc, camera);
   const o = camera.position, d = ray.ray.direction;
-  const h = m.maru_add_body(
+  const h = m.musoe_add_body(
     world, BODY_DYNAMIC, SHAPE_SPHERE, BALL_R, 0, 0, 0,
     o.x + d.x * 2, o.y + d.y * 2, o.z + d.z * 2, ...IDENT, BALL_DENSITY,
   );
   if (h === -1n) return;
   // 감쇠 — 각 감쇠 없는 구는 마찰로 선속만 줄고 회전이 남아 영원히 굴러 도시를
   // 연쇄로 깨운다. 구른 뒤 멈춰 잠들어야 도시가 재정착한다.
-  m.maru_set_damping(world, h, 0.1, 0.6);
+  m.musoe_set_damping(world, h, 0.1, 0.6);
   const V = 30; // m/s — substep당 0.125m < 반지름이라 CCD 불필요
-  m.maru_apply_impulse(world, h, d.x * V * BALL_MASS, d.y * V * BALL_MASS, d.z * V * BALL_MASS);
+  m.musoe_apply_impulse(world, h, d.x * V * BALL_MASS, d.y * V * BALL_MASS, d.z * V * BALL_MASS);
   balls.push(h);
   ballMesh.count = balls.length;
 });
@@ -155,7 +155,7 @@ function frame(now) {
   acc = Math.min(acc + dtReal, 0.25);
   const t0 = performance.now();
   let stepped = 0;
-  while (acc >= 1 / 60) { m.maru_step(world, 1 / 60); acc -= 1 / 60; stepped++; }
+  while (acc >= 1 / 60) { m.musoe_step(world, 1 / 60); acc -= 1 / 60; stepped++; }
   if (stepped) {
     stepMsNow = (performance.now() - t0) / stepped;
     stepMsAvg = stepMsAvg * 0.9 + stepMsNow * 0.1;
@@ -164,8 +164,8 @@ function frame(now) {
   // 핫패스: 포인터 2회 + 뷰 2회. **잠든 바디는 행렬 갱신·업로드를 건너뛴다** —
   // 안 움직였으니 행렬이 이미 맞다. 이 스킵이 없으면 매 프레임 9,600개 compose +
   // 614KB GPU 업로드가 프레임을 지배해 물리 격차가 렌더에 묻힌다(폰 실증).
-  const ptr = m.maru_transforms_ptr(world);
-  const fptr = m.maru_sleep_flags_ptr(world);
+  const ptr = m.musoe_transforms_ptr(world);
+  const fptr = m.musoe_sleep_flags_ptr(world);
   if (ptr && fptr) {
     const base = ptr >>> 2;
     const t = new Float32Array(m.memory.buffer);

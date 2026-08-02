@@ -10,7 +10,7 @@
 // 공정성 메모:
 // - rapier도 **각자의 기본 파라미터**로 돌린다(compare 하네스와 같은 원칙). rapier의 웹 배포는
 //   `rapier3d-compat`(wasm 내장 단일 번들)이고, 이것이 호스트가 실제로 쓰는 물건이다.
-// - maru판은 렌더 없이 `maru_step`만 잰다. 여기서도 `world.step()`만 잰다. 다만 rapier.js는
+// - musoe판은 렌더 없이 `musoe_step`만 잰다. 여기서도 `world.step()`만 잰다. 다만 rapier.js는
 //   변환을 **바디별 객체 호출**로 읽는 API라, 렌더가 붙으면 그 비용이 추가된다(설계서가
 //   말한 "JS↔WASM 마샬링" 세금). 이 벤치는 그걸 **재지 않는다** — 스텝 비용만의 비교다.
 import RAPIER from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.19.3/+esm';

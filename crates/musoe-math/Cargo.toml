@@ -1,0 +1,13 @@
+[package]
+name = "musoe-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Maru physics engine math core: scalar Vec3/Quat + SIMD128-shaped SoA batches"
+
+[dependencies]
+wide = { workspace = true }
+
+[features]
+# 테스트 전용 훅 — FP 환경을 일부러 깨뜨려 가드가 실제로 잡는지 보는 용도.
+test-hooks = []

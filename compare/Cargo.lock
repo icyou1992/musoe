@@ -366,35 +366,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "maru-collide"
+name = "musoe-collide"
 version = "0.1.0"
 dependencies = [
- "maru-math",
+ "musoe-math",
  "wide 0.7.33",
 ]
 
 [[package]]
-name = "maru-compare"
+name = "musoe-compare"
 version = "0.1.0"
 dependencies = [
  "joltc-sys",
- "maru-collide",
- "maru-dynamics",
- "maru-math",
+ "musoe-collide",
+ "musoe-dynamics",
+ "musoe-math",
  "rapier3d",
 ]
 
 [[package]]
-name = "maru-dynamics"
+name = "musoe-dynamics"
 version = "0.1.0"
 dependencies = [
- "maru-collide",
- "maru-math",
+ "musoe-collide",
+ "musoe-math",
  "wide 0.7.33",
 ]
 
 [[package]]
-name = "maru-math"
+name = "musoe-math"
 version = "0.1.0"
 dependencies = [
  "wide 0.7.33",

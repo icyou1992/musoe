@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/maru-math",
-    "crates/maru-collide",
-    "crates/maru-dynamics",
-    "crates/maru-bench",
-    "crates/maru-wasm",
+    "crates/musoe-math",
+    "crates/musoe-collide",
+    "crates/musoe-dynamics",
+    "crates/musoe-bench",
+    "crates/musoe-wasm",
 ]
 # 대조 벤치는 별도 워크스페이스다 — 외부 엔진(rapier)을 엔진 의존성 그래프와 게이트에
 # 들이지 않기 위해서다. 실행: compare/README.md

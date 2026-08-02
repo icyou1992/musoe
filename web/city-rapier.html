@@ -21,8 +21,8 @@
                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/" } }
 </script>
 <script type="module">
-// 수면 도시 포격 — maru의 실게임 프로파일(대부분 잠들고 국소만 활성)을 그대로 보여준다.
-// 물리 = maru wasm(C ABI + 선형 메모리 뷰), 렌더 = three.js InstancedMesh(드로우콜 2개).
+// 수면 도시 포격 — musoe의 실게임 프로파일(대부분 잠들고 국소만 활성)을 그대로 보여준다.
+// 물리 = musoe wasm(C ABI + 선형 메모리 뷰), 렌더 = three.js InstancedMesh(드로우콜 2개).
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
@@ -153,7 +153,7 @@ function frame(now) {
   }
 
   // 변환 읽기 — rapier.js 관례(바디별 객체 호출). **잠든 바디는 행렬 갱신·업로드
-  // 스킵**(maru판과 동일 로직 — 렌더 공정성 유지). 수면 조회는 rapier API 관례대로
+  // 스킵**(musoe판과 동일 로직 — 렌더 공정성 유지). 수면 조회는 rapier API 관례대로
   // 바디별 isSleeping() 호출.
   let asleep = 0, changed = false;
   for (let i = 0; i < boxes.length; i++) {

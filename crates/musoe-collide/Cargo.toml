@@ -1,0 +1,10 @@
+[package]
+name = "musoe-collide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Maru collision: shapes, broadphase dual tree, GJK/EPA, contact manifolds"
+
+[dependencies]
+musoe-math = { path = "../musoe-math" }
+wide = { workspace = true }
