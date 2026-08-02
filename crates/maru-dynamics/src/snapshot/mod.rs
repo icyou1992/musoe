@@ -271,6 +271,16 @@ pub fn read_world(world: &mut World, bytes: &[u8]) -> Result<(), SnapshotError> 
     for _ in 0..np {
         let key = (r.u32()?, r.u32()?);
         let ne = r.count(min_bytes::CACHE_ENTRY, decoded_size::cache_entry())?;
+        // **라이브에서 도달 가능한 크기만 복원한다** (교차검수 rev_ca87695d MAJOR).
+        // 한 페어의 캐시는 페어당 매니폴드 상한 × 접점 상한을 넘을 수 없다
+        // (하이트필드 64 매니폴드 × 4점 = 256, 복합 8×8 자식쌍도 그 안이다).
+        // 상한을 안 걸면 64 MiB 예산 안에서 수십만 항목짜리 페어 캐시가 복원되고,
+        // 그 벡터는 라이브가 만들 수 없는 크기로 메모리에 남는다 — 그 페어가 다음 스텝에
+        // 처리되면 핫패스의 용량 축소가 거대한 재할당을 강제하고, 안 처리되면 계속 잔류한다.
+        // 물리 매칭 쪽 fail-closed(`match_cache_entry`)만으로는 이 계약이 안 닫힌다.
+        if ne > crate::solver::CACHE_USED_WORDS * 64 {
+            return Err(SnapshotError::CountTooLarge);
+        }
         let mut entry = try_vec(ne)?;
         for _ in 0..ne {
             let fid = maru_collide::FeatureId(r.u32()?);

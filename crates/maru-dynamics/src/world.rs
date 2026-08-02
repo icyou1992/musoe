@@ -5207,17 +5207,6 @@ impl World {
                         existing.clear();
                     }
                     existing.extend(c.points.iter().map(&mut make));
-                    // **재사용 용량에 상한을 둔다** (교차검수 rev_8f75295a MAJOR).
-                    // 자리에서 채우면 `Vec` 용량이 스텝 간 살아남는데, 예전에는 매 스텝
-                    // 교체로 해제됐다. 복합 페어가 한 프레임에 자식 접점을 잔뜩 만들어
-                    // 크게 자란 뒤 접점 하나만 계속 유지되면, 논리 길이는 작아져도
-                    // **과거 최대치가 영구 잔류**한다 — 그것도 128 MiB 회계 밖에서.
-                    // 여유 4배(+바닥 4)를 넘으면 되돌린다: 정상 상태에서는 절대 발화하지
-                    // 않고(할당 0 유지), 한 번 부푼 키만 제자리로 돌아온다.
-                    let cap_limit = existing.len().max(4).saturating_mul(4);
-                    if existing.capacity() > cap_limit {
-                        existing.shrink_to_fit();
-                    }
                 }
                 // 새 키에서만 할당한다(이번 스텝에 새로 생긴 접촉).
                 None => {
@@ -5238,6 +5227,24 @@ impl World {
         //
         // 임펄스는 스텝 누적이므로 `1/dt`를 곱하면 그 스텝의 **평균 힘**이다. 서브스텝으로
         // 나누지 않는다: 호스트가 보는 시간 단위가 스텝이고, 충돌음·파괴 판정도 스텝 단위다.
+        // **재사용 용량 상한은 페어의 제약을 다 붙인 뒤 한 번만 판정한다**
+        // (교차검수 rev_8f75295a MAJOR로 도입 → rev_ca87695d MAJOR로 자리 수정).
+        // 자리에서 채우면 `Vec` 용량이 스텝 간 살아남는데, 한 번 크게 부푼 키가 접점
+        // 하나만 유지해도 과거 최대치가 영구 잔류한다(128 MiB 회계 밖). 여유 4배(+바닥 4)를
+        // 넘으면 되돌린다.
+        //
+        // **제약마다 판정하면 안 된다**: 메시·하이트필드·복합은 한 페어에서 매니폴드를
+        // 여럿 내는데, 첫 매니폴드를 붙인 직후 길이가 4면 상한이 16이라 용량 32를 4로 줄이고,
+        // 남은 7개를 붙이며 8→16→32로 다시 자란다 — 활성인 매 프레임 축소·재성장이
+        // 반복돼 "스텝 중 할당 0" 계약을 깬다. 최종 길이로 한 번만 본다.
+        for key in cache_written.iter() {
+            if let Some(existing) = self.contact_cache.get_mut(key) {
+                let cap_limit = existing.len().max(4).saturating_mul(4);
+                if existing.capacity() > cap_limit {
+                    existing.shrink_to_fit();
+                }
+            }
+        }
         if !force_rows.is_empty() {
             // 안정 정렬은 임시 버퍼를 할당할 수 있다 — 키가 유일 순서를 주므로 불안정 정렬로
             // 충분하다(같은 키 안의 순서는 합산에 영향이 없다).
