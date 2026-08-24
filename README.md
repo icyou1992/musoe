@@ -145,7 +145,10 @@ needs both narrow phase and solve to roughly halve; micro-optimisation will not 
 
 ### Settled — sleeping on, thresholds matched
 
-This is the regime most games actually sit in.
+Most game worlds hold far more sleeping bodies than active ones, so the fully dormant case is
+worth its own table. It is a distinct regime, not a summary of the engine: nothing is awake in
+the scenes below. Mixed scenes — a settled pile plus a handful of falling bodies — are in the
+throughput table above, and musoe is slower there.
 
 | Scene | musoe | rapier | ratio |
 |---|---|---|---|
