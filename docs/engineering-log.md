@@ -3,7 +3,9 @@
 > 이 문서는 **작업 기록**이다: 무엇을 재고, 무엇을 기각하고, 어디가 아직 결함인지의 원본
 > 근거가 여기 있다. 프로젝트 소개·빠른 시작·성능 요약은 [`../README.md`](../README.md)에 있다.
 
-설계 정본: `../../physics-engine-design/02-architecture.md`(저장소 밖) (v0.21, GPT 교차검수 23태스크 approve).
+설계 정본: [`design/02-architecture.md`](design/02-architecture.md) (v0.21, GPT 교차검수 23태스크 approve).
+근거 조사: [`design/01-engine-analysis.md`](design/01-engine-analysis.md) — PhysX·Chaos·Havok·Jolt·Rapier·Box2D v3 비교(2026-07-24).
+두 문서 모두 엔진 개명(maru → musoe) 이전에 쓰여 본문에서 프로젝트를 **Maru(가칭)** 로 부른다.
 
 ## 상태: M5 완료 (M0~M5 — 충돌·솔버·CCD·메시/하이트필드·스레드·L1·캐릭터)
 
