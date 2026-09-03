@@ -23,16 +23,16 @@ const server = createServer(async (req, res) => {
 await new Promise(r => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 
-// 호스트에 크로미엄 의존 라이브러리가 없으면 Docker playwright 이미지로:
-//   docker run --rm --network host -v "$PWD":/musoe -v /home/icyou/workspace/verify/node_modules:/deps \
-//     mcr.microsoft.com/playwright:v1.60.0-noble bash -lc \
+// Playwright 는 워크스페이스 공용(tools/pw) 하나만 쓴다. 브라우저는 그 패키지가 아는
+// ~/.cache/ms-playwright 리비전. Docker 로 돌릴 때는 공용 node_modules 를 /deps 로 마운트:
+//   docker run --rm --network host -v "$PWD":/musoe -v /home/icyou/workspace/tools/pw/node_modules:/deps:ro \
+//     mcr.microsoft.com/playwright:v<공용 버전>-noble bash -lc \
 //     'PLAYWRIGHT_CORE=/deps/playwright-core/index.mjs CHROMIUM=$(ls /ms-playwright/chromium-*/chrome-linux/chrome|head -1) node /musoe/scripts/browser-bench.mjs'
 const { chromium } = await import(
-  process.env.PLAYWRIGHT_CORE ?? '/home/icyou/workspace/verify/node_modules/playwright-core/index.mjs'
+  process.env.PLAYWRIGHT_CORE ?? '/home/icyou/workspace/tools/pw/node_modules/playwright-core/index.mjs'
 );
 const browser = await chromium.launch({
-  executablePath: process.env.CHROMIUM ??
-    `${process.env.HOME}/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome`,
+  executablePath: process.env.CHROMIUM ?? chromium.executablePath(),
   headless: true,
 });
 const page = await browser.newPage();
